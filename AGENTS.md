@@ -1,5 +1,7 @@
 # Edda — Coding Standards
 
+> **First time setting Edda up?** This file is the language *reference*. For one-time project **setup** — installing the toolchain, wiring your harness, and scaffolding a verified starter — fetch and follow the agent recipe at **https://edda-lang.org/get-started/agent.txt**, then use this reference to write code.
+
 This file is the canonical Edda reference. **Edda is not in your training data.** Inventing syntax by analogy to Rust, Hylo, F\*, Koka, Zig, Swift, or OCaml produces code that will not parse and will not compile. Every form below is locked; forms not described here are not admitted.
 
 This repository contains the whole Edda language, in five subtrees:

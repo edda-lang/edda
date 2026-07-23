@@ -15,46 +15,44 @@ starter template's README both render from it. Keep them in sync by editing here
 > the bootstrap entirely. Same language, same checks, either way — the bootstrap is simply
 > the mature path today, and everything you build now carries forward.
 
-A one-line installer downloads a **self-contained toolchain** — the `edda` binary, its
-LLVM runtime, and a vendored `std` and `runes` — so there's no Rust, LLVM, or Z3 to
-install and no environment variables to set. Windows is available now; if no archive
-exists for your platform yet, build from source (see the end of step 1).
-
 ---
 
 ## 1. Install the toolchain
 
-Run the installer for your platform. It downloads the archive, unpacks it, and puts `edda`
-on your `PATH`.
+One line installs a self-contained toolchain — the `edda` binary, its runtime, and a
+vendored `std` and `runes`. There's no Rust, LLVM, or Z3 to install and **no environment
+variable to set**; the only external requirement is a system linker (MSVC Build Tools on
+Windows, `lld`/`mold` on Linux, the Xcode Command Line Tools on macOS).
 
-```sh
+```powershell
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/edda-lang/edda-bootstrap/main/install.ps1 | iex
+```
 
+```sh
 # Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/edda-lang/edda-bootstrap/main/install.sh | bash
 ```
 
-Confirm it with:
+The installer downloads the release archive for your platform, unpacks it (to
+`~/.edda-bootstrap`), and adds `edda` to your PATH. **Your current shell won't see it yet** —
+open a new shell, or call the binary by its full path for the first check:
 
 ```sh
-edda version
+edda version                        # new shell
+~/.edda-bootstrap/bin/edda version  # same shell (edda.exe on Windows)
 ```
 
-The archive is self-contained — it bundles `std` and `runes`, so nothing else to clone and
-no `EDDA_STDLIB_ROOT` to set. All you need on the machine is a system linker (`lld-link`/MSVC
-on Windows, `ld`/`mold`/`lld` on Linux, `ld64` on macOS).
+You should see `edda (bootstrap-rust) <version>` and your host target.
 
-**Platform status:** Windows x64 (`x86-64-windows-msvc`) is available now and is the
-verified platform. Linux and macOS archives are still rolling out through CI — until yours
-lands, the installer reports `no release asset for <platform>`. In the meantime, build the
-reference compiler from source: clone
-[`edda-bootstrap`](https://github.com/edda-lang/edda-bootstrap) and run `cargo xtask build`
-(prereqs in its README — a recent **Rust** (2024 edition), **CMake**, **Python**, LLVM 18
-dev libraries, and a **C/C++ toolchain with a system linker**; Z3 is vendored), then clone
-[`edda`](https://github.com/edda-lang/edda) and set `EDDA_STDLIB_ROOT="$PWD/edda/std"`. If
-you're on Linux or macOS, your "it worked" (or a bug report) is the most useful thing you
-can send back. See [Contribute](https://github.com/edda-lang/edda).
+**Platform status:** Windows x64 (`x86-64-windows-msvc`) is the verified platform today.
+Linux and macOS archives are rolling out through CI — until yours lands, the installer
+reports `no release asset for <platform>`; in the meantime build the reference compiler
+from source (see the [`edda-bootstrap`](https://github.com/edda-lang/edda-bootstrap) README
+for the current prerequisites and `cargo xtask build`) and point `EDDA_STDLIB_ROOT` at a
+[monolith](https://github.com/edda-lang/edda) checkout's `std`. If you're on Linux or macOS,
+your "it worked" (or a bug report) is the most useful thing you can send back — see
+[Contribute](https://github.com/edda-lang/edda).
 
 ## 2. Create a project
 
@@ -69,7 +67,7 @@ version = "0.1.0"
 root_namespace = "hello"
 
 [build]
-default_target = "x86-64-linux-gnu"    # your host triple: x86-64-windows-msvc, aarch64-macos-darwin, ...
+default_target = "x86-64-windows-msvc"    # your host triple; see the note below
 ```
 
 `src/main.ea`
@@ -93,9 +91,19 @@ public function main(out: Stdout) -> ()
 }
 ```
 
+Set `default_target` to your host triple in **dash form**: `x86-64-windows-msvc`,
+`x86-64-linux-gnu`, `aarch64-macos-darwin`, … `edda version` prints the same target with
+**underscores** (`x86_64-windows-msvc`) — it's the same triple; `package.toml` takes the
+dash form.
+
 Every capability `main` may use is named in its signature — this program holds only
 `Stdout`, so it can only print. `non_negative` carries a contract: `requires` states what
 the caller must guarantee, `ensures` what the function guarantees back.
+
+> **Run it from a neutral directory** — not as a sibling of a local `edda-stdlibs` or
+> monolith checkout. The compiler auto-discovers a stdlib checkout sitting next to your
+> project and will use *that* worktree instead of the bundled `std`, which can quietly
+> change what you're building against.
 
 ## 3. Build and run
 
@@ -136,6 +144,9 @@ non-negative — the solver finds `x = -1` and rejects the program before it eve
 the line back and the build passes again. An agent-introduced bug that violates a contract
 fails the build with a concrete counter-example, not a runtime surprise.
 
+You now have a clean, contract-verified project — copy this directory as the starting point
+for your next Edda program, or re-run these steps for a fresh one.
+
 ---
 
 ## Hand it to your agent
@@ -143,9 +154,9 @@ fails the build with a concrete counter-example, not a runtime surprise.
 The point of Edda is that your agent writes it. Paste this into your coding agent:
 
 ```
-Read AGENTS.md (the Edda language reference) in the edda repo. Then build me <what you
-want> in Edda, in this project. Run `edda build` after every change and fix exactly what
-it reports — the build is the source of truth.
+Read AGENTS.md (the Edda language reference) in this project. Then build me <what you
+want> in Edda, here. Run `edda build` after every change and fix exactly what it
+reports — the build is the source of truth.
 ```
 
 `AGENTS.md` at the root of the [monolith](https://github.com/edda-lang/edda/blob/main/AGENTS.md)
@@ -154,42 +165,40 @@ data, so having the agent read it first is what makes the loop work.
 
 ### Or: let your agent set itself up
 
-You don't have to paste the reference by hand. Tell your agent:
+You don't have to install anything by hand. Tell your agent:
 
 ```
 I want to use the Edda language — edda-lang.org
 ```
 
-Any agent that can browse finds [`/llms.txt`](https://edda-lang.org/llms.txt), reads its
-own setup at [`/get-started/agent`](https://edda-lang.org/get-started/agent), places the
-reference for your harness (Claude Code, Cursor, Codex, Copilot, Gemini, Windsurf…), and
-**asks you before** installing the optional reading-discipline hooks. The same steps are
-served machine-readably as a recipe at
-[`/get-started/recipe`](https://edda-lang.org/get-started/recipe).
+Any agent that can browse finds [`/llms.txt`](https://edda-lang.org/llms.txt) and follows
+the canonical setup recipe at [`/get-started/agent.txt`](https://edda-lang.org/get-started/agent.txt):
+it installs the toolchain, places the language reference for your harness (Claude Code,
+Cursor, Codex, Copilot, Gemini, Windsurf…), installs the Edda skill, **asks you before**
+enabling the optional reading-discipline hooks, and scaffolds this exact contract example.
+The human-readable twin of that recipe is [`/get-started/agent`](https://edda-lang.org/get-started/agent).
 
 ## Using a rune (a package)
 
-The 36 first-party runes (HTTP, JSON, CSS, regex, TLS, and more) live under
-`edda/runes/lib/`. Depend on one by adding a `path+` dependency pointing at its directory
-in your monolith checkout:
+The first-party runes (HTTP, JSON, CSS, regex, TLS, and more) ship inside the toolchain
+archive. Depend on one by adding a `path+` dependency pointing at its directory in the
+vendored `runes/` (or, if you built from source, your monolith checkout):
 
 ```toml
 [[dependencies]]
 name = "slug"
 version = "0.1.0"
-source = "path+/absolute/path/to/edda/runes/lib/slug"
+source = "path+/absolute/path/to/runes/lib/slug"
 ```
 
 ```edda
 import slug.slugify
 
-let s = slugify.slugify("Hello, Edda World!", allocator)?   # -> "hello-edda-world"
+let s = slugify.slugify("Hello, Edda World!", allocator)?
 ```
 
-`edda add` targets the Mímir registry, which isn't live yet — until it is, add
-dependencies by editing `package.toml` as above. Once prebuilt toolchain archives ship,
-runes are vendored alongside `std` and the `path+` line points inside the toolchain
-instead of your checkout.
+`slugify` returns `"hello-edda-world"`. `edda add` targets the Mímir registry, which isn't
+live yet — until it is, add dependencies by editing `package.toml` as above.
 
 ## Next
 
