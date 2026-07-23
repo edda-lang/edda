@@ -15,57 +15,48 @@ starter template's README both render from it. Keep them in sync by editing here
 > the bootstrap entirely. Same language, same checks, either way — the bootstrap is simply
 > the mature path today, and everything you build now carries forward.
 
-There is no `curl | sh` installer yet, and prebuilt binaries are still landing. The path
-below **works on any machine that can build Rust**, which is the honest, portable way in
-today. When a prebuilt release exists for your platform, prefer it — it skips step 1's
-build.
+A one-line installer downloads a **self-contained toolchain** — the `edda` binary, its
+LLVM runtime, and a vendored `std` and `runes` — so there's no Rust, LLVM, or Z3 to
+install and no environment variables to set. Windows is available now; if no archive
+exists for your platform yet, build from source (see the end of step 1).
 
 ---
 
-## 1. Get the compiler (the bootstrap)
+## 1. Install the toolchain
 
-Build the reference compiler from source. See the
-[`edda-bootstrap`](https://github.com/edda-lang/edda-bootstrap) README for the current,
-authoritative prerequisites — in short: a recent **Rust** (2024 edition), **CMake**,
-**Python**, and a **C/C++ toolchain with a system linker** (`lld-link`/MSVC on Windows,
-`ld`/`mold`/`lld` on Linux, `ld64` on macOS). Z3 is vendored and statically linked, so
-there's no separate solver to install.
+Run the installer for your platform. It downloads the archive, unpacks it, and puts `edda`
+on your `PATH`.
 
 ```sh
-git clone https://github.com/edda-lang/edda-bootstrap
-cd edda-bootstrap
-cargo xtask build
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/edda-lang/edda-bootstrap/main/install.ps1 | iex
+
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/edda-lang/edda-bootstrap/main/install.sh | bash
 ```
 
-`cargo xtask build` release-builds the whole workspace and places the `edda` binary next
-to its runtime library (`edda_rt.lib`) under `target/release/` — they must stay together.
-Put that directory on your `PATH` so `edda` is available:
+Confirm it with:
 
 ```sh
-export PATH="$PWD/target/release:$PATH"      # Windows PowerShell: $env:PATH = "$PWD\target\release;$env:PATH"
 edda version
 ```
 
-**Platform status:** Windows x64 (`x86-64-windows-msvc`) is the verified platform today.
-Linux and macOS build and are expected to work but are still being verified across
-distros — if you're on one, your "it worked" (or a bug report) is the most useful thing
-you can send back. See [Contribute](https://github.com/edda-lang/edda).
+The archive is self-contained — it bundles `std` and `runes`, so nothing else to clone and
+no `EDDA_STDLIB_ROOT` to set. All you need on the machine is a system linker (`lld-link`/MSVC
+on Windows, `ld`/`mold`/`lld` on Linux, `ld64` on macOS).
 
-## 2. Get the standard library and runes
+**Platform status:** Windows x64 (`x86-64-windows-msvc`) is available now and is the
+verified platform. Linux and macOS archives are still rolling out through CI — until yours
+lands, the installer reports `no release asset for <platform>`. In the meantime, build the
+reference compiler from source: clone
+[`edda-bootstrap`](https://github.com/edda-lang/edda-bootstrap) and run `cargo xtask build`
+(prereqs in its README — a recent **Rust** (2024 edition), **CMake**, **Python**, LLVM 18
+dev libraries, and a **C/C++ toolchain with a system linker**; Z3 is vendored), then clone
+[`edda`](https://github.com/edda-lang/edda) and set `EDDA_STDLIB_ROOT="$PWD/edda/std"`. If
+you're on Linux or macOS, your "it worked" (or a bug report) is the most useful thing you
+can send back. See [Contribute](https://github.com/edda-lang/edda).
 
-The standard library (`std`) and the first-party packages (`runes`) live in the Edda
-monolith. Clone it and point the compiler at `std` with one environment variable:
-
-```sh
-git clone https://github.com/edda-lang/edda
-export EDDA_STDLIB_ROOT="$PWD/edda/std"      # Windows PowerShell: $env:EDDA_STDLIB_ROOT = "$PWD\edda\std"
-```
-
-That's the only variable a program importing `std.*` needs. (Prebuilt toolchain releases
-will ship `std` and `runes` *inside* the archive, at which point this step disappears —
-the way Rust, Go, and Zig bundle their standard libraries. For now the checkout is it.)
-
-## 3. Create a project
+## 2. Create a project
 
 A package is a `package.toml` plus a `src/` directory. Make a small but *real* one — a
 program with one capability and one contract, so the very first build proves something:
@@ -106,7 +97,7 @@ Every capability `main` may use is named in its signature — this program holds
 `Stdout`, so it can only print. `non_negative` carries a contract: `requires` states what
 the caller must guarantee, `ensures` what the function guarantees back.
 
-## 4. Build and run
+## 3. Build and run
 
 ```sh
 cd hello
@@ -121,7 +112,7 @@ edda run       # build, then execute
 non_negative(7) = 7
 ```
 
-## 5. Break it — watch the build refuse
+## 4. Break it — watch the build refuse
 
 This is why Edda exists. Delete the `requires x >= 0` line from `non_negative` and build
 again:

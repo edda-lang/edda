@@ -43,24 +43,45 @@ web/        first-party Edda applications; the flagship is the language website,
 codex/      the language specification and design notes
 ```
 
-## Building
+## Install
 
-The chain rebuilds from source: the [Rust bootstrap compiler](https://github.com/edda-lang/edda-bootstrap) produces an `edda` binary, and that binary builds the native compiler and everything else in this tree.
+The prebuilt toolchain is a self-contained archive — the `edda` binary, its LLVM runtime, and a vendored `std` and `runes` — with no Rust, LLVM, or Z3 to install. The installer downloads and unpacks it and puts `edda` on your `PATH`.
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/edda-lang/edda-bootstrap/main/install.ps1 | iex
+```
+
+**Linux / macOS**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/edda-lang/edda-bootstrap/main/install.sh | bash
+```
+
+Windows (`x86-64-windows-msvc`) is available now and is the verified platform. Linux and macOS archives are still rolling out through CI — until yours lands, the script reports `no release asset for <platform>`; build [from source](#build-from-source) in the meantime.
+
+The archive is self-contained, so `edda` needs no environment variables — only a system linker (MSVC Build Tools on Windows, `lld`/`mold` on Linux, the Xcode Command Line Tools on macOS). From a workspace in this repository (`compiler/`, `std/`, `runes/`, or `web/`):
+
+```sh
+edda version   # confirm the toolchain is on PATH
+edda build     # type-check + refinement discharge + codegen
+edda check     # type-check only
+edda run       # build, link, and execute
+```
+
+The compile pipeline, target matrix, and per-verb status are in [`compiler/README.md`](compiler/README.md).
+
+## Build from source
+
+The whole chain rebuilds from source: the [Rust bootstrap compiler](https://github.com/edda-lang/edda-bootstrap) produces an `edda` binary, and that binary builds the native compiler and everything else in this tree. This is the path to use where no prebuilt archive exists yet, or when hacking on the bootstrap itself.
 
 ```sh
 git clone https://github.com/edda-lang/edda-bootstrap
 cd edda-bootstrap && cargo build --release
 ```
 
-Then, from a workspace in this repository (`compiler/`, `std/`, `runes/`, or `web/`):
-
-```sh
-edda build     # type-check + refinement discharge + codegen
-edda check     # type-check only
-edda run       # build, link, and execute
-```
-
-The compile pipeline, target matrix, and per-verb status are in [`compiler/README.md`](compiler/README.md); the bootstrap's own build steps are in its README.
+Building the bootstrap needs a recent Rust (2024 edition), CMake, Python, and a C/C++ toolchain with a system linker; it links against LLVM 18 development libraries, so set `LLVM_SYS_180_PREFIX` to your LLVM 18 install. Z3 is vendored and statically linked. The bootstrap's own prerequisites and build steps are in its README. A from-source build resolves `std`/`runes` from this repository — set `EDDA_STDLIB_ROOT` to this checkout's `std/` when building outside it.
 
 ## Working with agents
 
