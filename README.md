@@ -2,7 +2,7 @@
 
 Edda is a systems programming language and toolchain built so a codebase stays coherent enough for an LLM to work in it correctly, no matter how large it grows. Every function signature carries its full contract — side effects in a `with { }` row, capabilities (`Filesystem`, `Network`, `Allocator`, …) as unforgeable arguments, `requires`/`ensures` refinements proved at compile time by an in-tree SMT solver — and every build emits a structure map of every directory, derived from the compiler's own checked data, so a model or a person sees what exists and what depends on it before touching a file.
 
-Edda is written in itself: roughly 230,000 lines — a ~178,000-line self-hosting compiler, the standard library, and the package ecosystem — written by LLMs that had never seen the language; there was no Edda to train on. A [Rust bootstrap compiler](https://github.com/edda-lang/edda-bootstrap) is the reference implementation that builds the native compiler; both are public, so the whole chain rebuilds from scratch. The native compiler emits code for x86-64, AArch64, and WebAssembly; Windows is the verified platform today, with Linux and browser-WASM bring-up underway — verifying a platform on your machine is a first contribution that needs no Edda knowledge.
+Edda is written in itself: roughly 250,000 lines — a ~197,000-line compiler, the standard library, and the package ecosystem — written by LLMs that had never seen the language; there was no Edda to train on. The compiler type-checks its own full source and compiles it through its own backend; a [Rust bootstrap compiler](https://github.com/edda-lang/edda-bootstrap) is the reference implementation that builds it, and both are public, so the whole chain rebuilds from scratch. The native compiler emits code for x86-64, AArch64, and WebAssembly; Windows is the verified platform today, with Linux and browser-WASM bring-up underway — verifying a platform on your machine is a first contribution that needs no Edda knowledge.
 
 Edda is named after the 13th-century Old Norse codex compiled by Snorri Sturluson — one large upfront effort that later generations built on without redoing. The language follows the same model: the heavy work lives in the compiler, verifier, and standard library, so downstream code carries its full contract on the surface.
 
@@ -36,7 +36,7 @@ function clamp(value: i32, lo: i32, hi: i32) -> i32
 ## Repository layout
 
 ```
-compiler/   the self-hosting compiler — an Edda workspace of 44 members
+compiler/   the native compiler — an Edda workspace of 44 members
 std/        the std.* standard library — 113 packages: core, collections, io, os, math, net, crypto, text, time, …
 runes/      36 ecosystem packages from the Mímir registry — HTTP, TLS, JSON, SQL, templating, …
 web/        first-party Edda applications; the flagship is the language website, itself a verified Edda program
