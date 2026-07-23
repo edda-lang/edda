@@ -1,0 +1,225 @@
+module optimize.linear_reuse.dataflow.cfg.consumption
+
+import std.mem.alloc
+import std.collections.vec
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(Discipline)
+spec std.collections.vec.Vec(u32)
+
+public type Discipline {
+    case copy_disc
+    case move_disc
+    case linear_disc
+    case affine_disc
+}
+
+public type ConsumptionInfo {
+    disciplines: Vec_Discipline.Vec
+    def_counts: Vec_u32.Vec
+    read_counts: Vec_u32.Vec
+    consume_counts: Vec_u32.Vec
+}
+
+public function discipline_from_consumption(c: mir_body_mod.Consumption) -> Discipline {
+    return match c {
+        case .copy_ => Discipline.copy_disc
+        case .move_ => Discipline.move_disc
+        case .linear_ => Discipline.linear_disc
+        case .affine_ => Discipline.affine_disc
+    }
+}
+
+public function discipline_of_local(body: mir_body_mod.MirBody, id: mir_local_mod.LocalId) -> Discipline {
+    let idx = mir_local_mod.index(id)
+    if idx >= Vec_Local.len(body.locals) {
+        return Discipline.copy_disc
+    }
+    let l = Vec_Local.at(body.locals, idx)
+    return discipline_from_consumption(l.consumption)
+}
+
+public function reuse_eligible_discipline(d: Discipline) -> bool {
+    return match d {
+        case .linear_disc => true
+        case .affine_disc => true
+        case .move_disc => false
+        case .copy_disc => false
+    }
+}
+
+public function classify(out: init ConsumptionInfo, body: mir_body_mod.MirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Local.len(body.locals)
+    uninit disciplines: Vec_Discipline.Vec
+    Vec_Discipline.new(init disciplines, allocator)?
+    uninit def_counts: Vec_u32.Vec
+    Vec_u32.new(init def_counts, allocator)?
+    uninit read_counts: Vec_u32.Vec
+    Vec_u32.new(init read_counts, allocator)?
+    uninit consume_counts: Vec_u32.Vec
+    Vec_u32.new(init consume_counts, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let l = Vec_Local.at(body.locals, i)
+        let d = discipline_from_consumption(l.consumption)
+        Vec_Discipline.push(mutable disciplines, take d, allocator)?
+        Vec_u32.push(mutable def_counts, 0, allocator)?
+        Vec_u32.push(mutable read_counts, 0, allocator)?
+        Vec_u32.push(mutable consume_counts, 0, allocator)?
+        i += 1
+    }
+    tally_blocks(mutable def_counts, mutable read_counts, mutable consume_counts, body, n)
+    out = ConsumptionInfo {
+        disciplines: disciplines,
+        def_counts: def_counts,
+        read_counts: read_counts,
+        consume_counts: consume_counts
+    }
+}
+
+public function info_consume_count(info: ConsumptionInfo, id: mir_local_mod.LocalId) -> u32 {
+    let idx = mir_local_mod.index(id)
+    if idx >= Vec_u32.len(info.consume_counts) { return 0 }
+    return Vec_u32.at(info.consume_counts, idx)
+}
+
+public function info_discipline(info: ConsumptionInfo, id: mir_local_mod.LocalId) -> Discipline {
+    let idx = mir_local_mod.index(id)
+    if idx >= Vec_Discipline.len(info.disciplines) { return Discipline.copy_disc }
+    return Vec_Discipline.at(info.disciplines, idx)
+}
+
+public function info_has_unique_consume(info: ConsumptionInfo, id: mir_local_mod.LocalId) -> bool {
+    return info_consume_count(info, id) >= 1
+}
+
+function tally_blocks(def_counts: mutable Vec_u32.Vec, read_counts: mutable Vec_u32.Vec, consume_counts: mutable Vec_u32.Vec, body: mir_body_mod.MirBody, n_locals: usize) -> () {
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases nb - b {
+        if b >= nb { break }
+        let bb = Vec_BasicBlock.at(body.blocks, b)
+        tally_block(mutable def_counts, mutable read_counts, mutable consume_counts, bb, n_locals)
+        b += 1
+    }
+}
+
+function tally_block(def_counts: mutable Vec_u32.Vec, read_counts: mutable Vec_u32.Vec, consume_counts: mutable Vec_u32.Vec, bb: mir_body_mod.BasicBlock, n_locals: usize) -> () {
+    let ns = Vec_Statement.len(bb.statements)
+    var i: usize = 0
+    loop decreases ns - i {
+        if i >= ns { break }
+        let s = Vec_Statement.at(bb.statements, i)
+        match s.kind {
+            case .assign(let dest, let value) => {
+                tally_assign_dest(mutable def_counts, mutable read_counts, dest, n_locals)
+                tally_rvalue(mutable read_counts, mutable consume_counts, value, n_locals)
+            }
+            case .storage_live(let l) => bump(mutable def_counts, mir_local_mod.index(l), n_locals)
+            case .storage_dead(_) => ()
+            case .nop_ => ()
+        }
+        i += 1
+    }
+    tally_terminator(mutable read_counts, mutable consume_counts, bb.terminator, n_locals)
+}
+
+function tally_assign_dest(def_counts: mutable Vec_u32.Vec, read_counts: mutable Vec_u32.Vec, dest: mir_place_mod.Place, n_locals: usize) -> () {
+    if mir_place_mod.proj_len(dest) == 0 {
+        bump(mutable def_counts, mir_local_mod.index(dest.local), n_locals)
+    } else {
+        bump(mutable read_counts, mir_local_mod.index(dest.local), n_locals)
+    }
+}
+
+function tally_rvalue(read_counts: mutable Vec_u32.Vec, consume_counts: mutable Vec_u32.Vec, value: mir_rvalue_mod.Rvalue, n_locals: usize) -> () {
+    match value {
+        case .use_(let operand) => tally_operand(mutable read_counts, mutable consume_counts, operand, n_locals)
+        case .binary(_, let lhs, let rhs) => {
+            tally_operand(mutable read_counts, mutable consume_counts, lhs, n_locals)
+            tally_operand(mutable read_counts, mutable consume_counts, rhs, n_locals)
+        }
+        case .unary(_, let operand) => tally_operand(mutable read_counts, mutable consume_counts, operand, n_locals)
+        case .cast(let operand, _, _, _) => tally_operand(mutable read_counts, mutable consume_counts, operand, n_locals)
+        case .aggregate(_, let elems, _) => {
+            let ne = Vec_Operand.len(elems)
+            var j: usize = 0
+            loop decreases ne - j {
+                if j >= ne { break }
+                tally_operand(mutable read_counts, mutable consume_counts, Vec_Operand.at(elems, j), n_locals)
+                j += 1
+            }
+        }
+        case .ref_(_, let place) => bump(mutable read_counts, mir_local_mod.index(place.local), n_locals)
+        case .len(let place) => bump(mutable read_counts, mir_local_mod.index(place.local), n_locals)
+        case .discriminant(let place) => bump(mutable read_counts, mir_local_mod.index(place.local), n_locals)
+        case .make_closure(_, let env) => tally_operand(mutable read_counts, mutable consume_counts, env, n_locals)
+    }
+}
+
+function tally_operand(read_counts: mutable Vec_u32.Vec, consume_counts: mutable Vec_u32.Vec, op: mir_rvalue_mod.Operand, n_locals: usize) -> () {
+    match op {
+        case .copy_(let place, _) => bump(mutable read_counts, mir_local_mod.index(place.local), n_locals)
+        case .move_(let place, _) => {
+            bump(mutable read_counts, mir_local_mod.index(place.local), n_locals)
+            bump(mutable consume_counts, mir_local_mod.index(place.local), n_locals)
+        }
+        case .constant(_) => ()
+    }
+}
+
+function tally_terminator(read_counts: mutable Vec_u32.Vec, consume_counts: mutable Vec_u32.Vec, term: mir_term_mod.Terminator, n_locals: usize) -> () {
+    match term.kind {
+        case .branch(let cond, _, _) => tally_operand(mutable read_counts, mutable consume_counts, cond, n_locals)
+        case .switch_(let discr, _) => tally_operand(mutable read_counts, mutable consume_counts, discr, n_locals)
+        case .raise_(let value, _) => tally_operand(mutable read_counts, mutable consume_counts, value, n_locals)
+        case .panic_(let message) => tally_operand(mutable read_counts, mutable consume_counts, message, n_locals)
+        case .call_(let callee, let args, _, _, _) => {
+            tally_operand(mutable read_counts, mutable consume_counts, callee, n_locals)
+            let na = Vec_Operand.len(args)
+            var j: usize = 0
+            loop decreases na - j {
+                if j >= na { break }
+                tally_operand(mutable read_counts, mutable consume_counts, Vec_Operand.at(args, j), n_locals)
+                j += 1
+            }
+        }
+        case .drop_(let place, _, _) => bump(mutable read_counts, mir_local_mod.index(place.local), n_locals)
+        case .spawn_(_, let args, let group_local, _, _, _) => {
+            bump(mutable read_counts, mir_local_mod.index(group_local), n_locals)
+            let na = Vec_Operand.len(args)
+            var j: usize = 0
+            loop decreases na - j {
+                if j >= na { break }
+                tally_operand(mutable read_counts, mutable consume_counts, Vec_Operand.at(args, j), n_locals)
+                j += 1
+            }
+        }
+        case .await_(let handle, _, _, _) => tally_operand(mutable read_counts, mutable consume_counts, handle, n_locals)
+        case .goto_(_) => ()
+        case .return_ => ()
+        case .unreachable_ => ()
+        case .coherence_enter(_, _) => ()
+        case .coherence_exit(_) => ()
+    }
+}
+
+function bump(counts: mutable Vec_u32.Vec, idx: usize, n_locals: usize) -> () {
+    if idx >= n_locals { return }
+    if idx >= Vec_u32.len(counts) { return }
+    let cur = Vec_u32.at(counts, idx)
+    Vec_u32.set_at(mutable counts, idx, cur +% 1)
+}

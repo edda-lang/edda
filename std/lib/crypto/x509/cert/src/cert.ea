@@ -1,0 +1,252 @@
+
+module std.crypto.x509.cert
+
+import std.encoding.asn1
+
+
+public type X509Error {
+    case malformed_der
+    case unsupported_version
+    case unsupported_algorithm
+    case missing_required_extension
+    case malformed_extension
+    case malformed_san
+    case malformed_name
+    case malformed_validity
+    case integer_out_of_range
+    case allocator_failed
+    case buffer_too_small
+    case index_out_of_range
+    case internal_error
+}
+
+
+public type SignatureAlgorithm {
+    case rsa_pkcs1_sha256
+    case rsa_pkcs1_sha384
+    case rsa_pkcs1_sha512
+    case rsa_pss_sha256
+    case rsa_pss_sha384
+    case rsa_pss_sha512
+    case ecdsa_p256_sha256
+    case ecdsa_p384_sha384
+    case ecdsa_p521_sha512
+    case ed25519
+    case ed448
+    case unsupported
+}
+
+public type PublicKeyAlgorithm {
+    case rsa
+    case ecdsa_p256
+    case ecdsa_p384
+    case ecdsa_p521
+    case ed25519
+    case ed448
+    case unsupported
+}
+
+
+public affine type Certificate {
+    handle_: u64
+}
+
+public function parse_der(der: [u8], allocator: Allocator) -> Certificate
+    with {allocator, err: X509Error}
+    extern "__edda_x509_parse_der"
+
+public function close(cert: take Certificate) -> ()
+    extern "__edda_x509_close"
+
+
+public function subject_common_name(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_subject_cn"
+
+public function issuer_common_name(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_issuer_cn"
+
+public function subject_dn_der(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_subject_dn_der"
+
+public function issuer_dn_der(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_issuer_dn_der"
+
+
+public function san_count(cert: Certificate) -> usize
+    extern "__edda_x509_san_count"
+
+public function san_dns_count(cert: Certificate) -> usize
+    extern "__edda_x509_san_dns_count"
+
+public function san_dns_at(
+    cert: Certificate,
+    n: usize,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_san_dns_at"
+
+public function san_ip_count(cert: Certificate) -> usize
+    extern "__edda_x509_san_ip_count"
+
+public function san_ip_at(
+    cert: Certificate,
+    n: usize,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_san_ip_at"
+
+
+public function not_before_unix(cert: Certificate) -> i64
+    extern "__edda_x509_not_before_unix"
+
+public function not_after_unix(cert: Certificate) -> i64
+    extern "__edda_x509_not_after_unix"
+
+public function serial_number(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_serial"
+
+public function public_key_algorithm(cert: Certificate) -> PublicKeyAlgorithm
+    extern "__edda_x509_public_key_algorithm"
+
+public function public_key_spki_der(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+    extern "__edda_x509_spki_der"
+
+function expected_raw_len(alg: PublicKeyAlgorithm) -> usize
+    with {err: X509Error}
+{
+    return match alg {
+        case .ecdsa_p256 => 65
+        case .ecdsa_p384 => 97
+        case .ecdsa_p521 => 133
+        case .ed25519 => 32
+        case .ed448 => 57
+        case .rsa => raise X509Error.unsupported_algorithm
+        case .unsupported => raise X509Error.unsupported_algorithm
+    }
+}
+
+function is_ec_point(alg: PublicKeyAlgorithm) -> bool {
+    return match alg {
+        case .ecdsa_p256 | .ecdsa_p384 | .ecdsa_p521 => true
+        case _ => false
+    }
+}
+
+function spki_bit_string(buf: [u8], spki_len: usize) -> asn1.BitStringView
+    with {err: asn1.Asn1Error}
+{
+    let spki: asn1.Element = asn1.read_element(buf, 0)?
+    asn1.expect(spki, asn1.TagClass.universal, 16, true)?
+    if spki.total_end != spki_len {
+        raise asn1.Asn1Error.trailing_bytes
+    }
+    var c: asn1.Cursor = asn1.children_cursor(spki)
+    let _alg: asn1.Element = match asn1.next(mutable c, buf)? {
+        case .some(let el) => el
+        case .none => raise asn1.Asn1Error.truncated
+    }
+    let bits: asn1.Element = match asn1.next(mutable c, buf)? {
+        case .some(let el) => el
+        case .none => raise asn1.Asn1Error.truncated
+    }
+    asn1.expect(bits, asn1.TagClass.universal, 3, false)?
+    return asn1.read_bit_string(buf, bits)?
+}
+
+public function public_key_raw(
+    cert: Certificate,
+    out: mutable [u8],
+    out_len_out: mutable usize,
+) -> ()
+    with {err: X509Error}
+{
+    let alg: PublicKeyAlgorithm = public_key_algorithm(cert)
+    let expected: usize = expected_raw_len(alg)?
+    var spki_len: usize = 0
+    public_key_spki_der(cert, mutable out, mutable spki_len)?
+    if spki_len > out.len() { raise X509Error.internal_error }
+    let view: asn1.BitStringView = handle err: asn1.Asn1Error as _e -> (raise X509Error.malformed_der) {
+        spki_bit_string(out, spki_len)?
+    }
+    if view.unused_bits != 0 { raise X509Error.malformed_der }
+    if view.content_start > view.content_end || view.content_end > spki_len {
+        raise X509Error.malformed_der
+    }
+    let raw_len: usize = view.content_end - view.content_start
+    if raw_len != expected { raise X509Error.malformed_der }
+    if is_ec_point(alg) && out[view.content_start] != 0x04 {
+        raise X509Error.malformed_der
+    }
+    var i: usize = 0
+    loop
+        decreases raw_len - i
+    {
+        if i >= raw_len { break }
+        out[i] = out[view.content_start + i]
+        i = i + 1
+    }
+    out_len_out = raw_len
+}
+
+public function signature_algorithm(cert: Certificate) -> SignatureAlgorithm
+    extern "__edda_x509_signature_algorithm"
+
+
+public function basic_constraints_is_ca(cert: Certificate) -> bool
+    extern "__edda_x509_bc_is_ca"
+
+public function basic_constraints_path_length(cert: Certificate) -> i32
+    extern "__edda_x509_bc_path_length"
+
+
+public function verify_hostname(cert: Certificate, hostname: String) -> bool
+    with {err: X509Error}
+    extern "__edda_x509_verify_hostname"
+
+public function verify_validity(cert: Certificate, now_unix_seconds: i64) -> bool
+    extern "__edda_x509_verify_validity"
+
+public function verify_signed_by(
+    cert: Certificate,
+    issuer: Certificate,
+) -> bool
+    with {err: X509Error}
+    extern "__edda_x509_verify_signed_by"
+
+public function is_self_signed(cert: Certificate) -> bool
+    with {err: X509Error}
+    extern "__edda_x509_is_self_signed"

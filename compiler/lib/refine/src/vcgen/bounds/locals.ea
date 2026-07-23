@@ -1,0 +1,175 @@
+
+module refine.vcgen.bounds.locals
+
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import mir.body.model as mir_body
+import mir.id.local as local_mod
+import mir.rvalue as rvalue_mod
+import mir.stmt as stmt_mod
+import mir.place as place_mod
+import local.smt.term as term_mod
+import local.vcgen.term.term as vterm_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+
+
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_body.Local)
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(local_mod.LocalId)
+spec std.core.option.Option(rvalue_mod.Rvalue)
+
+
+public function len_symbol(interner: interner_mod.Interner) -> Option_Symbol.Option {
+    let n = interner_mod.slot_count(interner)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let sym = symbol_mod.from_raw(i as u32 wrapping)
+        if is_len_bytes(interner_mod.lookup(interner, sym)) {
+            return Option_Symbol.some(value: sym)
+        }
+        i = i + 1
+    }
+    return Option_Symbol.none
+}
+
+
+function is_len_bytes(bytes: [u8]) -> bool {
+    if bytes.len() != 3 {
+        return false
+    }
+    return bytes[0] == 108 && bytes[1] == 101 && bytes[2] == 110
+}
+
+
+public function resolve_local_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    local_id: local_mod.LocalId,
+) -> Option_SmtTerm.Option {
+    return match vterm_mod.place_to_term(body, idx, place_mod.bare(local_id)) {
+        case .some(let t) => Option_SmtTerm.some(value: t)
+        case .none => def_operand_term(body, idx, local_id)
+    }
+}
+
+
+function def_operand_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    local_id: local_mod.LocalId,
+) -> Option_SmtTerm.Option {
+    return match def_rvalue(body, idx, local_id) {
+        case .some(let value) => match value {
+            case .use_(let op) => vterm_mod.operand_to_int_term(body, idx, op)
+            case _ => Option_SmtTerm.none
+        }
+        case .none => Option_SmtTerm.none
+    }
+}
+
+
+function def_rvalue(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    local_id: local_mod.LocalId,
+) -> Option_Rvalue.Option {
+    let ds = bodyidx_mod.def_site(idx, local_id)
+    if !ds.found {
+        return Option_Rvalue.none
+    }
+    if ds.block >= Vec_BasicBlock.len(body.blocks) {
+        return Option_Rvalue.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, ds.block)
+    if ds.stmt >= Vec_Statement.len(bb.statements) {
+        return Option_Rvalue.none
+    }
+    return match Vec_Statement.at(bb.statements, ds.stmt).kind {
+        case .assign(let dest, let value) => {
+            if place_mod.proj_len(dest) == 0 && local_mod.index(dest.local) == local_mod.index(local_id) {
+                Option_Rvalue.some(value: value)
+            } else {
+                Option_Rvalue.none
+            }
+        }
+        case _ => Option_Rvalue.none
+    }
+}
+
+
+public function named_slice_local(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    slice_local: local_mod.LocalId,
+) -> Option_LocalId.Option {
+    if is_named_local(body, slice_local) {
+        return Option_LocalId.some(value: slice_local)
+    }
+    return match copy_source_local(body, idx, slice_local) {
+        case .some(let src) => {
+            if is_named_local(body, src) {
+                Option_LocalId.some(value: src)
+            } else {
+                Option_LocalId.none
+            }
+        }
+        case .none => Option_LocalId.none
+    }
+}
+
+
+function is_named_local(
+    body: mir_body.MirBody,
+    local_id: local_mod.LocalId,
+) -> bool {
+    let idx = local_mod.index(local_id)
+    if idx >= Vec_Local.len(body.locals) {
+        return false
+    }
+    return match Vec_Local.at(body.locals, idx).name {
+        case .some(_) => true
+        case .none => false
+    }
+}
+
+
+function copy_source_local(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    target: local_mod.LocalId,
+) -> Option_LocalId.Option {
+    return match def_rvalue(body, idx, target) {
+        case .some(let value) => source_local_of(value)
+        case .none => Option_LocalId.none
+    }
+}
+
+
+function source_local_of(value: rvalue_mod.Rvalue) -> Option_LocalId.Option {
+    return match value {
+        case .use_(let op) => match op {
+            case .copy_(let pl, _) => bare_local_of(pl)
+            case .move_(let pl, _) => bare_local_of(pl)
+            case .constant(_) => Option_LocalId.none
+        }
+        case _ => Option_LocalId.none
+    }
+}
+
+
+function bare_local_of(pl: place_mod.Place) -> Option_LocalId.Option {
+    if place_mod.proj_len(pl) != 0 {
+        return Option_LocalId.none
+    }
+    return Option_LocalId.some(value: pl.local)
+}

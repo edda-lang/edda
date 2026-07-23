@@ -1,0 +1,119 @@
+
+module optimize.effect_gvn.licm.rel.worklist.worklist
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import ir.hlir.id.value as value_mod
+import ir.hlir.op as hlir_op_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.hashmap.IntMap(OpUses)
+spec std.core.option.Option(OpUses)
+
+
+public type OpUses {
+    ops: Vec_u32.Vec
+}
+
+
+public function enqueue_consumers(
+    worklist: mutable Vec_u32.Vec,
+    uses: IntMap_OpUses.IntMap,
+    result_: value_mod.ValueId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if result_.raw == 0 { return () }
+    match IntMap_OpUses.get(uses, result_.raw as i64) {
+        case .some(let cu) => {
+            let m = Vec_u32.len(cu.ops)
+            var i: usize = 0
+            loop
+                decreases m - i
+            {
+                if i >= m { break }
+                Vec_u32.push(mutable worklist, Vec_u32.at(cu.ops, i), allocator)?
+                i = i + 1
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+public function index_op_operands(
+    uses: mutable IntMap_OpUses.IntMap,
+    op: hlir_op_mod.HlirOp,
+    op_raw: u32,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var cnt: usize = 0
+    match op.kind {
+        case .binary(_, let lhs, let rhs) => {
+            cnt = cnt +| add_use(mutable uses, lhs, op_raw, allocator)?
+            cnt = cnt +| add_use(mutable uses, rhs, op_raw, allocator)?
+        }
+        case .unary(_, let operand) => { cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)? }
+        case .cast(let value, _, _, _) => { cnt = cnt +| add_use(mutable uses, value, op_raw, allocator)? }
+        case .field(let operand, _) => { cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)? }
+        case .index(let operand, let index_v) => {
+            cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)?
+            cnt = cnt +| add_use(mutable uses, index_v, op_raw, allocator)?
+        }
+        case .slice_subrange(let operand, let lo_v, let hi_v) => {
+            cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)?
+            cnt = cnt +| add_use(mutable uses, lo_v, op_raw, allocator)?
+            cnt = cnt +| add_use(mutable uses, hi_v, op_raw, allocator)?
+        }
+        case .len(let operand) => { cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)? }
+        case .discriminant(let operand) => { cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)? }
+        case .aggregate(_, let elems) => {
+            let am = Vec_ValueId.len(elems)
+            var ai: usize = 0
+            loop
+                decreases am - ai
+            {
+                if ai >= am { break }
+                cnt = cnt +| add_use(mutable uses, Vec_ValueId.at(elems, ai), op_raw, allocator)?
+                ai = ai + 1
+            }
+        }
+        case .ref_(_, let operand) => { cnt = cnt +| add_use(mutable uses, operand, op_raw, allocator)? }
+        case .make_closure(_, let env) => { cnt = cnt +| add_use(mutable uses, env, op_raw, allocator)? }
+        case _ => ()
+    }
+    return cnt
+}
+
+
+function add_use(
+    uses: mutable IntMap_OpUses.IntMap,
+    v: value_mod.ValueId,
+    op_raw: u32,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if v.raw == 0 { return 0 }
+    match IntMap_OpUses.get(uses, v.raw as i64) {
+        case .some(let cur) => {
+            var lst = cur.ops
+            Vec_u32.push(mutable lst, op_raw, allocator)?
+            let _ = IntMap_OpUses.insert(mutable uses, v.raw as i64, OpUses { ops: lst }, allocator)?
+        }
+        case .none => {
+            uninit lst: Vec_u32.Vec
+            Vec_u32.new(init lst, allocator)?
+            Vec_u32.push(mutable lst, op_raw, allocator)?
+            let _ = IntMap_OpUses.insert(mutable uses, v.raw as i64, OpUses { ops: lst }, allocator)?
+        }
+    }
+    return 1
+}

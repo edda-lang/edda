@@ -1,0 +1,110 @@
+
+module x64.emit.arith.binary.compare.compare
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.control.branch as branch_mod
+import local.encoding.simd.vector as vector_mod
+import local.emit.regsel as regsel_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_icmp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let lg = regsel_mod.vreg_gp(body, lhs)?
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, lg, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, lg, v, allocator)?
+    }
+    branch_mod.encode_setcc_rm8(mutable code, icmp_cond(op)?, dg, allocator)?
+    alu_mod.encode_movzx_r_rm8(mutable code, regs_mod.OpSize.qword_, dg, dg, allocator)?
+}
+
+public function emit_fcmp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let lx = regsel_mod.vreg_xmm(body, lhs)?
+    let rx = regsel_mod.operand_xmm(body, rhs)?
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let lv = regsel_mod.vreg_at(body, lhs)?
+    if lv.size == (4 as u32) {
+        vector_mod.encode_ucomiss(mutable code, lx, rx, allocator)?
+    } else {
+        vector_mod.encode_ucomisd(mutable code, lx, rx, allocator)?
+    }
+    branch_mod.encode_setcc_rm8(mutable code, fcmp_cond(op)?, dg, allocator)?
+    alu_mod.encode_movzx_r_rm8(mutable code, regs_mod.OpSize.qword_, dg, dg, allocator)?
+}
+
+function icmp_cond(op: lir_op_mod.LBinOp) -> branch_mod.Cond
+    with {err: lir_error_mod.LirError}
+{
+    return match op {
+        case .icmp_eq => branch_mod.Cond.e_
+        case .icmp_ne => branch_mod.Cond.ne_
+        case .icmp_slt => branch_mod.Cond.l_
+        case .icmp_sle => branch_mod.Cond.le_
+        case .icmp_sgt => branch_mod.Cond.g_
+        case .icmp_sge => branch_mod.Cond.ge_
+        case .icmp_ult => branch_mod.Cond.b_
+        case .icmp_ule => branch_mod.Cond.be_
+        case .icmp_ugt => branch_mod.Cond.a_
+        case .icmp_uge => branch_mod.Cond.ae_
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: non-comparison op in icmp_cond",
+        )
+    }
+}
+
+function fcmp_cond(op: lir_op_mod.LBinOp) -> branch_mod.Cond
+    with {err: lir_error_mod.LirError}
+{
+    return match op {
+        case .icmp_eq => branch_mod.Cond.e_
+        case .icmp_ne => branch_mod.Cond.ne_
+        case .icmp_slt => branch_mod.Cond.b_
+        case .icmp_ult => branch_mod.Cond.b_
+        case .icmp_sle => branch_mod.Cond.be_
+        case .icmp_ule => branch_mod.Cond.be_
+        case .icmp_sgt => branch_mod.Cond.a_
+        case .icmp_ugt => branch_mod.Cond.a_
+        case .icmp_sge => branch_mod.Cond.ae_
+        case .icmp_uge => branch_mod.Cond.ae_
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: non-comparison op in fcmp_cond",
+        )
+    }
+}

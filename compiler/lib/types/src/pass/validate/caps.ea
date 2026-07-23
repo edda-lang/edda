@@ -1,0 +1,220 @@
+
+module types.pass.validate.caps
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import span.loc.pos.span as span_mod
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import hir.build.file as hir_file
+import hir.item as hir_item
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+import target.capability as cap_mod
+import target.triple as triple_mod
+import local.check.pass.avail.gate as gate_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(ast_ident.Ident)
+
+
+spec std.core.option.Option(cap_mod.Capability)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public function validate_capability_rows(
+    file: hir_file.HirFile,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_items(file.items, triple, interner, mutable diags, allocator)?
+}
+
+
+function walk_items(
+    items: Vec_HItem.Vec,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        if !gate_mod.is_target_absent(item, triple, interner) {
+            walk_item_kind(item.kind, triple, interner, mutable diags, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+function walk_item_kind(
+    kind: hir_item.HItemKind,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match kind {
+        case .function_(let sig_box, let _body) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            validate_signature(sig, triple, interner, mutable diags, allocator)?
+        }
+        case .function_extern(let sig_box, let _name, let _sp, let _dll) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            validate_signature(sig, triple, interner, mutable diags, allocator)?
+        }
+        case .spec_decl(let _sig, let body) => {
+            walk_items(body, triple, interner, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function validate_signature(
+    sig: hir_item.HFnSignature,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let row = match sig.effects {
+        case .some(let r) => r
+        case .none        => return
+    }
+    walk_row_members(row.members, sig.params, triple, interner, mutable diags, allocator)?
+}
+
+function walk_row_members(
+    members: Vec_EffectMember.Vec,
+    params: Vec_HParam.Vec,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_EffectMember.len(members)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let m = Vec_EffectMember.at(members, i)
+        match m {
+            case .capability(let id) => check_cap_ident(id, params, triple, interner, mutable diags, allocator)?
+            case .spread(let path) => emit_closed_row(path.span, mutable diags, allocator)?
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+function emit_closed_row(
+    at: span_mod.Span,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(code_mod.effect_row_closed(), at, "effect row is closed; row spread/variable not admitted")
+    coll_mod.emit(mutable diags, take d, allocator)?
+}
+
+function check_cap_ident(
+    id: ast_ident.Ident,
+    params: Vec_HParam.Vec,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HParam.len(params)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let p = Vec_HParam.at(params, i)
+        if p.name.raw == id.name.raw {
+            validate_param_cap(p, id, triple, interner, mutable diags, allocator)?
+            return
+        }
+        i = i + 1 as usize
+    }
+}
+
+function validate_param_cap(
+    p: hir_item.HParam,
+    id: ast_ident.Ident,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let seg_sym = match extract_type_leaf(p.ty) {
+        case .some(let s) => s
+        case .none        => return
+    }
+    if (seg_sym.raw as usize) >= interner_mod.slot_count(interner) { return }
+    let bytes = interner_mod.lookup(interner, seg_sym)
+    let cap = match gate_mod.cap_from_bytes(bytes) {
+        case .some(let c) => c
+        case .none        => return
+    }
+    if cap_mod.supports(triple, cap) { return }
+    let msg = format_unavailable_message(cap, triple, allocator)?
+    let d = diag_mod.error_at(code_mod.capability_not_available_on_target(), id.span, msg)
+    coll_mod.emit(mutable diags, take d, allocator)?
+}
+
+
+function extract_type_leaf(ty: ast_tree.Ty) -> Option_Symbol {
+    let path = match ty.kind {
+        case .path(let p) => p
+        case _            => return Option_Symbol.none
+    }
+    if Vec_Ident.len(path.segments) != 1 as usize { return Option_Symbol.none }
+    let seg = Vec_Ident.at(path.segments, 0)
+    return Option_Symbol.some(value: seg.name)
+}
+
+function format_unavailable_message(
+    cap: cap_mod.Capability,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let cap_name = cap_mod.name(cap)
+    let triple_str = triple_mod.to_string(triple, allocator)?
+    let p1 = string.concat("capability `", cap_name, allocator)?
+    let p2 = string.concat(p1, "` is not available on build target `", allocator)?
+    let p3 = string.concat(p2, triple_str, allocator)?
+    return string.concat(p3, "`", allocator)?
+}

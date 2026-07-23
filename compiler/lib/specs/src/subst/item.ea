@@ -1,0 +1,201 @@
+
+module specs.subst.item
+
+import std.collections.vec
+import std.mem.alloc
+import syntax.ast.item as item_mod
+import syntax.ast.tree as tree_mod
+import local.subst.walk.map as map_mod
+import local.subst.walk.tree.tree as tree_subst_mod
+
+
+spec std.mem.alloc.Box(item_mod.FnDecl)
+spec std.mem.alloc.Box(item_mod.TypeDecl)
+spec std.mem.alloc.Box(item_mod.Spec)
+spec std.mem.alloc.Box(item_mod.SpecInvocation)
+spec std.mem.alloc.Box(item_mod.LetDecl)
+spec std.mem.alloc.Box(item_mod.Derive)
+
+
+spec std.collections.vec.Vec(item_mod.TypeField)
+spec std.collections.vec.Vec(item_mod.Variant)
+spec std.collections.vec.Vec(tree_mod.RefinementClause)
+
+
+public function subst_item(
+    item: item_mod.Item,
+    s: map_mod.Subst,
+    synthesize_box_ptr: bool,
+    allocator: Allocator,
+) -> item_mod.Item
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = match item.kind {
+        case .function_(let decl) => item_mod.ItemKind.function_(decl: subst_fndecl(decl, s, allocator)?)
+        case .type_decl(let decl) => item_mod.ItemKind.type_decl(decl: subst_typedecl(decl, s, synthesize_box_ptr, allocator)?)
+        case .spec_invocation(let inv) => item_mod.ItemKind.spec_invocation(invocation: subst_spec_invocation(inv, s, allocator)?)
+        case .spec_(let decl) => item_mod.ItemKind.spec_(decl: decl)
+        case .let_(let decl) => item_mod.ItemKind.let_(decl: decl)
+        case .import_(let imp) => item_mod.ItemKind.import_(decl: imp)
+        case .module_(let m) => item_mod.ItemKind.module_(decl: m)
+        case .derive_(let decl) => item_mod.ItemKind.derive_(decl: decl)
+    }
+    return item_mod.Item { span: item.span, attributes: item.attributes, kind: k }
+}
+
+
+function subst_fndecl(b: Box_FnDecl, s: map_mod.Subst, allocator: Allocator) -> Box_FnDecl
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_FnDecl.get(b)
+    let np = tree_subst_mod.subst_params(d.params, s, allocator)?
+    let nr = tree_subst_mod.subst_opt_ty(d.return_ty, s, allocator)?
+    let ne = tree_subst_mod.subst_opt_effect_row(d.effects, s, allocator)?
+    let nref = subst_refinements(d.refinements, s, allocator)?
+    let nbody = subst_fnbody(d.body, s, allocator)?
+    let nd = item_mod.FnDecl {
+        span: d.span,
+        stability: d.stability,
+        visibility: d.visibility,
+        refinement_stable: d.refinement_stable,
+        name: d.name,
+        outbound_generics: d.outbound_generics,
+        generics: d.generics,
+        params: np,
+        return_mode: d.return_mode,
+        return_ty: nr,
+        effects: ne,
+        refinements: nref,
+        body: nbody,
+    }
+    return Box_FnDecl.new(take nd, allocator)?
+}
+
+function subst_fnbody(body: item_mod.FnBody, s: map_mod.Subst, allocator: Allocator) -> item_mod.FnBody
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match body {
+        case .block_(let blk) => item_mod.FnBody.block_(body: tree_subst_mod.subst_block(blk, s, allocator)?)
+        case .extern_(let sp, let nsp, let name, let dll) => item_mod.FnBody.extern_(span: sp, name_span: nsp, name: name, dll: dll)
+    }
+}
+
+
+function subst_typedecl(b: Box_TypeDecl, s: map_mod.Subst, synthesize_box_ptr: bool, allocator: Allocator) -> Box_TypeDecl
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_TypeDecl.get(b)
+    let nk = match d.kind {
+        case .product(let fields) => item_mod.TypeDeclKind.product(fields: subst_typefields(fields, s, allocator)?)
+        case .sum(let variants) => item_mod.TypeDeclKind.sum(variants: subst_variants(variants, s, allocator)?)
+    }
+    let nd = item_mod.TypeDecl {
+        span: d.span,
+        stability: d.stability,
+        visibility: d.visibility,
+        linearity: d.linearity,
+        name: d.name,
+        generics: d.generics,
+        kind: nk,
+        synthesize_box_ptr: synthesize_box_ptr || d.synthesize_box_ptr,
+    }
+    return Box_TypeDecl.new(take nd, allocator)?
+}
+
+function subst_typefield(f: item_mod.TypeField, s: map_mod.Subst, allocator: Allocator) -> item_mod.TypeField
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let nt = tree_subst_mod.subst_ty(f.ty, s, allocator)?
+    let nr = tree_subst_mod.subst_opt_expr(f.refinement, s, allocator)?
+    return item_mod.TypeField { span: f.span, name: f.name, ty: nt, refinement: nr }
+}
+
+function subst_typefields(v: Vec_TypeField.Vec, s: map_mod.Subst, allocator: Allocator) -> Vec_TypeField.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_TypeField.Vec
+    Vec_TypeField.new(init out, allocator)?
+    let n = Vec_TypeField.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_TypeField.at(v, i)
+        let nf = subst_typefield(f, s, allocator)?
+        Vec_TypeField.push(mutable out, take nf, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function subst_variant(vt: item_mod.Variant, s: map_mod.Subst, allocator: Allocator) -> item_mod.Variant
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let np = subst_variant_payload(vt.payload, s, allocator)?
+    return item_mod.Variant { span: vt.span, name: vt.name, payload: np }
+}
+
+function subst_variants(v: Vec_Variant.Vec, s: map_mod.Subst, allocator: Allocator) -> Vec_Variant.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Variant.Vec
+    Vec_Variant.new(init out, allocator)?
+    let n = Vec_Variant.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let vt = Vec_Variant.at(v, i)
+        let nv = subst_variant(vt, s, allocator)?
+        Vec_Variant.push(mutable out, take nv, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function subst_variant_payload(payload: item_mod.VariantPayload, s: map_mod.Subst, allocator: Allocator) -> item_mod.VariantPayload
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match payload {
+        case .unit => item_mod.VariantPayload.unit
+        case .tuple(let elems) => item_mod.VariantPayload.tuple(elements: tree_subst_mod.subst_tys(elems, s, allocator)?)
+        case .struct_(let fields) => item_mod.VariantPayload.struct_(fields: subst_typefields(fields, s, allocator)?)
+    }
+}
+
+
+function subst_spec_invocation(
+    b: Box_SpecInvocation,
+    s: map_mod.Subst,
+    allocator: Allocator,
+) -> Box_SpecInvocation
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let v = Box_SpecInvocation.get(b)
+    let na = tree_subst_mod.subst_exprs(v.args, s, allocator)?
+    let nv = item_mod.SpecInvocation { span: v.span, path: v.path, args: na }
+    return Box_SpecInvocation.new(take nv, allocator)?
+}
+
+
+function subst_refinement(c: tree_mod.RefinementClause, s: map_mod.Subst, allocator: Allocator) -> tree_mod.RefinementClause
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let np = tree_subst_mod.subst_expr(c.pred, s, allocator)?
+    return tree_mod.RefinementClause { span: c.span, kind: c.kind, pred: np }
+}
+
+function subst_refinements(v: Vec_RefinementClause.Vec, s: map_mod.Subst, allocator: Allocator) -> Vec_RefinementClause.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init out, allocator)?
+    let n = Vec_RefinementClause.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let c = Vec_RefinementClause.at(v, i)
+        let nc = subst_refinement(c, s, allocator)?
+        Vec_RefinementClause.push(mutable out, take nc, allocator)?
+        i = i + 1
+    }
+    return out
+}

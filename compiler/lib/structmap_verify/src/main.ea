@@ -1,0 +1,208 @@
+
+module structmap_verify.main
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.os.fs
+import std.io.stream as stream
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as resolve_specsurface_mod
+import resolve.bind.lookup.env.walk.uses as resolve_uses_mod
+import resolve.build.drive.surface.walk.binding.walker as resolve_walker_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import target.triple as triple_mod
+import target.arch as arch_mod
+import target.os as os_mod
+import target.abi as abi_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import types.check.env.lower.nominals as nominals_mod
+import compile.setup.env.discover as discover_mod
+import compile.stdlib.resolve as resolve_mod
+import compile.instantiate.iter.enumerate.enumerate as enumerate_mod
+import compile.phase.pipeline.parse as parse_mod
+import compile.phase.pipeline.lower as lower_mod
+import compile.phase.pipeline.typecheck.full as typecheck_mod
+import driver.render.render as render_mod
+import structmap.lib as structmap_mod
+import local.compare as compare_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(diag_mod.Diagnostic)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(triple_mod.TargetTriple)
+
+
+public function main(rfs: ReadOnlyFilesystem, errout: Stderr, allocator: Allocator) -> i32
+    with {rfs, errout, allocator, panic, divergence}
+{
+    let code = handle err: fs.FsError as fe -> { let _ = fe; fail_fs(errout) } {
+        handle err: alloc.AllocError as ae -> { let _ = ae; fail_alloc(errout) } {
+            run(rfs, errout, allocator)?
+        }
+    }
+    return code
+}
+
+
+function run(rfs: ReadOnlyFilesystem, errout: Stderr, allocator: Allocator) -> i32
+    with {rfs, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit map: source_map_mod.SourceMap
+    source_map_mod.new_map(init map, allocator)?
+    uninit diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init diags, allocator)?
+
+    let workspace_root = env.current_dir(allocator)
+    let stdlib_lib_opt = resolve_mod.resolve_stdlib_lib(rfs, workspace_root, Option_String.none, mutable diags, allocator)?
+    let stdlib_lib = match stdlib_lib_opt {
+        case .some(let l) => l
+        case .none => {
+            render_mod.render_diagnostics(errout, diags, map, allocator)?
+            return 1
+        }
+    }
+
+    let stdlib_files = discover_mod.stdlib_sources(rfs, stdlib_lib, allocator)?
+    let stdlib_array = Vec_String.into_array(take stdlib_files, allocator)?
+    enumerate_mod.enumerate(rfs, stdlib_array, mutable map, allocator)?
+
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    let files = parse_mod.parse_sources(map, mutable interner, mutable diags, allocator)?
+
+    uninit ctx: resolve_ctx_mod.ResolveCtx
+    resolve_ctx_mod.new_ctx(init ctx, allocator)?
+    let wl = resolve_walker_mod.new_derive_whitelist(mutable interner, allocator)?
+    let cat = resolve_specsurface_mod.walk_package_with_catalogue(mutable ctx, files, wl, interner, allocator)?
+    resolve_specsurface_mod.register_invocations(mutable ctx, cat, files, mutable interner, allocator)?
+    resolve_uses_mod.walk_uses(mutable ctx, files, interner, allocator)?
+    drain_diagnostics(mutable diags, ctx.diags.items, allocator)?
+    let output = resolve_ctx_mod.finish(take ctx)
+    let hir_files = lower_mod.lower_to_hir(take files, output, output.next_def_id, mutable interner, allocator, allocator)?
+
+    uninit ty_interner: ty_interner_mod.Interner
+    ty_interner_mod.new_interner(init ty_interner, allocator)?
+    uninit effect_interner: effect_interner_mod.Interner
+    effect_interner_mod.new_interner(init effect_interner, allocator)?
+    let triple = triple_mod.triple_of(arch_mod.Arch.x86_64(), os_mod.Os.windows(), abi_mod.AbiVariant.msvc())
+    let prims = resolve_ctx_mod.output_primitives(output)
+    let caps = resolve_ctx_mod.output_capabilities(output)
+    let empty_nominals = nominals_mod.empty(allocator)?
+    uninit no_decl_only: Vec_HirFile.Vec
+    Vec_HirFile.new(init no_decl_only, allocator)?
+    uninit scratch: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch, allocator)?
+    let type_outputs = typecheck_mod.typecheck_files(
+        hir_files, no_decl_only, no_decl_only, triple, prims, caps, empty_nominals,
+        false, output,
+        interner, mutable ty_interner, mutable effect_interner, mutable scratch, allocator,
+    )?
+    let hir_slice = Vec_HirFile.into_array(take hir_files, allocator)?
+
+    let input = structmap_mod.EmitInput {
+        project_name: "std",
+        package_root: stdlib_lib,
+        compiler_version: "0.0.0",
+        descendant_tree: false,
+    }
+    let out = structmap_mod.emit(input, hir_slice, interner, map, type_outputs, effect_interner, allocator)?
+    let rendered = out.files
+    let paths = rendered.paths
+    let texts = rendered.texts
+
+    var total_compared: usize = 0
+    var total_mismatches: usize = 0
+    var total_missing: usize = 0
+    var files_checked: usize = 0
+    var files_skipped: usize = 0
+
+    let n: usize = Vec_String.len(paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let path = Vec_String.at(paths, i)
+        let text = Vec_String.at(texts, i)
+        if fs.path_exists(rfs, path) {
+            let committed = fs.read_to_string(rfs, path, allocator)?
+            let r = compare_mod.compare_text(text, committed, allocator)?
+            files_checked += 1
+            total_compared += r.compared
+            total_mismatches += r.mismatches
+            total_missing += r.missing
+            if r.mismatches > 0 {
+                let line = f"MISMATCH {path}: {r.mismatches} cone diffs ({r.detail})"
+                stream.eprint_line(errout, line)
+            }
+        } else {
+            files_skipped += 1
+        }
+        i += 1
+    }
+
+    interner_mod.dispose(take interner)
+    ty_interner_mod.dispose(take ty_interner)
+    effect_interner_mod.dispose(take effect_interner)
+
+    let failed = total_mismatches > 0
+    let summary = f"structmap_verify: files_checked={files_checked} skipped={files_skipped} functions_compared={total_compared} cone_mismatches={total_mismatches} unmatched={total_missing}"
+    stream.eprint_line(errout, summary)
+    if failed {
+        stream.eprint_line(errout, "structmap_verify: FAIL - native cone column diverges from committed bootstrap maps")
+    } else {
+        stream.eprint_line(errout, "structmap_verify: PASS - native cone column matches committed bootstrap maps")
+    }
+    return if failed { 1 } else { 0 }
+}
+
+
+function drain_diagnostics(
+    target: mutable diags_mod.Diagnostics,
+    source: Vec_Diagnostic.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Diagnostic.len(source)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n { break }
+        let d = Vec_Diagnostic.at(source, i)
+        diags_mod.emit(mutable target, take d, allocator)?
+        i = i + 1
+    }
+}
+
+
+function fail_fs(errout: Stderr) -> i32
+    with {errout}
+{
+    stream.eprint_line(errout, "structmap_verify: fatal filesystem error")
+    return 74
+}
+
+
+function fail_alloc(errout: Stderr) -> i32
+    with {errout}
+{
+    stream.eprint_line(errout, "structmap_verify: fatal allocation error")
+    return 71
+}

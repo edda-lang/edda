@@ -1,0 +1,190 @@
+
+module exhaustive_verify.main
+
+import std.mem.alloc
+import std.os.fs
+import std.collections.vec
+import std.core.option
+import std.core.fmt as fmt_mod
+import std.io.stream
+import std.text.string
+import intern.interner as interner_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import source.map as source_map_mod
+import target.triple as triple_mod
+import compile.check.check as check_mod
+import compile.trace.trace as trace_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(diag_mod.Diagnostic)
+
+
+public function main(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    clock: MonotonicClock,
+    errout: Stderr,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, clock, errout, allocator, panic, divergence}
+{
+    return handle err: fs.FsError as fe -> fail_fs(errout, fe) {
+        handle err: alloc.AllocError as ae -> fail_alloc(errout, ae) {
+            run(rfs, wfs, clock, errout, allocator)?
+        }
+    }
+}
+
+
+function run(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    clock: MonotonicClock,
+    errout: Stderr,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    var total: usize = 0
+    var passed: usize = 0
+
+    total = total + 1
+    let r1 = check_case(rfs, wfs, clock, errout, missing_variant_source(), true, "cross-file missing variant", mutable interner, allocator)?
+    if r1 { passed = passed + 1 }
+
+    total = total + 1
+    let r2 = check_case(rfs, wfs, clock, errout, exhaustive_source(), false, "cross-file exhaustive", mutable interner, allocator)?
+    if r2 { passed = passed + 1 }
+
+    total = total + 1
+    let r3 = check_case(rfs, wfs, clock, errout, wildcard_source(), false, "cross-file wildcard", mutable interner, allocator)?
+    if r3 { passed = passed + 1 }
+
+    let summary = build_summary(passed, total, allocator)?
+    stream.eprint_line(errout, summary)
+    interner_mod.dispose(take interner)
+    return if passed == total { 0 } else { 1 }
+}
+
+
+function check_case(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    clock: MonotonicClock,
+    errout: Stderr,
+    main_src: String,
+    expect_nonexhaustive: bool,
+    label: String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit map: source_map_mod.SourceMap
+    source_map_mod.new_map(init map, allocator)?
+    let _ = source_map_mod.add_file(mutable map, "kinds.ea", color_decl_source(), allocator)?
+    let _ = source_map_mod.add_file(mutable map, "main.ea", main_src, allocator)?
+
+    uninit diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init diags, allocator)?
+
+    let triple = handle err: triple_mod.TripleParseError as e -> panic("invalid golden triple") {
+        triple_mod.parse("x86-64-windows-msvc")
+    }
+
+    uninit no_paths_vec: Vec_String.Vec
+    Vec_String.new(init no_paths_vec, allocator)?
+    let no_paths = Vec_String.into_array(take no_paths_vec, allocator)?
+
+    let _ = check_mod.check_with_triple(rfs, wfs, no_paths, triple, clock, errout, trace_mod.off(), mutable map, mutable interner, mutable diags, allocator)?
+
+    let fired = diags_has_code(diags, diag_code_mod.non_exhaustive_match())
+    let ok = if expect_nonexhaustive { fired } else { (!fired) && (!diags_mod.has_errors(diags)) }
+    report(errout, ok, label, allocator)?
+    return ok
+}
+
+
+function diags_has_code(diags: diags_mod.Diagnostics, code: String) -> bool {
+    let n = diags_mod.count(diags)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let od = diags_mod.get(diags, i)
+        let hit = match od {
+            case .some(let d) => string.equals(d.code, code)
+            case .none => false
+        }
+        if hit { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function color_decl_source() -> String {
+    return "module pkg.kinds\n\npublic type Color {\n    case red\n    case green\n    case blue\n}\n"
+}
+
+
+function missing_variant_source() -> String {
+    return "module pkg.main\n\nimport local.kinds as kinds_mod\n\npublic function describe(c: kinds_mod.Color) -> i64 {\n    return match c {\n        case .red => 1\n        case .green => 2\n    }\n}\n"
+}
+
+
+function exhaustive_source() -> String {
+    return "module pkg.main\n\nimport local.kinds as kinds_mod\n\npublic function describe(c: kinds_mod.Color) -> i64 {\n    return match c {\n        case .red => 1\n        case .green => 2\n        case .blue => 3\n    }\n}\n"
+}
+
+
+function wildcard_source() -> String {
+    return "module pkg.main\n\nimport local.kinds as kinds_mod\n\npublic function describe(c: kinds_mod.Color) -> i64 {\n    return match c {\n        case .red => 1\n        case _ => 0\n    }\n}\n"
+}
+
+
+function report(
+    errout: Stderr,
+    ok: bool,
+    label: String,
+    allocator: Allocator,
+) -> ()
+    with {errout, allocator, err: alloc.AllocError}
+{
+    let tag = if ok { "pass: " } else { "fail: " }
+    let line = string.concat(tag, label, allocator)?
+    stream.eprint_line(errout, line)
+}
+
+
+function build_summary(passed: usize, total: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p = fmt_mod.usize_to_string(passed, allocator)?
+    let t = fmt_mod.usize_to_string(total, allocator)?
+    let s1 = string.concat("exhaustive-verify: ", p, allocator)?
+    let s2 = string.concat(s1, "/", allocator)?
+    let s3 = string.concat(s2, t, allocator)?
+    return string.concat(s3, " cross-file exhaustiveness goldens passed", allocator)?
+}
+
+
+function fail_fs(errout: Stderr, e: fs.FsError) -> i32
+    with {errout}
+{
+    errout.eprint_line("exhaustive-verify: filesystem error")
+    return 71
+}
+
+
+function fail_alloc(errout: Stderr, e: alloc.AllocError) -> i32
+    with {errout}
+{
+    errout.eprint_line("exhaustive-verify: out of memory")
+    return 70
+}

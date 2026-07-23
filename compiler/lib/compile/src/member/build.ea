@@ -1,0 +1,86 @@
+
+module compile.member.build
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import manifest.manifest as manifest_mod
+import manifest.model.structmap.structmap as structmap_config_mod
+import source.map as source_map_mod
+import target.triple as triple_mod
+import intern.interner as interner_mod
+import diagnostics.emit.collection as diags_mod
+import local.check.check as check_mod
+import local.check.version.version as version_mod
+import local.dump.dump as dump_mod
+import local.trace.trace as trace_mod
+import local.setup.env.load.load as load_mod
+import local.setup.env.load.triple as triple_phase_mod
+import local.setup.env.discover as discover_mod
+import local.setup.env.closure as closure_mod
+import local.stdlib.resolve as resolve_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.hashmap.StringMap(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(triple_mod.TargetTriple)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+
+
+public function build_member_with_target(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    workspace_root: String,
+    member_src_prefix: String,
+    member: String,
+    program_name: String,
+    target_override: Option_String.Option,
+    stdlib_override: Option_String.Option,
+    dump: dump_mod.DumpFlags,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> check_mod.PipelineSummary
+    with {rfs, wfs, subprocess, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return check_mod.empty_summary()
+    }
+    let output_kind = manifest_mod.kind_of(manifest)
+    let sources = if manifest_mod.has_workspace(manifest) {
+        closure_mod.scoped_member_sources(rfs, workspace_root, manifest, member, allocator)?
+    } else {
+        discover_mod.workspace_sources(rfs, workspace_root, manifest, allocator)?
+    }
+    let source_paths = Vec_String.into_array(take sources, allocator)?
+
+    let triple_opt = match target_override {
+        case .some(let s) => triple_phase_mod.resolve_triple_from_string(s, mutable diags, allocator)?
+        case .none => triple_phase_mod.resolve_triple_from_manifest(manifest, mutable diags, allocator)?
+    }
+    let stdlib_lib_opt = resolve_mod.resolve_stdlib_lib(rfs, workspace_root, stdlib_override, mutable diags, allocator)?
+    let stdlib_lib = match stdlib_lib_opt {
+        case .some(let l) => l
+        case .none => return check_mod.empty_summary()
+    }
+    let entry_filter = Option_String.some(value: member_src_prefix)
+    let primary_member = Option_String.some(value: member)
+    let member_deps = check_mod.member_deps_of(rfs, workspace_root, manifest, member, allocator)?
+    let current_version = version_mod.current_version_of(manifest, allocator)?
+    let descendant_tree = structmap_config_mod.descendant_tree(manifest_mod.structmap_of(manifest))
+    var pkg_files_memo = StringMap_String.new(allocator)?
+    var file_edges_memo = StringMap_String.new(allocator)?
+    let summary = check_mod.run_pipeline(rfs, wfs, source_paths, primary_member, member_deps, stdlib_lib, workspace_root, workspace_root, current_version, entry_filter, program_name, descendant_tree, triple_opt, check_mod.PipelineMode.build_, output_kind, dump, clock, errout, trace, mutable map, mutable interner, mutable diags, mutable pkg_files_memo, mutable file_edges_memo, allocator, allocator)?
+    check_mod.finish_link(rfs, subprocess, summary, mutable diags, allocator)?
+    return summary
+}

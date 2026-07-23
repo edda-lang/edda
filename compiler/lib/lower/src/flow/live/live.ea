@@ -1,0 +1,494 @@
+
+module lower.flow.live.live
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.term as mir_term_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+
+import local.flow.cfg.cfg as cfg_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_rvalue_mod.Constant)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(cfg_mod.BlockEdge)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+
+
+public type Liveness {
+    n_locals: usize
+    live_in: Vec_u64.Vec
+    def_outside_entry: Vec_bool.Vec
+}
+
+
+public function is_live_in(liv: Liveness, block: usize, local: usize) -> bool {
+    return bit_at(liv.live_in, block * words_per_row(liv.n_locals), local)
+}
+
+public function defined_outside_entry(liv: Liveness, local: usize) -> bool {
+    if local >= Vec_bool.len(liv.def_outside_entry) { return false }
+    return Vec_bool.at(liv.def_outside_entry, local)
+}
+
+
+public function compute(
+    out: init Liveness,
+    body: mir_body_mod.MirBody,
+    cfg: cfg_mod.Cfg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_blocks = Vec_BasicBlock.len(body.blocks)
+    let n_locals = Vec_Local.len(body.locals)
+    let wpr = words_per_row(n_locals)
+    let grid_words = n_blocks * wpr
+
+    uninit use_set: Vec_u64.Vec
+    new_zeros(init use_set, grid_words, allocator)?
+    uninit def_set: Vec_u64.Vec
+    new_zeros(init def_set, grid_words, allocator)?
+    uninit def_outside_entry: Vec_bool.Vec
+    new_false(init def_outside_entry, n_locals, allocator)?
+
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        block_use_def(
+            mutable use_set,
+            mutable def_set,
+            mutable def_outside_entry,
+            body,
+            b,
+            n_locals,
+            allocator,
+        )?
+        b += 1
+    }
+
+    uninit live_in: Vec_u64.Vec
+    new_zeros(init live_in, grid_words, allocator)?
+    uninit live_out: Vec_u64.Vec
+    new_zeros(init live_out, wpr, allocator)?
+
+    var fuel: usize = n_blocks + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        var changed = false
+        let n_rpo = Vec_u32.len(cfg.rpo_order)
+        var i: usize = 0
+        loop decreases n_rpo - i {
+            if i >= n_rpo { break }
+            let block = Vec_u32.at(cfg.rpo_order, n_rpo - 1 - i) as usize
+            if refresh_block(
+                mutable live_in,
+                mutable live_out,
+                use_set,
+                def_set,
+                cfg,
+                block,
+                n_locals,
+            ) {
+                changed = true
+            }
+            i += 1
+        }
+        if !changed { break }
+    }
+
+    out = Liveness {
+        n_locals: n_locals,
+        live_in: live_in,
+        def_outside_entry: def_outside_entry,
+    }
+}
+
+
+function refresh_block(
+    live_in: mutable Vec_u64.Vec,
+    live_out: mutable Vec_u64.Vec,
+    use_set: Vec_u64.Vec,
+    def_set: Vec_u64.Vec,
+    cfg: cfg_mod.Cfg,
+    block: usize,
+    n_locals: usize,
+) -> bool
+{
+    let wpr = words_per_row(n_locals)
+
+    var w0: usize = 0
+    loop decreases wpr - w0 {
+        if w0 >= wpr { break }
+        Vec_u64.set_at(mutable live_out, w0, 0 as u64)
+        w0 += 1
+    }
+
+    var e = cfg_mod.succ_start(cfg, block)
+    let end = cfg_mod.succ_end(cfg, block)
+    loop decreases end - e {
+        if e >= end { break }
+        if e < Vec_BlockEdge.len(cfg.succ_edges) {
+            let edge = Vec_BlockEdge.at(cfg.succ_edges, e)
+            let t = edge.target as usize
+            let tbase = t * wpr
+            var w: usize = 0
+            loop decreases wpr - w {
+                if w >= wpr { break }
+                let ti = tbase + w
+                if ti < Vec_u64.len(live_in) {
+                    let cur = Vec_u64.at(live_out, w)
+                    Vec_u64.set_at(mutable live_out, w, cur | Vec_u64.at(live_in, ti))
+                }
+                w += 1
+            }
+        }
+        e += 1
+    }
+
+    let base = block * wpr
+    var changed = false
+    var j: usize = 0
+    loop decreases wpr - j {
+        if j >= wpr { break }
+        let bi = base + j
+        if bi < Vec_u64.len(live_in) {
+            let use_word = Vec_u64.at(use_set, bi)
+            let def_word = Vec_u64.at(def_set, bi)
+            let flow = Vec_u64.at(live_out, j) & ~def_word
+            let add = use_word | flow
+            let old = Vec_u64.at(live_in, bi)
+            let newv = old | add
+            if newv != old {
+                Vec_u64.set_at(mutable live_in, bi, newv)
+                changed = true
+            }
+        }
+        j += 1
+    }
+    return changed
+}
+
+
+function block_use_def(
+    use_set: mutable Vec_u64.Vec,
+    def_set: mutable Vec_u64.Vec,
+    def_outside_entry: mutable Vec_bool.Vec,
+    body: mir_body_mod.MirBody,
+    b: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit seen_def: Vec_bool.Vec
+    new_false(init seen_def, n_locals, allocator)?
+    uninit reads: Vec_u32.Vec
+    Vec_u32.new(init reads, allocator)?
+
+    let block = Vec_BasicBlock.at(body.blocks, b)
+    let n = Vec_Statement.len(block.statements)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let stmt = Vec_Statement.at(block.statements, i)
+        match stmt.kind {
+            case .assign(let dest, let value) => {
+                Vec_u32.clear(mutable reads)
+                rvalue_reads(value, mutable reads, allocator)?
+                mark_reads(mutable use_set, seen_def, reads, b, n_locals)
+                mark_assign_dest(
+                    mutable use_set,
+                    mutable def_set,
+                    mutable def_outside_entry,
+                    mutable seen_def,
+                    mutable reads,
+                    dest,
+                    b,
+                    n_locals,
+                    allocator,
+                )?
+            }
+            case .storage_live(_) => ()
+            case .storage_dead(_) => ()
+            case .nop_ => ()
+        }
+        i += 1
+    }
+
+    Vec_u32.clear(mutable reads)
+    term_reads(block.terminator, mutable reads, allocator)?
+    mark_reads(mutable use_set, seen_def, reads, b, n_locals)
+    match block.terminator.kind {
+        case .call_(_, _, let dest, _, _) => mark_assign_dest(
+            mutable use_set,
+            mutable def_set,
+            mutable def_outside_entry,
+            mutable seen_def,
+            mutable reads,
+            dest,
+            b,
+            n_locals,
+            allocator,
+        )?
+        case .spawn_(_, _, _, let handle_dest, _, _) => mark_assign_dest(
+            mutable use_set,
+            mutable def_set,
+            mutable def_outside_entry,
+            mutable seen_def,
+            mutable reads,
+            handle_dest,
+            b,
+            n_locals,
+            allocator,
+        )?
+        case .await_(_, let dest, _, _) => mark_assign_dest(
+            mutable use_set,
+            mutable def_set,
+            mutable def_outside_entry,
+            mutable seen_def,
+            mutable reads,
+            dest,
+            b,
+            n_locals,
+            allocator,
+        )?
+        case _ => ()
+    }
+}
+
+
+function mark_assign_dest(
+    use_set: mutable Vec_u64.Vec,
+    def_set: mutable Vec_u64.Vec,
+    def_outside_entry: mutable Vec_bool.Vec,
+    seen_def: mutable Vec_bool.Vec,
+    reads: mutable Vec_u32.Vec,
+    dest: mir_place_mod.Place,
+    b: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if mir_place_mod.proj_len(dest) == 0 {
+        let l = dest.local.raw as usize
+        if l < n_locals {
+            let base = b * words_per_row(n_locals)
+            bit_set_true(mutable def_set, base, l)
+            Vec_bool.set_at(mutable seen_def, l, true)
+            if b != 1 {
+                Vec_bool.set_at(mutable def_outside_entry, l, true)
+            }
+        }
+        return
+    }
+    Vec_u32.clear(mutable reads)
+    place_reads(dest, mutable reads, allocator)?
+    mark_reads(mutable use_set, seen_def, reads, b, n_locals)
+}
+
+function mark_reads(
+    use_set: mutable Vec_u64.Vec,
+    seen_def: Vec_bool.Vec,
+    reads: Vec_u32.Vec,
+    b: usize,
+    n_locals: usize,
+) -> ()
+{
+    let base = b * words_per_row(n_locals)
+    let n = Vec_u32.len(reads)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let l = Vec_u32.at(reads, i) as usize
+        if l < n_locals {
+            if !Vec_bool.at(seen_def, l) {
+                bit_set_true(mutable use_set, base, l)
+            }
+        }
+        i += 1
+    }
+}
+
+
+function rvalue_reads(
+    value: mir_rvalue_mod.Rvalue,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match value {
+        case .use_(let operand) => operand_reads(operand, mutable out, allocator)?
+        case .binary(_, let lhs, let rhs) => {
+            operand_reads(lhs, mutable out, allocator)?
+            operand_reads(rhs, mutable out, allocator)?
+        }
+        case .unary(_, let operand) => operand_reads(operand, mutable out, allocator)?
+        case .cast(let operand, _, _, _) => operand_reads(operand, mutable out, allocator)?
+        case .aggregate(_, let elems, _) => {
+            let n = Vec_Operand.len(elems)
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                operand_reads(Vec_Operand.at(elems, i), mutable out, allocator)?
+                i += 1
+            }
+        }
+        case .ref_(_, let place) => place_reads(place, mutable out, allocator)?
+        case .len(let place) => place_reads(place, mutable out, allocator)?
+        case .discriminant(let place) => place_reads(place, mutable out, allocator)?
+        case .make_closure(_, let env) => operand_reads(env, mutable out, allocator)?
+    }
+}
+
+function term_reads(
+    term: mir_term_mod.Terminator,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match term.kind {
+        case .branch(let cond, _, _) => operand_reads(cond, mutable out, allocator)?
+        case .switch_(let discr, _) => operand_reads(discr, mutable out, allocator)?
+        case .return_ => Vec_u32.push(mutable out, 1 as u32, allocator)?
+        case .raise_(let value, _) => operand_reads(value, mutable out, allocator)?
+        case .panic_(let message) => operand_reads(message, mutable out, allocator)?
+        case .call_(let callee, let args, _, _, _) => {
+            operand_reads(callee, mutable out, allocator)?
+            operand_vec_reads(args, mutable out, allocator)?
+        }
+        case .drop_(let place, _, _) => place_reads(place, mutable out, allocator)?
+        case .spawn_(_, let args, let group_local, _, _, _) => {
+            operand_vec_reads(args, mutable out, allocator)?
+            Vec_u32.push(mutable out, group_local.raw, allocator)?
+        }
+        case .await_(let handle, _, _, _) => operand_reads(handle, mutable out, allocator)?
+        case _ => ()
+    }
+}
+
+function operand_vec_reads(
+    args: Vec_Operand.Vec,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Operand.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        operand_reads(Vec_Operand.at(args, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+function operand_reads(
+    operand: mir_rvalue_mod.Operand,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match operand {
+        case .copy_(let place, _) => place_reads(place, mutable out, allocator)?
+        case .move_(let place, _) => place_reads(place, mutable out, allocator)?
+        case .constant(_) => ()
+    }
+}
+
+function place_reads(
+    place: mir_place_mod.Place,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_u32.push(mutable out, place.local.raw, allocator)?
+    let n = mir_place_mod.proj_len(place)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(place, i)
+        match proj.kind {
+            case .index(let idx_local, _) => Vec_u32.push(mutable out, idx_local.raw, allocator)?
+            case .slice_subrange(let lo_local, let hi_local, _) => {
+                Vec_u32.push(mutable out, lo_local.raw, allocator)?
+                Vec_u32.push(mutable out, hi_local.raw, allocator)?
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}
+
+
+function words_per_row(n_locals: usize) -> usize {
+    return (n_locals + 63) / 64
+}
+
+function bit_at(bits: Vec_u64.Vec, base: usize, local: usize) -> bool {
+    let w = base + local / 64
+    if w >= Vec_u64.len(bits) { return false }
+    let word = Vec_u64.at(bits, w)
+    return ((word >> ((local % 64) as u64)) & (1 as u64)) == (1 as u64)
+}
+
+function bit_set_true(bits: mutable Vec_u64.Vec, base: usize, local: usize) -> () {
+    let w = base + local / 64
+    if w >= Vec_u64.len(bits) { return }
+    let word = Vec_u64.at(bits, w)
+    Vec_u64.set_at(mutable bits, w, word | ((1 as u64) << ((local % 64) as u64)))
+}
+
+
+function new_false(
+    out: init Vec_bool.Vec,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit bits: Vec_bool.Vec
+    Vec_bool.new(init bits, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_bool.push(mutable bits, false, allocator)?
+        i += 1
+    }
+    out = bits
+}
+
+function new_zeros(
+    out: init Vec_u64.Vec,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit words: Vec_u64.Vec
+    Vec_u64.new(init words, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u64.push(mutable words, 0 as u64, allocator)?
+        i += 1
+    }
+    out = words
+}

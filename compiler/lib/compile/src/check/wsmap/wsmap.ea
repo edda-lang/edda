@@ -1,0 +1,175 @@
+
+module compile.check.wsmap.wsmap
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import source.map as source_map_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import manifest.manifest as manifest_mod
+import manifest.model.workspace.workspace as ws_model_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import structmap.lib as structmap_mod
+import structmap.render.doc.emit as structmap_render_mod
+import structmap.aggregate.workspace as structmap_agg_mod
+import local.check.structdiag.structdiag as structdiag_mod
+import local.setup.env.load.load as load_mod
+import local.setup.env.membership as membership_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ws_model_mod.Workspace)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(structmap_agg_mod.MemberSummary)
+
+public function emit_workspace_structmaps(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    hir_slice: [hir_file_mod.HirFile],
+    workspace_root: String,
+    program_name: String,
+    descendant_tree: bool,
+    interner: interner_mod.Interner,
+    map: mutable source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    effect_interner: effect_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let members = workspace_member_names(rfs, workspace_root, mutable map, mutable diags, allocator)?
+    let member_n: usize = Vec_String.len(members)
+    if member_n == 0 {
+        let root_input = structmap_mod.EmitInput {
+            project_name: program_name,
+            package_root: workspace_root,
+            compiler_version: "0.0.0",
+            descendant_tree: descendant_tree,
+        }
+        let root_out = structmap_mod.emit(root_input, hir_slice, interner, map, type_outputs, effect_interner, allocator)?
+        write_rendered_files(wfs, root_out.files)?
+        structdiag_mod.push_structmap_diagnostics(mutable diags, root_out, allocator)?
+        return
+    }
+    uninit summaries: Vec_MemberSummary.Vec
+    Vec_MemberSummary.new(init summaries, allocator)?
+    uninit member_bodies: structmap_render_mod.RenderedFiles
+    structmap_render_mod.new_rendered(init member_bodies, allocator)?
+    var i: usize = 0
+    loop
+        decreases member_n - i
+    {
+        if i >= member_n { break }
+        let name = Vec_String.at(members, i)
+        let member_root = string.concat(string.concat(workspace_root, "/lib/", allocator)?, name, allocator)?
+        let member_project = membership_mod.member_project_name(rfs, member_root, name, allocator)?
+        let member_input = structmap_mod.EmitInput {
+            project_name: member_project,
+            package_root: member_root,
+            compiler_version: "0.0.0",
+            descendant_tree: false,
+        }
+        let member_out = structmap_mod.emit(member_input, hir_slice, interner, map, type_outputs, effect_interner, allocator)?
+        write_rendered_files(wfs, member_out.files)?
+        structdiag_mod.push_structmap_diagnostics(mutable diags, member_out, allocator)?
+        if descendant_tree {
+            append_bodies(mutable member_bodies, member_out.descendant_bodies, allocator)?
+        }
+        Vec_MemberSummary.push(
+            mutable summaries,
+            structmap_agg_mod.MemberSummary {
+                dir: member_root,
+                types: member_out.summary.types,
+                functions: member_out.summary.functions,
+                public_names: member_out.summary.public_names,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+    let ws_project = membership_mod.member_project_name(rfs, workspace_root, "workspace", allocator)?
+    let agg_files = if descendant_tree {
+        structmap_agg_mod.emit_workspace_descendant_tree(ws_project, "0.0.0", workspace_root, summaries, member_bodies, allocator)?
+    } else {
+        structmap_agg_mod.emit_workspace_aggregator(ws_project, "0.0.0", workspace_root, summaries, allocator)?
+    }
+    write_rendered_files(wfs, agg_files)?
+}
+
+function append_bodies(
+    dst: mutable structmap_render_mod.RenderedFiles,
+    src: structmap_render_mod.RenderedFiles,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_String.len(src.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let path = string.clone(Vec_String.at(src.paths, i), allocator)?
+        let text = string.clone(Vec_String.at(src.texts, i), allocator)?
+        Vec_String.push(mutable dst.paths, take path, allocator)?
+        Vec_String.push(mutable dst.texts, take text, allocator)?
+        i += 1
+    }
+}
+
+function workspace_member_names(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit results: Vec_String.Vec
+    Vec_String.new(init results, allocator)?
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return results
+    }
+    let ws = match load_mod.workspace_of(manifest) {
+        case .some(let w) => w
+        case .none => return results
+    }
+    let n = ws_model_mod.member_count(ws)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let name = string.clone(ws_model_mod.member_at(ws, i), allocator)?
+        Vec_String.push(mutable results, take name, allocator)?
+        i += 1
+    }
+    return results
+}
+
+function write_rendered_files(wfs: Filesystem, files: structmap_render_mod.RenderedFiles) -> ()
+    with {wfs, err: fs.FsError}
+{
+    let n: usize = Vec_String.len(files.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let path = Vec_String.at(files.paths, i)
+        let text = Vec_String.at(files.texts, i)
+        fs.write_string(wfs, path, text)?
+        i += 1
+    }
+}

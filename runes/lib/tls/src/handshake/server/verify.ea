@@ -1,0 +1,90 @@
+
+module tls.handshake.server.verify
+
+import std.mem.alloc
+import local.error
+import local.wire
+import local.crypto.signature as sig_mod
+import local.handshake.kind as hs_kind
+import local.handshake.message as hs_msg
+
+unstable public type ParsedCertificateVerify {
+    algorithm: sig_mod.SignatureScheme
+    signature: [u8]
+}
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _slice_copy(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    if hi < lo || hi > src.len() { raise error.TlsError.bad_handshake }
+    let n = hi - lo
+    var out = _alloc_bytes(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        out[i] = src[lo + i]
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+public function decode_certificate_verify(
+    body: [u8],
+    allocator: Allocator,
+) -> ParsedCertificateVerify
+    with {allocator, err: error.TlsError}
+{
+    if body.len() < (4 as usize) { raise error.TlsError.bad_handshake }
+    let alg = sig_mod.sig_scheme_from_wire(wire.read_u16_be(body, 0 as usize)?)?
+    let sig_len = wire.read_u16_be(body, 2 as usize)? as usize
+    let sig_lo = 4 as usize
+    let sig_hi = sig_lo + sig_len
+    if sig_hi != body.len() { raise error.TlsError.bad_handshake }
+    let sig = _slice_copy(body, sig_lo, sig_hi, allocator)?
+    return ParsedCertificateVerify { algorithm: alg, signature: sig }
+}
+
+public function encode_certificate_verify(
+    signature: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let sig_len = signature.len()
+    if sig_len > 0xfffd as usize { raise error.TlsError.bad_handshake }
+    let body_len = (4 as usize) + sig_len
+    let total = hs_msg.header_len() + body_len
+    var buf = _alloc_bytes(allocator, total)?
+    var pos = hs_msg.write_header(
+        mutable buf,
+        0 as usize,
+        hs_kind.HandshakeKind.certificate_verify,
+        body_len as u32,
+    )?
+    pos = wire.write_u16_be(
+        mutable buf,
+        pos,
+        sig_mod.sig_scheme_wire(sig_mod.SignatureScheme.rsa_pss_rsae_sha256),
+    )?
+    pos = wire.write_u16_be(mutable buf, pos, sig_len as u16)?
+    pos = wire.write_bytes(mutable buf, pos, signature)?
+    let _ = pos
+    return buf
+}

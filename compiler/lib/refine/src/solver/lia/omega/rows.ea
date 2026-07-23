@@ -1,0 +1,222 @@
+
+module refine.solver.lia.omega.rows
+
+import std.collections.vec
+import std.mem.alloc
+import local.smt.term as term_mod
+import local.solver.rational.wide as wide_mod
+import local.solver.theory.quant.linearize as lin_mod
+import local.solver.lia.frontend.frontend as lia_mod
+
+
+spec std.collections.vec.Vec(lin_mod.LinearTerm)
+spec std.collections.vec.Vec(OmegaRow)
+spec std.collections.vec.Vec(lia_mod.LiaConstraint)
+
+
+public type OmegaRow {
+    terms: Vec_LinearTerm.Vec
+    is_upper: bool
+    bound: wide_mod.Wide
+    alive: bool
+}
+
+
+public type Folded {
+    ok: bool
+    value: i128
+}
+
+
+public function build_rows(ctx: lia_mod.LiaCtx, rows: mutable Vec_OmegaRow.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_LiaConstraint.len(ctx.constraints)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let c = Vec_LiaConstraint.at(ctx.constraints, i)
+        let terms = clone_terms(c.form.terms, allocator)?
+        let r = OmegaRow {
+            terms: terms,
+            is_upper: c.is_upper,
+            bound: c.bound,
+            alive: true,
+        }
+        Vec_OmegaRow.push(mutable rows, take r, allocator)?
+        i = i + 1
+    }
+}
+
+
+public function clone_terms(src: Vec_LinearTerm.Vec, allocator: Allocator) -> Vec_LinearTerm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init out, allocator)?
+    let n = Vec_LinearTerm.len(src)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_LinearTerm.at(src, i)
+        Vec_LinearTerm.push(mutable out, take t, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function kill_row(rows: mutable Vec_OmegaRow.Vec, i: usize) -> () {
+    if i >= Vec_OmegaRow.len(rows) {
+        return
+    }
+    var r = Vec_OmegaRow.at(rows, i)
+    r.alive = false
+    Vec_OmegaRow.set_at(mutable rows, i, take r)
+}
+
+
+public function coeff_of(terms: Vec_LinearTerm.Vec, atom: term_mod.SmtTerm) -> i128
+    with {divergence}
+{
+    let n = Vec_LinearTerm.len(terms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_LinearTerm.at(terms, i)
+        if t.atom == atom {
+            return t.coeff
+        }
+        i = i + 1
+    }
+    return 0 as i128
+}
+
+
+public function add_scaled(dst: mutable Vec_LinearTerm.Vec, src: Vec_LinearTerm.Vec, factor: i128, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_LinearTerm.len(src)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_LinearTerm.at(src, i)
+        let scaled = fold_mul(factor, t.coeff)
+        if !scaled.ok {
+            return false
+        }
+        if !upsert_term(mutable dst, t.atom, scaled.value, allocator)? {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+
+function upsert_term(dst: mutable Vec_LinearTerm.Vec, atom: term_mod.SmtTerm, delta: i128, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_LinearTerm.len(dst)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_LinearTerm.at(dst, i)
+        if t.atom == atom {
+            let summed = fold_add(t.coeff, delta)
+            if !summed.ok {
+                return false
+            }
+            let nt = lin_mod.LinearTerm { atom: t.atom, coeff: summed.value }
+            Vec_LinearTerm.set_at(mutable dst, i, take nt)
+            return true
+        }
+        i = i + 1
+    }
+    let fresh = lin_mod.LinearTerm { atom: atom, coeff: delta }
+    Vec_LinearTerm.push(mutable dst, take fresh, allocator)?
+    return true
+}
+
+
+public function drop_zero_terms(terms: Vec_LinearTerm.Vec, allocator: Allocator) -> Vec_LinearTerm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init out, allocator)?
+    let n = Vec_LinearTerm.len(terms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_LinearTerm.at(terms, i)
+        if t.coeff != (0 as i128) {
+            Vec_LinearTerm.push(mutable out, take t, allocator)?
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+public function i128_top() -> i128 {
+    let p32 = 4294967296 as i128
+    let p96 = p32 * p32 * p32
+    let p126 = p96 * (1073741824 as i128)
+    return (p126 - (1 as i128)) * (2 as i128) + (1 as i128)
+}
+
+
+public function fold_mul(a: i128, b: i128) -> Folded {
+    if a == (0 as i128) || b == (0 as i128) {
+        return Folded { ok: true, value: 0 as i128 }
+    }
+    let top = i128_top()
+    let bottom = (0 as i128) - top - (1 as i128)
+    if a == bottom || b == bottom {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    let aa = if a < (0 as i128) { (0 as i128) - a } else { a }
+    let ab = if b < (0 as i128) { (0 as i128) - b } else { b }
+    if aa > top / ab {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    return Folded { ok: true, value: a * b }
+}
+
+
+public function fold_add(a: i128, b: i128) -> Folded {
+    let top = i128_top()
+    let bottom = (0 as i128) - top - (1 as i128)
+    if b > (0 as i128) && a > top - b {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    if b < (0 as i128) && a < bottom - b {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    let s = a + b
+    return Folded { ok: s != bottom, value: s }
+}

@@ -1,0 +1,147 @@
+
+module tls.cert.cv
+
+import std.crypto.x509.cert as x509_cert
+import std.crypto.sig.rsa as rsa
+import std.crypto.sig.ecdsa as ecdsa
+import std.mem.alloc
+import local.error
+import local.crypto.signature as sig_mod
+
+function _max_spki_len() -> usize { return 1024 as usize }
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _alloc_len_box(allocator: Allocator) -> [usize]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_usize_slots(allocator, 1 as usize)?
+    }
+}
+
+function _leaf_spki(
+    leaf_der: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let cert = handle err: x509_cert.X509Error -> (raise error.TlsError.certificate_parse_failed) {
+        x509_cert.parse_der(leaf_der, allocator)?
+    }
+    var spki_buf = _alloc_bytes(allocator, _max_spki_len())?
+    var len_box = _alloc_len_box(allocator)?
+    len_box[0 as usize] = 0 as usize
+    handle err: x509_cert.X509Error -> (raise error.TlsError.certificate_parse_failed) {
+        x509_cert.public_key_spki_der(cert, mutable spki_buf, mutable len_box[0 as usize])?
+    }
+    x509_cert.close(take cert)
+    let spki_len = len_box[0 as usize]
+    if spki_len == (0 as usize) || spki_len > _max_spki_len() {
+        raise error.TlsError.certificate_parse_failed
+    }
+    return spki_buf[0 as usize..<spki_len]
+}
+
+function _leaf_ec_point_p256(
+    leaf_der: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+    ensures result.len() == 65
+{
+    let cert = handle err: x509_cert.X509Error -> (raise error.TlsError.certificate_parse_failed) {
+        x509_cert.parse_der(leaf_der, allocator)?
+    }
+    var raw_buf = _alloc_bytes(allocator, _max_spki_len())?
+    var len_box = _alloc_len_box(allocator)?
+    len_box[0 as usize] = 0 as usize
+    handle err: x509_cert.X509Error -> (raise error.TlsError.certificate_parse_failed) {
+        x509_cert.public_key_raw(cert, mutable raw_buf, mutable len_box[0 as usize])?
+    }
+    x509_cert.close(take cert)
+    let raw_len = len_box[0 as usize]
+    if raw_len != (65 as usize) { raise error.TlsError.signature_verify_failed }
+    return raw_buf[0 as usize..<raw_len]
+}
+
+public function verify_certificate_verify(
+    leaf_der: [u8],
+    algorithm: sig_mod.SignatureScheme,
+    signature: [u8],
+    signed_input: [u8],
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    match algorithm {
+        case .rsa_pss_rsae_sha256 => {
+            let spki = _leaf_spki(leaf_der, allocator)?
+            let ok = handle err: rsa.RsaSigError -> (raise error.TlsError.signature_verify_failed) {
+                rsa.verify_pss_sha256(spki, signed_input, signature)?
+            }
+            if !ok { raise error.TlsError.signature_verify_failed }
+        }
+        case .ecdsa_secp256r1_sha256 => {
+            let point = _leaf_ec_point_p256(leaf_der, allocator)?
+            let ok = handle err: ecdsa.EcdsaSigError -> (raise error.TlsError.signature_verify_failed) {
+                ecdsa.verify_p256_der(point, signed_input, signature)?
+            }
+            if !ok { raise error.TlsError.signature_verify_failed }
+        }
+        case _ => {
+            raise error.TlsError.unsupported_signature_algorithm
+        }
+    }
+}
+
+function _max_modulus_len() -> usize { return 520 as usize }
+
+public function sign_certificate_verify(
+    random: Random,
+    private_key_pkcs8_der: [u8],
+    signed_input: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {random, allocator, err: error.TlsError}
+{
+    var n_out = _alloc_bytes(allocator, _max_modulus_len())?
+    var e_out = _alloc_bytes(allocator, 16 as usize)?
+    var n_len: usize = 0 as usize
+    var e_len: usize = 0 as usize
+    handle err: rsa.RsaSigError -> (raise error.TlsError.private_key_invalid) {
+        rsa.pkcs8_public_components(
+            private_key_pkcs8_der,
+            mutable n_out,
+            mutable n_len,
+            mutable e_out,
+            mutable e_len,
+        )?
+    }
+    if n_len == (0 as usize) || n_len > _max_modulus_len() {
+        raise error.TlsError.private_key_invalid
+    }
+    var sig_len = n_len
+    if n_out[0 as usize] == (0 as u8) && sig_len > (1 as usize) {
+        sig_len = sig_len - (1 as usize)
+    }
+    var signature = _alloc_bytes(allocator, sig_len)?
+    handle err: rsa.RsaSigError -> (raise error.TlsError.private_key_invalid) {
+        rsa.sign_pss_sha256(random, private_key_pkcs8_der, signed_input, mutable signature)?
+    }
+    return signature
+}

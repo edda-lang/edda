@@ -1,0 +1,519 @@
+
+module regalloc.scan.scan
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import target.triple as triple_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.lir.error as lir_error_mod
+
+import local.live.bank as bank_mod
+import local.live.live as live_mod
+import local.live.solve.interval as interval_mod
+import local.frame.frame as frame_mod
+import local.frame.frameplan as frameplan_mod
+import local.materialize as materialize_mod
+import local.scan.clobber as clobber_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(interval_mod.LiveInterval)
+spec std.collections.vec.Vec(frame_mod.SpillSlot)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(lir_reg_mod.PReg)
+
+
+public function run(
+    body: mutable lir_body_mod.LirBody,
+    bank: bank_mod.RegBank,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n_vregs = Vec_LirVReg.len(body.vregs)
+    if n_vregs <= 1 { return }
+
+    uninit live: live_mod.Liveness
+    live_mod.compute(init live, body, allocator)?
+
+    uninit intervals: Vec_LiveInterval.Vec
+    interval_mod.build(init intervals, body, live, allocator)?
+
+    uninit layout: frame_mod.FrameLayout
+    frame_mod.empty_layout(init layout, allocator)?
+
+    uninit call_sites: Vec_usize.Vec
+    uninit rdxrax_sites: Vec_usize.Vec
+    uninit rcx_sites: Vec_usize.Vec
+    clobber_mod.collect_clobber_positions(init call_sites, init rdxrax_sites, init rcx_sites, body, target, allocator)?
+
+    assign_registers(mutable body, intervals, mutable layout, bank, call_sites, rdxrax_sites, rcx_sites, allocator)?
+    reserve_buffers(mutable layout, body, allocator)?
+
+    let has_call = frameplan_mod.body_has_call(body)
+    let max_args = frameplan_mod.max_effective_call_args(body)
+    let agg = frameplan_mod.agg_scratch_bytes(body)
+    let agg_base = frameplan_mod.outgoing_bytes(has_call, max_args)
+    if frame_mod.slot_count(layout) > 0 || frame_mod.buffer_count(layout) > 0 || has_call {
+        materialize_mod.materialize_spills(mutable body, layout, agg_base, target, allocator)?
+    }
+    body.frame_size = frameplan_mod.final_frame_size(layout.total_size, has_call, max_args, agg)
+    record_debug_slots(mutable body, layout, allocator)?
+}
+
+
+function reserve_buffers(
+    layout: mutable frame_mod.FrameLayout,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_LirBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases nb - b {
+        if b >= nb { break }
+        let block = Vec_LirBlock.at(body.blocks, b)
+        let no = Vec_LirOpId.len(block.ops)
+        var i: usize = 0
+        loop decreases no - i {
+            if i >= no { break }
+            let op_id = Vec_LirOpId.at(block.ops, i)
+            let idx = op_id.raw as usize
+            if idx != 0 {
+                if idx < Vec_LirOp.len(body.ops) {
+                    let op = Vec_LirOp.at(body.ops, idx)
+                    match op.kind {
+                        case .stack_addr(let bytes, let dst) => {
+                            let _ = frame_mod.add_buffer(mutable layout, dst.raw, bytes, allocator)?
+                        }
+                        case .make_closure(_, _, let dst) => {
+                            let _ = frame_mod.add_buffer(mutable layout, dst.raw, 16 as u32, allocator)?
+                        }
+                        case .call_(_, _, let return_) => {
+                            match return_ {
+                                case .some(let rv) => {
+                                    match op.flags.intrinsic {
+                                        case .slice_from_raw => {
+                                            let _ = frame_mod.add_buffer(mutable layout, rv.raw, 16 as u32, allocator)?
+                                        }
+                                        case .string_from_raw => {
+                                            let _ = frame_mod.add_buffer(mutable layout, rv.raw, 16 as u32, allocator)?
+                                        }
+                                        case .float_to_wide => {
+                                            let _ = frame_mod.add_buffer(mutable layout, rv.raw, 16 as u32, allocator)?
+                                        }
+                                        case _ => {
+                                            let ridx = rv.raw as usize
+                                            let rsz = if ridx != 0 && ridx < Vec_LirVReg.len(body.vregs) { Vec_LirVReg.at(body.vregs, ridx).size } else { lir_reg_mod.register_width() }
+                                            if lir_reg_mod.is_by_memory(rsz) {
+                                                let _ = frame_mod.add_buffer(mutable layout, rv.raw, rsz, allocator)?
+                                            }
+                                        }
+                                    }
+                                }
+                                case .none => ()
+                            }
+                        }
+                        case .call_indirect(_, _, let return_) => {
+                            match return_ {
+                                case .some(let rv) => {
+                                    let ridx = rv.raw as usize
+                                    let rsz = if ridx != 0 && ridx < Vec_LirVReg.len(body.vregs) { Vec_LirVReg.at(body.vregs, ridx).size } else { lir_reg_mod.register_width() }
+                                    if lir_reg_mod.is_by_memory(rsz) {
+                                        let _ = frame_mod.add_buffer(mutable layout, rv.raw, rsz, allocator)?
+                                    }
+                                }
+                                case .none => ()
+                            }
+                        }
+                        case _ => ()
+                    }
+                }
+            }
+            i = i + 1
+        }
+        b = b + 1
+    }
+}
+
+
+function record_debug_slots(
+    body: mutable lir_body_mod.LirBody,
+    layout: frame_mod.FrameLayout,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_SpillSlot.len(layout.slots)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = Vec_SpillSlot.at(layout.slots, i)
+        if s.vreg_raw != (0 as u32) {
+            let frame_disp = (0 as i32) - ((s.offset + s.size) as i32)
+            lir_body_mod.push_debug_slot(mutable body, s.vreg_raw, frame_disp, allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function pool_contains(pool: Vec_u32.Vec, raw: u32) -> bool {
+    let n = Vec_u32.len(pool)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_u32.at(pool, i) == raw { return true }
+        i += 1
+    }
+    return false
+}
+
+
+function is_gp_class(class_: lir_reg_mod.RegClass) -> bool {
+    return match class_ {
+        case .gp => true
+        case _   => false
+    }
+}
+
+
+function assign_registers(
+    body: mutable lir_body_mod.LirBody,
+    intervals: Vec_LiveInterval.Vec,
+    layout: mutable frame_mod.FrameLayout,
+    bank: bank_mod.RegBank,
+    call_sites: Vec_usize.Vec,
+    rdxrax_sites: Vec_usize.Vec,
+    rcx_sites: Vec_usize.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit gp_busy: Vec_bool.Vec
+    bools16(init gp_busy, allocator)?
+    uninit fp_busy: Vec_bool.Vec
+    bools16(init fp_busy, allocator)?
+    uninit gp_end: Vec_usize.Vec
+    usizes16(init gp_end, allocator)?
+    uninit fp_end: Vec_usize.Vec
+    usizes16(init fp_end, allocator)?
+    uninit gp_occ: Vec_u32.Vec
+    u32s16(init gp_occ, allocator)?
+    uninit fp_occ: Vec_u32.Vec
+    u32s16(init fp_occ, allocator)?
+    uninit gp_occ_pin: Vec_bool.Vec
+    bools16(init gp_occ_pin, allocator)?
+    uninit fp_occ_pin: Vec_bool.Vec
+    bools16(init fp_occ_pin, allocator)?
+
+    let n = Vec_LiveInterval.len(intervals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let iv = Vec_LiveInterval.at(intervals, i)
+        match iv.class_ {
+            case .gp => assign_in_class(mutable body, mutable gp_busy, mutable gp_end, mutable gp_occ, mutable gp_occ_pin, mutable layout, iv, bank_mod.class_pool(bank, lir_reg_mod.RegClass.gp), bank_mod.class_safe_pool(bank, lir_reg_mod.RegClass.gp), call_sites, rdxrax_sites, rcx_sites, allocator)?
+            case .fp => assign_in_class(mutable body, mutable fp_busy, mutable fp_end, mutable fp_occ, mutable fp_occ_pin, mutable layout, iv, bank_mod.class_pool(bank, lir_reg_mod.RegClass.fp), bank_mod.class_safe_pool(bank, lir_reg_mod.RegClass.fp), call_sites, rdxrax_sites, rcx_sites, allocator)?
+            case .vector => assign_in_class(mutable body, mutable fp_busy, mutable fp_end, mutable fp_occ, mutable fp_occ_pin, mutable layout, iv, bank_mod.class_pool(bank, lir_reg_mod.RegClass.vector), bank_mod.class_safe_pool(bank, lir_reg_mod.RegClass.vector), call_sites, rdxrax_sites, rcx_sites, allocator)?
+            case .mask => raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "regalloc: mask register class has no x86-64 bank (AVX-512 k-registers not modeled)",
+            )
+        }
+        i += 1
+    }
+}
+
+
+function assign_in_class(
+    body: mutable lir_body_mod.LirBody,
+    busy: mutable Vec_bool.Vec,
+    ends: mutable Vec_usize.Vec,
+    occ: mutable Vec_u32.Vec,
+    occ_pin: mutable Vec_bool.Vec,
+    layout: mutable frame_mod.FrameLayout,
+    iv: interval_mod.LiveInterval,
+    pool: Vec_u32.Vec,
+    safe_pool: Vec_u32.Vec,
+    call_sites: Vec_usize.Vec,
+    rdxrax_sites: Vec_usize.Vec,
+    rcx_sites: Vec_usize.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    sweep_free(mutable busy, ends, iv.start)
+    match iv.pin {
+        case .some(let p) => reserve_precolor(body, mutable busy, mutable ends, mutable occ, mutable occ_pin, mutable layout, p, iv, allocator)?
+        case .none        => assign_free_or_spill(mutable body, mutable busy, mutable ends, mutable occ, mutable occ_pin, mutable layout, iv, pool, safe_pool, call_sites, rdxrax_sites, rcx_sites, allocator)?
+    }
+}
+
+
+function reserve_precolor(
+    body: lir_body_mod.LirBody,
+    busy: mutable Vec_bool.Vec,
+    ends: mutable Vec_usize.Vec,
+    occ: mutable Vec_u32.Vec,
+    occ_pin: mutable Vec_bool.Vec,
+    layout: mutable frame_mod.FrameLayout,
+    p: lir_reg_mod.PReg,
+    iv: interval_mod.LiveInterval,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let r = p.raw as usize
+    if r >= reg_window() {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc: precolor PReg outside the 16-register window",
+        )
+    }
+    if Vec_bool.at(busy, r) {
+        if Vec_usize.at(ends, r) >= iv.start {
+            if Vec_bool.at(occ_pin, r) {
+                raise lir_error_mod.LirError.internal_lowering_invariant(
+                    at: span_mod.dummy(),
+                    message: "regalloc: precolor conflict — two pinned intervals require the same register",
+                )
+            }
+            evict_occupant(body, mutable layout, Vec_u32.at(occ, r), allocator)?
+        }
+    }
+    Vec_bool.set_at(mutable busy, r, true)
+    Vec_usize.set_at(mutable ends, r, iv.end)
+    Vec_u32.set_at(mutable occ, r, iv.vreg_raw)
+    Vec_bool.set_at(mutable occ_pin, r, true)
+}
+
+
+function evict_occupant(
+    body: lir_body_mod.LirBody,
+    layout: mutable frame_mod.FrameLayout,
+    victim_raw: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let idx = victim_raw as usize
+    if idx == 0 { return }
+    if idx >= Vec_LirVReg.len(body.vregs) { return }
+    let cls = Vec_LirVReg.at(body.vregs, idx).class_
+    spill_vreg(mutable layout, victim_raw, cls, allocator)?
+}
+
+
+function assign_free_or_spill(
+    body: mutable lir_body_mod.LirBody,
+    busy: mutable Vec_bool.Vec,
+    ends: mutable Vec_usize.Vec,
+    occ: mutable Vec_u32.Vec,
+    occ_pin: mutable Vec_bool.Vec,
+    layout: mutable frame_mod.FrameLayout,
+    iv: interval_mod.LiveInterval,
+    pool: Vec_u32.Vec,
+    safe_pool: Vec_u32.Vec,
+    call_sites: Vec_usize.Vec,
+    rdxrax_sites: Vec_usize.Vec,
+    rcx_sites: Vec_usize.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let crosses_call = clobber_mod.spans_clobber(call_sites, iv.start, iv.end)
+    let active_pool = if crosses_call { safe_pool } else { pool }
+    let avoid_rax_rdx = !crosses_call && is_gp_class(iv.class_) && clobber_mod.spans_clobber(rdxrax_sites, iv.start, iv.end)
+    let avoid_rcx = !crosses_call && is_gp_class(iv.class_) && (clobber_mod.spans_clobber(rcx_sites, iv.start, iv.end) || clobber_mod.clobbers_at(rcx_sites, iv.start))
+    match find_free(active_pool, busy, avoid_rax_rdx, avoid_rcx) {
+        case .some(let raw) => {
+            let r = raw as usize
+            if r < reg_window() {
+                Vec_bool.set_at(mutable busy, r, true)
+                Vec_usize.set_at(mutable ends, r, iv.end)
+                Vec_u32.set_at(mutable occ, r, iv.vreg_raw)
+                Vec_bool.set_at(mutable occ_pin, r, false)
+                write_pin(mutable body, iv.vreg_raw, raw)
+                if pool_contains(safe_pool, raw) {
+                    note_callee_saved(mutable body, mutable layout, raw, allocator)?
+                }
+            }
+        }
+        case .none => spill(mutable layout, iv, allocator)?
+    }
+}
+
+
+function note_callee_saved(
+    body: mutable lir_body_mod.LirBody,
+    layout: mutable frame_mod.FrameLayout,
+    preg_raw: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if lir_body_mod.has_callee_save(body, preg_raw) { return }
+    let offset = frame_mod.add_slot(mutable layout, 0 as u32, lir_reg_mod.RegClass.gp, allocator)?
+    let size = frame_mod.slot_size_for(lir_reg_mod.RegClass.gp)
+    let disp = (0 as i32) - ((offset + size) as i32)
+    lir_body_mod.push_callee_save(mutable body, preg_raw, disp, allocator)?
+}
+
+
+function find_free(pool: Vec_u32.Vec, busy: Vec_bool.Vec, avoid_rax_rdx: bool, avoid_rcx: bool) -> Option_u32.Option {
+    let np = Vec_u32.len(pool)
+    var i: usize = 0
+    loop decreases np - i {
+        if i >= np { break }
+        let raw = Vec_u32.at(pool, i)
+        let ri = raw as usize
+        if ri < reg_window() {
+            if !Vec_bool.at(busy, ri) {
+                if !(avoid_rax_rdx && (raw == (0 as u32) || raw == (2 as u32))) {
+                    if !(avoid_rcx && raw == (1 as u32)) {
+                        return Option_u32.some(value: raw)
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    return Option_u32.none
+}
+
+
+function sweep_free(busy: mutable Vec_bool.Vec, ends: Vec_usize.Vec, start: usize) -> () {
+    var r: usize = 0
+    loop decreases reg_window() - r {
+        if r >= reg_window() { break }
+        if Vec_bool.at(busy, r) {
+            if Vec_usize.at(ends, r) < start {
+                Vec_bool.set_at(mutable busy, r, false)
+            }
+        }
+        r += 1
+    }
+}
+
+
+function write_pin(body: mutable lir_body_mod.LirBody, vreg_raw: u32, preg_raw: u32) -> () {
+    let idx = vreg_raw as usize
+    if idx == 0 { return }
+    if idx >= Vec_LirVReg.len(body.vregs) { return }
+    let cur = Vec_LirVReg.at(body.vregs, idx)
+    let updated = lir_reg_mod.LirVReg {
+        class_: cur.class_,
+        pin: Option_PReg.some(value: lir_reg_mod.PReg { raw: preg_raw }),
+        ty: cur.ty,
+        size: cur.size,
+        int_width: cur.int_width,
+        int_signed: cur.int_signed,
+        is_ref: cur.is_ref,
+    }
+    Vec_LirVReg.set_at(mutable body.vregs, idx, take updated)
+}
+
+
+function spill(
+    layout: mutable frame_mod.FrameLayout,
+    iv: interval_mod.LiveInterval,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    spill_vreg(mutable layout, iv.vreg_raw, iv.class_, allocator)?
+}
+
+
+function spill_vreg(
+    layout: mutable frame_mod.FrameLayout,
+    vreg_raw: u32,
+    class_: lir_reg_mod.RegClass,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match class_ {
+        case .gp => {
+            let _ = frame_mod.add_slot(mutable layout, vreg_raw, class_, allocator)?
+        }
+        case .fp => {
+            let _ = frame_mod.add_slot(mutable layout, vreg_raw, class_, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc: spilling a 128-bit vector/mask value needs movdqa stack-slot encoders (16-byte slot round-trip) not yet wired (see #196)",
+        )
+    }
+}
+
+
+function reg_window() -> usize {
+    return 16 as usize
+}
+
+
+function bools16(out: init Vec_bool.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_bool.Vec
+    Vec_bool.new(init v, allocator)?
+    let n: usize = 16
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_bool.push(mutable v, false, allocator)?
+        i += 1
+    }
+    out = v
+}
+
+
+function usizes16(out: init Vec_usize.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_usize.Vec
+    Vec_usize.new(init v, allocator)?
+    let n: usize = 16
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_usize.push(mutable v, 0 as usize, allocator)?
+        i += 1
+    }
+    out = v
+}
+
+
+function u32s16(out: init Vec_u32.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u32.Vec
+    Vec_u32.new(init v, allocator)?
+    let n: usize = 16
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable v, 0 as u32, allocator)?
+        i += 1
+    }
+    out = v
+}

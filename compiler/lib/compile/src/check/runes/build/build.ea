@@ -1,0 +1,234 @@
+
+module compile.check.runes.build.build
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import std.core.fmt as fmt_mod
+import diagnostics.emit.collection as diags_mod
+import intern.interner as interner_mod
+import manifest.manifest as manifest_mod
+import manifest.model.dependency.dependency as dep_mod
+import manifest.model.lockfile.lockfile as lf_mod
+import manifest.model.package.package as pkg_mod
+import source.map as source_map_mod
+import source.read as source_read_mod
+import local.setup.env.load.load as load_mod
+import local.phase.pipeline.parse as parse_mod
+import local.check.runes.resolve.cache.cache as cache_mod
+import local.check.runes.resolve.archive.archive as archive_mod
+import local.check.runes.resolve.git.git as git_mod
+import local.check.runes.effects as effects_mod
+import local.check.runes.surface as surface_mod
+import local.check.runes.tree as tree_mod
+import local.check.runes.util as util_mod
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(lf_mod.Rune)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+
+
+public function load_manifest_at(rfs: ReadOnlyFilesystem, package_root: String, allocator: Allocator) -> Option_LoadedManifest.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let manifest_path = string.concat(package_root, "/package.toml", allocator)?
+    if !fs.path_exists(rfs, manifest_path) {
+        return Option_LoadedManifest.none
+    }
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    return load_mod.manifest_load(rfs, mutable scratch_map, package_root, mutable scratch_diags, allocator)?
+}
+
+
+public function build_archive_rune(
+    rfs: ReadOnlyFilesystem,
+    project_root: String,
+    dep_name: String,
+    source: dep_mod.DependencySource,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_Rune.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let res_opt = cache_mod.resolve_rune_archive(rfs, project_root, dep_name, source, allocator)?
+    match res_opt {
+        case .none => return Option_Rune.none
+        case .some(let res) => {
+            match res {
+                case .cached(let path) => {
+                    let descriptor_opt = cache_mod.source_descriptor(dep_name, source, allocator)?
+                    match descriptor_opt {
+                        case .none => return Option_Rune.none
+                        case .some(let descriptor) =>
+                            return archive_mod.build_rune_from_archive(rfs, path, dep_name, descriptor, mutable diags, allocator)?
+                    }
+                }
+                case .uncached(_) => return Option_Rune.none
+            }
+        }
+    }
+}
+
+
+public function build_path_rune(
+    rfs: ReadOnlyFilesystem,
+    dep_root: String,
+    dep_name: String,
+    rel: String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Rune.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let source_str = string.concat("path+", rel, allocator)?
+    return build_tree_rune(rfs, dep_root, dep_name, take source_str, mutable interner, allocator)?
+}
+
+
+public function build_git_rune(
+    rfs: ReadOnlyFilesystem,
+    project_root: String,
+    dep_name: String,
+    source: dep_mod.DependencySource,
+    url: String,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_Rune.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let cached = build_archive_rune(rfs, project_root, dep_name, source, mutable diags, allocator)?
+    match cached {
+        case .some(_) => return cached
+        case .none => ()
+    }
+    let descriptor_opt = cache_mod.source_descriptor(dep_name, source, allocator)?
+    let descriptor = match descriptor_opt {
+        case .none => return Option_Rune.none
+        case .some(let d) => d
+    }
+    let checkout_dir = cache_mod.checkout_dir_of(project_root, dep_name, descriptor, allocator)?
+    if !fs.path_exists(rfs, checkout_dir) {
+        return Option_Rune.none
+    }
+    let parts = string.split(url, "#", allocator)?
+    let rev_opt = git_mod.resolved_rev_of(rfs, checkout_dir, allocator)?
+    let source_str = match rev_opt {
+        case .some(let rev) => {
+            let a = string.concat("git+", parts[0], allocator)?
+            let b = string.concat(a, "#", allocator)?
+            string.concat(b, rev, allocator)?
+        }
+        case .none => string.concat("git+", url, allocator)?
+    }
+    return build_tree_rune(rfs, checkout_dir, dep_name, take source_str, mutable interner, allocator)?
+}
+
+
+function build_tree_rune(
+    rfs: ReadOnlyFilesystem,
+    dep_root: String,
+    dep_name: String,
+    source_str: take String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Rune.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let dep_m_opt = load_manifest_at(rfs, dep_root, allocator)?
+    let dep_m = match dep_m_opt {
+        case .none => return Option_Rune.none
+        case .some(let loaded) => loaded
+    }
+    let version = version_of(dep_m, allocator)?
+    let dep_names = dep_names_of(dep_m, allocator)?
+    let files = tree_mod.tree_files(rfs, dep_root, allocator)?
+    let rune_hash = tree_mod.hash_tree(rfs, dep_root, files, allocator)?
+    uninit parse_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init parse_map, allocator)?
+    uninit parse_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init parse_diags, allocator)?
+    read_sources(rfs, files, mutable parse_map, allocator)?
+    let asts = parse_mod.parse_sources(parse_map, mutable interner, mutable parse_diags, allocator)?
+    let surface_hash = surface_mod.hash_surface(asts, parse_map, interner, allocator)?
+    let effect_hash = effects_mod.hash_effects(asts, parse_map, allocator)?
+    let name_owned = string.clone(dep_name, allocator)?
+    let r = lf_mod.rune_of(
+        take name_owned,
+        take version,
+        take source_str,
+        take rune_hash,
+        take surface_hash,
+        take effect_hash,
+        "",
+        "",
+        take dep_names,
+    )
+    return Option_Rune.some(value: r)
+}
+
+
+function version_of(m: manifest_mod.LoadedManifest, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match m {
+        case .package(let pkg, _, _, _, _, _, _) => render_semver(pkg_mod.version(pkg), allocator)?
+        case .workspace_only(_, _, _, _, _) => "0.0.0"
+    }
+}
+
+
+function render_semver(v: pkg_mod.SemVer, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let major = fmt_mod.u32_to_string(pkg_mod.major(v), allocator)?
+    let minor = fmt_mod.u32_to_string(pkg_mod.minor(v), allocator)?
+    let patch = fmt_mod.u32_to_string(pkg_mod.patch(v), allocator)?
+    let a = string.concat(major, ".", allocator)?
+    let b = string.concat(a, minor, allocator)?
+    let c = string.concat(b, ".", allocator)?
+    return string.concat(c, patch, allocator)?
+}
+
+
+function dep_names_of(m: manifest_mod.LoadedManifest, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n = manifest_mod.dependency_count_of(m)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let name = string.clone(manifest_mod.dependency_name_at(m, i), allocator)?
+        Vec_String.push(mutable out, take name, allocator)?
+        i = i + 1
+    }
+    util_mod.sort_strings(mutable out)
+    return out
+}
+
+
+function read_sources(
+    rfs: ReadOnlyFilesystem,
+    files: Vec_String.Vec,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let n = Vec_String.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let path = string.clone(Vec_String.at(files, i), allocator)?
+        let _ = source_read_mod.read_file(rfs, mutable map, take path, allocator)?
+        i = i + 1
+    }
+}

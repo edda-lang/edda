@@ -1,0 +1,396 @@
+
+module compile.setup.env.closure
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import source.map as source_map_mod
+import manifest.manifest as manifest_mod
+import manifest.model.package.package as pkg_mod
+import manifest.model.workspace.workspace as ws_mod
+import local.setup.env.load.load as load_mod
+import local.setup.env.discover as discover_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.hashmap.StringMap(String)
+spec std.collections.hashmap.StringMap(bool)
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+
+
+public function program_name_of(primary_member: Option_String.Option, manifest: manifest_mod.LoadedManifest) -> String {
+    return match primary_member {
+        case .some(let m) => m
+        case .none => match manifest_mod.package_name_of(manifest) {
+            case .some(let name) => name
+            case .none => "program"
+        }
+    }
+}
+
+
+public function scoped_member_sources(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    current_member: String,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit results: Vec_String.Vec
+    Vec_String.new(init results, allocator)?
+    let ws = match load_mod.workspace_of(manifest) {
+        case .some(let w) => w
+        case .none => return results
+    }
+    let ns_map = build_ns_map(rfs, workspace_root, ws, allocator)?
+    var edge_memo = StringMap_String.new(allocator)?
+    let root_segment = ws_mod.discover_root_of(ws)
+    return scoped_member_sources_cached(rfs, workspace_root, root_segment, current_member, ns_map, mutable edge_memo, allocator, allocator)?
+}
+
+
+public function scoped_member_sources_cached(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    root_segment: String,
+    current_member: String,
+    ns_map: StringMap_String.StringMap,
+    edge_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit results: Vec_String.Vec
+    Vec_String.new(init results, allocator)?
+    let members = compute_closure_cached(rfs, workspace_root, root_segment, ns_map, current_member, mutable edge_memo, memo_alloc, allocator)?
+
+    let mn = Vec_String.len(members)
+    var i: usize = 0
+    loop decreases (mn - i) {
+        if i >= mn { break }
+        let src_dir = member_src_dir(workspace_root, root_segment, Vec_String.at(members, i), allocator)?
+        discover_mod.walk_dir(rfs, src_dir, mutable results, allocator)?
+        i = i + 1
+    }
+    return results
+}
+
+
+public function build_ns_map(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    ws: ws_mod.Workspace,
+    allocator: Allocator,
+) -> StringMap_String.StringMap
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+
+    var m = StringMap_String.new(allocator)?
+    let root_segment = ws_mod.discover_root_of(ws)
+    let n = ws_mod.member_count(ws)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member = ws_mod.member_at(ws, i)
+        let dir = member_dir(workspace_root, root_segment, member, allocator)?
+        let mf_opt = load_mod.manifest_load(rfs, mutable scratch_map, dir, mutable scratch_diags, allocator)?
+        match mf_opt {
+            case .some(let mf) => match mf {
+                case .package(let pkg, _, _, _, _, _, _) => {
+                    let ns = pkg_mod.root_namespace(pkg)
+                    let _ = StringMap_String.insert(mutable m, ns, string.clone(member, allocator)?, allocator)?
+                }
+                case .workspace_only(_, _, _, _, _) => ()
+            }
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return m
+}
+
+
+public function member_closure_of(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    member: String,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let ws = match load_mod.workspace_of(manifest) {
+        case .some(let w) => w
+        case .none => return single_member_vec(member, allocator)?
+    }
+    let ns_map = build_ns_map(rfs, workspace_root, ws, allocator)?
+    var edge_memo = StringMap_String.new(allocator)?
+    let root_segment = ws_mod.discover_root_of(ws)
+    return compute_closure_cached(rfs, workspace_root, root_segment, ns_map, member, mutable edge_memo, allocator, allocator)?
+}
+
+
+public function member_package_dep_names(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    member: String,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let ws = match load_mod.workspace_of(manifest) {
+        case .some(let w) => w
+        case .none => return manifest_dep_names(manifest, allocator)?
+    }
+    let root_segment = ws_mod.discover_root_of(ws)
+    let dir = member_dir(workspace_root, root_segment, member, allocator)?
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let mf_opt = load_mod.manifest_load(rfs, mutable scratch_map, dir, mutable scratch_diags, allocator)?
+    return match mf_opt {
+        case .some(let mf) => manifest_dep_names(mf, allocator)?
+        case .none => empty_names(allocator)?
+    }
+}
+
+
+function single_member_vec(member: String, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit only: Vec_String.Vec
+    Vec_String.new(init only, allocator)?
+    Vec_String.push(mutable only, string.clone(member, allocator)?, allocator)?
+    return only
+}
+
+
+function empty_names(allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit names: Vec_String.Vec
+    Vec_String.new(init names, allocator)?
+    return names
+}
+
+
+function manifest_dep_names(m: manifest_mod.LoadedManifest, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit names: Vec_String.Vec
+    Vec_String.new(init names, allocator)?
+    let n = manifest_mod.dependency_count_of(m)
+    for i in 0..<n {
+        Vec_String.push(mutable names, string.clone(manifest_mod.dependency_name_at(m, i), allocator)?, allocator)?
+    }
+    return names
+}
+
+
+function compute_closure_cached(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    root_segment: String,
+    ns_map: StringMap_String.StringMap,
+    start_member: String,
+    edge_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    var visited = StringMap_bool.new(allocator)?
+    uninit order: Vec_String.Vec
+    Vec_String.new(init order, allocator)?
+    uninit worklist: Vec_String.Vec
+    Vec_String.new(init worklist, allocator)?
+    Vec_String.push(mutable worklist, string.clone(start_member, allocator)?, allocator)?
+
+    var idx: usize = 0
+    loop {
+        let wn = Vec_String.len(worklist)
+        if idx >= wn { break }
+        let m = Vec_String.at(worklist, idx)
+        idx = idx + 1
+        if StringMap_bool.contains(visited, m) {
+            continue
+        }
+        let _ = StringMap_bool.insert(mutable visited, m, true, allocator)?
+        Vec_String.push(mutable order, string.clone(m, allocator)?, allocator)?
+        let joined = member_import_deps(rfs, workspace_root, root_segment, m, ns_map, mutable edge_memo, memo_alloc, allocator)?
+        push_joined(joined, mutable worklist, allocator)?
+    }
+    return order
+}
+
+
+function member_import_deps(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    root_segment: String,
+    member: String,
+    ns_map: StringMap_String.StringMap,
+    edge_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> String
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    match StringMap_String.get(edge_memo, member) {
+        case .some(let joined) => return string.clone(joined, allocator)?
+        case .none => ()
+    }
+    uninit deps: Vec_String.Vec
+    Vec_String.new(init deps, allocator)?
+    add_member_imports(rfs, workspace_root, root_segment, member, ns_map, mutable deps, allocator)?
+    let joined = join_deps(deps, allocator)?
+    let _ = StringMap_String.insert(mutable edge_memo, member, string.clone(joined, memo_alloc)?, memo_alloc)?
+    return joined
+}
+
+
+function join_deps(deps: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var joined: String = ""
+    let n = Vec_String.len(deps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i > 0 {
+            joined = string.concat(joined, ",", allocator)?
+        }
+        joined = string.concat(joined, Vec_String.at(deps, i), allocator)?
+        i = i + 1
+    }
+    return joined
+}
+
+
+function push_joined(joined: String, worklist: mutable Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let parts = string.split(joined, ",", allocator)?
+    let n = parts.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if !string.is_empty(parts[i]) {
+            Vec_String.push(mutable worklist, string.clone(parts[i], allocator)?, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function add_member_imports(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    root_segment: String,
+    member: String,
+    ns_map: StringMap_String.StringMap,
+    worklist: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let src_dir = member_src_dir(workspace_root, root_segment, member, allocator)?
+    uninit files: Vec_String.Vec
+    Vec_String.new(init files, allocator)?
+    discover_mod.walk_dir(rfs, src_dir, mutable files, allocator)?
+
+    let fn = Vec_String.len(files)
+    var i: usize = 0
+    loop decreases (fn - i) {
+        if i >= fn { break }
+        scan_file(rfs, Vec_String.at(files, i), ns_map, mutable worklist, allocator)?
+        i = i + 1
+    }
+}
+
+
+function scan_file(
+    rfs: ReadOnlyFilesystem,
+    path: String,
+    ns_map: StringMap_String.StringMap,
+    worklist: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let content = fs.read_to_string(rfs, path, allocator)?
+    let lines = string.split(content, "\n", allocator)?
+    let n = lines.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match import_root_seg(lines[i], allocator)? {
+            case .some(let seg) => match StringMap_String.get(ns_map, seg) {
+                case .some(let mem) =>
+                    Vec_String.push(mutable worklist, string.clone(mem, allocator)?, allocator)?
+                case .none => ()
+            }
+            case .none => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function import_root_seg(line: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let t = string.trim(line, allocator)?
+    if !string.starts_with(t, "import ") {
+        return Option_String.none
+    }
+    let toks = string.split(t, " ", allocator)?
+    let n = toks.len()
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n {
+            return Option_String.none
+        }
+        if !string.is_empty(toks[i]) {
+            let dots = string.split(toks[i], ".", allocator)?
+            if dots.len() == 0 as usize {
+                return Option_String.none
+            }
+            return Option_String.some(value: string.clone(dots[0], allocator)?)
+        }
+        i = i + 1
+    }
+    return Option_String.none
+}
+
+
+function member_dir(workspace_root: String, root_segment: String, member: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = string.concat(workspace_root, "/", allocator)?
+    let b = string.concat(a, root_segment, allocator)?
+    let p = string.concat(b, "/", allocator)?
+    return string.concat(p, member, allocator)?
+}
+
+
+function member_src_dir(workspace_root: String, root_segment: String, member: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let d = member_dir(workspace_root, root_segment, member, allocator)?
+    return string.concat(d, "/src", allocator)?
+}

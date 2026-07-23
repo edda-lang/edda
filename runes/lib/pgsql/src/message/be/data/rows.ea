@@ -1,0 +1,146 @@
+
+module pgsql.message.be.data.rows
+
+import std.mem.alloc
+import local.error
+import local.link.wire
+
+
+function _alloc_field_slots(allocator: Allocator, n: usize) -> [FieldDescription]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_column_slots(allocator: Allocator, n: usize) -> [DataColumn]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_u32_slots(allocator: Allocator, n: usize) -> [u32]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+public type ParameterDescription {
+    type_oids: [u32]
+}
+
+public function decode_parameter_description(
+    body: [u8],
+    allocator: Allocator,
+) -> ParameterDescription
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let count_i16 = wire.read_i16_be(body, 0 as usize)?
+    let count = count_i16 as usize
+    let oids = _alloc_u32_slots(allocator, count)?
+    var p: usize = 2 as usize
+    var i: usize = 0 as usize
+    loop decreases count - i {
+        if i >= count { break }
+        let raw = wire.read_i32_be(body, p)?
+        oids[i] = raw as u32
+        p = p + (4 as usize)
+        i = i + (1 as usize)
+    }
+    return ParameterDescription { type_oids: oids }
+}
+
+
+public type FieldDescription {
+    name: [u8]
+    table_oid: u32
+    column_attr: i16
+    type_oid: u32
+    type_size: i16
+    type_modifier: i32
+    format_code: i16
+}
+
+public type RowDescription {
+    fields: [FieldDescription]
+}
+
+public function decode_row_description(
+    body: [u8],
+    allocator: Allocator,
+) -> RowDescription
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let count_i16 = wire.read_i16_be(body, 0 as usize)?
+    let count = count_i16 as usize
+    let fields = _alloc_field_slots(allocator, count)?
+    var pos: usize = 2 as usize
+    var i: usize = 0 as usize
+    loop decreases count - i {
+        if i >= count { break }
+        let name_cs = wire.read_cstring(body, pos)?
+        var p = name_cs.next_pos
+        let table_oid_raw = wire.read_i32_be(body, p)?
+        p = p + (4 as usize)
+        let col_attr = wire.read_i16_be(body, p)?
+        p = p + (2 as usize)
+        let type_oid_raw = wire.read_i32_be(body, p)?
+        p = p + (4 as usize)
+        let type_size = wire.read_i16_be(body, p)?
+        p = p + (2 as usize)
+        let type_mod = wire.read_i32_be(body, p)?
+        p = p + (4 as usize)
+        let format = wire.read_i16_be(body, p)?
+        p = p + (2 as usize)
+        fields[i] = FieldDescription {
+            name: body[name_cs.bytes_lo..<name_cs.bytes_hi],
+            table_oid: table_oid_raw as u32,
+            column_attr: col_attr,
+            type_oid: type_oid_raw as u32,
+            type_size: type_size,
+            type_modifier: type_mod,
+            format_code: format,
+        }
+        pos = p
+        i = i + (1 as usize)
+    }
+    return RowDescription { fields: fields }
+}
+
+
+public type DataColumn {
+    is_null: bool
+    value: [u8]
+}
+
+public type DataRow {
+    columns: [DataColumn]
+}
+
+public function decode_data_row(
+    body: [u8],
+    allocator: Allocator,
+) -> DataRow
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let count_i16 = wire.read_i16_be(body, 0 as usize)?
+    let count = count_i16 as usize
+    let cols = _alloc_column_slots(allocator, count)?
+    var pos: usize = 2 as usize
+    var i: usize = 0 as usize
+    loop decreases count - i {
+        if i >= count { break }
+        let raw_len = wire.read_i32_be(body, pos)?
+        pos = pos + (4 as usize)
+        if raw_len < (0 as i32) {
+            cols[i] = DataColumn {
+                is_null: true,
+                value: body[pos..<pos],
+            }
+        } else {
+            let vlen = raw_len as usize
+            wire.require_remaining(body, pos, vlen)?
+            cols[i] = DataColumn {
+                is_null: false,
+                value: body[pos..<(pos + vlen)],
+            }
+            pos = pos + vlen
+        }
+        i = i + (1 as usize)
+    }
+    return DataRow { columns: cols }
+}

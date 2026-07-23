@@ -1,0 +1,137 @@
+
+module std.testing.properties
+
+import std.math.scalar
+import std.mem.alloc
+import std.text.string
+
+public type CheckResult {
+    passed: bool
+    runs_executed: usize
+    failing_seed: u64
+}
+
+function golden() -> u64 {
+    return 11400714819323198485
+}
+
+public function mix(seed: u64) -> u64 {
+    var z: u64 = seed +% golden()
+    z = (z ^ (z >> 30)) *% 13787848793156543929
+    z = (z ^ (z >> 27)) *% 10723151780598845931
+    return z ^ (z >> 31)
+}
+
+function field_seed(seed: u64, index: u64) -> u64 {
+    return mix(seed +% ((index +% 1) *% golden()))
+}
+
+public function gen_value(comptime U: Type, seed: u64, allocator: Allocator) -> U
+    with {allocator, err: alloc.AllocError}
+{
+    comptime if U == bool {
+        return (mix(seed) & 1) == 1
+    } else { comptime if U == u8 {
+        return mix(seed) as u8 wrapping
+    } else { comptime if U == i8 {
+        return mix(seed) as i8 wrapping
+    } else { comptime if U == u16 {
+        return mix(seed) as u16 wrapping
+    } else { comptime if U == i16 {
+        return mix(seed) as i16 wrapping
+    } else { comptime if U == u32 {
+        return mix(seed) as u32 wrapping
+    } else { comptime if U == i32 {
+        return mix(seed) as i32 wrapping
+    } else { comptime if U == u64 {
+        return mix(seed)
+    } else { comptime if U == i64 {
+        return mix(seed) as i64 wrapping
+    } else { comptime if U == usize {
+        return mix(seed) as usize
+    } else { comptime if U == isize {
+        return (mix(seed) as i64 wrapping) as isize
+    } else { comptime if U == u128 {
+        let lo: u64 = mix(seed)
+        let hi: u64 = mix(seed +% golden())
+        return ((hi as u128) << 64) | (lo as u128)
+    } else { comptime if U == i128 {
+        let lo: u64 = mix(seed)
+        let hi: u64 = mix(seed +% golden())
+        return (((hi as u128) << 64) | (lo as u128)) as i128 wrapping
+    } else { comptime if U == f32 {
+        return scalar.f32_from_bits(mix(seed) as u32 wrapping)
+    } else { comptime if U == f64 {
+        return scalar.f64_from_bits(mix(seed))
+    } else { comptime if is_sum(U) {
+        let tag: usize = (mix(seed) % (field_count(U) as u64)) as usize
+        comptime for i in 0..<field_count(U) {
+            comptime if is_primitive(field_type_at(U, i)) {
+                if tag == i {
+                    return U.(i)()
+                }
+            } else {
+                if tag == i {
+                    return U.(i)(gen_value(field_type_at(U, i), field_seed(seed, i), allocator)?)
+                }
+            }
+        }
+        comptime if is_primitive(field_type_at(U, 0)) {
+            return U.(0)()
+        } else {
+            return U.(0)(gen_value(field_type_at(U, 0), field_seed(seed, 0), allocator)?)
+        }
+    } else { comptime if U == String {
+        let n: usize = (mix(seed) % 16) as usize
+        var buf: [u8] = allocator.alloc_array(u8, n)?
+        var i: usize = 0
+        loop
+            decreases n - i
+        {
+            if i >= n { break }
+            let r: u64 = mix(seed +% ((i as u64) +% 1)) % 26
+            buf[i] = (r as u8 wrapping) +% 97
+            i = i + 1
+        }
+        return string.from_owned_utf8(take buf)
+    } else { comptime if is_primitive(U) {
+        return ()
+    } else {
+        uninit out: U
+        comptime for i in 0..<field_count(U) {
+            out.(i) = gen_value(field_type_at(U, i), field_seed(seed, i), allocator)?
+        }
+        return out
+    } } } } } } } } } } } } } } } } } }
+}
+
+public spec properties(comptime T: Type) {
+
+    public function prop_marker() -> bool {
+        return true
+    }
+
+    public function generate(seed: u64, allocator: Allocator) -> T
+        with {allocator, err: alloc.AllocError}
+    {
+        return gen_value(T, seed, allocator)?
+    }
+
+    public function check(property: function(T) -> bool, runs: usize, seed: u64, allocator: Allocator) -> CheckResult
+        with {allocator, err: alloc.AllocError}
+    {
+        var i: usize = 0
+        loop
+            decreases runs - i
+        {
+            if i >= runs { break }
+            let case_seed: u64 = mix(seed +% (i as u64))
+            let candidate: T = gen_value(T, case_seed, allocator)?
+            if !property(candidate) {
+                return CheckResult { passed: false, runs_executed: i + 1, failing_seed: case_seed }
+            }
+            i += 1
+        }
+        return CheckResult { passed: true, runs_executed: runs, failing_seed: 0 }
+    }
+}

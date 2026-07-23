@@ -1,0 +1,384 @@
+module optimize.alias_mem.sroa.plan.step.leaf.scan
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.sroa.model as model_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+
+public function scan_candidates(
+    plan: mutable model_mod.Plan,
+    body: mir_body_mod.MirBody,
+    info: escape_mod.EscapeInfo,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let n_locals: usize = Vec_Local.len(body.locals)
+    let first_temp: usize = escape_mod.first_temp_index(body)
+    var li: usize = first_temp
+    loop decreases n_locals - li {
+        if li >= n_locals { break }
+        if li < 4294967295 {
+            let cand_local = mir_local_mod.LocalId { raw: li as u32 }
+            if escape_mod.escapes(info, cand_local) == false {
+                evaluate_candidate(mutable plan, body, li, allocator)?
+            }
+        }
+        li += 1
+    }
+    return true
+}
+
+
+function evaluate_candidate(
+    plan: mutable model_mod.Plan,
+    body: mir_body_mod.MirBody,
+    base_index: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_fields: i64 = aggregate_field_count(body, base_index)
+    if n_fields < 0 {
+        return
+    }
+    if n_fields == 0 {
+        return
+    }
+    if all_uses_are_field_reads(body, base_index, n_fields) == false {
+        return
+    }
+    Vec_u32.push(mutable plan.candidate_base_index, base_index as u32, allocator)?
+    Vec_u32.push(mutable plan.candidate_n_fields, n_fields as u32, allocator)?
+    Vec_u32.push(mutable plan.candidate_first_new, 0, allocator)?
+}
+
+
+public function aggregate_field_count(body: mir_body_mod.MirBody, base_index: usize) -> i64 {
+    var found: bool = false
+    var count: i64 = -1
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        let n_stmts: usize = Vec_Statement.len(block.statements)
+        var si: usize = 0
+        loop decreases n_stmts - si {
+            if si >= n_stmts { break }
+            let stmt = Vec_Statement.at(block.statements, si)
+            match stmt.kind {
+                case .assign(let dest, let value) => {
+                    if place_is_bare_local(dest, base_index) {
+                        let elems_count: i64 = splittable_aggregate_len(value)
+                        if elems_count < 0 {
+                            return -1
+                        }
+                        if found {
+                            return -1
+                        }
+                        found = true
+                        count = elems_count
+                    }
+                }
+                case _ => ()
+            }
+            si += 1
+        }
+        bi += 1
+    }
+    if found == false {
+        return -1
+    }
+    return count
+}
+
+
+function splittable_aggregate_len(rv: mir_rvalue_mod.Rvalue) -> i64 {
+    return match rv {
+        case .aggregate(let kind, let elems, _) => match kind {
+            case .tuple => Vec_Operand.len(elems) as i64
+            case _ => -1
+        }
+        case _ => -1
+    }
+}
+
+
+function all_uses_are_field_reads(
+    body: mir_body_mod.MirBody,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    if base_index == 1 {
+        return false
+    }
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        if block_uses_ok(block, base_index, n_fields) == false {
+            return false
+        }
+        bi += 1
+    }
+    return true
+}
+
+
+function block_uses_ok(
+    block: mir_body_mod.BasicBlock,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(block.statements, si)
+        if statement_uses_ok(stmt, base_index, n_fields) == false {
+            return false
+        }
+        si += 1
+    }
+    return terminator_uses_ok(block.terminator, base_index)
+}
+
+
+function statement_uses_ok(
+    stmt: mir_stmt_mod.Statement,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    return match stmt.kind {
+        case .assign(let dest, let value) =>
+            assign_uses_ok(dest, value, base_index, n_fields)
+        case .storage_live(_) => true
+        case .storage_dead(_) => true
+        case .nop_ => true
+    }
+}
+
+
+function assign_uses_ok(
+    dest: mir_place_mod.Place,
+    value: mir_rvalue_mod.Rvalue,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    if place_is_bare_local(dest, base_index) {
+        if rvalue_is_splittable_aggregate(value) == false {
+            return false
+        }
+        return rvalue_uses_ok(value, base_index, n_fields)
+    }
+    if place_mentions_base(dest, base_index) {
+        return false
+    }
+    return rvalue_uses_ok(value, base_index, n_fields)
+}
+
+
+function rvalue_is_splittable_aggregate(rv: mir_rvalue_mod.Rvalue) -> bool {
+    return match rv {
+        case .aggregate(let kind, _, _) => match kind {
+            case .tuple => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+
+function rvalue_uses_ok(
+    rv: mir_rvalue_mod.Rvalue,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    return match rv {
+        case .use_(let operand) => operand_use_ok(operand, base_index, n_fields)
+        case .binary(_, let lhs, let rhs) =>
+            operand_use_ok(lhs, base_index, n_fields) && operand_use_ok(rhs, base_index, n_fields)
+        case .unary(_, let operand) => operand_use_ok(operand, base_index, n_fields)
+        case .cast(let operand, _, _, _) => operand_use_ok(operand, base_index, n_fields)
+        case .aggregate(_, let elems, _) => operands_use_ok(elems, base_index, n_fields)
+        case .ref_(_, let place) => place_mentions_base(place, base_index) == false
+        case .len(let place) => place_mentions_base(place, base_index) == false
+        case .discriminant(let place) => place_mentions_base(place, base_index) == false
+        case .make_closure(_, let env) => operand_use_ok(env, base_index, n_fields)
+    }
+}
+
+
+function operands_use_ok(
+    ops: Vec_Operand.Vec,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        if operand_use_ok(op, base_index, n_fields) == false {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+
+function operand_use_ok(
+    op: mir_rvalue_mod.Operand,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    return match op {
+        case .copy_(let place, _) => place_use_ok(place, base_index, n_fields)
+        case .move_(let place, _) => move_place_ok(place, base_index)
+        case .constant(_) => true
+    }
+}
+
+
+function move_place_ok(place: mir_place_mod.Place, base_index: usize) -> bool {
+    return place_mentions_base(place, base_index) == false
+}
+
+
+function place_use_ok(
+    place: mir_place_mod.Place,
+    base_index: usize,
+    n_fields: i64,
+) -> bool {
+    if mir_local_mod.index(escape_mod.base_local(place)) != base_index {
+        return projection_mentions_local(place, base_index) == false
+    }
+    if projection_mentions_local(place, base_index) {
+        return false
+    }
+    let idx: i64 = single_field_index(place)
+    if idx < 0 {
+        return false
+    }
+    if idx >= n_fields {
+        return false
+    }
+    return true
+}
+
+
+function terminator_uses_ok(term: mir_term_mod.Terminator, base_index: usize) -> bool {
+    return match term.kind {
+        case .branch(let cond, _, _) => move_operand_or_full_ok(cond, base_index)
+        case .switch_(let discr, _) => move_operand_or_full_ok(discr, base_index)
+        case .raise_(let value, _) => move_operand_or_full_ok(value, base_index)
+        case .panic_(let message) => move_operand_or_full_ok(message, base_index)
+        case .call_(let callee, let args, let dest, _, _) =>
+            move_operand_or_full_ok(callee, base_index)
+            && operands_no_base(args, base_index)
+            && place_mentions_base(dest, base_index) == false
+        case .drop_(let place, _, _) => place_mentions_base(place, base_index) == false
+        case .await_(let handle, let dest, _, _) =>
+            move_operand_or_full_ok(handle, base_index)
+            && place_mentions_base(dest, base_index) == false
+        case .spawn_(_, let args, _, let handle_dest, _, _) =>
+            operands_no_base(args, base_index)
+            && place_mentions_base(handle_dest, base_index) == false
+        case _ => true
+    }
+}
+
+
+function move_operand_or_full_ok(op: mir_rvalue_mod.Operand, base_index: usize) -> bool {
+    return match op {
+        case .copy_(let place, _) => place_mentions_base(place, base_index) == false
+        case .move_(let place, _) => place_mentions_base(place, base_index) == false
+        case .constant(_) => true
+    }
+}
+
+
+function operands_no_base(ops: Vec_Operand.Vec, base_index: usize) -> bool {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        if move_operand_or_full_ok(op, base_index) == false {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+
+public function place_is_bare_local(p: mir_place_mod.Place, base_index: usize) -> bool {
+    if mir_local_mod.index(escape_mod.base_local(p)) != base_index {
+        return false
+    }
+    return escape_mod.is_bare(p)
+}
+
+
+function place_mentions_base(p: mir_place_mod.Place, base_index: usize) -> bool {
+    if mir_local_mod.index(escape_mod.base_local(p)) == base_index {
+        return true
+    }
+    return projection_mentions_local(p, base_index)
+}
+
+
+function projection_mentions_local(p: mir_place_mod.Place, base_index: usize) -> bool {
+    let n: usize = mir_place_mod.proj_len(p)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(p, i)
+        let hit: bool = match proj.kind {
+            case .index(let idx_local, _) =>
+                mir_local_mod.index(idx_local) == base_index
+            case .slice_subrange(let lo_local, let hi_local, _) =>
+                mir_local_mod.index(lo_local) == base_index
+                || mir_local_mod.index(hi_local) == base_index
+            case _ => false
+        }
+        if hit {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+
+public function single_field_index(p: mir_place_mod.Place) -> i64 {
+    if mir_place_mod.proj_len(p) != 1 {
+        return -1
+    }
+    let proj = mir_place_mod.proj_at(p, 0)
+    return match proj.kind {
+        case .field(let idx) => idx as i64
+        case _ => -1
+    }
+}

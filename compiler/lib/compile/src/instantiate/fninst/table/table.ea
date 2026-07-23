@@ -1,0 +1,143 @@
+module compile.instantiate.fninst.table.table
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import hir.def as def_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import resolve.paths.imports as imports_mod
+import resolve.paths.modules as mt_mod
+import specs.gen.monomorphise.qualify.qualify as qualify_mod
+import syntax.ast.attr as ast_attr_mod
+import syntax.ast.item as ast_item_mod
+
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+spec std.mem.alloc.Box(hir_item_mod.HFnSignature)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(ast_attr_mod.Attribute)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(TemplateEntry)
+
+
+public type TemplateEntry {
+    def_raw: u32
+    name: sym_mod.Symbol
+    decl: ast_item_mod.FnDecl
+    attrs: Vec_Attribute.Vec
+    origin_segs: Vec_Symbol.Vec
+    import_scope: imports_mod.ImportScope
+}
+
+
+public type TemplateTable {
+    by_def: IntMap_u32.IntMap
+    entries: Vec_TemplateEntry.Vec
+}
+
+
+public function new_table(allocator: Allocator) -> TemplateTable
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_TemplateEntry.Vec
+    Vec_TemplateEntry.new(init entries, allocator)?
+    let by_def = IntMap_u32.new(allocator)?
+    return TemplateTable { by_def: by_def, entries: entries }
+}
+
+
+public function lookup(t: TemplateTable, def: def_mod.DefId) -> Option_u32.Option {
+    return IntMap_u32.get(t.by_def, def.raw as i64)
+}
+
+
+public function extend(
+    t: mutable TemplateTable,
+    files: Vec_HirFile.Vec,
+    mt: mt_mod.ModuleTree,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var i: usize = 0
+    loop
+        decreases Vec_HirFile.len(files) - i
+    {
+        if i >= Vec_HirFile.len(files) { break }
+        extend_file(mutable t, Vec_HirFile.at(files, i), mt, interner, allocator)?
+        i += 1
+    }
+}
+
+
+function extend_file(
+    t: mutable TemplateTable,
+    file: hir_file_mod.HirFile,
+    mt: mt_mod.ModuleTree,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var i: usize = 0
+    loop
+        decreases Vec_HItem.len(file.items) - i
+    {
+        if i >= Vec_HItem.len(file.items) { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .function_(let sig_box, _) => {
+                let sig = Box_HFnSignature.get(sig_box)
+                let ob = Vec_GenericParam.len(sig.outbound_generics)
+                let ip = Vec_GenericParam.len(sig.generics)
+                let shape_ok = (ob > 0 && ip == 0) || (ip > 0 && ob == 0)
+                if shape_ok && !IntMap_u32.contains(t.by_def, item.def_id.raw as i64) {
+                    record_template(mutable t, item, sig.name, file, mt, interner, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}
+
+
+function record_template(
+    t: mutable TemplateTable,
+    item: hir_item_mod.HItem,
+    name: sym_mod.Symbol,
+    file: hir_file_mod.HirFile,
+    mt: mt_mod.ModuleTree,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.ast_item.kind {
+        case .function_(let b) => {
+            let d = Box_FnDecl.get(b)
+            let segs = qualify_mod.invoker_module_segments(file.source.items, allocator)?
+            let imp_scope = imports_mod.build(file.source.items, segs, mt, interner, allocator)?
+            let idx = Vec_TemplateEntry.len(t.entries)
+            Vec_TemplateEntry.push(mutable t.entries, TemplateEntry {
+                def_raw: item.def_id.raw,
+                name: name,
+                decl: d,
+                attrs: item.ast_item.attributes,
+                origin_segs: segs,
+                import_scope: imp_scope,
+            }, allocator)?
+            let _ = IntMap_u32.insert(mutable t.by_def, item.def_id.raw as i64, idx as u32, allocator)?
+        }
+        case _ => ()
+    }
+}

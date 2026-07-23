@@ -1,0 +1,179 @@
+
+module cache.blob.mir.operand.codec
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import mir.rvalue as rvalue_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.place.codec as place_codec_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.ops.codec as ops_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(rvalue_mod.Constant)
+
+
+public function write_operand(
+    op: rvalue_mod.Operand,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match op {
+        case .copy_(let place, let ty) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            place_codec_mod.write_place(place, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, ty.raw, allocator)?
+        }
+        case .move_(let place, let ty) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            place_codec_mod.write_place(place, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, ty.raw, allocator)?
+        }
+        case .constant(let c) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            write_constant(c, it, mutable out, allocator)?
+        }
+    }
+}
+
+public function read_operand(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => {
+            let place = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            rvalue_mod.Operand.copy_(place: place, ty: ty)
+        }
+        case 1 => {
+            let place = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            rvalue_mod.Operand.move_(place: place, ty: ty)
+        }
+        case 2 => rvalue_mod.Operand.constant(c: read_constant(bytes, mutable cur, mutable it, allocator)?)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown Operand tag")
+    }
+}
+
+public function write_constant(
+    c: rvalue_mod.Constant,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    prim_mod.push_u32_le(mutable out, c.ty.raw, allocator)?
+    write_constant_kind(c.kind, it, mutable out, allocator)?
+}
+
+public function read_constant(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Constant
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let kind = read_constant_kind(bytes, mutable cur, mutable it, allocator)?
+    return rvalue_mod.Constant { ty: ty, kind: kind }
+}
+
+public function write_constant_kind(
+    k: rvalue_mod.ConstantKind,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match k {
+        case .int_(let bits) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            prim_mod.push_u128_le(mutable out, bits, allocator)?
+        }
+        case .float_(let bits, let width) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            prim_mod.push_u64_le(mutable out, bits, allocator)?
+            ops_mod.write_float_width(width, mutable out, allocator)?
+        }
+        case .bool_(let value) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            prim_mod.push_bool(mutable out, value, allocator)?
+        }
+        case .str_(let symbol) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            symbol_codec_mod.write_symbol(it, symbol, mutable out, allocator)?
+        }
+        case .unit_     => prim_mod.push_u8(mutable out, 4, allocator)?
+        case .zero_init => prim_mod.push_u8(mutable out, 5, allocator)?
+        case .aggregate(let elems) => {
+            prim_mod.push_u8(mutable out, 6, allocator)?
+            let n = Vec_Constant.len(elems)
+            prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                write_constant(Vec_Constant.at(elems, i), it, mutable out, allocator)?
+                i += 1
+            }
+        }
+        case .fn_ref(let def) => {
+            prim_mod.push_u8(mutable out, 7, allocator)?
+            prim_mod.push_u32_le(mutable out, def.raw, allocator)?
+        }
+    }
+}
+
+public function read_constant_kind(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.ConstantKind
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => rvalue_mod.ConstantKind.int_(bits: prim_mod.read_u128_le(bytes, mutable cur)?)
+        case 1 => {
+            let bits = prim_mod.read_u64_le(bytes, mutable cur)?
+            let width = ops_mod.read_float_width(bytes, mutable cur)?
+            rvalue_mod.ConstantKind.float_(bits: bits, width: width)
+        }
+        case 2 => rvalue_mod.ConstantKind.bool_(value: prim_mod.read_bool(bytes, mutable cur)?)
+        case 3 => rvalue_mod.ConstantKind.str_(symbol: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+        case 4 => rvalue_mod.ConstantKind.unit_
+        case 5 => rvalue_mod.ConstantKind.zero_init
+        case 6 => {
+            let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+            uninit elems: Vec_Constant.Vec
+            Vec_Constant.new(init elems, allocator)?
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                let elem = read_constant(bytes, mutable cur, mutable it, allocator)?
+                Vec_Constant.push(mutable elems, take elem, allocator)?
+                i += 1
+            }
+            rvalue_mod.ConstantKind.aggregate(elems: elems)
+        }
+        case 7 => rvalue_mod.ConstantKind.fn_ref(def: def_mod.DefId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown ConstantKind tag")
+    }
+}

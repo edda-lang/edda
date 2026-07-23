@@ -1,0 +1,177 @@
+
+module structmap_verify.compare
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string as string
+import local.toon as toon_mod
+
+spec std.collections.vec.Vec(String)
+
+
+public type Legend {
+    ids: Vec_String.Vec
+    rows: Vec_String.Vec
+}
+
+public type ConeResult {
+    compared: usize
+    mismatches: usize
+    missing: usize
+    detail: String
+}
+
+
+function build_legend(lines: [String], allocator: Allocator) -> Legend
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_String.Vec
+    Vec_String.new(init ids, allocator)?
+    uninit rows: Vec_String.Vec
+    Vec_String.new(init rows, allocator)?
+    let eff_rows = toon_mod.section_rows(lines, "effects[", allocator)?
+    let n: usize = Vec_String.len(eff_rows)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let fields = toon_mod.split_fields(Vec_String.at(eff_rows, i), allocator)?
+        let fn: usize = Vec_String.len(fields)
+        if fn >= 2 {
+            Vec_String.push(mutable ids, Vec_String.at(fields, 0), allocator)?
+            Vec_String.push(mutable rows, Vec_String.at(fields, 1), allocator)?
+        }
+        i += 1
+    }
+    return Legend { ids: ids, rows: rows }
+}
+
+
+function legend_lookup(legend: Legend, id: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_String.len(legend.ids)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if string.equals(Vec_String.at(legend.ids, i), id) {
+            if i < Vec_String.len(legend.rows) {
+                return Vec_String.at(legend.rows, i)
+            }
+            return string.clone("", allocator)?
+        }
+        i += 1
+    }
+    return string.clone(id, allocator)?
+}
+
+
+function resolve_cone(legend: Legend, fields: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if Vec_String.len(fields) <= 8 {
+        return string.clone("", allocator)?
+    }
+    let cone = Vec_String.at(fields, 8)
+    if string.equals(cone, "=") {
+        let eff = Vec_String.at(fields, 7)
+        if string.is_empty(eff) {
+            return string.clone("", allocator)?
+        }
+        return legend_lookup(legend, eff, allocator)?
+    }
+    if string.is_empty(cone) {
+        return string.clone("", allocator)?
+    }
+    return legend_lookup(legend, cone, allocator)?
+}
+
+
+function find_name(names: Vec_String.Vec, target: String) -> usize {
+    let n: usize = Vec_String.len(names)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if string.equals(Vec_String.at(names, i), target) {
+            return i
+        }
+        i += 1
+    }
+    return n
+}
+
+
+public function compare_text(emitted: String, committed: String, allocator: Allocator) -> ConeResult
+    with {allocator, err: alloc.AllocError}
+{
+    let el = toon_mod.lines_of(emitted, allocator)?
+    let cl = toon_mod.lines_of(committed, allocator)?
+    let elegend = build_legend(el, allocator)?
+    let clegend = build_legend(cl, allocator)?
+
+    let cfuncs = toon_mod.section_rows(cl, "functions[", allocator)?
+    uninit cnames: Vec_String.Vec
+    Vec_String.new(init cnames, allocator)?
+    uninit ccones: Vec_String.Vec
+    Vec_String.new(init ccones, allocator)?
+    let cn: usize = Vec_String.len(cfuncs)
+    var ci: usize = 0
+    loop
+        decreases cn - ci
+    {
+        if ci >= cn { break }
+        let fields = toon_mod.split_fields(Vec_String.at(cfuncs, ci), allocator)?
+        if Vec_String.len(fields) >= 1 {
+            Vec_String.push(mutable cnames, Vec_String.at(fields, 0), allocator)?
+            Vec_String.push(mutable ccones, resolve_cone(clegend, fields, allocator)?, allocator)?
+        }
+        ci += 1
+    }
+
+    let efuncs = toon_mod.section_rows(el, "functions[", allocator)?
+    var compared: usize = 0
+    var mismatches: usize = 0
+    var missing: usize = 0
+    var detail = string.clone("", allocator)?
+    let en: usize = Vec_String.len(efuncs)
+    var ei: usize = 0
+    loop
+        decreases en - ei
+    {
+        if ei >= en { break }
+        let fields = toon_mod.split_fields(Vec_String.at(efuncs, ei), allocator)?
+        if Vec_String.len(fields) >= 1 {
+            let name = Vec_String.at(fields, 0)
+            let nr = resolve_cone(elegend, fields, allocator)?
+            let idx = find_name(cnames, name)
+            if idx < Vec_String.len(ccones) {
+                let cr = Vec_String.at(ccones, idx)
+                compared += 1
+                if !string.equals(nr, cr) {
+                    mismatches += 1
+                    if string.is_empty(detail) {
+                        detail = f"{name}: native cone=[{nr}] committed cone=[{cr}]"
+                    }
+                }
+            } else {
+                missing += 1
+                if string.is_empty(detail) {
+                    detail = f"{name}: present in native emit, absent in committed map"
+                }
+            }
+        }
+        ei += 1
+    }
+
+    return ConeResult {
+        compared: compared,
+        mismatches: mismatches,
+        missing: missing,
+        detail: detail,
+    }
+}

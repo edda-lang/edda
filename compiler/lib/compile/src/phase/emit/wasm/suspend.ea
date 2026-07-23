@@ -1,0 +1,115 @@
+
+module compile.phase.emit.wasm.suspend
+
+import std.mem.alloc
+import std.collections.vec
+
+import target.triple as triple_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as mir_body_mod
+import mir.term as term_mod
+import mir.rvalue as rvalue_mod
+import hir.def as def_mod
+import resolve.build.builtins as builtins_mod
+
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+
+
+public function audit_suspend_points(
+    files: Vec_MirFile.Vec,
+    target: triple_mod.TargetTriple,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if !is_browser_target(target) { return () }
+    let await_def = builtins_mod.seed(1).builtins.task_await
+    let nf = Vec_MirFile.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let file = Vec_MirFile.at(files, fi)
+        audit_file(file, await_def, mutable diags, allocator)?
+        fi += 1
+    }
+}
+
+
+function audit_file(
+    file: mir_file_mod.MirFile,
+    await_def: def_mod.DefId,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_MirBody.len(file.bodies)
+    var bi: usize = 0
+    loop decreases nb - bi {
+        if bi >= nb { break }
+        let body = Vec_MirBody.at(file.bodies, bi)
+        if body_suspend_count(body, await_def) > 1 {
+            emit_multi_suspend_diag(mutable diags, allocator)?
+        }
+        bi += 1
+    }
+}
+
+
+function body_suspend_count(body: mir_body_mod.MirBody, await_def: def_mod.DefId) -> usize {
+    var count: usize = 0
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var i: usize = 0
+    loop decreases nb - i {
+        if i >= nb { break }
+        let blk = Vec_BasicBlock.at(body.blocks, i)
+        if term_is_task_await(blk.terminator, await_def) { count += 1 }
+        i += 1
+    }
+    return count
+}
+
+
+function term_is_task_await(term: term_mod.Terminator, await_def: def_mod.DefId) -> bool {
+    return match term.kind {
+        case .call_(let callee, _, _, _, _) => operand_is_fn_ref(callee, await_def)
+        case _                              => false
+    }
+}
+
+
+function operand_is_fn_ref(op: rvalue_mod.Operand, target_def: def_mod.DefId) -> bool {
+    return match op {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let d) => d.raw == target_def.raw
+            case _              => false
+        }
+        case _ => false
+    }
+}
+
+
+function is_browser_target(target: triple_mod.TargetTriple) -> bool {
+    return match triple_mod.os(target) {
+        case .browser => true
+        case _        => false
+    }
+}
+
+
+function emit_multi_suspend_diag(diags: mutable diags_mod.Diagnostics, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let msg = "scope(exec)/await: only a single suspend point per function is supported on the browser target (restricted single-frame, V1.0); multiple awaits in one function require multi-frame CPS lowering, deferred post-V1.0"
+    let d = diag_mod.error_at(diag_code_mod.codegen_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

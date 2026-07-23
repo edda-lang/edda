@@ -1,0 +1,249 @@
+
+module refine.vcgen.term.term
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.symbol as symbol_mod
+import mir.body.model as mir_body
+import mir.id.local as local_mod
+import mir.rvalue as rvalue_mod
+import mir.stmt as stmt_mod
+import mir.place as place_mod
+import types.ty.kind as ty_kind_mod
+import local.smt.term as term_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+
+
+spec std.collections.vec.Vec(mir_body.Local)
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.core.option.Option(symbol_mod.Symbol)
+
+
+public function operand_to_int_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    op: rvalue_mod.Operand,
+) -> Option_SmtTerm.Option {
+    return match op {
+        case .constant(let c) => const_to_term(c)
+        case .copy_(let place, _) => place_to_term(body, idx, place)
+        case .move_(let place, _) => place_to_term(body, idx, place)
+    }
+}
+
+
+function i128_max_bits() -> u128 {
+    let p63 = (9223372036854775807 as u128) + (1 as u128)
+    let p64 = p63 + p63
+    return p63 * p64 - (1 as u128)
+}
+
+
+public function const_to_term(c: rvalue_mod.Constant) -> Option_SmtTerm.Option {
+    return match c.kind {
+        case .int_(let bits) => {
+            if bits <= i128_max_bits() {
+                Option_SmtTerm.some(value: term_mod.SmtTerm.numeral(value: bits as i128))
+            } else {
+                Option_SmtTerm.none
+            }
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+public function place_to_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    place: place_mod.Place,
+) -> Option_SmtTerm.Option {
+    if place_mod.proj_len(place) != 0 {
+        return Option_SmtTerm.none
+    }
+    let li = local_mod.index(place.local)
+    if li >= Vec_Local.len(body.locals) {
+        return Option_SmtTerm.none
+    }
+    let local = Vec_Local.at(body.locals, li)
+    return match local.name {
+        case .some(let nm) => Option_SmtTerm.some(
+            value: term_mod.SmtTerm.var_(name: nm, sort: term_mod.SmtSort.int_),
+        )
+        case .none => neg_const_fold(body, idx, place.local)
+    }
+}
+
+
+function neg_const_fold(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    local_id: local_mod.LocalId,
+) -> Option_SmtTerm.Option {
+    let ds = bodyidx_mod.def_site(idx, local_id)
+    if !ds.found {
+        return Option_SmtTerm.none
+    }
+    if ds.block >= Vec_BasicBlock.len(body.blocks) {
+        return Option_SmtTerm.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, ds.block)
+    if ds.stmt >= Vec_Statement.len(bb.statements) {
+        return Option_SmtTerm.none
+    }
+    return match Vec_Statement.at(bb.statements, ds.stmt).kind {
+        case .assign(let dest, let value) => {
+            if place_mod.proj_len(dest) == 0 && local_mod.index(dest.local) == local_mod.index(local_id) {
+                fold_neg_rvalue(value)
+            } else {
+                Option_SmtTerm.none
+            }
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function fold_neg_rvalue(value: rvalue_mod.Rvalue) -> Option_SmtTerm.Option {
+    return match value {
+        case .unary(let op, let operand) => match op {
+            case .neg => match operand {
+                case .constant(let c) => match c.kind {
+                    case .int_(let bits) => if bits <= i128_max_bits() {
+                        Option_SmtTerm.some(value: term_mod.SmtTerm.numeral(value: (0 as i128) - (bits as i128)))
+                    } else {
+                        Option_SmtTerm.none
+                    }
+                    case _ => Option_SmtTerm.none
+                }
+                case _ => Option_SmtTerm.none
+            }
+            case _ => Option_SmtTerm.none
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+public function mk_bin(
+    op: term_mod.SmtOp,
+    lhs: take term_mod.SmtTerm,
+    rhs: take term_mod.SmtTerm,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take lhs, allocator)?
+    Vec_SmtTerm.push(mutable args, take rhs, allocator)?
+    return term_mod.SmtTerm.app(op: op, args: args)
+}
+
+
+function i128_top_val() -> i128 {
+    let p32 = 4294967296 as i128
+    let p96 = p32 * p32 * p32
+    let p126 = p96 * (1073741824 as i128)
+    return (p126 - (1 as i128)) * (2 as i128) + (1 as i128)
+}
+
+
+public function anchor_term(anchor: symbol_mod.Symbol) -> term_mod.SmtTerm {
+    return term_mod.SmtTerm.var_(name: anchor, sort: term_mod.SmtSort.int_)
+}
+
+
+public function anchor_def_term(anchor: symbol_mod.Symbol, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    return mk_bin(
+        term_mod.SmtOp.eq_,
+        take anchor_term(anchor),
+        take term_mod.SmtTerm.numeral(value: i128_top_val()),
+        allocator,
+    )?
+}
+
+
+public function bound_lo_term(
+    pk: ty_kind_mod.PrimKind,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    return match pk {
+        case .i8_ => term_mod.SmtTerm.numeral(value: (0 - 128) as i128)
+        case .i16_ => term_mod.SmtTerm.numeral(value: (0 - 32768) as i128)
+        case .i32_ => term_mod.SmtTerm.numeral(value: (0 - 2147483648) as i128)
+        case .i64_ => term_mod.SmtTerm.numeral(value: (0 - 9223372036854775807 - 1) as i128)
+        case .i128_ => mk_bin(
+            term_mod.SmtOp.sub,
+            take term_mod.SmtTerm.numeral(value: (0 - 1) as i128),
+            take anchor_term(anchor),
+            allocator,
+        )?
+        case .isize_ => if ptr_width >= 8 {
+            term_mod.SmtTerm.numeral(value: (0 - 9223372036854775807 - 1) as i128)
+        } else {
+            term_mod.SmtTerm.numeral(value: (0 - 2147483648) as i128)
+        }
+        case _ => term_mod.SmtTerm.numeral(value: 0 as i128)
+    }
+}
+
+
+public function bound_hi_term(
+    pk: ty_kind_mod.PrimKind,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    return match pk {
+        case .i8_ => term_mod.SmtTerm.numeral(value: 127 as i128)
+        case .i16_ => term_mod.SmtTerm.numeral(value: 32767 as i128)
+        case .i32_ => term_mod.SmtTerm.numeral(value: 2147483647 as i128)
+        case .i64_ => term_mod.SmtTerm.numeral(value: 9223372036854775807 as i128)
+        case .u8_ => term_mod.SmtTerm.numeral(value: 255 as i128)
+        case .u16_ => term_mod.SmtTerm.numeral(value: 65535 as i128)
+        case .u32_ => term_mod.SmtTerm.numeral(value: 4294967295 as i128)
+        case .u64_ => u64_max_numeral()
+        case .i128_ => term_mod.SmtTerm.numeral(value: i128_top_val())
+        case .u128_ => mk_bin(
+            term_mod.SmtOp.add,
+            take mk_bin(
+                term_mod.SmtOp.mul,
+                take term_mod.SmtTerm.numeral(value: 2 as i128),
+                take anchor_term(anchor),
+                allocator,
+            )?,
+            take term_mod.SmtTerm.numeral(value: 1 as i128),
+            allocator,
+        )?
+        case .isize_ => if ptr_width >= 8 {
+            term_mod.SmtTerm.numeral(value: 9223372036854775807 as i128)
+        } else {
+            term_mod.SmtTerm.numeral(value: 2147483647 as i128)
+        }
+        case .usize_ => if ptr_width >= 8 {
+            u64_max_numeral()
+        } else {
+            term_mod.SmtTerm.numeral(value: 4294967295 as i128)
+        }
+        case _ => term_mod.SmtTerm.numeral(value: 0 as i128)
+    }
+}
+
+
+function u64_max_numeral() -> term_mod.SmtTerm {
+    let p32 = 4294967296 as i128
+    return term_mod.SmtTerm.numeral(value: p32 * p32 - (1 as i128))
+}

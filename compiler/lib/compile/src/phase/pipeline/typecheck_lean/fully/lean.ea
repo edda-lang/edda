@@ -1,0 +1,227 @@
+
+module compile.phase.pipeline.typecheck_lean.fully.lean
+
+import std.mem.alloc
+import std.collections.vec
+import diagnostics.emit.collection as diags_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import resolve.primitives.defs as primitives_mod
+import resolve.capabilities.defs as capabilities_mod
+import target.triple as triple_mod
+import target.arch as arch_mod
+import types.check as types_check_mod
+import types.check.decl.indexes as types_check_indexes_mod
+import types.check.env.lower.nominals as nominals_mod
+import types.check.env.lower.merge.merge as merge_mod
+import types.check.env.lower.lean.lean as nominals_lean_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import resolve.ctx as resolve_ctx_mod
+import local.phase.pipeline.typecheck.feed as typecheck_feed_mod
+import local.phase.pipeline.typecheck.full as typecheck_mod
+import local.phase.pipeline.ffi.lean as extern_consistency_lean_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_file_mod.HirFileDecl)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(nominals_mod.NominalEntry)
+
+
+public function typecheck_files_fully_lean(
+    hir_files: Vec_HirFile.Vec,
+    dep_files: Vec_HirFileDecl.Vec,
+    decl_only_files: Vec_HirFileDecl.Vec,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    extra_nominals: nominals_mod.NominalMap,
+    enforce_file_scope: bool,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_TypeOutput.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit type_outputs: Vec_TypeOutput.Vec
+    Vec_TypeOutput.new(init type_outputs, allocator)?
+    let n = Vec_HirFile.len(hir_files)
+    let depn = Vec_HirFileDecl.len(dep_files)
+    let dn = Vec_HirFileDecl.len(decl_only_files)
+
+    var regular_nominals = nominals_mod.empty(allocator)?
+    var k: usize = 0
+    loop decreases (n - k + 1) as usize {
+        if k >= n {
+            break
+        }
+        let nfile = Vec_HirFile.at(hir_files, k)
+        let file_nominals = nominals_mod.build_nominals(nfile.items, interner, mutable ty_interner, allocator)?
+        nominals_mod.extend(mutable regular_nominals, file_nominals, allocator)?
+        k = k + 1 as usize
+    }
+    var rk: usize = 0
+    loop decreases (depn - rk + 1) as usize {
+        if rk >= depn {
+            break
+        }
+        let nfile = Vec_HirFileDecl.at(dep_files, rk)
+        let file_nominals = nominals_lean_mod.build_nominals_decl(nfile.items, interner, mutable ty_interner, allocator)?
+        nominals_mod.extend(mutable regular_nominals, file_nominals, allocator)?
+        rk = rk + 1 as usize
+    }
+    var instance_nominals = nominals_mod.empty(allocator)?
+    var dk: usize = 0
+    loop decreases (dn - dk + 1) as usize {
+        if dk >= dn {
+            break
+        }
+        let nfile = Vec_HirFileDecl.at(decl_only_files, dk)
+        let file_nominals = nominals_lean_mod.build_nominals_decl(nfile.items, interner, mutable ty_interner, allocator)?
+        nominals_mod.extend(mutable instance_nominals, file_nominals, allocator)?
+        dk = dk + 1 as usize
+    }
+    nominals_mod.extend(mutable instance_nominals, extra_nominals, allocator)?
+
+    var all_nominals = nominals_mod.empty(allocator)?
+    merge_mod.prepend_base(mutable all_nominals, regular_nominals, allocator)?
+    nominals_mod.extend(mutable all_nominals, instance_nominals, allocator)?
+
+    let ptr_width = arch_mod.pointer_width(triple_mod.arch(triple))
+    uninit decls: types_check_mod.DeclTables
+    types_check_mod.new_decl_tables(init decls, allocator)?
+    var j: usize = 0
+    loop decreases (n - j + 1) as usize {
+        if j >= n {
+            break
+        }
+        let dfile = Vec_HirFile.at(hir_files, j)
+        let fmap = typecheck_mod.file_nominal_map(all_nominals, regular_nominals, instance_nominals, enforce_file_scope, output, dfile, allocator)?
+        types_check_mod.collect_file_decls(
+            mutable decls,
+            dfile,
+            fmap,
+            ptr_width,
+            interner,
+            mutable ty_interner,
+            mutable effect_interner,
+            allocator,
+        )?
+        j = j + 1 as usize
+    }
+    var rj: usize = 0
+    loop decreases (depn - rj + 1) as usize {
+        if rj >= depn {
+            break
+        }
+        let dfile = Vec_HirFileDecl.at(dep_files, rj)
+        let fmap = file_nominal_map_decl(all_nominals, regular_nominals, instance_nominals, enforce_file_scope, output, dfile, allocator)?
+        types_check_mod.collect_file_decls_lean(
+            mutable decls,
+            dfile,
+            fmap,
+            ptr_width,
+            interner,
+            mutable ty_interner,
+            mutable effect_interner,
+            allocator,
+        )?
+        rj = rj + 1 as usize
+    }
+    var dj: usize = 0
+    loop decreases (dn - dj + 1) as usize {
+        if dj >= dn {
+            break
+        }
+        let dfile = Vec_HirFileDecl.at(decl_only_files, dj)
+        types_check_mod.collect_file_decls_lean(
+            mutable decls,
+            dfile,
+            all_nominals,
+            ptr_width,
+            interner,
+            mutable ty_interner,
+            mutable effect_interner,
+            allocator,
+        )?
+        dj = dj + 1 as usize
+    }
+
+    if enforce_file_scope {
+        extern_consistency_lean_mod.check_extern_consistency_lean(hir_files, dep_files, decl_only_files, decls, interner, ty_interner, mutable diags, allocator)?
+    }
+
+    let indexes = types_check_indexes_mod.build_decl_indexes(decls.fn_signatures, decls.type_defs, decls.variant_names, allocator)?
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let file = Vec_HirFile.at(hir_files, i)
+        let fmap = typecheck_mod.file_nominal_map(all_nominals, regular_nominals, instance_nominals, enforce_file_scope, output, file, allocator)?
+        let shadowed = typecheck_mod.file_shadowed_instance_modules(instance_nominals, enforce_file_scope, output, file, allocator)?
+        let type_out = types_check_mod.check_file(
+            file,
+            decls,
+            indexes,
+            triple,
+            prim_defs,
+            cap_defs,
+            fmap,
+            shadowed,
+            interner,
+            mutable ty_interner,
+            mutable effect_interner,
+            allocator,
+        )?
+        typecheck_feed_mod.drain_diags(mutable diags, mutable type_out.diags.items, allocator)?
+        Vec_TypeOutput.push(mutable type_outputs, take type_out, allocator)?
+        i = i + 1 as usize
+    }
+    return type_outputs
+}
+
+
+function file_nominal_map_decl(
+    all_nominals: nominals_mod.NominalMap,
+    regular_nominals: nominals_mod.NominalMap,
+    instance_nominals: nominals_mod.NominalMap,
+    enforce_file_scope: bool,
+    output: resolve_ctx_mod.ResolveOutput,
+    file: hir_file_mod.HirFileDecl,
+    allocator: Allocator,
+) -> nominals_mod.NominalMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var fmap = nominals_mod.empty(allocator)?
+    if !enforce_file_scope {
+        merge_mod.prepend_base(mutable fmap, all_nominals, allocator)?
+        return fmap
+    }
+    merge_mod.prepend_base(mutable fmap, regular_nominals, allocator)?
+    let mod_path = nominals_lean_mod.file_module_path_decl(file.items, allocator)?
+    let file_mod_id = resolve_ctx_mod.output_module_id_of(output, mod_path)
+    let m = Vec_NominalEntry.len(instance_nominals.entries)
+    var i: usize = 0
+    loop decreases (m - i) {
+        if i >= m { break }
+        let e = Vec_NominalEntry.at(instance_nominals.entries, i)
+        if resolve_ctx_mod.output_file_invoked_spec(output, file_mod_id, e.module_leaf) {
+            nominals_mod.with_entry(mutable fmap, e.name, e.module_leaf, e.ty, allocator)?
+            let bare = resolve_ctx_mod.output_inst_bare_of(output, e.module_leaf)
+            if bare.raw != (0 as u32) && bare.raw != e.module_leaf.raw {
+                nominals_mod.with_entry(mutable fmap, e.name, bare, e.ty, allocator)?
+                let primary = resolve_ctx_mod.output_inst_primary_of(output, e.module_leaf)
+                if primary.raw != (0 as u32) && primary.raw == e.name.raw {
+                    nominals_mod.with_entry(mutable fmap, bare, bare, e.ty, allocator)?
+                }
+            }
+        }
+        i = i + 1
+    }
+    return fmap
+}

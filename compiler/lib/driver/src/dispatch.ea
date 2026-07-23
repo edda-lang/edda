@@ -1,0 +1,201 @@
+
+module driver.dispatch
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import std.mem.rt
+import std.os.fs
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import source.map as source_map_mod
+import intern.interner as interner_mod
+import compile.check.check as check_mod
+import compile.gc.local.local as gc_mod
+import compile.gc.schedule.schedule as gc_schedule_mod
+import compile.workspace.stream as stream_mod
+import compile.setup.env.membership as membership_mod
+import local.banner.banner as banner_mod
+import local.cli as cli_mod
+import local.exec.run as exec_mod
+import local.exit as exit_mod
+import local.render.render as render_mod
+import local.version as version_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.hashmap.StringMap(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(stream_mod.StreamSetup)
+
+
+public function dispatch(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    out: Stdout,
+    clock: MonotonicClock,
+    wall_clock: Clock,
+    errout: Stderr,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, subprocess, out, clock, wall_clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence, time(ops <= 1)}
+{
+    match parsed.subcommand {
+        case .check =>
+            return dispatch_check(parsed, rfs, wfs, out, clock, errout, workspace_root, mutable map, mutable interner, mutable diags, allocator)?
+        case .build => {
+            let member = membership_mod.current_member_of(rfs, workspace_root, allocator)?
+            let name = banner_mod.resolve_name(rfs, workspace_root, member, mutable map, mutable diags, allocator)?
+            banner_mod.print_start(out, "build", name, allocator)?
+            let started = banner_mod.begin(clock)
+            let summary = check_mod.build_workspace_with_target(rfs, wfs, subprocess, workspace_root, parsed.target, parsed.stdlib_path, parsed.dump, clock, errout, parsed.trace, mutable map, mutable interner, mutable diags, allocator)?
+            banner_mod.print_summary(out, "build", summary.modules, summary.artifacts_cached, summary.artifacts_generated, started, clock, allocator)?
+            gc_schedule_mod.maybe_run(rfs, wfs, workspace_root, wall_clock, mutable diags, allocator)?
+        }
+        case .run => return exec_mod.build_and_run(parsed, rfs, wfs, subprocess, out, "run", clock, errout, workspace_root, mutable map, mutable interner, mutable diags, allocator)?
+        case .test => return exec_mod.run_tests(parsed, rfs, wfs, subprocess, out, clock, errout, workspace_root, mutable map, mutable interner, mutable diags, allocator)?
+        case .bench => emit_not_yet_implemented(mutable diags, "bench", allocator)?
+        case .fmt => emit_not_yet_implemented(mutable diags, "fmt", allocator)?
+        case .lint => emit_not_yet_implemented(mutable diags, "lint", allocator)?
+        case .gc => gc_mod.run_gc(rfs, wfs, workspace_root, wall_clock, mutable diags, allocator)?
+        case .promote => emit_not_yet_implemented(mutable diags, "promote", allocator)?
+        case .demote => emit_not_yet_implemented(mutable diags, "demote", allocator)?
+        case .regenerate => emit_not_yet_implemented(mutable diags, "regenerate", allocator)?
+        case .clean => emit_not_yet_implemented(mutable diags, "clean", allocator)?
+        case .daemon => emit_not_yet_implemented(mutable diags, "daemon", allocator)?
+        case .structmap => emit_not_yet_implemented(mutable diags, "structmap", allocator)?
+        case .version => version_mod.print_version(out, parsed.json, allocator)?
+    }
+    return 0
+}
+
+
+function dispatch_check(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    out: Stdout,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, out, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let current = membership_mod.current_member_of(rfs, workspace_root, allocator)?
+    let scoped = match current {
+        case .some(_) => true
+        case .none => false
+    }
+    if scoped {
+        let name = banner_mod.resolve_name(rfs, workspace_root, current, mutable map, mutable diags, allocator)?
+        banner_mod.print_start(out, "check", name, allocator)?
+        let started = banner_mod.begin(clock)
+        let summary = check_mod.check_workspace_with_target(rfs, wfs, workspace_root, parsed.target, parsed.stdlib_path, parsed.dump, clock, errout, parsed.trace, mutable map, mutable interner, mutable diags, allocator)?
+        banner_mod.print_summary(out, "check", summary.modules, summary.artifacts_cached, summary.artifacts_generated, started, clock, allocator)?
+        return 0
+    }
+
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let members = stream_mod.workspace_member_dirs(rfs, workspace_root, mutable scratch_map, mutable scratch_diags, allocator)?
+    if Vec_String.len(members) == 0 as usize {
+        let name = banner_mod.resolve_name(rfs, workspace_root, Option_String.none, mutable map, mutable diags, allocator)?
+        banner_mod.print_start(out, "check", name, allocator)?
+        let started = banner_mod.begin(clock)
+        let summary = check_mod.check_workspace_with_target(rfs, wfs, workspace_root, parsed.target, parsed.stdlib_path, parsed.dump, clock, errout, parsed.trace, mutable map, mutable interner, mutable diags, allocator)?
+        banner_mod.print_summary(out, "check", summary.modules, summary.artifacts_cached, summary.artifacts_generated, started, clock, allocator)?
+        return 0
+    }
+    return stream_members(parsed, rfs, wfs, out, clock, errout, workspace_root, members, allocator)?
+}
+
+
+function stream_members(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    out: Stdout,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    members: Vec_String.Vec,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, out, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    var worst: i32 = 0
+    let _ = rt.region_bytes()
+
+    uninit s_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init s_map, allocator)?
+    uninit s_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init s_diags, allocator)?
+    let setup = match stream_mod.prepare_stream(rfs, workspace_root, parsed.stdlib_path, mutable s_map, mutable s_diags, allocator)? {
+        case .some(let s) => s
+        case .none => {
+            render_mod.render_diagnostics(errout, s_diags, s_map, allocator)?
+            return exit_mod.exit_code_of(s_diags)
+        }
+    }
+    var edge_memo = StringMap_String.new(allocator)?
+    var pkg_files_memo = StringMap_String.new(allocator)?
+    var file_edges_memo = StringMap_String.new(allocator)?
+
+    let n = Vec_String.len(members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member = Vec_String.at(members, i)
+
+        let m_alloc = alloc.fork(allocator)
+
+        uninit m_map: source_map_mod.SourceMap
+        source_map_mod.new_map(init m_map, m_alloc)?
+        uninit m_interner: interner_mod.Interner
+        interner_mod.new_interner(init m_interner, m_alloc)?
+        uninit m_diags: diags_mod.Diagnostics
+        diags_mod.new_diagnostics(init m_diags, m_alloc)?
+
+        let name = banner_mod.resolve_name(rfs, workspace_root, Option_String.some(value: member), mutable m_map, mutable m_diags, m_alloc)?
+        banner_mod.print_start(out, "check", name, m_alloc)?
+        let started = banner_mod.begin(clock)
+        let summary = stream_mod.check_one_member(rfs, wfs, workspace_root, member, setup, mutable edge_memo, mutable pkg_files_memo, mutable file_edges_memo, allocator, parsed.target, parsed.dump, clock, errout, parsed.trace, mutable m_map, mutable m_interner, mutable m_diags, m_alloc)?
+        banner_mod.print_summary(out, "check", summary.modules, summary.artifacts_cached, summary.artifacts_generated, started, clock, m_alloc)?
+        render_mod.render_diagnostics(errout, m_diags, m_map, m_alloc)?
+        let code = exit_mod.exit_code_of(m_diags)
+        if code != 0 { worst = code }
+        interner_mod.dispose(take m_interner)
+        alloc.close(take m_alloc)
+        i = i + 1
+    }
+    return worst
+}
+
+
+function emit_not_yet_implemented(
+    diags: mutable diags_mod.Diagnostics,
+    name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let msg = string.concat("subcommand not yet implemented by driver: ", name, allocator)?
+    let d = diag_mod.error_at(diag_code_mod.cli_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

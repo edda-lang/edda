@@ -1,0 +1,769 @@
+
+module specs.gen.monomorphise.monomorphise
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import cteval.res.output as cteval_out_mod
+import cteval.state.value as value_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import hir.def as def_mod
+import hir.node as node_mod
+import intern.interner as sym_interner_mod
+import intern.symbol as sym_mod
+import resolve.paths.modules as mt_mod
+import resolve.paths.imports as imports_mod
+import resolve.build.drive.surface.registry as registry_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as specsurface_mod
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import span.file as file_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.item as item_mod
+import syntax.ast.tree as tree_mod
+import types.effect.interner as row_interner_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as types_check_mod
+import local.gen.eqsynth as eqsynth_mod
+import local.gen.typaths as typaths_mod
+import local.error as err_mod
+import local.address.hash as hash_mod
+import local.address.id as id_mod
+import local.address.instance as inst_mod
+import local.gen.build.debug.dispatch as debug_dispatch_mod
+import local.gen.build.instantiate as instantiate_mod
+import local.gen.build.output as output_mod
+import local.gen.respan.respan as respan_mod
+import local.gen.monomorphise.address.address as addr_mod
+import local.gen.monomorphise.address.disambig as disambig_mod
+import local.gen.monomorphise.eqdeps.eqdeps as eqdeps_mod
+import local.gen.monomorphise.colldeps.detect as colldeps_mod
+import local.gen.monomorphise.colldeps.exprs as collexprs_mod
+import local.gen.monomorphise.qualify.qualify as qualify_mod
+import local.specdefs as specdefs_mod
+import local.cachectx as cachectx_mod
+import local.gen.cache.cache as spec_cache_mod
+import local.subst.walk.map as subst_map_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(subst_map_mod.Rename)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(cteval_out_mod.SpecArgEntry)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(inst_mod.SpecInstance)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(item_mod.Item)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(colldeps_mod.CollMatch)
+spec std.mem.alloc.Box(item_mod.SpecInvocation)
+
+
+spec std.core.option.Option(id_mod.ModuleId)
+spec std.core.option.Option(item_mod.Spec)
+spec std.core.option.Option(specdefs_mod.SpecOrigin)
+spec std.core.option.Option(ty_mod.TyId)
+
+
+public function monomorphise_file(
+    file: hir_file_mod.HirFile,
+    cteval_out: cteval_out_mod.ComptimeOutput,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    spec_map: specdefs_mod.SpecDefMap,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> output_mod.SpecOutput
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError}
+{
+    uninit out: output_mod.SpecOutput
+    output_mod.new(init out, allocator)?
+    let invoker_segs = qualify_mod.invoker_module_segments(file.source.items, allocator)?
+    let import_scope = imports_mod.build(file.source.items, invoker_segs, mt, sym_interner, allocator)?
+    walk_items(
+        file.items, file.items, invoker_segs, import_scope, cteval_out, registry, mt, spec_map,
+        types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+        mutable sym_interner, ty_interner, row_interner,
+        mutable out, mutable map, allocator,
+    )?
+    return out
+}
+
+
+function walk_items(
+    items: Vec_HItem.Vec,
+    file_items: Vec_HItem.Vec,
+    invoker_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    cteval_out: cteval_out_mod.ComptimeOutput,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    spec_map: specdefs_mod.SpecDefMap,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        walk_item(
+            item, file_items, invoker_segs, import_scope, cteval_out, registry, mt, spec_map,
+            types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+            mutable sym_interner, ty_interner, row_interner,
+            mutable out, mutable map, allocator,
+        )?
+        i = i + 1
+    }
+}
+
+function walk_item(
+    item: hir_item_mod.HItem,
+    file_items: Vec_HItem.Vec,
+    invoker_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    cteval_out: cteval_out_mod.ComptimeOutput,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    spec_map: specdefs_mod.SpecDefMap,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError}
+{
+    match item.kind {
+        case .spec_invocation(let path, _) => {
+            let arg_exprs = invocation_arg_exprs(item, allocator)?
+            let q_args = qualify_mod.qualify_type_args(arg_exprs, invoker_segs, import_scope, registry, mt, allocator)?
+            let q_path = qualify_mod.qualify_path(path, invoker_segs, import_scope, registry, mt, allocator)?
+            monomorphise_invocation(
+                item.node_id, q_path, q_args, file_items, cteval_out, registry, mt, spec_map,
+                types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+                mutable sym_interner, ty_interner, row_interner,
+                mutable out, mutable map, allocator,
+            )?
+        }
+        case .spec_decl(_, let inner) =>
+            walk_items(
+                inner, file_items, invoker_segs, import_scope, cteval_out, registry, mt, spec_map,
+                types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+                mutable sym_interner, ty_interner, row_interner,
+                mutable out, mutable map, allocator,
+            )?
+        case _ => ()
+    }
+}
+
+
+function invocation_arg_exprs(
+    item: hir_item_mod.HItem,
+    allocator: Allocator,
+) -> Vec_Expr.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match item.ast_item.kind {
+        case .spec_invocation(let box) => return Box_SpecInvocation.get(box).args
+        case _ => {
+            uninit empty: Vec_Expr.Vec
+            Vec_Expr.new(init empty, allocator)?
+            return empty
+        }
+    }
+}
+
+
+function monomorphise_invocation(
+    parent_node_id: node_mod.NodeId,
+    path: ast_ident_mod.Path,
+    arg_exprs: Vec_Expr.Vec,
+    file_items: Vec_HItem.Vec,
+    cteval_out: cteval_out_mod.ComptimeOutput,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    spec_map: specdefs_mod.SpecDefMap,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError}
+{
+    let at: span_mod.Span = path.span
+
+    let idx_opt = cteval_out_mod.spec_invocation_args_index(cteval_out, parent_node_id)
+    let idx: usize = match idx_opt {
+        case .some(let i) => i
+        case .none => return
+    }
+    let entry = Vec_SpecArgEntry.at(cteval_out.spec_invocation_args, idx)
+
+    let segs = addr_mod.path_segments(path, allocator)?
+    let spec_def = registry_mod.lookup_path(registry, segs, mt)
+    if def_mod.is_error(spec_def) {
+        let rendered = addr_mod.render_path_string(path, sym_interner, allocator)?
+        output_mod.push_failure(
+            mutable out,
+            err_mod.SpecError.unresolved_spec(at: at, path: rendered),
+            allocator,
+        )?
+        return
+    }
+
+    let is_box = addr_mod.is_alloc_box_path(path, sym_interner, allocator)?
+    let is_eq = addr_mod.is_compare_eq_path(path, sym_interner, allocator)?
+    let is_debug = addr_mod.is_fmt_debug_path(path, sym_interner, allocator)?
+
+    handle err: err_mod.SpecError as e -> {
+        output_mod.push_failure(mutable out, take e, allocator)?
+    } {
+        record_invocation(
+            entry, spec_def, path, arg_exprs, at, is_box, is_eq, is_debug, file_items, spec_map,
+            registry, mt, types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+            mutable sym_interner, ty_interner, row_interner,
+            mutable out, mutable map, allocator,
+        )?
+    }
+}
+
+function record_invocation(
+    entry: cteval_out_mod.SpecArgEntry,
+    spec_def: def_mod.DefId,
+    path: ast_ident_mod.Path,
+    arg_exprs: Vec_Expr.Vec,
+    at: span_mod.Span,
+    is_box: bool,
+    is_eq: bool,
+    is_debug: bool,
+    file_items: Vec_HItem.Vec,
+    spec_map: specdefs_mod.SpecDefMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError, err: err_mod.SpecError}
+{
+    let arg_bytes = addr_mod.encode_arg_vec(
+        entry.args, at,
+        sym_interner, ty_interner, ty_paths, row_interner,
+        allocator,
+    )?
+    let name_bytes = canonical_name_bytes(
+        spec_map, spec_def, path, sym_interner, allocator,
+    )?
+    let h = addr_mod.compose_and_finalise(
+        name_bytes, take arg_bytes, allocator,
+    )?
+
+    let prior = find_by_hash(out, h)
+    let is_dedup_hit = match prior {
+        case .some(_) => true
+        case .none => false
+    }
+    if is_dedup_hit { return }
+
+    let eq_target = if is_eq { addr_mod.eq_target_of(entry, ty_interner) } else { Option_TyId.none }
+    var module_name = specsurface_mod.mangle(path, arg_exprs, mutable sym_interner, allocator)?
+    var suffixed = false
+    match eq_target {
+        case .some(_) => {
+            module_name = addr_mod.eq_suffixed_name(module_name, h, mutable sym_interner, allocator)?
+            suffixed = true
+        }
+        case .none => {
+            if registry_mod.is_colliding(registry, module_name) {
+                module_name = disambig_mod.disambiguated_name(module_name, entry.args, ty_interner, ty_paths, mutable sym_interner, allocator)?
+            }
+        }
+    }
+    if !suffixed {
+        addr_mod.check_short_name_collision(
+            mutable out, module_name, h, at, sym_interner, allocator,
+        )?
+    }
+
+    let module_id = alloc_module_id(out)
+    let args_clone = addr_mod.clone_arg_vec(entry.args, allocator)?
+    let instance = inst_mod.new(
+        module_id, h, spec_def, module_name, take args_clone,
+    )
+    output_mod.record_instance(mutable out, take instance, allocator)?
+
+    let module_name_str = addr_mod.render_symbol_string(module_name, sym_interner, allocator)?
+    let synth_file_name = f"<generated: {module_name_str}>"
+    let synth_file = source_map_mod.add_file(mutable map, synth_file_name, "", allocator)?
+    let synthesized = generate_instance_items(
+        spec_def, module_id, module_name, h, entry, arg_exprs, at, is_box, eq_target, spec_map,
+        registry, mt, types_out, rfs, wfs, mutable cache_ctx,
+        synth_file, mutable sym_interner, ty_interner, mutable out, allocator,
+    )?
+
+    if is_debug {
+        match addr_mod.eq_target_of(entry, ty_interner) {
+            case .some(let dt) => {
+                output_mod.record_debug_pair(mutable out, dt, module_name, allocator)?
+                cascade_deps(
+                    dt, spec_def, path, at, false, true, file_items, spec_map, registry, mt, types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+                    mutable sym_interner, ty_interner, row_interner,
+                    mutable out, mutable map, allocator,
+                )?
+            }
+            case .none => ()
+        }
+    }
+
+    if synthesized {
+        let target = match eq_target {
+            case .some(let t) => t
+            case .none => { return }
+        }
+        output_mod.record_eq_pair(mutable out, target, module_name, allocator)?
+        cascade_deps(
+            target, spec_def, path, at, true, false, file_items, spec_map, registry, mt, types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+            mutable sym_interner, ty_interner, row_interner,
+            mutable out, mutable map, allocator,
+        )?
+    }
+}
+
+
+function cascade_deps(
+    target: ty_mod.TyId,
+    spec_def: def_mod.DefId,
+    path: ast_ident_mod.Path,
+    at: span_mod.Span,
+    is_eq: bool,
+    is_debug: bool,
+    file_items: Vec_HItem.Vec,
+    spec_map: specdefs_mod.SpecDefMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError, err: err_mod.SpecError}
+{
+    let deps = eqdeps_mod.direct_nominal_deps(target, types_out, ty_interner, allocator)?
+    let n = Vec_TyId.len(deps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        cascade_one_dep(
+            Vec_TyId.at(deps, i), spec_def, path, at, is_eq, is_debug, file_items, spec_map, registry, mt, types_out, ty_paths,
+            rfs, wfs, mutable cache_ctx,
+            mutable sym_interner, ty_interner, row_interner,
+            mutable out, mutable map, allocator,
+        )?
+        i = i + 1
+    }
+}
+
+
+function nominal_def_of_ty(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> def_mod.DefId {
+    if ty_mod.is_error(t) {
+        return def_mod.error()
+    }
+    if ty_mod.index(t) >= ty_interner_mod.slot_count(ty_interner) {
+        return def_mod.error()
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .record(let def) => def
+        case .sum_(let def) => def
+        case _ => def_mod.error()
+    }
+}
+
+
+function cascade_one_dep(
+    dep: ty_mod.TyId,
+    spec_def: def_mod.DefId,
+    path: ast_ident_mod.Path,
+    at: span_mod.Span,
+    is_eq: bool,
+    is_debug: bool,
+    file_items: Vec_HItem.Vec,
+    spec_map: specdefs_mod.SpecDefMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError, err: err_mod.SpecError}
+{
+    match typaths_mod.ty_path_of(ty_paths, dep) {
+        case .some(let tp) => {
+            uninit dep_args: Vec_ComptimeValue.Vec
+            Vec_ComptimeValue.new(init dep_args, allocator)?
+            Vec_ComptimeValue.push(mutable dep_args, value_mod.ComptimeValue.type_meta(ty: dep), allocator)?
+            let dep_entry = cteval_out_mod.SpecArgEntry { node_id: node_mod.error(), args: dep_args }
+            let dep_exprs = addr_mod.ty_path_arg_exprs(tp, at, allocator)?
+            record_invocation(
+                dep_entry, spec_def, path, dep_exprs, at, false, is_eq, is_debug, file_items, spec_map,
+                registry, mt, types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+                mutable sym_interner, ty_interner, row_interner,
+                mutable out, mutable map, allocator,
+            )?
+        }
+        case .none => ()
+    }
+}
+
+
+function delegate_collection_eq(
+    cm: colldeps_mod.CollMatch,
+    at: span_mod.Span,
+    file_items: Vec_HItem.Vec,
+    spec_map: specdefs_mod.SpecDefMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    types_out: types_check_mod.TypeOutput,
+    ty_paths: typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    row_interner: row_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError, err: err_mod.SpecError}
+{
+    let eq_path = collexprs_mod.compare_spec_path(cm.eq_leaf, at, mutable sym_interner, allocator)?
+    let eq_segs = addr_mod.path_segments(eq_path, allocator)?
+    let eq_spec_def = registry_mod.lookup_path(registry, eq_segs, mt)
+    if def_mod.is_error(eq_spec_def) {
+        return
+    }
+    let elem_exprs = collexprs_mod.elem_arg_exprs(cm.elem, ty_paths, ty_interner, mutable sym_interner, at, allocator)?
+    if Vec_Expr.len(elem_exprs) == 0 {
+        return
+    }
+    uninit elem_args: Vec_ComptimeValue.Vec
+    Vec_ComptimeValue.new(init elem_args, allocator)?
+    Vec_ComptimeValue.push(mutable elem_args, value_mod.ComptimeValue.type_meta(ty: cm.elem), allocator)?
+    let elem_entry = cteval_out_mod.SpecArgEntry { node_id: node_mod.error(), args: elem_args }
+    record_invocation(
+        elem_entry, eq_spec_def, eq_path, elem_exprs, at, false, false, false, file_items, spec_map,
+        registry, mt, types_out, ty_paths, rfs, wfs, mutable cache_ctx,
+        mutable sym_interner, ty_interner, row_interner,
+        mutable out, mutable map, allocator,
+    )?
+    let arg_bytes = addr_mod.encode_arg_vec(
+        elem_entry.args, at,
+        sym_interner, ty_interner, ty_paths, row_interner,
+        allocator,
+    )?
+    let name_bytes = canonical_name_bytes(
+        spec_map, eq_spec_def, eq_path, sym_interner, allocator,
+    )?
+    let h = addr_mod.compose_and_finalise(
+        name_bytes, take arg_bytes, allocator,
+    )?
+    match find_by_hash(out, h) {
+        case .some(let mid) => {
+            let idx = id_mod.index(mid)
+            if idx >= 1 {
+                if (idx - 1) < Vec_SpecInstance.len(out.instances) {
+                    let inst = Vec_SpecInstance.at(out.instances, idx - 1)
+                    output_mod.record_coll_eq_pair(mutable out, cm.coll_module, inst.short_name, allocator)?
+                }
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+function generate_instance_items(
+    spec_def: def_mod.DefId,
+    module_id: id_mod.ModuleId,
+    module_name: sym_mod.Symbol,
+    h: hash_mod.SpecHash,
+    entry: cteval_out_mod.SpecArgEntry,
+    arg_exprs: Vec_Expr.Vec,
+    at: span_mod.Span,
+    is_box: bool,
+    eq_target: Option_TyId.Option,
+    spec_map: specdefs_mod.SpecDefMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    types_out: types_check_mod.TypeOutput,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    synth_file: file_mod.FileId,
+    sym_interner: mutable sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError, err: err_mod.SpecError}
+{
+    match specdefs_mod.lookup(spec_map, spec_def) {
+        case .none => return false
+        case .some(let spec_ast) => {
+            let spec_name = addr_mod.render_symbol_string(spec_ast.name.name, sym_interner, allocator)?
+            let origin_segs = origin_segments_of(spec_map, spec_def, allocator)?
+            let origin_import_scope = origin_import_scope_of(spec_map, spec_def, allocator)?
+            var body_items = debug_dispatch_mod.body_override(
+                spec_name, origin_segs, entry, types_out, ty_interner,
+                mutable sym_interner, spec_ast.body, allocator,
+            )?
+            var synthesized = false
+            match eq_target {
+                case .some(let target) => {
+                    let synth = eqsynth_mod.try_synthesize(
+                        spec_ast.body, target, types_out, ty_interner,
+                        mutable sym_interner, at, allocator,
+                    )?
+                    if Vec_Item.len(synth) != 0 {
+                        body_items = synth
+                        synthesized = true
+                    }
+                }
+                case .none => ()
+            }
+            let s = instantiate_mod.build_renames(
+                take spec_name, spec_ast.generics, body_items,
+                entry.args, arg_exprs, at, module_name, origin_segs, origin_import_scope, registry, mt,
+                mutable sym_interner, allocator,
+            )?
+            let cache_key = rename_cache_key(h, s, sym_interner, allocator)?
+            let use_cache = match eq_target {
+                case .some(_) => false
+                case .none => cachectx_mod.enabled(cache_ctx)
+            }
+            if use_cache {
+                let cache_res = spec_cache_mod.try_read(rfs, wfs, cache_key, cache_ctx, mutable sym_interner, allocator)?
+                match cache_res {
+                    case .some(let cached) => {
+                        cache_ctx.hits = cache_ctx.hits + 1
+                        let restored = respan_mod.respan_items(cached, synth_file, allocator)?
+                        output_mod.record_instance_items(mutable out, module_id, module_name, take restored, allocator)?
+                        return false
+                    }
+                    case .none => {
+                        cache_ctx.misses = cache_ctx.misses + 1
+                    }
+                }
+            }
+            let items = instantiate_mod.instantiate_with(s, body_items, is_box, allocator)?
+            let respanned = respan_mod.respan_items(items, synth_file, allocator)?
+            if use_cache {
+                spec_cache_mod.store(rfs, wfs, cache_ctx, cache_key, respanned, sym_interner, allocator)?
+            }
+            output_mod.record_instance_items(mutable out, module_id, module_name, take respanned, allocator)?
+            return synthesized
+        }
+    }
+}
+
+
+function rename_cache_key(
+    h: hash_mod.SpecHash,
+    s: subst_map_mod.Subst,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> hash_mod.SpecHash
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Rename.len(s.renames)
+    if n == 0 as usize {
+        return h
+    }
+    let hex = hash_mod.to_hex(h, allocator)?
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let r = Vec_Rename.at(s.renames, i)
+        push_sym_bytes(mutable buf, r.from, sym_interner, allocator)?
+        Vec_u8.push(mutable buf, 124 as u8, allocator)?
+        push_sym_bytes(mutable buf, r.to, sym_interner, allocator)?
+        Vec_u8.push(mutable buf, 59 as u8, allocator)?
+        i = i + 1
+    }
+    return addr_mod.compose_and_finalise(hex.bytes(), take buf, allocator)?
+}
+
+
+function push_sym_bytes(
+    buf: mutable Vec_u8.Vec,
+    s: sym_mod.Symbol,
+    interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let rendered = addr_mod.render_symbol_string(s, interner, allocator)?
+    let bs = rendered.bytes()
+    let n = bs.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_u8.push(mutable buf, bs[i], allocator)?
+        i = i + 1
+    }
+}
+
+
+function canonical_name_bytes(
+    spec_map: specdefs_mod.SpecDefMap,
+    spec_def: def_mod.DefId,
+    path: ast_ident_mod.Path,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let nsegs = Vec_Ident.len(path.segments)
+    if nsegs == 0 {
+        return addr_mod.render_path_bytes(path, sym_interner, allocator)?
+    }
+    match specdefs_mod.lookup_origin(spec_map, spec_def) {
+        case .some(let origin) => {
+            let on = Vec_Symbol.len(origin.segs)
+            if on == 0 {
+                return addr_mod.render_path_bytes(path, sym_interner, allocator)?
+            }
+            uninit full: Vec_Symbol.Vec
+            Vec_Symbol.new(init full, allocator)?
+            var i: usize = 0
+            loop decreases (on - i) {
+                if i >= on { break }
+                Vec_Symbol.push(mutable full, Vec_Symbol.at(origin.segs, i), allocator)?
+                i = i + 1
+            }
+            let leaf = Vec_Ident.at(path.segments, nsegs - 1)
+            Vec_Symbol.push(mutable full, leaf.name, allocator)?
+            return addr_mod.render_segments_bytes(full, sym_interner, allocator)?
+        }
+        case .none => {
+            return addr_mod.render_path_bytes(path, sym_interner, allocator)?
+        }
+    }
+}
+
+
+function origin_segments_of(
+    spec_map: specdefs_mod.SpecDefMap,
+    spec_def: def_mod.DefId,
+    allocator: Allocator,
+) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match specdefs_mod.lookup_origin(spec_map, spec_def) {
+        case .some(let origin) => return origin.segs
+        case .none => {
+            uninit empty: Vec_Symbol.Vec
+            Vec_Symbol.new(init empty, allocator)?
+            return empty
+        }
+    }
+}
+
+
+function origin_import_scope_of(
+    spec_map: specdefs_mod.SpecDefMap,
+    spec_def: def_mod.DefId,
+    allocator: Allocator,
+) -> imports_mod.ImportScope
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match specdefs_mod.lookup_origin(spec_map, spec_def) {
+        case .some(let origin) => return origin.import_scope
+        case .none => {
+            uninit empty: imports_mod.ImportScope
+            imports_mod.new_scope(init empty, allocator)?
+            return empty
+        }
+    }
+}
+
+
+function find_by_hash(
+    out: output_mod.SpecOutput,
+    h: hash_mod.SpecHash,
+) -> Option_ModuleId.Option
+{
+    return output_mod.lookup_by_hash(out, h)
+}
+
+function alloc_module_id(out: output_mod.SpecOutput) -> id_mod.ModuleId
+    requires Vec_SpecInstance.len(out.instances) < 4294967295
+{
+    let next_raw = (Vec_SpecInstance.len(out.instances) + 1) as u32
+    return id_mod.ModuleId { raw: next_raw }
+}
+
+

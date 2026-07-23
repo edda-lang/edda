@@ -1,0 +1,328 @@
+
+module json.encode.encoder
+
+import std.mem.alloc
+import std.text.string
+import json.value.core as value
+
+spec std.mem.alloc.Box(value.JsonValue)
+
+public type EncodeError {
+    case out_of_memory
+    case buffer_overflow
+}
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _write_byte(buf: mutable [u8], pos: usize, b: u8) -> usize
+    with {err: EncodeError}
+{
+    if pos >= buf.len() { raise EncodeError.buffer_overflow }
+    buf[pos] = b
+    return pos + 1 as usize
+}
+
+function _write_bytes(buf: mutable [u8], pos: usize, src: [u8]) -> usize
+    with {err: EncodeError}
+{
+    let n = src.len()
+    var i: usize = 0
+    var p: usize = pos
+    loop decreases n - i {
+        if i >= n { break }
+        p = _write_byte(mutable buf, p, src[i])?
+        i += 1
+    }
+    return p
+}
+
+function _hex_byte(n: u32) -> u8 {
+    let n4 = n & (0xF as u32)
+    if n4 < (10 as u32) {
+        return ((n4 + (48 as u32)) & (0xFF as u32)) as u8
+    }
+    return ((n4 - (10 as u32) + (97 as u32)) & (0xFF as u32)) as u8
+}
+
+function _write_escaped(buf: mutable [u8], pos: usize, src: [u8]) -> usize
+    with {err: EncodeError}
+{
+    let n = src.len()
+    var p: usize = pos
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = src[i]
+        if c == 34 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 34 as u8)?
+        } else if c == 92 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 92 as u8)?
+        } else if c == 10 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 110 as u8)?
+        } else if c == 9 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 116 as u8)?
+        } else if c == 13 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 114 as u8)?
+        } else if c == 8 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 98 as u8)?
+        } else if c == 12 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 102 as u8)?
+        } else if c < 32 as u8 {
+            p = _write_byte(mutable buf, p, 92 as u8)?
+            p = _write_byte(mutable buf, p, 117 as u8)?
+            p = _write_byte(mutable buf, p, 48 as u8)?
+            p = _write_byte(mutable buf, p, 48 as u8)?
+            p = _write_byte(mutable buf, p, _hex_byte((c as u32) >> (4 as u32)))?
+            p = _write_byte(mutable buf, p, _hex_byte(c as u32))?
+        } else {
+            p = _write_byte(mutable buf, p, c)?
+        }
+        i += 1
+    }
+    return p
+}
+
+function _measure_escaped(src: [u8]) -> usize {
+    let n = src.len()
+    var total: usize = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = src[i]
+        if c == 34 as u8 || c == 92 as u8 || c == 10 as u8 || c == 9 as u8
+            || c == 13 as u8 || c == 8 as u8 || c == 12 as u8 {
+            total = total + 2 as usize
+        } else if c < 32 as u8 {
+            total = total + 6 as usize
+        } else {
+            total = total + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+    return total
+}
+
+function _measure_value(b: Box_JsonValue, indent_step: usize, depth: usize) -> usize
+    decreases box_depth(b)
+{
+    let v = b.get()
+    return match v {
+        case .null_value        => 4 as usize
+        case .bool_value(let bb) => if bb { 4 as usize } else { 5 as usize }
+        case .num_value(let n)  => {
+            let s = f"{n}"
+            s.bytes().len()
+        }
+        case .str_value(let s)  => 2 as usize + _measure_escaped(s.bytes())
+        case .arr_value(let xs) => {
+            let n = xs.len()
+            if n == 0 as usize { return 2 as usize }
+            let pretty = indent_step > 0 as usize
+            var total: usize = 2 as usize
+            total = total + (n - 1 as usize)
+            if pretty {
+                total = total + 1 as usize
+                total = total + n * (depth + 1 as usize) * indent_step
+                total = total + (n - 1 as usize)
+                total = total + 1 as usize
+                total = total + depth * indent_step
+            }
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                total = total + _measure_value(xs[i], indent_step, depth + 1 as usize)
+                i = i + 1 as usize
+            }
+            total
+        }
+        case .obj_value(let entries) => {
+            let n = entries.len()
+            if n == 0 as usize { return 2 as usize }
+            let pretty = indent_step > 0 as usize
+            var total: usize = 2 as usize
+            total = total + (n - 1 as usize)
+            total = total + n * 3 as usize
+            if pretty {
+                total = total + 1 as usize
+                total = total + n * (depth + 1 as usize) * indent_step
+                total = total + (n - 1 as usize)
+                total = total + 1 as usize
+                total = total + depth * indent_step
+                total = total + n
+            }
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                total = total + _measure_escaped(entries[i].key.bytes())
+                total = total + _measure_value(entries[i].value, indent_step, depth + 1 as usize)
+                i = i + 1 as usize
+            }
+            total
+        }
+    }
+}
+
+function _write_spaces(buf: mutable [u8], pos: usize, n: usize) -> usize
+    with {err: EncodeError}
+{
+    var p: usize = pos
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        p = _write_byte(mutable buf, p, 32 as u8)?
+        i = i + 1 as usize
+    }
+    return p
+}
+
+function _encode_value(
+    b: take Box_JsonValue,
+    buf: mutable [u8],
+    pos: usize,
+    indent_step: usize,
+    depth: usize,
+    allocator: mutable Allocator,
+) -> usize
+    with {allocator, err: EncodeError}
+    decreases box_depth(b)
+{
+    let v = Box_JsonValue.unbox(take b, mutable allocator)
+    return match v {
+        case .null_value => _write_bytes(mutable buf, pos, "null".bytes())?
+        case .bool_value(let bb) => {
+            if bb {
+                _write_bytes(mutable buf, pos, "true".bytes())?
+            } else {
+                _write_bytes(mutable buf, pos, "false".bytes())?
+            }
+        }
+        case .num_value(let n) => {
+            let s = f"{n}"
+            _write_bytes(mutable buf, pos, s.bytes())?
+        }
+        case .str_value(let s) => {
+            let p1 = _write_byte(mutable buf, pos, 34 as u8)?
+            let p2 = _write_escaped(mutable buf, p1, s.bytes())?
+            _write_byte(mutable buf, p2, 34 as u8)?
+        }
+        case .arr_value(let xs) => {
+            let n = xs.len()
+            if n == 0 as usize {
+                let p1 = _write_byte(mutable buf, pos, 91 as u8)?
+                _write_byte(mutable buf, p1, 93 as u8)?
+            } else {
+                let pretty = indent_step > 0 as usize
+                let p_open = _write_byte(mutable buf, pos, 91 as u8)?
+                var p: usize = p_open
+                var i: usize = 0
+                loop decreases n - i {
+                    if i >= n { break }
+                    if i > 0 as usize {
+                        p = _write_byte(mutable buf, p, 44 as u8)?
+                    }
+                    if pretty {
+                        p = _write_byte(mutable buf, p, 10 as u8)?
+                        p = _write_spaces(mutable buf, p, (depth + 1 as usize) * indent_step)?
+                    }
+                    p = _encode_value(take xs[i], mutable buf, p, indent_step, depth + 1 as usize, mutable allocator)?
+                    i += 1
+                }
+                if pretty {
+                    p = _write_byte(mutable buf, p, 10 as u8)?
+                    p = _write_spaces(mutable buf, p, depth * indent_step)?
+                }
+                _write_byte(mutable buf, p, 93 as u8)?
+            }
+        }
+        case .obj_value(let entries) => {
+            let n = entries.len()
+            if n == 0 as usize {
+                let p1 = _write_byte(mutable buf, pos, 123 as u8)?
+                _write_byte(mutable buf, p1, 125 as u8)?
+            } else {
+                let pretty = indent_step > 0 as usize
+                let p_open = _write_byte(mutable buf, pos, 123 as u8)?
+                var p: usize = p_open
+                var i: usize = 0
+                loop decreases n - i {
+                    if i >= n { break }
+                    if i > 0 as usize {
+                        p = _write_byte(mutable buf, p, 44 as u8)?
+                    }
+                    if pretty {
+                        p = _write_byte(mutable buf, p, 10 as u8)?
+                        p = _write_spaces(mutable buf, p, (depth + 1 as usize) * indent_step)?
+                    }
+                    let pk1 = _write_byte(mutable buf, p, 34 as u8)?
+                    let pk2 = _write_escaped(mutable buf, pk1, entries[i].key.bytes())?
+                    let pk3 = _write_byte(mutable buf, pk2, 34 as u8)?
+                    let pkv = _write_byte(mutable buf, pk3, 58 as u8)?
+                    let pv = if pretty {
+                        _write_byte(mutable buf, pkv, 32 as u8)?
+                    } else {
+                        pkv
+                    }
+                    p = _encode_value(take entries[i].value, mutable buf, pv, indent_step, depth + 1 as usize, mutable allocator)?
+                    i += 1
+                }
+                if pretty {
+                    p = _write_byte(mutable buf, p, 10 as u8)?
+                    p = _write_spaces(mutable buf, p, depth * indent_step)?
+                }
+                _write_byte(mutable buf, p, 125 as u8)?
+            }
+        }
+    }
+}
+
+public function encode_to_bytes(
+    v: take value.JsonValue,
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: EncodeError}
+{
+    return handle err: alloc.AllocError -> { raise EncodeError.out_of_memory } {
+        let root = Box_JsonValue.new(take v, allocator)?
+        let needed = _measure_value(root, 0 as usize, 0 as usize)
+        var buf = _alloc_u8_slots(allocator, needed)?
+        let n = _encode_value(take root, mutable buf, 0 as usize, 0 as usize, 0 as usize, mutable allocator)?
+        buf[0 as usize..<n]
+    }
+}
+
+public function encode_to_string(
+    v: take value.JsonValue,
+    allocator: mutable Allocator,
+) -> String
+    with {allocator, err: EncodeError}
+{
+    let bytes = encode_to_bytes(take v, mutable allocator)?
+    return handle err: alloc.AllocError -> { raise EncodeError.out_of_memory } {
+        string.bytes_slice_to_string(bytes, 0, bytes.len(), allocator)?
+    }
+}
+
+public function encode_pretty(
+    v: take value.JsonValue,
+    indent: usize,
+    allocator: mutable Allocator,
+) -> String
+    with {allocator, err: EncodeError}
+{
+    return handle err: alloc.AllocError -> { raise EncodeError.out_of_memory } {
+        let root = Box_JsonValue.new(take v, allocator)?
+        let needed = _measure_value(root, indent, 0 as usize)
+        var buf = _alloc_u8_slots(allocator, needed)?
+        let n = _encode_value(take root, mutable buf, 0 as usize, indent, 0 as usize, mutable allocator)?
+        string.bytes_slice_to_string(buf, 0, n, allocator)?
+    }
+}

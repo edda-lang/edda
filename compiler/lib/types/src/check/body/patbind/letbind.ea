@@ -1,0 +1,131 @@
+module types.check.body.patbind.letbind
+
+import std.mem.alloc
+import std.collections.vec
+import syntax.ast.tree as ast_tree
+import hir.tree as hir_tree
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.check.body.defwrite.defwrite as defwrite_mod
+
+spec std.collections.vec.Vec(ast_tree.Pat)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+public function record_let_bindings(
+    bindings: Vec_HBinding.Vec,
+    pat: ast_tree.Pat,
+    expected_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HBinding.len(bindings)
+    if n == 0 as usize {
+        return
+    }
+    if n == 1 as usize {
+        let b = Vec_HBinding.at(bindings, 0 as usize)
+        defwrite_mod.write_at_def_id(mutable local_types, b.def_id, expected_ty, allocator)?
+        return
+    }
+    if !is_pure_tuple_pat(pat) {
+        return
+    }
+    let _ = destructure_tuple_pat(pat, expected_ty, bindings, 0 as usize, ty_interner, mutable local_types, allocator)?
+}
+
+function is_pure_tuple_pat(pat: ast_tree.Pat) -> bool
+    with {divergence}
+{
+    return match pat.kind {
+        case .binding(_) => true
+        case .tuple(let elements) => all_pats_pure_tuple(elements)
+        case _ => false
+    }
+}
+
+function all_pats_pure_tuple(elements: Vec_Pat.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_Pat.len(elements)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sub = Vec_Pat.at(elements, i)
+        if !is_pure_tuple_pat(sub) {
+            return false
+        }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function destructure_tuple_pat(
+    pat: ast_tree.Pat,
+    expected_ty: ty_mod.TyId,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match pat.kind {
+        case .binding(_) => {
+            if cursor < Vec_HBinding.len(bindings) {
+                let b = Vec_HBinding.at(bindings, cursor)
+                defwrite_mod.write_at_def_id(mutable local_types, b.def_id, expected_ty, allocator)?
+                cursor + 1 as usize
+            } else {
+                cursor
+            }
+        }
+        case .tuple(let elements) => {
+            let pn = Vec_Pat.len(elements)
+            if ty_mod.is_error(expected_ty) {
+                cursor
+            } else {
+                let recv_cty = ty_interner_mod.lookup(ty_interner, expected_ty)
+                match recv_cty {
+                    case .tuple_(let elem_tys) => {
+                        if Vec_TyId.len(elem_tys) != pn {
+                            cursor
+                        } else {
+                            iter_tuple_destructure(elements, elem_tys, bindings, cursor, ty_interner, mutable local_types, allocator)?
+                        }
+                    }
+                    case _ => cursor
+                }
+            }
+        }
+        case _ => cursor
+    }
+}
+
+function iter_tuple_destructure(
+    elements: Vec_Pat.Vec,
+    elem_tys: Vec_TyId.Vec,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(elements)
+    var c: usize = cursor
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sub = Vec_Pat.at(elements, i)
+        let sub_ty = Vec_TyId.at(elem_tys, i)
+        c = destructure_tuple_pat(sub, sub_ty, bindings, c, ty_interner, mutable local_types, allocator)?
+        i = i + 1 as usize
+    }
+    return c
+}

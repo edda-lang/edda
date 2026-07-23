@@ -1,0 +1,210 @@
+
+module types.check.pass.unusedcapture.scan
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.def as def_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+
+
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+
+
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(Box_HExpr)
+
+
+public function block_uses_def(block: hir_tree.HBlock, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if stmt_uses_def(Vec_HStmt.at(block.stmts, i), def) {
+            return true
+        }
+        i = i + 1 as usize
+    }
+    return match block.trailing {
+        case .some(let box_e) => expr_uses_def(Box_HExpr.get(box_e), def)
+        case .none => false
+    }
+}
+
+
+function stmt_uses_def(stmt: hir_tree.HStmt, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, _, _, let init_) => expr_uses_def(init_, def)
+        case .uninit_(_, _, _) => false
+        case .assign(let target, _, let rhs) => expr_uses_def(target, def) || expr_uses_def(rhs, def)
+    }
+}
+
+
+function expr_uses_def(expr: hir_tree.HExpr, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match expr.kind {
+        case .use_(let d) => d.raw == def.raw
+        case .binary(_, let lhs, let rhs) => boxed_uses_def(lhs, def) || boxed_uses_def(rhs, def)
+        case .unary(_, let inner) => boxed_uses_def(inner, def)
+        case .call(_, let args) => args_uses_def(args, def)
+        case .variant_ctor(_, _, let args) => args_uses_def(args, def)
+        case .dyn_call(let callee, let args) => boxed_uses_def(callee, def) || args_uses_def(args, def)
+        case .method_call(_, let args) => args_uses_def(args, def)
+        case .field(let recv, _) => boxed_uses_def(recv, def)
+        case .positional(let recv, let index) => boxed_uses_def(recv, def) || boxed_uses_def(index, def)
+        case .index(let recv, let idx) => boxed_uses_def(recv, def) || boxed_uses_def(idx, def)
+        case .subrange(let recv, let lo, let hi, _) => boxed_uses_def(recv, def) || opt_boxed_uses_def(lo, def) || opt_boxed_uses_def(hi, def)
+        case .if_(let cond, let then_b, let else_opt) => boxed_uses_def(cond, def) || block_uses_def(then_b, def) || opt_block_uses_def(else_opt, def)
+        case .match_(let scrut, let arms) => boxed_uses_def(scrut, def) || arms_uses_def(arms, def)
+        case .block_(let body) => block_uses_def(body, def)
+        case .loop_(let body, _, let dec_opt) => block_uses_def(body, def) || opt_boxed_uses_def(dec_opt, def)
+        case .cast(let inner, _, _) => boxed_uses_def(inner, def)
+        case .tuple(let elements) => exprs_uses_def(elements, def)
+        case .struct_lit(_, let fields) => args_uses_def(fields, def)
+        case .raise_(let inner) => boxed_uses_def(inner, def)
+        case .panic_(let inner) => boxed_uses_def(inner, def)
+        case .return_(let opt) => opt_boxed_uses_def(opt, def)
+        case .break_(_, let opt) => opt_boxed_uses_def(opt, def)
+        case .comptime_(let inner) => boxed_uses_def(inner, def)
+        case .comptime_block(let body) => block_uses_def(body, def)
+        case .comptime_for(_, let lo, let hi, _, let body) => boxed_uses_def(lo, def) || boxed_uses_def(hi, def) || block_uses_def(body, def)
+        case .scope_(_, _, let body) => block_uses_def(body, def)
+        case .handle_(_, _, let recovery, let body) => boxed_uses_def(recovery, def) || block_uses_def(body, def)
+        case .closure(let boxed) => block_uses_def(Box_HClosure.get(boxed).body, def)
+        case .spawn_(let boxed) => spawn_uses_def(Box_HSpawn.get(boxed), def)
+        case .forall_(_, let iter, let body) => boxed_uses_def(iter, def) || boxed_uses_def(body, def)
+        case .exists_(_, let iter, let body) => boxed_uses_def(iter, def) || boxed_uses_def(body, def)
+        case _ => false
+    }
+}
+
+
+function spawn_uses_def(sp: hir_tree.HSpawn, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    if spawn_args_uses_def(sp.args, def) {
+        return true
+    }
+    return block_uses_def(sp.body, def)
+}
+
+
+function boxed_uses_def(boxed: Box_HExpr, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return expr_uses_def(Box_HExpr.get(boxed), def)
+}
+
+
+function opt_boxed_uses_def(opt: Option_Box_HExpr.Option, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match opt {
+        case .some(let boxed) => boxed_uses_def(boxed, def)
+        case .none => false
+    }
+}
+
+
+function opt_block_uses_def(opt: Option_HBlock.Option, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match opt {
+        case .some(let block) => block_uses_def(block, def)
+        case .none => false
+    }
+}
+
+
+function exprs_uses_def(exprs: Vec_HExpr.Vec, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if expr_uses_def(Vec_HExpr.at(exprs, i), def) {
+            return true
+        }
+        i = i + 1 as usize
+    }
+    return false
+}
+
+
+function args_uses_def(args: Vec_HArg.Vec, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if expr_uses_def(Vec_HArg.at(args, i).expr, def) {
+            return true
+        }
+        i = i + 1 as usize
+    }
+    return false
+}
+
+
+function arms_uses_def(arms: Vec_HArm.Vec, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        if expr_uses_def(arm.body, def) {
+            return true
+        }
+        if guard_uses_def(arm.guard, def) {
+            return true
+        }
+        i = i + 1 as usize
+    }
+    return false
+}
+
+
+function guard_uses_def(opt: Option_HExpr.Option, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match opt {
+        case .some(let g) => expr_uses_def(g, def)
+        case .none => false
+    }
+}
+
+
+function spawn_args_uses_def(args: Vec_HSpawnArg.Vec, def: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HSpawnArg.len(args)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if expr_uses_def(Vec_HSpawnArg.at(args, i).init_, def) {
+            return true
+        }
+        i = i + 1 as usize
+    }
+    return false
+}

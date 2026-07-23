@@ -1,0 +1,420 @@
+
+module object.coff.codeview.typetable.table
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import std.text.string
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import hir.def as def_mod
+import target.triple as triple_mod
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import cteval.builtin.target.layout.compute.engine as layout_engine_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(check_mod.TypeOutput)
+spec std.collections.vec.Vec(DebugMember)
+spec std.collections.hashmap.IntMap(DebugAgg)
+spec std.core.option.Option(DebugAgg)
+spec std.core.option.Option(usize)
+
+
+derive eq, hash, debug for DebugAggKind
+derive eq, hash, debug for DebugMember
+derive eq, hash, debug for DebugAgg
+derive eq, hash, debug for DebugTypeTable
+
+
+public type DebugAggKind {
+    case record_
+    case tuple_
+    case array_
+    case fatptr_
+    case enum_
+    case sum_
+}
+
+
+public type DebugMember {
+    name: String
+    ty: ty_mod.TyId
+    offset: u32
+}
+
+
+public type DebugAgg {
+    kind: DebugAggKind
+    total_size: u32
+    members: Vec_DebugMember.Vec
+    elem_ty: ty_mod.TyId
+    array_count: u64
+}
+
+
+public type DebugTypeTable {
+    by_ty: IntMap_DebugAgg.IntMap
+}
+
+
+public function new_debug_table(allocator: Allocator) -> DebugTypeTable
+    with {allocator, err: alloc.AllocError}
+{
+    let m = IntMap_DebugAgg.new(allocator)?
+    return DebugTypeTable { by_ty: m }
+}
+
+
+public function lookup_debug(table: DebugTypeTable, ty: ty_mod.TyId) -> Option_DebugAgg.Option {
+    return IntMap_DebugAgg.get(table.by_ty, ty.raw as i64)
+}
+
+
+public function build_debug_table(
+    ty_interner: ty_interner_mod.Interner,
+    seed_outs: Vec_TypeOutput.Vec,
+    inst_outs: Vec_TypeOutput.Vec,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> DebugTypeTable
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var table = new_debug_table(allocator)?
+    let n = ty_interner_mod.slot_count(ty_interner)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        let ty = ty_mod.TyId { raw: i as u32 wrapping }
+        match debug_agg_for(ty, ty_interner, seed_outs, triple, interner, allocator)? {
+            case .some(let agg) => {
+                let _ = IntMap_DebugAgg.insert(mutable table.by_ty, i as i64, take agg, allocator)?
+            }
+            case .none => {
+                match debug_agg_for(ty, ty_interner, inst_outs, triple, interner, allocator)? {
+                    case .some(let agg2) => {
+                        let _ = IntMap_DebugAgg.insert(mutable table.by_ty, i as i64, take agg2, allocator)?
+                    }
+                    case .none => ()
+                }
+            }
+        }
+        i += 1
+    }
+    return table
+}
+
+
+function resolve_out_index(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    outs: Vec_TypeOutput.Vec,
+    triple: triple_mod.TargetTriple,
+) -> Option_usize.Option
+    with {divergence}
+{
+    let n = Vec_TypeOutput.len(outs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        match layout_engine_mod.compute_layout(ty, ty_interner, Vec_TypeOutput.at(outs, i), triple) {
+            case .ok(_) => return Option_usize.some(value: i)
+            case .unsupported(_) => ()
+        }
+        i += 1
+    }
+    return Option_usize.none
+}
+
+
+function total_size_of(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> u32
+    with {divergence}
+{
+    return match layout_engine_mod.compute_layout(ty, ty_interner, out, triple) {
+        case .ok(let l) => l.size as u32 wrapping
+        case .unsupported(_) => 0 as u32
+    }
+}
+
+
+function debug_agg_for(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    outs: Vec_TypeOutput.Vec,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_DebugAgg.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_DebugAgg.none
+    }
+    let oi = match resolve_out_index(ty, ty_interner, outs, triple) {
+        case .some(let v) => v
+        case .none => return Option_DebugAgg.none
+    }
+    let out = Vec_TypeOutput.at(outs, oi)
+    let cty = ty_interner_mod.lookup(ty_interner, ty)
+    return match cty {
+        case .record(let def) => {
+            let members = record_members(ty, def, ty_interner, out, triple, interner, allocator)?
+            Option_DebugAgg.some(value: DebugAgg {
+                kind: DebugAggKind.record_,
+                total_size: total_size_of(ty, ty_interner, out, triple),
+                members: members,
+                elem_ty: ty_mod.error(),
+                array_count: 0 as u64,
+            })
+        }
+        case .tuple_(let elems) => {
+            let members = tuple_members(ty, elems, ty_interner, out, triple, allocator)?
+            Option_DebugAgg.some(value: DebugAgg {
+                kind: DebugAggKind.tuple_,
+                total_size: total_size_of(ty, ty_interner, out, triple),
+                members: members,
+                elem_ty: ty_mod.error(),
+                array_count: 0 as u64,
+            })
+        }
+        case .array(let elem, let len) => {
+            uninit empty: Vec_DebugMember.Vec
+            Vec_DebugMember.new(init empty, allocator)?
+            Option_DebugAgg.some(value: DebugAgg {
+                kind: DebugAggKind.array_,
+                total_size: total_size_of(ty, ty_interner, out, triple),
+                members: empty,
+                elem_ty: elem,
+                array_count: len,
+            })
+        }
+        case .slice(let elem) => {
+            uninit empty: Vec_DebugMember.Vec
+            Vec_DebugMember.new(init empty, allocator)?
+            Option_DebugAgg.some(value: DebugAgg {
+                kind: DebugAggKind.fatptr_,
+                total_size: total_size_of(ty, ty_interner, out, triple),
+                members: empty,
+                elem_ty: elem,
+                array_count: 0 as u64,
+            })
+        }
+        case .string_ => {
+            uninit empty: Vec_DebugMember.Vec
+            Vec_DebugMember.new(init empty, allocator)?
+            Option_DebugAgg.some(value: DebugAgg {
+                kind: DebugAggKind.fatptr_,
+                total_size: total_size_of(ty, ty_interner, out, triple),
+                members: empty,
+                elem_ty: ty_mod.error(),
+                array_count: 0 as u64,
+            })
+        }
+        case .sum_(let def) => Option_DebugAgg.some(value: build_sum(ty, def, ty_interner, out, triple, interner, allocator)?)
+        case _ => Option_DebugAgg.none
+    }
+}
+
+
+function payload_present(
+    pty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(pty) { return false }
+    return match layout_engine_mod.compute_layout(pty, ty_interner, out, triple) {
+        case .ok(let l) => l.size > (0 as usize)
+        case .unsupported(_) => false
+    }
+}
+
+
+function build_sum(
+    ty: ty_mod.TyId,
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> DebugAgg
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let disc = check_mod.discriminant_ty(out)
+    let total = total_size_of(ty, ty_interner, out, triple)
+    let n = check_mod.variant_count_of(out, def)
+
+    var any_payload = false
+    var payload_align: usize = 1
+    var k0: usize = 0
+    loop decreases n - k0 {
+        if k0 >= n { break }
+        let pty0 = check_mod.variant_payload_ty(out, def, k0 as u32 wrapping)
+        if payload_present(pty0, ty_interner, out, triple) {
+            any_payload = true
+            match layout_engine_mod.compute_layout(pty0, ty_interner, out, triple) {
+                case .ok(let l) => if l.align > payload_align { payload_align = l.align }
+                case .unsupported(_) => ()
+            }
+        }
+        k0 += 1
+    }
+
+    uninit members: Vec_DebugMember.Vec
+    Vec_DebugMember.new(init members, allocator)?
+    var k: usize = 0
+    loop decreases n - k {
+        if k >= n { break }
+        let nm = match check_mod.variant_name_at(out, def, k) {
+            case .some(let s) => sym_to_string(s, interner, allocator)?
+            case .none => synth_field_name(k, allocator)?
+        }
+        let pty = check_mod.variant_payload_ty(out, def, k as u32 wrapping)
+        if any_payload {
+            if payload_present(pty, ty_interner, out, triple) {
+                Vec_DebugMember.push(mutable members, take DebugMember { name: nm, ty: pty, offset: 0 as u32 }, allocator)?
+            }
+        } else {
+            Vec_DebugMember.push(mutable members, take DebugMember { name: nm, ty: ty_mod.error(), offset: k as u32 wrapping }, allocator)?
+        }
+        k += 1
+    }
+
+    let disc_size = total_size_of(disc, ty_interner, out, triple)
+    let payload_offset = layout_engine_mod.align_up_to(disc_size as usize, payload_align)
+    return DebugAgg {
+        kind: if any_payload { DebugAggKind.sum_ } else { DebugAggKind.enum_ },
+        total_size: total,
+        members: members,
+        elem_ty: disc,
+        array_count: payload_offset as u64,
+    }
+}
+
+
+function record_members(
+    ty: ty_mod.TyId,
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_DebugMember.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit members: Vec_DebugMember.Vec
+    Vec_DebugMember.new(init members, allocator)?
+    let count = check_mod.field_ty_count(out, def)
+    var k: usize = 0
+    loop decreases count - k {
+        if k >= count { break }
+        let fty = check_mod.field_ty_at(out, def, k)
+        let nm = match check_mod.field_name_at(out, def, 0 as u32, k) {
+            case .some(let s) => if symbol_mod.is_empty(s) { synth_field_name(k, allocator)? } else { sym_to_string(s, interner, allocator)? }
+            case .none => synth_field_name(k, allocator)?
+        }
+        let off = match layout_engine_mod.field_offset_at(ty, k, ty_interner, out, triple) {
+            case .ok(let o) => o as u32 wrapping
+            case .unsupported(_) => 0 as u32
+        }
+        Vec_DebugMember.push(mutable members, take DebugMember { name: nm, ty: fty, offset: off }, allocator)?
+        k += 1
+    }
+    return members
+}
+
+
+function tuple_members(
+    ty: ty_mod.TyId,
+    elems: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Vec_DebugMember.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit members: Vec_DebugMember.Vec
+    Vec_DebugMember.new(init members, allocator)?
+    let count = Vec_TyId.len(elems)
+    var k: usize = 0
+    loop decreases count - k {
+        if k >= count { break }
+        let off = match layout_engine_mod.field_offset_at(ty, k, ty_interner, out, triple) {
+            case .ok(let o) => o as u32 wrapping
+            case .unsupported(_) => 0 as u32
+        }
+        Vec_DebugMember.push(
+            mutable members,
+            take DebugMember { name: synth_field_name(k, allocator)?, ty: Vec_TyId.at(elems, k), offset: off },
+            allocator,
+        )?
+        k += 1
+    }
+    return members
+}
+
+
+function sym_to_string(s: symbol_mod.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = interner_mod.lookup(interner, s)
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function synth_field_name(idx: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return string.concat("f", usize_to_string(idx, allocator)?, allocator)?
+}
+
+
+function usize_to_string(value: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if value < (10 as usize) {
+        return digit_string(value)
+    }
+    let hi = usize_to_string(value / (10 as usize), allocator)?
+    return string.concat(hi, digit_string(value % (10 as usize)), allocator)?
+}
+
+
+function digit_string(d: usize) -> String {
+    return match d {
+        case 0 => "0"
+        case 1 => "1"
+        case 2 => "2"
+        case 3 => "3"
+        case 4 => "4"
+        case 5 => "5"
+        case 6 => "6"
+        case 7 => "7"
+        case 8 => "8"
+        case _ => "9"
+    }
+}

@@ -1,0 +1,247 @@
+
+module refine.solver.cnf.tseitin.tseitin
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.atom.atom as atom_mod
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(Clause)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public type Clause {
+    lits: Vec_Lit.Vec
+    origin: Vec_usize.Vec
+}
+
+
+public type Encoder {
+    atoms: atom_mod.AtomTable
+    clauses: Vec_Clause.Vec
+    current_origin: Vec_usize.Vec
+}
+
+
+public function new_encoder(out: init Encoder, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit atoms: atom_mod.AtomTable
+    atom_mod.new_table(init atoms, allocator)?
+    uninit clauses: Vec_Clause.Vec
+    Vec_Clause.new(init clauses, allocator)?
+    uninit current_origin: Vec_usize.Vec
+    Vec_usize.new(init current_origin, allocator)?
+    out = Encoder {
+        atoms: atoms,
+        clauses: clauses,
+        current_origin: current_origin,
+    }
+}
+
+
+public function set_premise_origin(enc: mutable Encoder, idx: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_usize.clear(mutable enc.current_origin)
+    Vec_usize.push(mutable enc.current_origin, idx, allocator)?
+}
+
+
+public function clear_origin(enc: mutable Encoder) -> () {
+    Vec_usize.clear(mutable enc.current_origin)
+}
+
+
+function add_clause(enc: mutable Encoder, lits: take Vec_Lit.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit origin_copy: Vec_usize.Vec
+    Vec_usize.new(init origin_copy, allocator)?
+    Vec_usize.extend_from_slice(mutable origin_copy, Vec_usize.as_slice(enc.current_origin), allocator)?
+    let c = Clause { lits: lits, origin: origin_copy }
+    Vec_Clause.push(mutable enc.clauses, take c, allocator)?
+}
+
+
+function unit_clause(enc: mutable Encoder, l: lit_mod.Lit, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit lits: Vec_Lit.Vec
+    Vec_Lit.new(init lits, allocator)?
+    Vec_Lit.push(mutable lits, take l, allocator)?
+    add_clause(mutable enc, take lits, allocator)?
+}
+
+
+function binary_clause(enc: mutable Encoder, a: lit_mod.Lit, b: lit_mod.Lit, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit lits: Vec_Lit.Vec
+    Vec_Lit.new(init lits, allocator)?
+    Vec_Lit.push(mutable lits, take a, allocator)?
+    Vec_Lit.push(mutable lits, take b, allocator)?
+    add_clause(mutable enc, take lits, allocator)?
+}
+
+
+public function encode_term(enc: mutable Encoder, term: term_mod.SmtTerm, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match term {
+        case .true_ => forced(mutable enc, true, allocator)?
+        case .false_ => forced(mutable enc, false, allocator)?
+        case .app(let op, let args) => encode_app(mutable enc, op, args, term, allocator)?
+        case _ => atom_lit(mutable enc, term, allocator)?
+    }
+}
+
+
+function forced(enc: mutable Encoder, value: bool, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError}
+{
+    let v = atom_mod.fresh(mutable enc.atoms, allocator)?
+    let pos = lit_mod.make_lit(v, false)
+    if value {
+        unit_clause(mutable enc, pos, allocator)?
+    } else {
+        let neg = lit_mod.make_lit(v, true)
+        unit_clause(mutable enc, neg, allocator)?
+    }
+    return pos
+}
+
+
+function atom_lit(enc: mutable Encoder, term: term_mod.SmtTerm, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let v = atom_mod.intern(mutable enc.atoms, term, allocator)?
+    return lit_mod.make_lit(v, false)
+}
+
+
+function encode_app(
+    enc: mutable Encoder,
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    term: term_mod.SmtTerm,
+    allocator: Allocator,
+) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match op {
+        case .and_ => encode_and(mutable enc, args, allocator)?
+        case .or_ => encode_or(mutable enc, args, allocator)?
+        case .not_ => encode_not(mutable enc, args, allocator)?
+        case .implies_ => encode_implies(mutable enc, args, allocator)?
+        case _ => atom_lit(mutable enc, term, allocator)?
+    }
+}
+
+
+function encode_not(enc: mutable Encoder, args: Vec_SmtTerm.Vec, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 1 {
+        return forced(mutable enc, true, allocator)?
+    }
+    let inner = encode_term(mutable enc, Vec_SmtTerm.at(args, 0), allocator)?
+    return lit_mod.lit_negate(inner)
+}
+
+
+function encode_implies(enc: mutable Encoder, args: Vec_SmtTerm.Vec, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 2 {
+        return forced(mutable enc, true, allocator)?
+    }
+    let a = encode_term(mutable enc, Vec_SmtTerm.at(args, 0), allocator)?
+    let b = encode_term(mutable enc, Vec_SmtTerm.at(args, 1), allocator)?
+    let x = atom_mod.fresh(mutable enc.atoms, allocator)?
+    let xp = lit_mod.make_lit(x, false)
+    let xn = lit_mod.make_lit(x, true)
+    binary_clause(mutable enc, xn, lit_mod.lit_negate(a), allocator)?
+    binary_clause(mutable enc, xn, b, allocator)?
+    ternary_or(mutable enc, xp, a, lit_mod.lit_negate(b), allocator)?
+    return xp
+}
+
+
+function ternary_or(enc: mutable Encoder, a: lit_mod.Lit, b: lit_mod.Lit, c: lit_mod.Lit, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit lits: Vec_Lit.Vec
+    Vec_Lit.new(init lits, allocator)?
+    Vec_Lit.push(mutable lits, take a, allocator)?
+    Vec_Lit.push(mutable lits, take b, allocator)?
+    Vec_Lit.push(mutable lits, take c, allocator)?
+    add_clause(mutable enc, take lits, allocator)?
+}
+
+
+function encode_and(enc: mutable Encoder, args: Vec_SmtTerm.Vec, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let x = atom_mod.fresh(mutable enc.atoms, allocator)?
+    let xp = lit_mod.make_lit(x, false)
+    let xn = lit_mod.make_lit(x, true)
+    uninit big: Vec_Lit.Vec
+    Vec_Lit.new(init big, allocator)?
+    let xp_head = xp
+    Vec_Lit.push(mutable big, take xp_head, allocator)?
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let ai = encode_term(mutable enc, Vec_SmtTerm.at(args, i), allocator)?
+        binary_clause(mutable enc, xn, ai, allocator)?
+        Vec_Lit.push(mutable big, take lit_mod.lit_negate(ai), allocator)?
+        i = i + 1
+    }
+    add_clause(mutable enc, take big, allocator)?
+    return xp
+}
+
+
+function encode_or(enc: mutable Encoder, args: Vec_SmtTerm.Vec, allocator: Allocator) -> lit_mod.Lit
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let x = atom_mod.fresh(mutable enc.atoms, allocator)?
+    let xp = lit_mod.make_lit(x, false)
+    let xn = lit_mod.make_lit(x, true)
+    uninit big: Vec_Lit.Vec
+    Vec_Lit.new(init big, allocator)?
+    Vec_Lit.push(mutable big, take xn, allocator)?
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let ai = encode_term(mutable enc, Vec_SmtTerm.at(args, i), allocator)?
+        binary_clause(mutable enc, xp, lit_mod.lit_negate(ai), allocator)?
+        Vec_Lit.push(mutable big, take ai, allocator)?
+        i = i + 1
+    }
+    add_clause(mutable enc, take big, allocator)?
+    return xp
+}
+
+
+public function assert_true(enc: mutable Encoder, term: term_mod.SmtTerm, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let l = encode_term(mutable enc, term, allocator)?
+    unit_clause(mutable enc, l, allocator)?
+}

@@ -1,0 +1,169 @@
+
+module ir.hlir.tree.oplower.scalar.scalar
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import types.ty.interner as ty_interner_mod
+
+import local.hlir.op as hlir_op_mod
+import local.hlir.tree.body as hlir_body_mod
+import local.hlir.id.value as hlir_value_mod
+
+import local.lir.op as lir_op_mod
+import local.lir.error as lir_error_mod
+import local.lir.tree.reg as lir_reg_mod
+import local.lir.id.vreg as lir_vreg_mod
+
+import local.hlir.lower.ids as lower_ids_mod
+import local.hlir.tree.node.sizing as sizing_mod
+
+
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function lower_op_kind(
+    hop: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> lir_op_mod.LirOpKind
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    return match hop.kind {
+        case .literal(let c) => lir_op_mod.LirOpKind.constant_(
+            c: convert_constant(c),
+            dst: dst,
+        )
+        case .binary(let op, let lhs, let rhs) => lir_op_mod.LirOpKind.binary(
+            op: convert_binop(op, operand_is_signed(body, lhs, ty_interner)?)?,
+            lhs: lower_ids_mod.vreg_of_value(lhs),
+            rhs: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(rhs)),
+            dst: dst,
+        )
+        case .unary(let op, let operand) => lir_op_mod.LirOpKind.unary(
+            op: convert_unop(op),
+            operand: lower_ids_mod.vreg_of_value(operand),
+            dst: dst,
+        )
+        case .call_(let callee, let args) => lir_op_mod.LirOpKind.call_(
+            callee: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(callee)),
+            args: lower_ids_mod.convert_value_id_vec(args, allocator)?,
+            return_: Option_LirVRegId.some(value: dst),
+        )
+        case .call_indirect(let callee, let args) => lir_op_mod.LirOpKind.call_indirect(
+            callee: lower_ids_mod.vreg_of_value(callee),
+            args: lower_ids_mod.convert_value_id_vec(args, allocator)?,
+            return_: Option_LirVRegId.some(value: dst),
+        )
+        case .cast(let value, _, let to, let kind) => lir_op_mod.LirOpKind.convert_(
+            src: lower_ids_mod.vreg_of_value(value),
+            to_width: sizing_mod.int_resize_width(to, ty_interner),
+            to_signed: sizing_mod.int_resize_signed(to, ty_interner),
+            kind: convert_cast_kind(kind),
+            dst: dst,
+        )
+        case .make_closure(let code, let env) => lir_op_mod.LirOpKind.make_closure(
+            code: code,
+            env: lower_ids_mod.vreg_of_value(env),
+            dst: dst,
+        )
+        case .stack_alloc(let bytes) => lir_op_mod.LirOpKind.stack_addr(bytes: bytes, dst: dst)
+        case .ref_(_, let operand) => lir_op_mod.LirOpKind.copy_(
+            src: lower_ids_mod.vreg_of_value(operand),
+            dst: dst,
+        )
+        case .err_flag => lir_op_mod.LirOpKind.err_flag(dst: dst)
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+}
+
+function convert_constant(c: hlir_op_mod.HConstant) -> lir_op_mod.LConstant {
+    return match c {
+        case .int_(let value, let ty) => lir_op_mod.LConstant.int_(value: value, ty: ty)
+        case .float_(let bits, let width) => lir_op_mod.LConstant.float_(bits: bits, width: width)
+        case .bool_(let value) => lir_op_mod.LConstant.bool_(value: value)
+        case .unit_ => lir_op_mod.LConstant.unit_
+        case .string_(let symbol) => lir_op_mod.LConstant.string_(symbol: symbol)
+        case .fn_ref(let def) => lir_op_mod.LConstant.fn_ref(def: def)
+    }
+}
+
+function operand_is_signed(
+    body: hlir_body_mod.HlirBody,
+    value: hlir_value_mod.ValueId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {err: lir_error_mod.LirError}
+{
+    if (value.raw as usize) >= Vec_HlirValue.len(body.values) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: binary operand value id out of range",
+        )
+    }
+    let v = Vec_HlirValue.at(body.values, value.raw as usize)
+    return sizing_mod.int_resize_signed(v.ty, ty_interner)
+}
+
+function convert_binop(op: hlir_op_mod.HBinOp, signed_: bool) -> lir_op_mod.LBinOp
+    with {err: lir_error_mod.LirError}
+{
+    return match op {
+        case .add => lir_op_mod.LBinOp.add
+        case .sub => lir_op_mod.LBinOp.sub
+        case .mul => lir_op_mod.LBinOp.mul
+        case .div => if signed_ { lir_op_mod.LBinOp.sdiv } else { lir_op_mod.LBinOp.udiv }
+        case .rem => if signed_ { lir_op_mod.LBinOp.srem } else { lir_op_mod.LBinOp.urem }
+        case .add_wrap => lir_op_mod.LBinOp.add
+        case .sub_wrap => lir_op_mod.LBinOp.sub
+        case .mul_wrap => lir_op_mod.LBinOp.mul
+        case .bit_and => lir_op_mod.LBinOp.bit_and
+        case .bit_or => lir_op_mod.LBinOp.bit_or
+        case .bit_xor => lir_op_mod.LBinOp.bit_xor
+        case .shl => lir_op_mod.LBinOp.shl
+        case .shr => if signed_ { lir_op_mod.LBinOp.ashr } else { lir_op_mod.LBinOp.lshr }
+        case .eq => lir_op_mod.LBinOp.icmp_eq
+        case .ne => lir_op_mod.LBinOp.icmp_ne
+        case .lt => if signed_ { lir_op_mod.LBinOp.icmp_slt } else { lir_op_mod.LBinOp.icmp_ult }
+        case .le => if signed_ { lir_op_mod.LBinOp.icmp_sle } else { lir_op_mod.LBinOp.icmp_ule }
+        case .gt => if signed_ { lir_op_mod.LBinOp.icmp_sgt } else { lir_op_mod.LBinOp.icmp_ugt }
+        case .ge => if signed_ { lir_op_mod.LBinOp.icmp_sge } else { lir_op_mod.LBinOp.icmp_uge }
+        case .add_sat => lir_op_mod.LBinOp.add_sat
+        case .sub_sat => lir_op_mod.LBinOp.sub_sat
+        case .mul_sat => lir_op_mod.LBinOp.mul_sat
+        case .logical_and => lir_op_mod.LBinOp.bit_and
+        case .logical_or => lir_op_mod.LBinOp.bit_or
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+}
+
+function convert_unop(op: hlir_op_mod.HUnOp) -> lir_op_mod.LUnOp {
+    return match op {
+        case .neg => lir_op_mod.LUnOp.neg
+        case .bit_not => lir_op_mod.LUnOp.bit_not
+        case .logical_not => lir_op_mod.LUnOp.logical_not
+    }
+}
+
+function convert_cast_kind(kind: hlir_op_mod.HCastKind) -> lir_op_mod.LCastKind {
+    return match kind {
+        case .integer => lir_op_mod.LCastKind.integer
+        case .integer_wrapping => lir_op_mod.LCastKind.integer_wrapping
+        case .integer_saturating => lir_op_mod.LCastKind.integer_saturating
+        case .integer_checked => lir_op_mod.LCastKind.integer_checked
+        case .float => lir_op_mod.LCastKind.float
+        case .float_to_integer => lir_op_mod.LCastKind.float_to_integer
+        case .integer_to_float => lir_op_mod.LCastKind.integer_to_float
+    }
+}

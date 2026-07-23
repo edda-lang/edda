@@ -1,0 +1,369 @@
+
+module types.check.decl.items.items
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.item as ast_item_mod
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.tree as hir_tree
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.pass.effect as effect_mod
+import types.effect.row as effect_facts_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.env.sig as sig_mod
+import local.check.env.fields as fields_mod
+import local.check.decl.types.typedecl as typedecl_mod
+import local.check.env.lower.ty.ty as ty_lower_mod
+import local.check.effect.effects as effects_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HDeclItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+spec std.collections.vec.Vec(fields_mod.FieldNameMatrix)
+spec std.collections.vec.Vec(fields_mod.FieldRefinementList)
+spec std.core.option.Option(ast_item_mod.Stability)
+
+
+public function process_items(
+    file: hir_file.HirFile,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    fn_signatures: mutable Vec_FnSig.Vec,
+    type_defs: mutable Vec_TyId.Vec,
+    field_tys: mutable Vec_FieldTyList.Vec,
+    variant_names: mutable Vec_VariantNameList.Vec,
+    field_names: mutable Vec_FieldNameMatrix.Vec,
+    field_refinements: mutable Vec_FieldRefinementList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_items(file.items, builtins, interner, mutable ty_interner, mutable effect_interner, mutable fn_signatures, mutable type_defs, mutable field_tys, mutable variant_names, mutable field_names, mutable field_refinements, allocator)?
+}
+
+
+function walk_items(
+    items: Vec_HItem.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    fn_signatures: mutable Vec_FnSig.Vec,
+    type_defs: mutable Vec_TyId.Vec,
+    field_tys: mutable Vec_FieldTyList.Vec,
+    variant_names: mutable Vec_VariantNameList.Vec,
+    field_names: mutable Vec_FieldNameMatrix.Vec,
+    field_refinements: mutable Vec_FieldRefinementList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        process_one_item(item, builtins, interner, mutable ty_interner, mutable effect_interner, mutable fn_signatures, mutable type_defs, mutable field_tys, mutable variant_names, mutable field_names, mutable field_refinements, allocator)?
+        i = i + 1
+    }
+}
+
+function process_one_item(
+    item: hir_item.HItem,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    fn_signatures: mutable Vec_FnSig.Vec,
+    type_defs: mutable Vec_TyId.Vec,
+    field_tys: mutable Vec_FieldTyList.Vec,
+    variant_names: mutable Vec_VariantNameList.Vec,
+    field_names: mutable Vec_FieldNameMatrix.Vec,
+    field_refinements: mutable Vec_FieldRefinementList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(let sig_box, _) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            process_function_signature(sig, item.def_id, builtins, interner, mutable ty_interner, mutable effect_interner, mutable fn_signatures, allocator)?
+        }
+        case .function_extern(let sig_box, _, _, _) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            process_function_signature(sig, item.def_id, builtins, interner, mutable ty_interner, mutable effect_interner, mutable fn_signatures, allocator)?
+        }
+        case .type_decl(let sig_box) => {
+            let sig = Box_HTypeSignature.get(sig_box)
+            typedecl_mod.process_type_decl(sig, item.def_id, builtins, interner, mutable ty_interner, mutable effect_interner, mutable type_defs, mutable field_tys, mutable variant_names, mutable field_names, mutable field_refinements, allocator)?
+        }
+        case .spec_decl(_, let inner_items) => {
+            walk_items(inner_items, builtins, interner, mutable ty_interner, mutable effect_interner, mutable fn_signatures, mutable type_defs, mutable field_tys, mutable variant_names, mutable field_names, mutable field_refinements, allocator)?
+        }
+        case .spec_invocation(_, let args) => {
+            register_spec_arg_nominals(args, mutable ty_interner, mutable type_defs, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+public function register_spec_arg_nominals(
+    args: Vec_HExpr.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    type_defs: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HExpr.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_HExpr.at(args, i).kind {
+            case .use_(let def_id) => register_spec_arg_nominal(def_id, mutable ty_interner, mutable type_defs, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function register_spec_arg_nominal(
+    def_id: def_mod.DefId,
+    ty_interner: mutable ty_interner_mod.Interner,
+    type_defs: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def_id) {
+        return
+    }
+    let idx = def_mod.index(def_id)
+    if idx < Vec_TyId.len(type_defs) {
+        if !ty_mod.is_error(Vec_TyId.at(type_defs, idx)) {
+            return
+        }
+    }
+    let cty = ty_kind_mod.CTy.record(def: def_id)
+    let ty_id = ty_interner_mod.intern(mutable ty_interner, take cty, allocator)?
+    typedecl_mod.write_type_at_def_id(mutable type_defs, def_id, ty_id, allocator)?
+}
+
+
+public function process_function_signature(
+    sig: hir_item.HFnSignature,
+    def_id: def_mod.DefId,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    fn_signatures: mutable Vec_FnSig.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var empty_gs = ty_lower_mod.empty_generic_scope(allocator)?
+    ty_lower_mod.generic_scope_set_params(mutable empty_gs, sig.params)
+    uninit param_tys: Vec_TyId.Vec
+    Vec_TyId.new(init param_tys, allocator)?
+    uninit param_names: Vec_Symbol.Vec
+    Vec_Symbol.new(init param_names, allocator)?
+    let pn = Vec_HParam.len(sig.params)
+    var pi: usize = 0
+    var has_by_ref: bool = false
+    loop decreases (pn - pi) {
+        if pi >= pn { break }
+        let p = Vec_HParam.at(sig.params, pi)
+        let pty = ty_lower_mod.lower_ast_ty(p.ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        Vec_TyId.push(mutable param_tys, pty, allocator)?
+        Vec_Symbol.push(mutable param_names, p.name, allocator)?
+        let p_by_ref = match p.mode {
+            case .mutable_ => true
+            case .init_ => true
+            case _ => false
+        }
+        if p_by_ref {
+            has_by_ref = true
+        }
+        pi = pi + 1
+    }
+    let ret = ty_lower_mod.lower_ast_ty(sig.return_ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+    let lowered = effects_mod.lower_effect_row(sig.effects, sig.params, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+    let refs = clone_refinements(sig.refinements, allocator)?
+    let refs_hir = clone_refinements_hir(sig.refinements_hir, allocator)?
+    let fn_type = intern_fn_type(param_tys, ret, mutable ty_interner, allocator)?
+    let leading_comptime_params = Vec_GenericParam.len(sig.generics)
+    let fn_sig = sig_mod.FnSig {
+        name: sig.name,
+        params: param_tys,
+        param_names: param_names,
+        ret: ret,
+        effects: lowered.row,
+        refinements: refs,
+        refinements_hir: refs_hir,
+        fn_type: fn_type,
+        effect_facts: lowered.facts,
+        stability: classify_stability(sig.stability),
+        has_by_ref_param: has_by_ref,
+        leading_comptime_params: leading_comptime_params,
+    }
+    write_at_def_id(mutable fn_signatures, def_id, take fn_sig, allocator)?
+}
+
+function classify_stability(s: Option_Stability) -> sig_mod.ChkStability {
+    return match s {
+        case .some(let st) => match st {
+            case .stable_(let _since) => sig_mod.ChkStability.stable_
+            case .unstable_           => sig_mod.ChkStability.unstable_
+        }
+        case .none => sig_mod.ChkStability.unconstrained
+    }
+}
+
+function intern_fn_type(
+    param_tys: Vec_TyId.Vec,
+    ret: ty_mod.TyId,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+    requires ty_interner_mod.slot_count(ty_interner) < 4294967296
+{
+    uninit fn_type_params: Vec_TyId.Vec
+    Vec_TyId.new(init fn_type_params, allocator)?
+    let n = Vec_TyId.len(param_tys)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let pt = Vec_TyId.at(param_tys, i)
+        Vec_TyId.push(mutable fn_type_params, pt, allocator)?
+        i = i + 1
+    }
+    return ty_interner_mod.intern(
+        mutable ty_interner,
+        ty_kind_mod.CTy.fn_(params: fn_type_params, ret: ret, effects: effect_mod.empty()),
+        allocator,
+    )?
+}
+
+function clone_refinements(
+    src: Vec_RefinementClause.Vec,
+    allocator: Allocator,
+) -> Vec_RefinementClause.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init out, allocator)?
+    let n = Vec_RefinementClause.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let clause = Vec_RefinementClause.at(src, i)
+        Vec_RefinementClause.push(mutable out, take clause, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function clone_refinements_hir(
+    src: Vec_HExpr.Vec,
+    allocator: Allocator,
+) -> Vec_HExpr.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_HExpr.Vec
+    Vec_HExpr.new(init out, allocator)?
+    let n = Vec_HExpr.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let h = Vec_HExpr.at(src, i)
+        Vec_HExpr.push(mutable out, take h, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function write_at_def_id(
+    fn_signatures: mutable Vec_FnSig.Vec,
+    def_id: def_mod.DefId,
+    sig: take sig_mod.FnSig,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target = def_mod.index(def_id)
+    pad_with_sentinels(mutable fn_signatures, target, allocator)?
+    let current = Vec_FnSig.len(fn_signatures)
+    if current == target {
+        Vec_FnSig.push(mutable fn_signatures, take sig, allocator)?
+    } else {
+        Vec_FnSig.set_at(mutable fn_signatures, target, take sig)
+    }
+}
+
+function pad_with_sentinels(
+    fn_signatures: mutable Vec_FnSig.Vec,
+    target: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        let len = Vec_FnSig.len(fn_signatures)
+        if len >= target { break }
+        let sentinel = sentinel_fn_sig(allocator)?
+        Vec_FnSig.push(mutable fn_signatures, take sentinel, allocator)?
+    }
+}
+
+function sentinel_fn_sig(allocator: Allocator) -> sig_mod.FnSig
+    with {allocator, err: alloc.AllocError}
+{
+    uninit empty_params: Vec_TyId.Vec
+    Vec_TyId.new(init empty_params, allocator)?
+    uninit empty_param_names: Vec_Symbol.Vec
+    Vec_Symbol.new(init empty_param_names, allocator)?
+    uninit empty_refs: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init empty_refs, allocator)?
+    uninit empty_refs_hir: Vec_HExpr.Vec
+    Vec_HExpr.new(init empty_refs_hir, allocator)?
+    return sig_mod.FnSig {
+        name: symbol_mod.empty(),
+        params: empty_params,
+        param_names: empty_param_names,
+        ret: ty_mod.error(),
+        effects: effect_mod.empty(),
+        refinements: empty_refs,
+        refinements_hir: empty_refs_hir,
+        fn_type: ty_mod.error(),
+        effect_facts: effect_facts_mod.pure_facts(),
+        stability: sig_mod.ChkStability.unconstrained,
+        has_by_ref_param: false,
+        leading_comptime_params: 0,
+    }
+}

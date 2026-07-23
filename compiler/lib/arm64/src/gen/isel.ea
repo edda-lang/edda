@@ -1,0 +1,192 @@
+
+module arm64.gen.isel
+
+import std.mem.alloc
+import std.collections.vec
+
+import target.triple as triple_mod
+import target.arch as arch_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.file as lir_file_mod
+import ir.lir.error as lir_error_mod
+
+import local.abi.abi as abi_mod
+import local.gen.emit as emit_mod
+import ir.emitted as emit_types_mod
+
+import regalloc.scan.scan as regalloc_scan_mod
+import regalloc.live.bank as regalloc_bank_mod
+
+import object.coff as coff_mod
+import object.coff.wrap.wrap as coff_wrap_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(lir_body_mod.LirBody)
+spec std.collections.vec.Vec(emit_types_mod.EmittedBody)
+
+
+public function select_body(
+    out: init Vec_u8.Vec,
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    abi_mod.lower_abi(mutable body, target, allocator)?
+    run_regalloc(mutable body, target, allocator)?
+
+    uninit code: Vec_u8.Vec
+    emit_mod.emit_body(init code, body, allocator)?
+    out = code
+}
+
+
+public function select_body_full(
+    out: init emit_types_mod.EmittedFn,
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    abi_mod.lower_abi(mutable body, target, allocator)?
+    run_regalloc(mutable body, target, allocator)?
+
+    uninit emitted: emit_types_mod.EmittedFn
+    emit_mod.emit_body_full(init emitted, body, allocator)?
+    out = emitted
+}
+
+
+function run_regalloc(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit bank: regalloc_bank_mod.RegBank
+    regalloc_bank_mod.arm64_bank(init bank, target, allocator)?
+    regalloc_scan_mod.run(mutable body, bank, target, allocator)?
+}
+
+
+public function select_to_coff(
+    out: init coff_mod.CoffFile,
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    symbol_name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, err: coff_wrap_mod.WrapError, panic}
+{
+    let machine = coff_machine_for(triple_mod.arch(target))
+
+    uninit code: Vec_u8.Vec
+    select_body(init code, mutable body, target, allocator)?
+
+    uninit obj: coff_mod.CoffFile
+    coff_wrap_mod.wrap_function_obj(init obj, machine, take code, symbol_name, allocator)?
+    out = obj
+}
+
+
+public function select_file(
+    out: init Vec_u8.Vec,
+    file: lir_file_mod.LirFile,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    uninit code: Vec_u8.Vec
+    Vec_u8.new(init code, allocator)?
+    select_all_bodies(mutable code, file, target, allocator)?
+    out = code
+}
+
+
+public function select_file_full(
+    out: init Vec_EmittedBody.Vec,
+    file: lir_file_mod.LirFile,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    uninit bodies: Vec_EmittedBody.Vec
+    Vec_EmittedBody.new(init bodies, allocator)?
+    let n = Vec_LirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        var body = Vec_LirBody.at(file.bodies, i)
+        let def_id = body.def_id
+        uninit emitted: emit_types_mod.EmittedFn
+        select_body_full(init emitted, mutable body, target, allocator)?
+        Vec_EmittedBody.push(
+            mutable bodies,
+            take emit_types_mod.EmittedBody {
+                def_id: def_id,
+                code: emitted.code,
+                relocations: emitted.relocations,
+                lines: emitted.lines,
+                debug_locals: emitted.debug_locals,
+                debug_slots: emitted.debug_slots,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+    out = bodies
+}
+
+
+function select_all_bodies(
+    out: mutable Vec_u8.Vec,
+    file: lir_file_mod.LirFile,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let n = Vec_LirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        var body = Vec_LirBody.at(file.bodies, i)
+        uninit code: Vec_u8.Vec
+        select_body(init code, mutable body, target, allocator)?
+        append_bytes(mutable out, code, allocator)?
+        i += 1
+    }
+}
+
+
+function append_bytes(
+    out: mutable Vec_u8.Vec,
+    src: Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_u8.len(src)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u8.push(mutable out, Vec_u8.at(src, i), allocator)?
+        i += 1
+    }
+}
+
+
+function coff_machine_for(a: arch_mod.Arch) -> coff_mod.CoffMachine {
+    return match a {
+        case .x86_64  => coff_mod.CoffMachine.amd64
+        case .aarch64 => coff_mod.CoffMachine.arm64
+        case _        => coff_mod.CoffMachine.unknown
+    }
+}

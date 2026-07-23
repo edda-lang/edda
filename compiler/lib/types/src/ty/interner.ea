@@ -1,0 +1,246 @@
+
+module types.ty.interner
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import target.capability as cap_mod
+
+
+spec std.collections.vec.Vec(ty_kind_mod.CTy)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(String)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(usize)
+
+
+public linear type Interner {
+    slots: Vec_CTy.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+    type_names: Vec_String.Vec
+}
+
+
+function mix(acc: u64, value: u64) -> u64 {
+    return (acc ^ value) *% (1099511628211 as u64)
+}
+
+
+function prim_tag(p: ty_kind_mod.PrimKind) -> u64 {
+    return match p {
+        case .i8_ => 1 as u64
+        case .i16_ => 2 as u64
+        case .i32_ => 3 as u64
+        case .i64_ => 4 as u64
+        case .i128_ => 5 as u64
+        case .u8_ => 6 as u64
+        case .u16_ => 7 as u64
+        case .u32_ => 8 as u64
+        case .u64_ => 9 as u64
+        case .u128_ => 10 as u64
+        case .isize_ => 11 as u64
+        case .usize_ => 12 as u64
+        case .f32_ => 13 as u64
+        case .f64_ => 14 as u64
+        case .bool_ => 15 as u64
+        case .unit_ => 16 as u64
+        case .never_ => 17 as u64
+        case .codepoint_ => 18 as u64
+        case .type_meta => 19 as u64
+        case .heap_ptr => 20 as u64
+    }
+}
+
+
+function cap_tag(c: cap_mod.Capability) -> u64 {
+    return match c {
+        case .filesystem => 1 as u64
+        case .read_only_filesystem => 2 as u64
+        case .sandboxed_filesystem => 3 as u64
+        case .network => 4 as u64
+        case .localhost_network => 5 as u64
+        case .restricted_network => 6 as u64
+        case .clock => 7 as u64
+        case .monotonic_clock => 8 as u64
+        case .random => 9 as u64
+        case .deterministic_random => 10 as u64
+        case .allocator => 11 as u64
+        case .bounded_allocator => 12 as u64
+        case .executor => 13 as u64
+        case .stdin => 14 as u64
+        case .stdout => 15 as u64
+        case .stderr => 16 as u64
+        case .subprocess => 17 as u64
+        case .dom => 18 as u64
+        case .window => 19 as u64
+        case .extension_content => 20 as u64
+        case .extension_worker => 21 as u64
+        case .debugger => 22 as u64
+    }
+}
+
+
+function tyid_vec_hash(acc: u64, v: Vec_TyId.Vec) -> u64 {
+    let n = Vec_TyId.len(v)
+    var h = mix(acc, n as u64)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        h = mix(h, Vec_TyId.at(v, i).raw as u64)
+        i = i + 1
+    }
+    return h
+}
+
+
+function cty_hash(t: ty_kind_mod.CTy) -> u64 {
+    return match t {
+        case .primitive(let p) => mix(101 as u64, prim_tag(p))
+        case .string_ => 102 as u64
+        case .slice(let elem) => mix(103 as u64, elem.raw as u64)
+        case .array(let elem, let len) => mix(mix(104 as u64, elem.raw as u64), len)
+        case .tuple_(let elems) => tyid_vec_hash(105 as u64, elems)
+        case .record(let def) => mix(106 as u64, def.raw as u64)
+        case .sum_(let def) => mix(107 as u64, def.raw as u64)
+        case .fn_(let params, let ret, let effects) =>
+            mix(mix(tyid_vec_hash(108 as u64, params), ret.raw as u64), effects.raw as u64)
+        case .spec_instance(let def, let args) =>
+            tyid_vec_hash(mix(109 as u64, def.raw as u64), args)
+        case .refined(let base, _) => mix(110 as u64, base.raw as u64)
+        case .capability(let cap) => mix(111 as u64, cap_tag(cap))
+        case .opaque(let def) => mix(113 as u64, def.raw as u64)
+        case .error_ => 112 as u64
+    }
+}
+
+
+public function new_interner(out: init Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit slots: Vec_CTy.Vec
+    Vec_CTy.new(init slots, allocator)?
+    uninit nexts: Vec_usize.Vec
+    Vec_usize.new(init nexts, allocator)?
+    uninit type_names: Vec_String.Vec
+    Vec_String.new(init type_names, allocator)?
+    let head = IntMap_usize.new(allocator)?
+    out = Interner { slots: slots, head: head, nexts: nexts, type_names: type_names }
+    let _ = register_slot(mutable out, take ty_kind_mod.CTy.error_, allocator)?
+}
+
+
+function register_slot(
+    it: mutable Interner,
+    t: take ty_kind_mod.CTy,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let bucket = cty_hash(t) as i64 wrapping
+    let new_index = Vec_CTy.len(it.slots)
+    let prev = match IntMap_usize.get(it.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable it.nexts, prev, allocator)?
+    Vec_CTy.push(mutable it.slots, take t, allocator)?
+    Vec_String.push(mutable it.type_names, "", allocator)?
+    let _ = IntMap_usize.insert(mutable it.head, bucket, new_index + 1 as usize, allocator)?
+    return new_index as u32
+}
+
+
+public function slot_count(it: Interner) -> usize {
+    return Vec_CTy.len(it.slots)
+}
+
+public function intern(
+    it: mutable Interner,
+    t: take ty_kind_mod.CTy,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) < 4294967296
+{
+    let bucket = cty_hash(t) as i64 wrapping
+    let start = match IntMap_usize.get(it.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    let fuel = Vec_CTy.len(it.slots) + 1 as usize
+    let found = find_in_chain(it, t, start, fuel)
+    match found {
+        case .some(let idx) => return ty_mod.TyId { raw: idx as u32 }
+        case .none => ()
+    }
+    let new_raw = register_slot(mutable it, take t, allocator)?
+    return ty_mod.TyId { raw: new_raw }
+}
+
+function find_in_chain(
+    it: Interner,
+    t: ty_kind_mod.CTy,
+    slot_one_based: usize,
+    fuel: usize,
+) -> Option_usize.Option
+    decreases fuel
+{
+    if fuel == 0 { return Option_usize.none }
+    if slot_one_based == 0 { return Option_usize.none }
+    let idx = slot_one_based - 1
+    if idx >= Vec_CTy.len(it.slots) { return Option_usize.none }
+    if Vec_CTy.at(it.slots, idx) == t {
+        return Option_usize.some(value: idx)
+    }
+    if idx >= Vec_usize.len(it.nexts) { return Option_usize.none }
+    let nxt = Vec_usize.at(it.nexts, idx)
+    return find_in_chain(it, t, nxt, fuel - 1)
+}
+
+public function lookup(
+    it: Interner,
+    id: ty_mod.TyId where (id.raw as usize) < slot_count(it),
+) -> ty_kind_mod.CTy {
+    return Vec_CTy.at(it.slots, id.raw as usize)
+}
+
+
+public function is_opaque(it: Interner, id: ty_mod.TyId) -> bool {
+    if ty_mod.is_error(id) {
+        return false
+    }
+    if (id.raw as usize) >= slot_count(it) {
+        return false
+    }
+    return ty_kind_mod.is_opaque(lookup(it, id))
+}
+
+
+public function set_type_name(it: mutable Interner, id: ty_mod.TyId, name: take String) -> () {
+    if ty_mod.is_error(id) {
+        return
+    }
+    if (id.raw as usize) >= slot_count(it) {
+        return
+    }
+    Vec_String.set_at(mutable it.type_names, id.raw as usize, take name)
+}
+
+
+public function type_name_of(it: Interner, id: ty_mod.TyId) -> String {
+    if ty_mod.is_error(id) {
+        return ""
+    }
+    if (id.raw as usize) >= slot_count(it) {
+        return ""
+    }
+    return Vec_String.at(it.type_names, id.raw as usize)
+}
+
+
+public function dispose(it: take Interner) -> () { }

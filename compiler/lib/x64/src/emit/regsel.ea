@@ -1,0 +1,168 @@
+
+module x64.emit.regsel
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.emit.types as etypes_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+
+
+public function vreg_at(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> lir_reg_mod.LirVReg
+    with {err: lir_error_mod.LirError}
+{
+    let idx = vreg_id.raw as usize
+    if idx == 0 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: op references sentinel vreg id 0",
+        )
+    }
+    if idx >= Vec_LirVReg.len(body.vregs) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: vreg id out of range",
+        )
+    }
+    return Vec_LirVReg.at(body.vregs, idx)
+}
+
+public function vreg_is_fp(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> bool
+    with {err: lir_error_mod.LirError}
+{
+    let vreg = vreg_at(body, vreg_id)?
+    return match vreg.class_ {
+        case .fp => true
+        case _ => false
+    }
+}
+
+public function vreg_gp(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> regs_mod.Gp64Reg
+    with {err: lir_error_mod.LirError}
+{
+    let vreg = vreg_at(body, vreg_id)?
+    return match vreg.pin {
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: general-purpose vreg is unpinned — register allocation did not run",
+        )
+        case .some(let p) => preg_gp(p)?
+    }
+}
+
+public function vreg_xmm(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> regs_mod.XmmReg
+    with {err: lir_error_mod.LirError}
+{
+    let vreg = vreg_at(body, vreg_id)?
+    return match vreg.pin {
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: floating-point vreg is unpinned — register allocation did not run",
+        )
+        case .some(let p) => preg_xmm(p)?
+    }
+}
+
+public function preg_gp(p: lir_reg_mod.PReg) -> regs_mod.Gp64Reg
+    with {err: lir_error_mod.LirError}
+{
+    return match regs_mod.gp64_of_preg(p) {
+        case .some(let r) => r
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: physical register is outside the GP64 register window",
+        )
+    }
+}
+
+public function preg_xmm(p: lir_reg_mod.PReg) -> regs_mod.XmmReg
+    with {err: lir_error_mod.LirError}
+{
+    return match regs_mod.xmm_of_preg(p) {
+        case .some(let r) => r
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: physical register is outside the XMM register window",
+        )
+    }
+}
+
+public function resolve_gp_operand(
+    body: lir_body_mod.LirBody,
+    operand: lir_reg_mod.Operand,
+) -> etypes_mod.GpOperand
+    with {err: lir_error_mod.LirError}
+{
+    return match operand {
+        case .vreg(let id) => etypes_mod.GpOperand.reg(r: vreg_gp(body, id)?)
+        case .preg(let p) => etypes_mod.GpOperand.reg(r: preg_gp(p)?)
+        case .imm(let value) => imm_operand(value)?
+    }
+}
+
+public function imm_operand(value: i64) -> etypes_mod.GpOperand
+    with {err: lir_error_mod.LirError}
+{
+    let i32_min: i64 = -2147483648 as i64
+    let i32_max: i64 = 2147483647 as i64
+    if value >= i32_min && value <= i32_max {
+        return etypes_mod.GpOperand.imm32(v: value as i32)
+    }
+    raise lir_error_mod.LirError.internal_lowering_invariant(
+        at: span_mod.dummy(),
+        message: "x64.gen.emit: 64-bit immediate operand must be materialized into a register by isel",
+    )
+}
+
+public function operand_xmm(
+    body: lir_body_mod.LirBody,
+    operand: lir_reg_mod.Operand,
+) -> regs_mod.XmmReg
+    with {err: lir_error_mod.LirError}
+{
+    return match operand {
+        case .vreg(let id) => vreg_xmm(body, id)?
+        case .preg(let p) => preg_xmm(p)?
+        case .imm(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: floating-point operand cannot be an immediate",
+        )
+    }
+}
+
+public function mov_if_diff(
+    code: mutable Vec_u8.Vec,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if regs_mod.gp64_reg_num(dst) != regs_mod.gp64_reg_num(src) {
+        alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, dst, src, allocator)?
+    }
+}

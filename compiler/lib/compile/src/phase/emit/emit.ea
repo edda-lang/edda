@@ -1,0 +1,197 @@
+
+module compile.phase.emit.emit
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.os.fs
+import std.text.string
+
+import target.triple as triple_mod
+import cache.addr.hash as hash_mod
+import intern.interner as interner_mod
+import types.ty.interner as ty_interner_mod
+import source.map as source_map_mod
+import mir.file.store as mir_file_mod
+import object.coff.codeview.typetable.table as debug_table_mod
+import object.coff as coff_mod
+import object.lib as object_mod
+import link.emit.image.output as output_mod
+import span.loc.pos.span as span_mod
+
+import diagnostics.emit.collection as diags_mod
+
+import local.phase.emit.link.link as link_phase_mod
+import local.phase.emit.library.library as library_mod
+import local.phase.emit.symbols.symbols as symbols_mod
+import local.phase.emit.symbols.surface as surface_mod
+import local.phase.emit.write.write as write_mod
+import local.phase.emit.wasm.wasm as wasm_phase_mod
+import local.trace.trace as trace_mod
+import link.coff.read as coff_read_mod
+import link.coff.cursor as link_cursor_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.hashmap.IntMap(String)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(hash_mod.ArtifactHash)
+spec std.core.option.Option(library_mod.LinkRequest)
+
+
+public function emit_and_link(
+    optimized: take Vec_MirFile.Vec,
+    target: triple_mod.TargetTriple,
+    workspace_root: String,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_table_mod.DebugTypeTable,
+    source_map: source_map_mod.SourceMap,
+    object_index: StringMap_ArtifactHash.StringMap,
+    program_name: String,
+    has_entry: bool,
+    kind: output_mod.OutputKind,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_LinkRequest.Option
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    match triple_mod.arch(target) {
+        case .wasm32 => {
+            wasm_phase_mod.emit_wasm(optimized, target, workspace_root, wfs, interner, ty_interner, source_map, mutable diags, allocator)?
+            return Option_LinkRequest.none
+        }
+        case .wasm64 => {
+            wasm_phase_mod.emit_wasm(optimized, target, workspace_root, wfs, interner, ty_interner, source_map, mutable diags, allocator)?
+            return Option_LinkRequest.none
+        }
+        case _ => ()
+    }
+
+    let is_library = match kind {
+        case .dynamic_library => true
+        case .static_library  => true
+        case .executable      => false
+    }
+
+    let triple_str = triple_mod.to_string(target, allocator)?
+    let outdir = link_phase_mod.output_dir(workspace_root, triple_str, allocator)?
+    fs.create_dir_all(wfs, outdir)?
+
+    let s_syms = trace_mod.phase_begin(trace, clock, errout, "emit-syms", allocator)?
+    let rt_provided = link_phase_mod.runtime_defined_symbols(rfs, allocator)?
+    let syms = symbols_mod.build_global_symbols(optimized, rt_provided, interner, mutable diags, allocator)?
+    let declared_externs = surface_mod.collect_declared_extern_names(optimized, interner, allocator)?
+    let declared_extern_dlls = surface_mod.collect_declared_extern_dlls(optimized, interner, allocator)?
+    let export_names = collect_exports(optimized, interner, allocator)?
+    trace_mod.phase_end(s_syms, clock, errout, allocator)?
+
+    uninit paths: Vec_String.Vec
+    Vec_String.new(init paths, allocator)?
+    let s_objs = trace_mod.phase_begin(trace, clock, errout, "emit-objs", allocator)?
+    write_mod.emit_objects(take optimized, target, outdir, syms, wfs, rfs, workspace_root, object_index, interner, ty_interner, debug_table, source_map, clock, errout, trace, mutable diags, mutable paths, allocator)?
+    trace_mod.phase_end_n(s_objs, clock, errout, Vec_String.len(paths), "objects", allocator)?
+
+    if is_library {
+        if Vec_String.len(paths) == 0 as usize { return Option_LinkRequest.none }
+        let is_dynamic = match kind {
+            case .dynamic_library => true
+            case _                => false
+        }
+        if is_dynamic {
+            let rt_path = link_phase_mod.runtime_lib_path(allocator)?
+            Vec_String.push(mutable paths, take rt_path, allocator)?
+        }
+        let outpath = library_mod.output_lib_path(outdir, target, program_name, kind, allocator)?
+        let req = library_mod.new_request(kind, take outpath, take paths, take export_names, target)
+        return Option_LinkRequest.some(value: req)
+    }
+
+    if !has_entry { return Option_LinkRequest.none }
+    match object_mod.format_for_triple(target) {
+        case .coff => {
+            let coffs = read_coff_objects(paths, rfs, mutable diags, allocator)?
+            if Vec_CoffFile.len(coffs) == 0 as usize { return Option_LinkRequest.none }
+            let bindir = link_phase_mod.bin_dir(workspace_root, triple_str, allocator)?
+            fs.create_dir_all(wfs, bindir)?
+            let outpath = link_phase_mod.output_exe_path(bindir, target, program_name, allocator)?
+            let s_link = trace_mod.phase_begin(trace, clock, errout, "emit-link", allocator)?
+            link_phase_mod.link_image_to_file(coffs, outpath, declared_externs, declared_extern_dlls, rfs, wfs, mutable diags, allocator)?
+            trace_mod.phase_end(s_link, clock, errout, allocator)?
+        }
+        case _ => link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), "link (no internal linker for this target's object format yet — only COFF/Windows is supported; objects were emitted but no executable image was linked)", allocator)?
+    }
+    return Option_LinkRequest.none
+}
+
+
+function collect_exports(
+    files: Vec_MirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit extern_defs: Vec_u32.Vec
+    Vec_u32.new(init extern_defs, allocator)?
+    uninit extern_names: Vec_String.Vec
+    Vec_String.new(init extern_names, allocator)?
+    uninit abi_defs: Vec_u32.Vec
+    Vec_u32.new(init abi_defs, allocator)?
+    uninit abi_names: Vec_String.Vec
+    Vec_String.new(init abi_names, allocator)?
+    let n = Vec_MirFile.len(files)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let mf = Vec_MirFile.at(files, i)
+        surface_mod.collect_export_surface(mf, mutable extern_defs, mutable extern_names, mutable abi_defs, mutable abi_names, interner, allocator)?
+        i += 1
+    }
+    return abi_names
+}
+
+
+function read_coff_objects(
+    paths: Vec_String.Vec,
+    rfs: ReadOnlyFilesystem,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_CoffFile.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit out: Vec_CoffFile.Vec
+    Vec_CoffFile.new(init out, allocator)?
+    let n = Vec_String.len(paths)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let path = Vec_String.at(paths, i)
+        let buf = fs.read_bytes(rfs, path, allocator)?
+        uninit raw: Vec_u8.Vec
+        Vec_u8.new(init raw, allocator)?
+        Vec_u8.extend_from_slice(mutable raw, buf, allocator)?
+        handle err: link_cursor_mod.ReadError as _e -> link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), unreadable_object_msg(path, allocator)?, allocator)? {
+            Vec_CoffFile.push(mutable out, coff_read_mod.parse_file(raw, allocator)?, allocator)?
+        }
+        i += 1
+    }
+    return out
+}
+
+
+function unreadable_object_msg(path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("link: unreadable object file ", path, allocator)?
+}

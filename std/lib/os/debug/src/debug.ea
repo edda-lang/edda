@@ -1,0 +1,205 @@
+
+module std.os.debug
+
+import std.os.raw
+import std.os.pages
+import local.win
+
+public linear type Tracee {
+    pid: i32
+    process_id: u32
+    thread_id: u32
+    proc_handle: u64
+    thread_handle: u64
+}
+
+public type StopEvent {
+    case stopped(signal: i32)
+    case exited(code: i32)
+    case terminated(signal: i32)
+}
+
+public type DebugError {
+    case attach_failed(reason: String)
+    case detach_failed(reason: String)
+    case not_stopped(reason: String)
+    case io_failure(reason: String)
+    case scratch_unavailable
+}
+
+function scratch() -> u64
+    with {err: debug.DebugError}
+{
+    return handle err: pages.PageError as _e -> (raise debug.DebugError.scratch_unavailable) {
+        pages.map(4096)?
+    }
+}
+
+function release(addr: u64) -> () {
+    if addr == 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(addr, 4096)?
+    }
+}
+
+function decode_status(status: u32) -> StopEvent {
+    let low: u32 = status & 0x7F
+    if (status & 0xFF) == 0x7F {
+        return debug.StopEvent.stopped(signal: ((status >> 8) & 0xFF) as i32 wrapping)
+    }
+    if low == 0 {
+        return debug.StopEvent.exited(code: ((status >> 8) & 0xFF) as i32 wrapping)
+    }
+    return debug.StopEvent.terminated(signal: low as i32 wrapping)
+}
+
+function wait_linux(pid: i32) -> StopEvent
+    with {err: debug.DebugError}
+{
+    let pg: u64 = scratch()?
+    let r: i64 = raw.syscall6(61, pid as u64, pg, 0, 0, 0, 0)
+    if r < 0 {
+        release(pg)
+        raise debug.DebugError.io_failure(reason: "waitpid failed")
+    }
+    let status: u32 = raw.load_u32(pg)
+    release(pg)
+    return decode_status(status)
+}
+
+function refresh_thread(t: mutable Tracee, tid: u32) -> () {
+    comptime if target_has("windows") {
+        if t.thread_handle != 0 { let _ = win.close_handle(t.thread_handle) }
+        t.thread_handle = win.open_thread(0x1FFFFF as u32, 0, tid)
+        t.thread_id = tid
+    } else {
+        let _ = tid
+    }
+}
+
+function pump_windows(t: mutable Tracee, evt: u64) -> StopEvent
+    with {err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        var fuel: u64 = 4096
+        loop
+            decreases fuel
+        {
+            if fuel == 0 { raise debug.DebugError.io_failure(reason: "debug-event pump exhausted") }
+            fuel = fuel - 1
+            if win.wait_for_debug_event(evt, 0xFFFFFFFF as u32) == 0 {
+                raise debug.DebugError.io_failure(reason: "WaitForDebugEvent failed")
+            }
+            let code: u32 = raw.load_u32(evt)
+            let pid: u32 = raw.load_u32(evt +% 4)
+            let tid: u32 = raw.load_u32(evt +% 8)
+            t.process_id = pid
+            if code == 5 {
+                let ec: u32 = raw.load_u32(evt +% 0x10)
+                return debug.StopEvent.exited(code: ec as i32 wrapping)
+            }
+            if code == 1 {
+                refresh_thread(mutable t, tid)
+                return debug.StopEvent.stopped(signal: 5)
+            }
+            if code == 3 {
+                t.proc_handle = raw.load_u64(evt +% 0x18)
+                t.thread_handle = raw.load_u64(evt +% 0x20)
+                t.thread_id = tid
+            }
+            let _ = win.continue_debug_event(pid, tid, 0x00010002 as u32)
+        }
+    } else {
+        return debug.StopEvent.stopped(signal: 0)
+    }
+}
+
+public function attach(d: Debugger, pid: i32) -> Tracee
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        let pidu: u32 = pid as u32 wrapping
+        if win.debug_active_process(pidu) == 0 {
+            raise debug.DebugError.attach_failed(reason: "DebugActiveProcess failed")
+        }
+        let evt: u64 = scratch()?
+        var t: Tracee = Tracee { pid: pid, process_id: pidu, thread_id: 0, proc_handle: 0, thread_handle: 0 }
+        let _ev: debug.StopEvent = pump_windows(mutable t, evt)?
+        release(evt)
+        return t
+    } else {
+        let r: i64 = raw.syscall6(101, 16, pid as u64, 0, 0, 0, 0)
+        if r < 0 { raise debug.DebugError.attach_failed(reason: "PTRACE_ATTACH failed") }
+        let _ev: debug.StopEvent = wait_linux(pid)?
+        return Tracee { pid: pid, process_id: 0, thread_id: 0, proc_handle: 0, thread_handle: 0 }
+    }
+}
+
+public function detach(d: Debugger, t: take Tracee) -> ()
+    with {d}
+{
+    comptime if target_has("windows") {
+        if t.thread_handle != 0 { let _ = win.close_handle(t.thread_handle) }
+        let _ = win.debug_active_process_stop(t.process_id)
+    } else {
+        let _ = raw.syscall6(101, 17, t.pid as u64, 0, 0, 0, 0)
+    }
+}
+
+public function wait_stop(d: Debugger, t: mutable Tracee) -> StopEvent
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        let evt: u64 = scratch()?
+        let ev: debug.StopEvent = pump_windows(mutable t, evt)?
+        release(evt)
+        return ev
+    } else {
+        return wait_linux(t.pid)?
+    }
+}
+
+function set_trap_flag(t: Tracee) -> ()
+    with {err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        let ctx: u64 = scratch()?
+        raw.store_u32(ctx +% 0x30, 0x100007 as u32)
+        if win.get_thread_context(t.thread_handle, ctx) == 0 {
+            release(ctx)
+            raise debug.DebugError.io_failure(reason: "GetThreadContext failed")
+        }
+        let flags: u32 = raw.load_u32(ctx +% 0x44) | 0x100
+        raw.store_u32(ctx +% 0x44, flags)
+        if win.set_thread_context(t.thread_handle, ctx) == 0 {
+            release(ctx)
+            raise debug.DebugError.io_failure(reason: "SetThreadContext failed")
+        }
+        release(ctx)
+    } else {
+        let _ = t
+    }
+}
+
+public function cont(d: Debugger, t: Tracee) -> ()
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        let _ = win.continue_debug_event(t.process_id, t.thread_id, 0x00010002 as u32)
+    } else {
+        let r: i64 = raw.syscall6(101, 7, t.pid as u64, 0, 0, 0, 0)
+        if r < 0 { raise debug.DebugError.io_failure(reason: "PTRACE_CONT failed") }
+    }
+}
+
+public function single_step(d: Debugger, t: Tracee) -> ()
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        set_trap_flag(t)?
+        let _ = win.continue_debug_event(t.process_id, t.thread_id, 0x00010002 as u32)
+    } else {
+        let r: i64 = raw.syscall6(101, 9, t.pid as u64, 0, 0, 0, 0)
+        if r < 0 { raise debug.DebugError.io_failure(reason: "PTRACE_SINGLESTEP failed") }
+    }
+}

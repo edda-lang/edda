@@ -1,0 +1,221 @@
+
+module std.os.process.spawn.envblock
+
+import std.mem.alloc
+import std.os.raw
+import local.child.child
+
+function multi_byte_to_wide_char(
+    code_page: u64,
+    flags: u64,
+    multi_str: u64,
+    multi_len: i32,
+    wide_str: u64,
+    wide_len_: i32,
+) -> i32
+    extern "MultiByteToWideChar" from "kernel32.dll"
+
+function wide_char_to_multi_byte(
+    code_page: u64,
+    flags: u64,
+    wide_str: u64,
+    wide_len_: i32,
+    multi_str: u64,
+    multi_len: i32,
+    default_char: u64,
+    used_default: u64,
+) -> i32
+    extern "WideCharToMultiByte" from "kernel32.dll"
+
+function get_environment_strings_w() -> u64
+    extern "GetEnvironmentStringsW" from "kernel32.dll"
+
+function free_environment_strings_w(block: u64) -> i32
+    extern "FreeEnvironmentStringsW" from "kernel32.dll"
+
+function env_utf8_to_wide(src: u64, src_len: i32, allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let wlen: i32 = multi_byte_to_wide_char(65001, 0, src, src_len, 0, 0)
+    if wlen <= 0 {
+        let empty: [u8] = allocator.alloc_array(u8, 2)?
+        raw.store_u16(raw.slice_addr(empty), 0)
+        return raw.slice_addr(empty)
+    }
+    let wbuf: [u8] = allocator.alloc_array(u8, (wlen as usize) * 2)?
+    let dst: u64 = raw.slice_addr(wbuf)
+    let _ = multi_byte_to_wide_char(65001, 0, src, src_len, dst, wlen)
+    return dst
+}
+
+function env_block_wide_chars(block: u64) -> usize {
+    if block == 0 { return 0 }
+    var i: usize = 0
+    var fuel: u64 = 2097152
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if raw.load_u16(block +% ((i as u64) *% 2)) == 0 {
+            if raw.load_u16(block +% (((i + 1) as u64) *% 2)) == 0 { break }
+        }
+        i = i + 1
+    }
+    return i + 1
+}
+
+function keep_parent_entry(pbuf: [u8], start: usize, end: usize, pairs: [child.EnvPair]) -> bool {
+    var eq: usize = start
+    var found: bool = false
+    var j: usize = start + 1
+    loop decreases end - j {
+        if j >= end { break }
+        if !found && pbuf[j] == 0x3D {
+            eq = j
+            found = true
+        }
+        j = j + 1
+    }
+    if !found { return true }
+    return !child.env_key_matches(pbuf[start..<eq], pairs, true)
+}
+
+public function build_env_block_windows(pairs: [child.EnvPair], allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = pairs.len()
+    var total: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        total = total + pairs[i].key.bytes().len() + 1 + pairs[i].value.bytes().len() + 1
+        i = i + 1
+    }
+    let buf: [u8] = allocator.alloc_array(u8, total + 1)?
+    var w: usize = 0
+    var j: usize = 0
+    loop
+        decreases n - j
+    {
+        if j >= n { break }
+        let kb: [u8] = pairs[j].key.bytes()
+        var k: usize = 0
+        loop
+            decreases kb.len() - k
+        {
+            if k >= kb.len() { break }
+            buf[w] = kb[k]
+            w = w + 1
+            k = k + 1
+        }
+        buf[w] = 0x3D
+        w = w + 1
+        let vb: [u8] = pairs[j].value.bytes()
+        var m: usize = 0
+        loop
+            decreases vb.len() - m
+        {
+            if m >= vb.len() { break }
+            buf[w] = vb[m]
+            w = w + 1
+            m = m + 1
+        }
+        buf[w] = 0
+        w = w + 1
+        j = j + 1
+    }
+    buf[w] = 0
+    return env_utf8_to_wide(raw.slice_addr(buf), (total + 1) as i32, allocator)?
+}
+
+public function build_env_block_merged_windows(pairs: [child.EnvPair], allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let wblock: u64 = get_environment_strings_w()
+    let wchars: usize = env_block_wide_chars(wblock)
+    if wchars == 0 { return build_env_block_windows(pairs, allocator)? }
+    let mblen: i32 = wide_char_to_multi_byte(65001, 0, wblock, wchars as i32 wrapping, 0, 0, 0, 0)
+    if mblen <= 0 {
+        let _ = free_environment_strings_w(wblock)
+        return build_env_block_windows(pairs, allocator)?
+    }
+    let pbuf: [u8] = allocator.alloc_array(u8, mblen as usize)?
+    let _ = wide_char_to_multi_byte(65001, 0, wblock, wchars as i32 wrapping, raw.slice_addr(pbuf), mblen, 0, 0)
+    let _ = free_environment_strings_w(wblock)
+    let used: usize = mblen as usize
+
+    var kept_total: usize = 0
+    var i: usize = 0
+    var start: usize = 0
+    loop decreases used - i {
+        if i >= used { break }
+        if pbuf[i] == 0 {
+            if i > start && keep_parent_entry(pbuf, start, i, pairs) {
+                kept_total = kept_total + (i - start) + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+
+    var pair_total: usize = 0
+    var t: usize = 0
+    loop decreases pairs.len() - t {
+        if t >= pairs.len() { break }
+        pair_total = pair_total + pairs[t].key.bytes().len() + 1 + pairs[t].value.bytes().len() + 1
+        t = t + 1
+    }
+
+    let total: usize = kept_total + pair_total
+    let mbuf: [u8] = allocator.alloc_array(u8, total + 1)?
+    var w: usize = 0
+    i = 0
+    start = 0
+    loop decreases used - i {
+        if i >= used { break }
+        if pbuf[i] == 0 {
+            if i > start && keep_parent_entry(pbuf, start, i, pairs) {
+                var c: usize = start
+                loop decreases i - c {
+                    if c >= i { break }
+                    mbuf[w] = pbuf[c]
+                    w = w + 1
+                    c = c + 1
+                }
+                mbuf[w] = 0
+                w = w + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+
+    var j: usize = 0
+    loop decreases pairs.len() - j {
+        if j >= pairs.len() { break }
+        let kb: [u8] = pairs[j].key.bytes()
+        var k: usize = 0
+        loop decreases kb.len() - k {
+            if k >= kb.len() { break }
+            mbuf[w] = kb[k]
+            w = w + 1
+            k = k + 1
+        }
+        mbuf[w] = 0x3D
+        w = w + 1
+        let vb: [u8] = pairs[j].value.bytes()
+        var m: usize = 0
+        loop decreases vb.len() - m {
+            if m >= vb.len() { break }
+            mbuf[w] = vb[m]
+            w = w + 1
+            m = m + 1
+        }
+        mbuf[w] = 0
+        w = w + 1
+        j = j + 1
+    }
+    mbuf[w] = 0
+    return env_utf8_to_wide(raw.slice_addr(mbuf), (total + 1) as i32, allocator)?
+}

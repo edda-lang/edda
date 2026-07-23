@@ -1,0 +1,88 @@
+
+module hir.error
+
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+
+derive eq, hash, clone, debug for DesugarKind
+derive eq, clone, debug for HirError
+
+
+public type DesugarKind {
+    case method_call
+    case f_string
+    case try_
+    case for_
+    case await_
+}
+
+public type HirError {
+    case effect_row_in_expr(at: span_mod.Span)
+
+    case desugar_not_implemented(at: span_mod.Span, kind: DesugarKind)
+}
+
+
+public function to_diagnostic(e: HirError, allocator: Allocator) -> diag_mod.Diagnostic
+    with {allocator, err: alloc.AllocError}
+{
+    let at = span_of(e)
+    let msg = format_message(e, allocator)?
+    return diag_mod.error_at(code_mod.hir_error(), at, msg)
+}
+
+
+public stable function span_of(e: HirError) -> span_mod.Span {
+    return match e {
+        case .effect_row_in_expr(let at) => at
+        case .desugar_not_implemented(let at, _) => at
+    }
+}
+
+
+function format_message(e: HirError, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .effect_row_in_expr(_) => fmt_effect_row_in_expr(allocator)?
+        case .desugar_not_implemented(_, let kind) => fmt_desugar_not_implemented(kind, allocator)?
+    }
+}
+
+function fmt_effect_row_in_expr(allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(
+        "effect row reached HIR lowering at expression position — ",
+        "rows have no runtime value and cannot appear outside a function/type signature",
+        allocator,
+    )?
+}
+
+function fmt_desugar_not_implemented(kind: DesugarKind, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(
+        "AST → HIR desugar not yet implemented for this form: ",
+        fmt_desugar_kind(kind),
+        allocator,
+    )?
+    return string.concat(
+        p1,
+        " — deferred desugars awaiting lib/resolve",
+        allocator,
+    )?
+}
+
+function fmt_desugar_kind(kind: DesugarKind) -> String {
+    return match kind {
+        case .method_call => "method-call (`receiver.name(args)`) → free-function rewrite"
+        case .f_string => "f-string interpolation (`f\"...\"`) → String.concat chain"
+        case .try_ => "`?` propagation → match-on-Outcome"
+        case .for_ => "`for x in iter` → loop + iterator-protocol calls"
+        case .await_ => "`.await` postfix → task_await call"
+    }
+}

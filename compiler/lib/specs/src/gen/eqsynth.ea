@@ -1,0 +1,454 @@
+
+module specs.gen.eqsynth
+
+import std.collections.vec
+import std.mem.alloc
+import std.core.option
+import intern.interner as sym_interner_mod
+import intern.symbol as sym_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.attr as attr_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.literal as literal_mod
+import syntax.ast.ops as ast_ops_mod
+import syntax.ast.tree as ast_tree_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as types_check_mod
+
+
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_tree_mod.Stmt)
+spec std.collections.vec.Vec(ast_tree_mod.MatchArm)
+spec std.collections.vec.Vec(ast_tree_mod.Pat)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(ast_tree_mod.Param)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(ast_tree_mod.Expr)
+spec std.core.option.Option(usize)
+
+
+public function try_synthesize(
+    body: Vec_Item.Vec,
+    target: ty_mod.TyId,
+    types_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable sym_interner_mod.Interner,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Item.Vec
+    Vec_Item.new(init out, allocator)?
+    let n = Vec_Item.len(body)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(body, i).kind {
+            case .function_(let b) => {
+                let decl = Box_FnDecl.get(b)
+                if Vec_Param.len(decl.params) == 2 {
+                    synthesize_from_decl(mutable out, decl, target, types_out, ty_interner, mutable interner, at, allocator)?
+                    return out
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+function synthesize_from_decl(
+    out: mutable Vec_Item.Vec,
+    decl: ast_item_mod.FnDecl,
+    target: ty_mod.TyId,
+    types_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable sym_interner_mod.Interner,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires Vec_Param.len(decl.params) == 2
+{
+    let a_sym = Vec_Param.at(decl.params, 0).name.name
+    let b_sym = Vec_Param.at(decl.params, 1).name.name
+    let cmp = match nominal_cmp_expr(target, a_sym, b_sym, types_out, ty_interner, mutable interner, at, allocator)? {
+        case .none => { return }
+        case .some(let e) => e
+    }
+    let ret = ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.return_(value: Option_Box_Expr.some(value: Box_Expr.new(take cmp, allocator)?)),
+    }
+    uninit stmts: Vec_Stmt.Vec
+    Vec_Stmt.new(init stmts, allocator)?
+    let block = ast_tree_mod.Block {
+        span: at,
+        stmts: stmts,
+        trailing: Option_Box_Expr.some(value: Box_Expr.new(take ret, allocator)?),
+    }
+    let new_decl = ast_item_mod.FnDecl {
+        span: decl.span,
+        stability: decl.stability,
+        visibility: decl.visibility,
+        refinement_stable: decl.refinement_stable,
+        name: decl.name,
+        outbound_generics: decl.outbound_generics,
+        generics: decl.generics,
+        params: decl.params,
+        return_mode: decl.return_mode,
+        return_ty: decl.return_ty,
+        effects: decl.effects,
+        refinements: decl.refinements,
+        body: ast_item_mod.FnBody.block_(body: block),
+    }
+    uninit attrs: Vec_Attribute.Vec
+    Vec_Attribute.new(init attrs, allocator)?
+    let item = ast_item_mod.Item {
+        span: at,
+        attributes: attrs,
+        kind: ast_item_mod.ItemKind.function_(decl: Box_FnDecl.new(take new_decl, allocator)?),
+    }
+    Vec_Item.push(mutable out, take item, allocator)?
+}
+
+
+function nominal_cmp_expr(
+    target: ty_mod.TyId,
+    a_sym: sym_mod.Symbol,
+    b_sym: sym_mod.Symbol,
+    types_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable sym_interner_mod.Interner,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if ty_mod.is_error(target) {
+        return Option_Expr.none
+    }
+    if ty_mod.index(target) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_Expr.none
+    }
+    return match ty_interner_mod.lookup(ty_interner, target) {
+        case .record(let def) => {
+            if !def_tables_cover(def, target, types_out) {
+                return Option_Expr.none
+            }
+            record_cmp_expr(def, a_sym, b_sym, types_out, at, allocator)?
+        }
+        case .sum_(let def) => {
+            if !def_tables_cover(def, target, types_out) {
+                return Option_Expr.none
+            }
+            sum_cmp_expr(def, a_sym, b_sym, types_out, ty_interner, mutable interner, at, allocator)?
+        }
+        case _ => Option_Expr.none
+    }
+}
+
+
+function def_tables_cover(def: def_mod.DefId, target: ty_mod.TyId, types_out: types_check_mod.TypeOutput) -> bool {
+    return match types_check_mod.type_id_of_def(types_out, def) {
+        case .some(let t) => t.raw == target.raw
+        case .none => false
+    }
+}
+
+
+function record_cmp_expr(
+    def: def_mod.DefId,
+    a_sym: sym_mod.Symbol,
+    b_sym: sym_mod.Symbol,
+    types_out: types_check_mod.TypeOutput,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = types_check_mod.field_ty_count(types_out, def)
+    if n == 0 {
+        return Option_Expr.some(value: bool_literal(true, at))
+    }
+    var acc = bool_literal(true, at)
+    var have_any = false
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let name = match types_check_mod.field_name_at(types_out, def, 0, i) {
+            case .some(let s) => s
+            case .none => { return Option_Expr.none }
+        }
+        if name.raw == sym_mod.empty().raw {
+            return Option_Expr.none
+        }
+        let term = eq_expr(
+            field_expr(a_sym, name, at, allocator)?,
+            field_expr(b_sym, name, at, allocator)?,
+            at, allocator,
+        )?
+        if have_any {
+            acc = and_expr(take acc, take term, at, allocator)?
+        } else {
+            acc = term
+            have_any = true
+        }
+        i = i + 1
+    }
+    return Option_Expr.some(value: acc)
+}
+
+
+function sum_cmp_expr(
+    def: def_mod.DefId,
+    a_sym: sym_mod.Symbol,
+    b_sym: sym_mod.Symbol,
+    types_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable sym_interner_mod.Interner,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = types_check_mod.variant_count_of(types_out, def)
+    if n == 0 {
+        return Option_Expr.some(value: bool_literal(true, at))
+    }
+    uninit outer_arms: Vec_MatchArm.Vec
+    Vec_MatchArm.new(init outer_arms, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let vname = match types_check_mod.variant_name_at(types_out, def, i) {
+            case .some(let s) => s
+            case .none => { return Option_Expr.none }
+        }
+        let arity = match payload_arity(def, i, types_out, ty_interner) {
+            case .some(let k) => k
+            case .none => { return Option_Expr.none }
+        }
+        let a_pat = variant_pat(vname, "__eqa", arity, at, mutable interner, allocator)?
+        let b_pat = variant_pat(vname, "__eqb", arity, at, mutable interner, allocator)?
+        let payload_cmp = binder_cmp_expr(arity, at, mutable interner, allocator)?
+        uninit inner_arms: Vec_MatchArm.Vec
+        Vec_MatchArm.new(init inner_arms, allocator)?
+        Vec_MatchArm.push(mutable inner_arms, ast_tree_mod.MatchArm {
+            span: at,
+            pat: take b_pat,
+            guard: Option_Expr.none,
+            body: take payload_cmp,
+        }, allocator)?
+        Vec_MatchArm.push(mutable inner_arms, ast_tree_mod.MatchArm {
+            span: at,
+            pat: ast_tree_mod.Pat { span: at, kind: ast_tree_mod.PatKind.wildcard },
+            guard: Option_Expr.none,
+            body: bool_literal(false, at),
+        }, allocator)?
+        let inner_match = ast_tree_mod.Expr {
+            span: at,
+            kind: ast_tree_mod.ExprKind.match_(
+                scrutinee: Box_Expr.new(name_expr(b_sym, at, allocator)?, allocator)?,
+                arms: inner_arms,
+            ),
+        }
+        Vec_MatchArm.push(mutable outer_arms, ast_tree_mod.MatchArm {
+            span: at,
+            pat: take a_pat,
+            guard: Option_Expr.none,
+            body: take inner_match,
+        }, allocator)?
+        i = i + 1
+    }
+    let outer = ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.match_(
+            scrutinee: Box_Expr.new(name_expr(a_sym, at, allocator)?, allocator)?,
+            arms: outer_arms,
+        ),
+    }
+    return Option_Expr.some(value: outer)
+}
+
+
+function payload_arity(
+    def: def_mod.DefId,
+    variant_idx: usize,
+    types_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+) -> Option_usize.Option {
+    let pty = types_check_mod.variant_payload_ty(types_out, def, variant_idx as u32)
+    if ty_mod.is_error(pty) {
+        return Option_usize.none
+    }
+    if ty_mod.index(pty) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_usize.none
+    }
+    return match ty_interner_mod.lookup(ty_interner, pty) {
+        case .primitive(let p) => match p {
+            case .unit_ => Option_usize.some(value: 0)
+            case _ => Option_usize.none
+        }
+        case .tuple_(let elems) => Option_usize.some(value: Vec_TyId.len(elems))
+        case _ => Option_usize.none
+    }
+}
+
+
+function variant_pat(
+    vname: sym_mod.Symbol,
+    binder_prefix: String,
+    arity: usize,
+    at: span_mod.Span,
+    interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.Pat
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    Vec_Ident.push(mutable segs, ast_ident_mod.Ident { name: vname, span: at }, allocator)?
+    let vpath = ast_ident_mod.Path { segments: segs, span: at }
+    if arity == 0 {
+        return ast_tree_mod.Pat {
+            span: at,
+            kind: ast_tree_mod.PatKind.variant(path: vpath, payload: ast_tree_mod.VariantPatPayload.none),
+        }
+    }
+    uninit binders: Vec_Pat.Vec
+    Vec_Pat.new(init binders, allocator)?
+    var i: usize = 0
+    loop decreases (arity - i) {
+        if i >= arity { break }
+        let bname = binder_sym(binder_prefix, i, mutable interner, allocator)?
+        Vec_Pat.push(mutable binders, ast_tree_mod.Pat {
+            span: at,
+            kind: ast_tree_mod.PatKind.binding(name: ast_ident_mod.Ident { name: bname, span: at }),
+        }, allocator)?
+        i = i + 1
+    }
+    return ast_tree_mod.Pat {
+        span: at,
+        kind: ast_tree_mod.PatKind.variant(path: vpath, payload: ast_tree_mod.VariantPatPayload.tuple(elements: binders)),
+    }
+}
+
+
+function binder_cmp_expr(
+    arity: usize,
+    at: span_mod.Span,
+    interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if arity == 0 {
+        return bool_literal(true, at)
+    }
+    var acc = bool_literal(true, at)
+    var have_any = false
+    var i: usize = 0
+    loop decreases (arity - i) {
+        if i >= arity { break }
+        let a_name = binder_sym("__eqa", i, mutable interner, allocator)?
+        let b_name = binder_sym("__eqb", i, mutable interner, allocator)?
+        let term = eq_expr(
+            name_expr(a_name, at, allocator)?,
+            name_expr(b_name, at, allocator)?,
+            at, allocator,
+        )?
+        if have_any {
+            acc = and_expr(take acc, take term, at, allocator)?
+        } else {
+            acc = term
+            have_any = true
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+
+function binder_sym(prefix: String, i: usize, interner: mutable sym_interner_mod.Interner, allocator: Allocator) -> sym_mod.Symbol
+    with {allocator, err: alloc.AllocError}
+{
+    return sym_interner_mod.intern(mutable interner, f"{prefix}{i}", allocator)?
+}
+
+
+function bool_literal(v: bool, at: span_mod.Span) -> ast_tree_mod.Expr {
+    return ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.literal(value: literal_mod.Literal.bool(value: v)),
+    }
+}
+
+
+function name_expr(name: sym_mod.Symbol, at: span_mod.Span, allocator: Allocator) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    Vec_Ident.push(mutable segs, ast_ident_mod.Ident { name: name, span: at }, allocator)?
+    return ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.path(path: ast_ident_mod.Path { segments: segs, span: at }),
+    }
+}
+
+
+function field_expr(base: sym_mod.Symbol, field: sym_mod.Symbol, at: span_mod.Span, allocator: Allocator) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    let recv = name_expr(base, at, allocator)?
+    return ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.field(
+            receiver: Box_Expr.new(take recv, allocator)?,
+            name: ast_ident_mod.Ident { name: field, span: at },
+        ),
+    }
+}
+
+
+function eq_expr(lhs: take ast_tree_mod.Expr, rhs: take ast_tree_mod.Expr, at: span_mod.Span, allocator: Allocator) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    return ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.binary(
+            op: ast_ops_mod.BinOp.eq,
+            lhs: Box_Expr.new(take lhs, allocator)?,
+            rhs: Box_Expr.new(take rhs, allocator)?,
+        ),
+    }
+}
+
+
+function and_expr(lhs: take ast_tree_mod.Expr, rhs: take ast_tree_mod.Expr, at: span_mod.Span, allocator: Allocator) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    return ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.binary(
+            op: ast_ops_mod.BinOp.and,
+            lhs: Box_Expr.new(take lhs, allocator)?,
+            rhs: Box_Expr.new(take rhs, allocator)?,
+        ),
+    }
+}

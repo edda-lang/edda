@@ -1,0 +1,347 @@
+
+module x64.emit.value.value.emit
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.control.branch as branch_mod
+import local.encoding.simd.vector as vector_mod
+import local.emit.regsel as regsel_mod
+import local.emit.arith.subwidth.subwidth as subwidth_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function emit_mov(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if regsel_mod.vreg_is_fp(body, dst)? {
+        let dx = regsel_mod.vreg_xmm(body, dst)?
+        let sx = regsel_mod.operand_xmm(body, src)?
+        if regs_mod.xmm_reg_num(dx) != regs_mod.xmm_reg_num(sx) {
+            vector_mod.encode_movsd(mutable code, dx, sx, allocator)?
+        }
+        return ()
+    }
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    match regsel_mod.resolve_gp_operand(body, src)? {
+        case .reg(let r) => {
+            if regs_mod.gp64_reg_num(dg) != regs_mod.gp64_reg_num(r) {
+                alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, dg, r, allocator)?
+            }
+        }
+        case .imm32(let v) => alu_mod.encode_mov_rm_imm(mutable code, regs_mod.OpSize.qword_, dg, v, allocator)?
+    }
+}
+
+public function emit_copy(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if regsel_mod.vreg_is_fp(body, dst)? {
+        let dx = regsel_mod.vreg_xmm(body, dst)?
+        let sx = regsel_mod.vreg_xmm(body, src)?
+        if regs_mod.xmm_reg_num(dx) != regs_mod.xmm_reg_num(sx) {
+            vector_mod.encode_movsd(mutable code, dx, sx, allocator)?
+        }
+        return ()
+    }
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let sg = regsel_mod.vreg_gp(body, src)?
+    if regs_mod.gp64_reg_num(dg) != regs_mod.gp64_reg_num(sg) {
+        alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, dg, sg, allocator)?
+    }
+}
+
+
+public function emit_load(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    addr: lir_reg_mod.MemRef,
+    dst: lir_vreg_mod.LirVRegId,
+    width: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if regsel_mod.vreg_is_fp(body, dst)? {
+        let dx = regsel_mod.vreg_xmm(body, dst)?
+        let fbase = mem_base(body, addr)?
+        match addr.index {
+            case .none => vector_mod.encode_movsd_x_mem(mutable code, dx, fbase, addr.displacement, allocator)?
+            case .some(let iid) => {
+                let ireg = mem_index(body, iid)?
+                vector_mod.encode_movsd_x_mem_idx(mutable code, dx, fbase, ireg, scale_log2(addr.scale)?, addr.displacement, allocator)?
+            }
+        }
+        return ()
+    }
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let base = mem_base(body, addr)?
+    match addr.index {
+        case .none => emit_load_gp(mutable code, width, dg, base, addr.displacement, allocator)?
+        case .some(let iid) => {
+            let ireg = mem_index(body, iid)?
+            emit_load_gp_idx(mutable code, width, dg, base, ireg, scale_log2(addr.scale)?, addr.displacement, allocator)?
+        }
+    }
+}
+
+function emit_load_gp(
+    code: mutable Vec_u8.Vec,
+    width: u32,
+    dg: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if width == (1 as u32) {
+        alu_mod.encode_movzx_r_mem8(mutable code, regs_mod.OpSize.qword_, dg, base, disp, allocator)?
+        return ()
+    }
+    if width == (2 as u32) {
+        alu_mod.encode_movzx_r_mem16(mutable code, regs_mod.OpSize.qword_, dg, base, disp, allocator)?
+        return ()
+    }
+    if width == (4 as u32) {
+        alu_mod.encode_mov_r_mem(mutable code, regs_mod.OpSize.dword_, dg, base, disp, allocator)?
+        return ()
+    }
+    alu_mod.encode_mov_r_mem(mutable code, regs_mod.OpSize.qword_, dg, base, disp, allocator)?
+}
+
+function emit_load_gp_idx(
+    code: mutable Vec_u8.Vec,
+    width: u32,
+    dg: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    if width == (1 as u32) {
+        alu_mod.encode_movzx_r_mem8_idx(mutable code, regs_mod.OpSize.qword_, dg, base, index, scale_log2, disp, allocator)?
+        return ()
+    }
+    if width == (2 as u32) {
+        alu_mod.encode_movzx_r_mem16_idx(mutable code, regs_mod.OpSize.qword_, dg, base, index, scale_log2, disp, allocator)?
+        return ()
+    }
+    if width == (4 as u32) {
+        alu_mod.encode_mov_r_mem_idx(mutable code, regs_mod.OpSize.dword_, dg, base, index, scale_log2, disp, allocator)?
+        return ()
+    }
+    alu_mod.encode_mov_r_mem_idx(mutable code, regs_mod.OpSize.qword_, dg, base, index, scale_log2, disp, allocator)?
+}
+
+public function emit_store(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    value: lir_vreg_mod.LirVRegId,
+    addr: lir_reg_mod.MemRef,
+    width: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if regsel_mod.vreg_is_fp(body, value)? {
+        let sx = regsel_mod.vreg_xmm(body, value)?
+        let fbase = mem_base(body, addr)?
+        match addr.index {
+            case .none => {
+                if width == (16 as u32) {
+                    vector_mod.encode_movups_mem_x(mutable code, fbase, addr.displacement, sx, allocator)?
+                } else {
+                    vector_mod.encode_movsd_mem_x(mutable code, fbase, addr.displacement, sx, allocator)?
+                }
+            }
+            case .some(let iid) => {
+                let ireg = mem_index(body, iid)?
+                vector_mod.encode_movsd_mem_x_idx(mutable code, fbase, ireg, scale_log2(addr.scale)?, addr.displacement, sx, allocator)?
+            }
+        }
+        return ()
+    }
+    let sreg = regsel_mod.vreg_gp(body, value)?
+    let base = mem_base(body, addr)?
+    match addr.index {
+        case .none => emit_store_gp(mutable code, width, base, addr.displacement, sreg, allocator)?
+        case .some(let iid) => {
+            let ireg = mem_index(body, iid)?
+            emit_store_gp_idx(mutable code, width, base, ireg, scale_log2(addr.scale)?, addr.displacement, sreg, allocator)?
+        }
+    }
+}
+
+function emit_store_gp(
+    code: mutable Vec_u8.Vec,
+    width: u32,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    sreg: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if width == (1 as u32) {
+        alu_mod.encode_mov_mem_r8(mutable code, base, disp, sreg, allocator)?
+        return ()
+    }
+    if width == (2 as u32) {
+        alu_mod.encode_mov_mem_r(mutable code, regs_mod.OpSize.word_, base, disp, sreg, allocator)?
+        return ()
+    }
+    if width == (4 as u32) {
+        alu_mod.encode_mov_mem_r(mutable code, regs_mod.OpSize.dword_, base, disp, sreg, allocator)?
+        return ()
+    }
+    alu_mod.encode_mov_mem_r(mutable code, regs_mod.OpSize.qword_, base, disp, sreg, allocator)?
+}
+
+function emit_store_gp_idx(
+    code: mutable Vec_u8.Vec,
+    width: u32,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    sreg: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    if width == (1 as u32) {
+        alu_mod.encode_mov_mem_r8_idx(mutable code, base, index, scale_log2, disp, sreg, allocator)?
+        return ()
+    }
+    if width == (2 as u32) {
+        alu_mod.encode_mov_mem_r_idx(mutable code, regs_mod.OpSize.word_, base, index, scale_log2, disp, sreg, allocator)?
+        return ()
+    }
+    if width == (4 as u32) {
+        alu_mod.encode_mov_mem_r_idx(mutable code, regs_mod.OpSize.dword_, base, index, scale_log2, disp, sreg, allocator)?
+        return ()
+    }
+    alu_mod.encode_mov_mem_r_idx(mutable code, regs_mod.OpSize.qword_, base, index, scale_log2, disp, sreg, allocator)?
+}
+
+function mem_base(
+    body: lir_body_mod.LirBody,
+    addr: lir_reg_mod.MemRef,
+) -> regs_mod.Gp64Reg
+    with {err: lir_error_mod.LirError}
+{
+    return match addr.base {
+        case .some(let bid) => regsel_mod.vreg_gp(body, bid)?
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: memory reference without a base register (absolute/rip addressing needs a relocation form)",
+        )
+    }
+}
+
+function mem_index(
+    body: lir_body_mod.LirBody,
+    iid: lir_vreg_mod.LirVRegId,
+) -> regs_mod.Gp64Reg
+    with {err: lir_error_mod.LirError}
+    ensures regs_mod.gp64_reg_num(result) != (4 as u8)
+{
+    let ireg = regsel_mod.vreg_gp(body, iid)?
+    if regs_mod.gp64_reg_num(ireg) == (4 as u8) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: rsp cannot be a SIB index register",
+        )
+    }
+    return ireg
+}
+
+function scale_log2(scale: u32) -> u8
+    with {err: lir_error_mod.LirError}
+{
+    if scale == 1 { return 0 as u8 }
+    if scale == 2 { return 1 as u8 }
+    if scale == 4 { return 2 as u8 }
+    if scale == 8 { return 3 as u8 }
+    raise lir_error_mod.LirError.internal_lowering_invariant(
+        at: span_mod.dummy(),
+        message: "x64.gen.emit: memory scale must be 1, 2, 4, or 8",
+    )
+}
+
+public function emit_call(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    callee: lir_reg_mod.Operand,
+    return_: Option_LirVRegId.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match callee {
+        case .vreg(let id) => branch_mod.encode_call_rm(mutable code, regsel_mod.vreg_gp(body, id)?, allocator)?
+        case .preg(let p) => branch_mod.encode_call_rm(mutable code, regsel_mod.preg_gp(p)?, allocator)?
+        case .imm(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: call to an immediate address is not a V1.0 form; materialize the callee via fn_ref",
+        )
+    }
+    match return_ {
+        case .none => ()
+        case .some(let rv) => emit_return_move(mutable code, body, rv, allocator)?
+    }
+}
+
+function emit_return_move(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    rv: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if regsel_mod.vreg_is_fp(body, rv)? {
+        let dx = regsel_mod.vreg_xmm(body, rv)?
+        if regs_mod.xmm_reg_num(dx) != (0 as u8) {
+            vector_mod.encode_movsd(mutable code, dx, regs_mod.XmmReg.xmm0, allocator)?
+        }
+        return ()
+    }
+    let dg = regsel_mod.vreg_gp(body, rv)?
+    if regs_mod.gp64_reg_num(dg) != (0 as u8) {
+        alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, dg, regs_mod.Gp64Reg.rax, allocator)?
+    }
+    subwidth_mod.canonicalize_sub_width(mutable code, body, rv, allocator)?
+}

@@ -1,0 +1,108 @@
+
+module syntax.parse.ty.pat.atom
+
+import std.mem.alloc
+import diagnostics.emit.collection as diags_mod
+import span.loc.pos.span as span_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.literal as literal_mod
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+import local.parse.ty.pat.leaf.util as pat_util_mod
+
+
+public function parse_let_binding(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    let after_kw = pos + 1
+    match util_mod.peek(tokens, after_kw) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, after_kw)
+            let ident = ident_mod.Ident { name: sym, span: id_span }
+            let full_span = pat_util_mod.merge_spans(kw_span, id_span)
+            let pat = tree_mod.Pat {
+                span: full_span,
+                kind: tree_mod.PatKind.binding(name: ident),
+            }
+            return (pat, after_kw + 1)
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, after_kw), "expected identifier after `let` in pattern", allocator)?
+            let pat = tree_mod.Pat { span: kw_span, kind: tree_mod.PatKind.error }
+            return (pat, after_kw)
+        }
+    }
+}
+
+
+public function parse_literal_or_range(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    lo_lit: literal_mod.Literal,
+    lo_span: span_mod.Span,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let after_lo = pos + 1
+    let inclusive = match util_mod.peek(tokens, after_lo) {
+        case .dot_dot_eq => true
+        case .dot_dot_lt => false
+        case _ => {
+            let pat = tree_mod.Pat { span: lo_span, kind: tree_mod.PatKind.literal(value: lo_lit) }
+            return (pat, after_lo)
+        }
+    }
+    return parse_range_hi(tokens, after_lo + 1, lo_lit, lo_span, inclusive, mutable diags, allocator)?
+}
+
+function parse_range_hi(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    lo_lit: literal_mod.Literal,
+    lo_span: span_mod.Span,
+    inclusive: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let hi_tok = util_mod.peek(tokens, pos)
+    let hi_span = util_mod.span_at(tokens, pos)
+    return match hi_tok {
+        case .kw_true => build_range_pat(lo_lit, lo_span, literal_mod.Literal.bool(value: true), hi_span, inclusive, pos + 1)
+        case .kw_false => build_range_pat(lo_lit, lo_span, literal_mod.Literal.bool(value: false), hi_span, inclusive, pos + 1)
+        case .int(let v, let b) => build_range_pat(lo_lit, lo_span, literal_mod.Literal.int(value: v, base: b), hi_span, inclusive, pos + 1)
+        case .float(let s) => build_range_pat(lo_lit, lo_span, literal_mod.Literal.float(sym: s), hi_span, inclusive, pos + 1)
+        case .str(let s) => build_range_pat(lo_lit, lo_span, literal_mod.Literal.str(sym: s), hi_span, inclusive, pos + 1)
+        case _ => {
+            util_mod.emit_error(mutable diags, hi_span, "expected literal as upper bound of range pattern (int, float, str, or bool)", allocator)?
+            let pat = tree_mod.Pat { span: lo_span, kind: tree_mod.PatKind.error }
+            (pat, pos)
+        }
+    }
+}
+
+function build_range_pat(
+    lo_lit: literal_mod.Literal,
+    lo_span: span_mod.Span,
+    hi_lit: literal_mod.Literal,
+    hi_span: span_mod.Span,
+    inclusive: bool,
+    next_pos: usize,
+) -> (tree_mod.Pat, usize) {
+    let full_span = pat_util_mod.merge_spans(lo_span, hi_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.range(lo: lo_lit, hi: hi_lit, inclusive: inclusive),
+    }
+    return (pat, next_pos)
+}

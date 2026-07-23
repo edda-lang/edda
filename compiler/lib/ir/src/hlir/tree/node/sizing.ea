@@ -1,0 +1,235 @@
+
+module ir.hlir.tree.node.sizing
+
+import std.core.option
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as kind_mod
+import target.triple as triple_mod
+import mir.layout.table as mir_layout_mod
+import local.lir.tree.reg as lir_reg_mod
+
+
+spec std.core.option.Option(mir_layout_mod.AggLayout)
+spec std.collections.vec.Vec(u32)
+
+
+public function vreg_size_for(
+    ty: ty_mod.TyId,
+    layouts: mir_layout_mod.LayoutTable,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+) -> u32 {
+    let wasm = match triple_mod.arch(target) {
+        case .wasm32 => true
+        case _ => false
+    }
+    if is_slice_ty(ty, ty_interner, 16 as u32) || is_string_ty(ty, ty_interner, 16 as u32) {
+        return if wasm { 8 as u32 } else { 16 as u32 }
+    }
+    let fw = float_width(ty, ty_interner, 16 as u32)
+    if fw != (0 as u32) { return fw }
+    let iw = resize_width(ty, ty_interner, 16 as u32)
+    if iw > (8 as u32) { return iw }
+    if !wasm {
+        let base = peel_refined(ty, ty_interner, 16 as u32)
+        match mir_layout_mod.lookup(layouts, base) {
+            case .some(let l) => {
+                if l.total_size != (0 as u32) && lir_reg_mod.is_by_memory(l.total_size) {
+                    return l.total_size
+                }
+                if l.total_size != (0 as u32) && !is_scalar_sum_shape(base, l, ty_interner) {
+                    return 16 as u32
+                }
+            }
+            case .none => ()
+        }
+    }
+    return lir_reg_mod.register_width()
+}
+
+
+function is_scalar_sum_shape(
+    base: ty_mod.TyId,
+    l: mir_layout_mod.AggLayout,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool {
+    if (base.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return false }
+    let is_sum = match ty_interner_mod.lookup(ty_interner, base) {
+        case .sum_(_) => true
+        case _ => false
+    }
+    if !is_sum { return l.scalar_wrapper }
+    if Vec_u32.len(l.field_sizes) < (2 as usize) { return true }
+    return Vec_u32.at(l.field_sizes, 1 as usize) == (0 as u32)
+}
+
+
+function peel_refined(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> ty_mod.TyId
+    decreases fuel
+{
+    if fuel == (0 as u32) { return ty }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return ty }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .refined(let base, _) => peel_refined(base, ty_interner, fuel - (1 as u32))
+        case _ => ty
+    }
+}
+
+
+function is_slice_ty(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> bool
+    decreases fuel
+{
+    if fuel == (0 as u32) { return false }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return false }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .slice(_) => true
+        case .refined(let base, _) => is_slice_ty(base, ty_interner, fuel - (1 as u32))
+        case _ => false
+    }
+}
+
+
+function is_string_ty(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> bool
+    decreases fuel
+{
+    if fuel == (0 as u32) { return false }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return false }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .string_ => true
+        case .refined(let base, _) => is_string_ty(base, ty_interner, fuel - (1 as u32))
+        case _ => false
+    }
+}
+
+
+public function vreg_class_for(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> lir_reg_mod.RegClass {
+    if float_width(ty, ty_interner, 16 as u32) != (0 as u32) {
+        return lir_reg_mod.RegClass.fp
+    }
+    return lir_reg_mod.RegClass.gp
+}
+
+
+public function int_resize_width(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> u32 {
+    return resize_width(ty, ty_interner, 16 as u32)
+}
+
+
+public function int_resize_signed(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool {
+    return resize_signed(ty, ty_interner, 16 as u32)
+}
+
+
+function resize_width(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> u32
+    decreases fuel
+{
+    if fuel == (0 as u32) { return 8 as u32 }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return 8 as u32 }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(let p) => prim_width(p)
+        case .refined(let base, _) => resize_width(base, ty_interner, fuel - (1 as u32))
+        case _ => 8 as u32
+    }
+}
+
+
+function resize_signed(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> bool
+    decreases fuel
+{
+    if fuel == (0 as u32) { return false }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return false }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(let p) => prim_signed(p)
+        case .refined(let base, _) => resize_signed(base, ty_interner, fuel - (1 as u32))
+        case _ => false
+    }
+}
+
+
+function prim_width(p: kind_mod.PrimKind) -> u32 {
+    return match p {
+        case .i8_ => 1 as u32
+        case .u8_ => 1 as u32
+        case .bool_ => 1 as u32
+        case .i16_ => 2 as u32
+        case .u16_ => 2 as u32
+        case .i32_ => 4 as u32
+        case .u32_ => 4 as u32
+        case .codepoint_ => 4 as u32
+        case .f32_ => 4 as u32
+        case .f64_ => 8 as u32
+        case .i128_ => 16 as u32
+        case .u128_ => 16 as u32
+        case _ => 8 as u32
+    }
+}
+
+
+function prim_signed(p: kind_mod.PrimKind) -> bool {
+    return match p {
+        case .i8_ => true
+        case .i16_ => true
+        case .i32_ => true
+        case .i64_ => true
+        case .i128_ => true
+        case .isize_ => true
+        case _ => false
+    }
+}
+
+
+function float_width(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> u32
+    decreases fuel
+{
+    if fuel == (0 as u32) { return 0 as u32 }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return 0 as u32 }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(let p) => float_prim_width(p)
+        case .refined(let base, _) => float_width(base, ty_interner, fuel - (1 as u32))
+        case _ => 0 as u32
+    }
+}
+
+
+function float_prim_width(p: kind_mod.PrimKind) -> u32 {
+    return match p {
+        case .f32_ => 4 as u32
+        case .f64_ => 8 as u32
+        case _ => 0 as u32
+    }
+}

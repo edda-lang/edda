@@ -1,0 +1,250 @@
+
+module mir.lower.build.ctx.subst.subst
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ident as ident_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(ast_tree_mod.CallArg)
+spec std.collections.vec.Vec(SubEntry)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.core.option.Option(ast_tree_mod.Expr)
+
+
+public type SubEntry {
+    name: symbol_mod.Symbol
+    expr: ast_tree_mod.Expr
+}
+
+
+public function named_ident_expr(name: symbol_mod.Symbol, allocator: Allocator) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    let seg = ident_mod.Ident { name: name, span: span_mod.dummy() }
+    Vec_Ident.push(mutable segments, seg, allocator)?
+    let path = ident_mod.Path { segments: segments, span: span_mod.dummy() }
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.path(path: path),
+    }
+}
+
+
+function error_expr(span: span_mod.Span) -> ast_tree_mod.Expr {
+    return ast_tree_mod.Expr {
+        span: span,
+        kind: ast_tree_mod.ExprKind.error,
+    }
+}
+
+
+public function subst_expr(
+    e: ast_tree_mod.Expr,
+    subs: Vec_SubEntry.Vec,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match e.kind {
+        case .literal(let v) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.literal(value: v),
+        }
+        case .path(let p) => subst_path_expr(e.span, p, subs, allocator)?
+        case .binary(let op, let l, let r) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.binary(
+                op: op,
+                lhs: subst_expr_box(l, subs, allocator)?,
+                rhs: subst_expr_box(r, subs, allocator)?,
+            ),
+        }
+        case .unary(let op, let x) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.unary(
+                op: op,
+                expr: subst_expr_box(x, subs, allocator)?,
+            ),
+        }
+        case .field(let r, let name) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.field(
+                receiver: subst_expr_box(r, subs, allocator)?,
+                name: name,
+            ),
+        }
+        case .tuple_index(let r, let ix) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.tuple_index(
+                receiver: subst_expr_box(r, subs, allocator)?,
+                index: ix,
+            ),
+        }
+        case .positional(let r, let ix) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.positional(
+                receiver: subst_expr_box(r, subs, allocator)?,
+                index: subst_expr_box(ix, subs, allocator)?,
+            ),
+        }
+        case .index(let r, let ix) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.index(
+                receiver: subst_expr_box(r, subs, allocator)?,
+                index: subst_expr_box(ix, subs, allocator)?,
+            ),
+        }
+        case .cast(let x, let ty, let mode) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.cast(
+                expr: subst_expr_box(x, subs, allocator)?,
+                ty: ty,
+                mode: mode,
+            ),
+        }
+        case .method_call(let recv, let name, let margs) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.method_call(
+                receiver: subst_expr_box(recv, subs, allocator)?,
+                name: name,
+                args: subst_callargs(margs, subs, allocator)?,
+            ),
+        }
+        case .call(let callee, let cargs) => ast_tree_mod.Expr {
+            span: e.span,
+            kind: ast_tree_mod.ExprKind.call(
+                callee: subst_expr_box(callee, subs, allocator)?,
+                args: subst_callargs(cargs, subs, allocator)?,
+            ),
+        }
+        case _ => error_expr(e.span)
+    }
+}
+
+
+function subst_expr_box(
+    b: Box_Expr,
+    subs: Vec_SubEntry.Vec,
+    allocator: Allocator,
+) -> Box_Expr
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_Expr.get(b)
+    let sub = subst_expr(inner, subs, allocator)?
+    return Box_Expr.new(take sub, allocator)?
+}
+
+
+function subst_path_expr(
+    span: span_mod.Span,
+    p: ident_mod.Path,
+    subs: Vec_SubEntry.Vec,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    let nseg = Vec_Ident.len(p.segments)
+    if nseg == 0 as usize {
+        return error_expr(span)
+    }
+    let head = Vec_Ident.at(p.segments, 0)
+    return match sub_lookup(subs, head.name) {
+        case .some(let rep) => fold_path_fields(take rep, span, p, 1 as usize, nseg, allocator)?
+        case .none => {
+            if nseg == 1 as usize {
+                return named_ident_expr(head.name, allocator)?
+            }
+            ast_tree_mod.Expr {
+                span: span,
+                kind: ast_tree_mod.ExprKind.path(path: p),
+            }
+        }
+    }
+}
+
+
+function fold_path_fields(
+    base: take ast_tree_mod.Expr,
+    span: span_mod.Span,
+    p: ident_mod.Path,
+    i: usize,
+    nseg: usize,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+    requires i <= nseg
+    decreases (nseg - i)
+{
+    if i >= nseg {
+        return base
+    }
+    let seg = Vec_Ident.at(p.segments, i)
+    let base_box = Box_Expr.new(take base, allocator)?
+    let next = ast_tree_mod.Expr {
+        span: span,
+        kind: ast_tree_mod.ExprKind.field(receiver: base_box, name: seg),
+    }
+    return fold_path_fields(take next, span, p, i + 1, nseg, allocator)?
+}
+
+
+function subst_callargs(
+    v: Vec_CallArg.Vec,
+    subs: Vec_SubEntry.Vec,
+    allocator: Allocator,
+) -> Vec_CallArg.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_CallArg.Vec
+    Vec_CallArg.new(init out, allocator)?
+    let n = Vec_CallArg.len(v)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let a = Vec_CallArg.at(v, i)
+        let ne = subst_expr(a.expr, subs, allocator)?
+        let na = ast_tree_mod.CallArg {
+            span: a.span,
+            mode: a.mode,
+            name: a.name,
+            expr: ne,
+        }
+        Vec_CallArg.push(mutable out, take na, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function sub_lookup(
+    subs: Vec_SubEntry.Vec,
+    name: symbol_mod.Symbol,
+) -> Option_Expr.Option {
+    let n = Vec_SubEntry.len(subs)
+    var j: usize = 0
+    loop
+        decreases (n - j)
+    {
+        if j >= n {
+            break
+        }
+        let entry = Vec_SubEntry.at(subs, j)
+        if entry.name.raw == name.raw {
+            return Option_Expr.some(value: entry.expr)
+        }
+        j = j + 1
+    }
+    return Option_Expr.none
+}

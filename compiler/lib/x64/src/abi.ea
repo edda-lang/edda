@@ -1,0 +1,368 @@
+
+module x64.abi
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import target.triple as triple_mod
+import hir.node as node_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import local.gen.sel.regs as regs_mod
+import local.abi.shared as shared_mod
+import local.abi.returns as returns_mod
+
+
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+
+
+spec std.core.option.Option(lir_reg_mod.PReg)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function lower_abi(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    var sret_ptr: Option_LirVRegId.Option = Option_LirVRegId.none
+    var shift: u32 = 0
+    if returns_mod.returns_by_memory(body) || body.fn_attrs.err_bymem {
+        let sret_preg = match gp_arg_preg(target, 0 as u32)? {
+            case .some(let p) => p
+            case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "x64.abi: no first integer-argument register for the sret hidden pointer",
+            )
+        }
+        let arrival = lir_body_mod.push_vreg(
+            mutable body,
+            take shared_mod.pinned_vreg(lir_reg_mod.RegClass.gp, sret_preg),
+            allocator,
+        )?
+        let home = lir_body_mod.push_vreg(
+            mutable body,
+            take shared_mod.unpinned_vreg(lir_reg_mod.RegClass.gp),
+            allocator,
+        )?
+        let copy_op = lir_op_mod.LirOp {
+            origin: node_mod.error(),
+            kind: lir_op_mod.LirOpKind.copy_(src: arrival, dst: home),
+            flags: shared_mod.stack_flags(),
+        }
+        let copy_id = lir_body_mod.push_op(mutable body, take copy_op, allocator)?
+        uninit sret_prefix: Vec_LirOpId.Vec
+        Vec_LirOpId.new(init sret_prefix, allocator)?
+        Vec_LirOpId.push(mutable sret_prefix, copy_id, allocator)?
+        prepend_entry_ops(mutable body, sret_prefix, allocator)?
+        sret_ptr = Option_LirVRegId.some(value: home)
+        shift = 1 as u32
+    }
+    copy_out_reg_params(mutable body, target, shift, allocator)?
+    setup_stack_params(mutable body, target, shift, allocator)?
+    returns_mod.pin_return_values(mutable body, target, sret_ptr, allocator)?
+}
+
+
+function copy_out_reg_params(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    shift: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit prefix: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init prefix, allocator)?
+
+    let n = body.n_params as usize
+    var i: usize = 1
+    loop decreases (n + 1) - i {
+        if i > n { break }
+        if i >= Vec_LirVReg.len(body.vregs) {
+            raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "x64.abi: n_params exceeds vregs.len()",
+            )
+        }
+        let arg_index = ((i - 1) as u32) +% shift
+        let arg_class = Vec_LirVReg.at(body.vregs, i).class_
+        match reg_arg_preg(target, arg_class, arg_index)? {
+            case .some(let preg) => {
+                let dst_vreg = Vec_LirVReg.at(body.vregs, i)
+                let arrival = lir_body_mod.push_vreg(mutable body, take shared_mod.pinned_vreg(arg_class, preg), allocator)?
+                let dst = lir_vreg_mod.LirVRegId { raw: i as u32 }
+                let op = lir_op_mod.LirOp {
+                    origin: node_mod.error(),
+                    kind: boundary_copy_kind(arg_class, dst_vreg, arrival, dst),
+                    flags: shared_mod.stack_flags(),
+                }
+                let id = lir_body_mod.push_op(mutable body, take op, allocator)?
+                Vec_LirOpId.push(mutable prefix, id, allocator)?
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+
+    if Vec_LirOpId.len(prefix) > 0 {
+        prepend_entry_ops(mutable body, prefix, allocator)?
+    }
+}
+
+function boundary_copy_kind(
+    arg_class: lir_reg_mod.RegClass,
+    dst_vreg: lir_reg_mod.LirVReg,
+    arrival: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+) -> lir_op_mod.LirOpKind {
+    let is_gp = match arg_class {
+        case .gp => true
+        case _ => false
+    }
+    if is_gp && dst_vreg.int_width < (8 as u32) {
+        return lir_op_mod.LirOpKind.convert_(
+            src: arrival,
+            to_width: dst_vreg.int_width,
+            to_signed: dst_vreg.int_signed,
+            kind: lir_op_mod.LCastKind.integer,
+            dst: dst,
+        )
+    }
+    return lir_op_mod.LirOpKind.copy_(src: arrival, dst: dst)
+}
+
+function reg_arg_preg(
+    target: triple_mod.TargetTriple,
+    class_: lir_reg_mod.RegClass,
+    arg_index: u32,
+) -> Option_PReg.Option
+    with {err: lir_error_mod.LirError}
+{
+    return match class_ {
+        case .fp => xmm_arg_preg(target, arg_index)?
+        case _ => gp_arg_preg(target, arg_index)?
+    }
+}
+
+
+function setup_stack_params(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    shift: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if !any_stack_param(body, target, shift)? { return }
+
+    let rbp_base = lir_body_mod.push_vreg(mutable body, take shared_mod.pinned_vreg(lir_reg_mod.RegClass.gp, frame_base_preg()), allocator)?
+
+    uninit prefix: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init prefix, allocator)?
+
+    let n = body.n_params as usize
+    var i: usize = 1
+    loop decreases (n + 1) - i {
+        if i > n { break }
+        if i >= Vec_LirVReg.len(body.vregs) { break }
+        let arg_index = ((i - 1) as u32) +% shift
+        let arg_class = Vec_LirVReg.at(body.vregs, i).class_
+        match reg_arg_preg(target, arg_class, arg_index)? {
+            case .some(_) => ()
+            case .none => {
+                let id = make_inbound_load(mutable body, rbp_base, i, inbound_disp(arg_index), allocator)?
+                Vec_LirOpId.push(mutable prefix, id, allocator)?
+            }
+        }
+        i += 1
+    }
+
+    prepend_entry_ops(mutable body, prefix, allocator)?
+}
+
+function any_stack_param(
+    body: lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    shift: u32,
+) -> bool
+    with {err: lir_error_mod.LirError}
+{
+    let n = body.n_params as usize
+    var i: usize = 1
+    loop decreases (n + 1) - i {
+        if i > n { break }
+        if i >= Vec_LirVReg.len(body.vregs) { break }
+        let arg_index = ((i - 1) as u32) +% shift
+        let arg_class = Vec_LirVReg.at(body.vregs, i).class_
+        match reg_arg_preg(target, arg_class, arg_index)? {
+            case .none => return true
+            case .some(_) => ()
+        }
+        i += 1
+    }
+    return false
+}
+
+function make_inbound_load(
+    body: mutable lir_body_mod.LirBody,
+    rbp_base: lir_vreg_mod.LirVRegId,
+    param_idx: usize,
+    disp: i32,
+    allocator: Allocator,
+) -> lir_op_id_mod.LirOpId
+    with {allocator, err: alloc.AllocError}
+{
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: rbp_base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: disp,
+    }
+    let dst = lir_vreg_mod.LirVRegId { raw: param_idx as u32 }
+    let op = lir_op_mod.LirOp {
+        origin: node_mod.error(),
+        kind: lir_op_mod.LirOpKind.load(addr: addr, dst: dst, width: 8 as u32),
+        flags: shared_mod.stack_flags(),
+    }
+    return lir_body_mod.push_op(mutable body, take op, allocator)?
+}
+
+function prepend_entry_ops(
+    body: mutable lir_body_mod.LirBody,
+    prefix: Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let entry_idx: usize = 1
+    if entry_idx >= Vec_LirBlock.len(body.blocks) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.abi: missing entry block for stack-parameter loads",
+        )
+    }
+    let block = Vec_LirBlock.at(body.blocks, entry_idx)
+
+    uninit new_ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init new_ops, allocator)?
+
+    let np = Vec_LirOpId.len(prefix)
+    var p: usize = 0
+    loop decreases np - p {
+        if p >= np { break }
+        Vec_LirOpId.push(mutable new_ops, Vec_LirOpId.at(prefix, p), allocator)?
+        p += 1
+    }
+    let no = Vec_LirOpId.len(block.ops)
+    var q: usize = 0
+    loop decreases no - q {
+        if q >= no { break }
+        Vec_LirOpId.push(mutable new_ops, Vec_LirOpId.at(block.ops, q), allocator)?
+        q += 1
+    }
+
+    let new_block = lir_body_mod.LirBlock {
+        node_id_origin: block.node_id_origin,
+        params: block.params,
+        ops: new_ops,
+        terminator: block.terminator,
+        coherence_region: block.coherence_region,
+    }
+    Vec_LirBlock.set_at(mutable body.blocks, entry_idx, take new_block)
+}
+
+function inbound_disp(arg_index: u32) -> i32 {
+    return ((16 as u32) + (arg_index *% (8 as u32))) as i32
+}
+
+function frame_base_preg() -> lir_reg_mod.PReg {
+    return lir_reg_mod.PReg { raw: 5 as u32 }
+}
+
+
+function gp_arg_preg(
+    target: triple_mod.TargetTriple,
+    arg_index: u32,
+) -> Option_PReg.Option
+    with {err: lir_error_mod.LirError}
+{
+    return match triple_mod.os(target) {
+        case .windows => msvc_gp_arg_preg(arg_index)
+        case .linux => sysv_gp_arg_preg(arg_index)
+        case .macos => sysv_gp_arg_preg(arg_index)
+        case .freebsd => sysv_gp_arg_preg(arg_index)
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.abi: no x86-64 calling convention locked for this OS",
+        )
+    }
+}
+
+function msvc_gp_arg_preg(arg_index: u32) -> Option_PReg.Option {
+    if arg_index == 0 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.rcx)) }
+    if arg_index == 1 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.rdx)) }
+    if arg_index == 2 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.r8)) }
+    if arg_index == 3 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.r9)) }
+    return Option_PReg.none
+}
+
+function sysv_gp_arg_preg(arg_index: u32) -> Option_PReg.Option {
+    if arg_index == 0 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.rdi)) }
+    if arg_index == 1 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.rsi)) }
+    if arg_index == 2 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.rdx)) }
+    if arg_index == 3 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.rcx)) }
+    if arg_index == 4 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.r8)) }
+    if arg_index == 5 { return Option_PReg.some(value: regs_mod.preg_of(regs_mod.Gp64Reg.r9)) }
+    return Option_PReg.none
+}
+
+
+function xmm_arg_preg(
+    target: triple_mod.TargetTriple,
+    arg_index: u32,
+) -> Option_PReg.Option
+    with {err: lir_error_mod.LirError}
+{
+    return match triple_mod.os(target) {
+        case .windows => msvc_xmm_arg_preg(arg_index)
+        case .linux => sysv_xmm_arg_preg(arg_index)
+        case .macos => sysv_xmm_arg_preg(arg_index)
+        case .freebsd => sysv_xmm_arg_preg(arg_index)
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.abi: no x86-64 calling convention locked for this OS",
+        )
+    }
+}
+
+function msvc_xmm_arg_preg(arg_index: u32) -> Option_PReg.Option {
+    if arg_index == 0 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm0)) }
+    if arg_index == 1 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm1)) }
+    if arg_index == 2 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm2)) }
+    if arg_index == 3 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm3)) }
+    return Option_PReg.none
+}
+
+function sysv_xmm_arg_preg(arg_index: u32) -> Option_PReg.Option {
+    if arg_index == 0 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm0)) }
+    if arg_index == 1 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm1)) }
+    if arg_index == 2 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm2)) }
+    if arg_index == 3 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm3)) }
+    if arg_index == 4 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm4)) }
+    if arg_index == 5 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm5)) }
+    if arg_index == 6 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm6)) }
+    if arg_index == 7 { return Option_PReg.some(value: regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm7)) }
+    return Option_PReg.none
+}

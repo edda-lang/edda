@@ -1,0 +1,91 @@
+
+module optimize.refine_elim.narrow.pinned.pinned
+
+import std.collections.vec
+import std.mem.alloc as alloc
+
+import local.refine_elim.narrow.util.util as util_mod
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.term as mir_term_mod
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+public function build_pinned(
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Local.len(body.locals)
+    var pinned = util_mod.new_bools(n, allocator)?
+    let abi_end = abi_clamp((2 as usize) + (body.n_params as usize), n)
+    var i: usize = 0
+    loop decreases (abi_end - i) {
+        if i >= abi_end { break }
+        Vec_bool.set_at(mutable pinned, i, true)
+        i = i + 1
+    }
+    pin_terminator_dests(mutable pinned, body)
+    pin_ref_taken(mutable pinned, body)
+    return pinned
+}
+
+function abi_clamp(want: usize, n: usize) -> usize {
+    if want > n { return n }
+    return want
+}
+
+function pin_terminator_dests(pinned: mutable Vec_bool.Vec, body: mir_body_mod.MirBody) -> () {
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases (nb - b) {
+        if b >= nb { break }
+        let block = Vec_BasicBlock.at(body.blocks, b)
+        util_mod.mark_if(mutable pinned, term_dest_local(block.terminator.kind))
+        b = b + 1
+    }
+}
+
+function term_dest_local(kind: mir_term_mod.TermKind) -> i64 {
+    return match kind {
+        case .call_(_, _, let dest, _, _) => util_mod.bare_local_of(dest)
+        case .await_(_, let dest, _, _) => util_mod.bare_local_of(dest)
+        case .spawn_(_, _, _, let hdest, _, _) => util_mod.bare_local_of(hdest)
+        case _ => (0 as i64) - (1 as i64)
+    }
+}
+
+function pin_ref_taken(pinned: mutable Vec_bool.Vec, body: mir_body_mod.MirBody) -> () {
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases (nb - b) {
+        if b >= nb { break }
+        let block = Vec_BasicBlock.at(body.blocks, b)
+        let ns = Vec_Statement.len(block.statements)
+        var s: usize = 0
+        loop decreases (ns - s) {
+            if s >= ns { break }
+            let st = Vec_Statement.at(block.statements, s)
+            pin_ref_in_stmt(mutable pinned, st.kind)
+            s = s + 1
+        }
+        b = b + 1
+    }
+}
+
+function pin_ref_in_stmt(pinned: mutable Vec_bool.Vec, kind: mir_stmt_mod.MStmtKind) -> () {
+    match kind {
+        case .assign(_, let value) => {
+            match value {
+                case .ref_(_, let place) => util_mod.mark_if(mutable pinned, util_mod.bare_local_of(place))
+                case _ => {}
+            }
+        }
+        case _ => {}
+    }
+}

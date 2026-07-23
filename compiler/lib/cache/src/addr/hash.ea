@@ -1,0 +1,221 @@
+
+module cache.addr.hash
+
+import std.core.option
+import std.crypto.hash.blake3
+import std.mem.alloc
+import std.text.string
+
+spec std.core.option.Option(ArtifactHash)
+spec std.core.option.Option(HashPrefix)
+spec std.core.option.Option(u64)
+
+derive eq, hash, ord, clone, debug for ArtifactHash
+derive eq, hash, ord, clone, debug for HashPrefix
+derive eq, hash, ord, clone, debug for BodyVersion
+
+
+public type ArtifactHash {
+    w0: u64
+    w1: u64
+    w2: u64
+    w3: u64
+}
+
+public type HashPrefix {
+    value: u64
+}
+
+public type BodyVersion {
+    value: u8
+}
+
+
+public stable function zero() -> ArtifactHash {
+    return ArtifactHash { w0: 0, w1: 0, w2: 0, w3: 0 }
+}
+
+public stable function from_bytes(bytes: [u8]) -> ArtifactHash
+    requires bytes.len() == 32
+{
+    return ArtifactHash {
+        w0: u64_from_be_bytes(bytes, 0),
+        w1: u64_from_be_bytes(bytes, 8),
+        w2: u64_from_be_bytes(bytes, 16),
+        w3: u64_from_be_bytes(bytes, 24),
+    }
+}
+
+public stable function prefix(h: ArtifactHash) -> HashPrefix
+    ensures result.value == h.w0 >> 16
+{
+    return HashPrefix { value: h.w0 >> 16 }
+}
+
+public stable function shard(h: ArtifactHash) -> u16
+    ensures result == (h.w0 >> 48) as u16
+{
+    return (h.w0 >> 48) as u16
+}
+
+
+public function hash_bytes(bytes: [u8], allocator: Allocator) -> ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    var scratch: [u8] = allocator.alloc_array(u8, 32)?
+    blake3.blake3(bytes, mutable scratch, 0)
+    return from_bytes(scratch)
+}
+
+
+public stable function to_hex_bytes(h: ArtifactHash, out: mutable [u8], offset: usize) -> ()
+    requires offset + 64 <= out.len()
+{
+    write_u64_hex_be(h.w0, mutable out, offset)
+    write_u64_hex_be(h.w1, mutable out, offset + 16)
+    write_u64_hex_be(h.w2, mutable out, offset + 32)
+    write_u64_hex_be(h.w3, mutable out, offset + 48)
+}
+
+public function to_hex_string(h: ArtifactHash, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var buf: [u8] = allocator.alloc_array(u8, 64)?
+    to_hex_bytes(h, mutable buf, 0)
+    return string.from_owned_utf8(take buf)
+}
+
+
+public function parse_hex(s: String) -> Option_ArtifactHash {
+    let bytes = s.bytes()
+    if bytes.len() != 64 { return Option_ArtifactHash.none }
+    return match read_hex_acc(bytes, 0, 16, 0) {
+        case .none => Option_ArtifactHash.none
+        case .some(let w0) => match read_hex_acc(bytes, 16, 16, 0) {
+            case .none => Option_ArtifactHash.none
+            case .some(let w1) => match read_hex_acc(bytes, 32, 16, 0) {
+                case .none => Option_ArtifactHash.none
+                case .some(let w2) => match read_hex_acc(bytes, 48, 16, 0) {
+                    case .none => Option_ArtifactHash.none
+                    case .some(let w3) =>
+                        Option_ArtifactHash.some(value: ArtifactHash { w0: w0, w1: w1, w2: w2, w3: w3 })
+                }
+            }
+        }
+    }
+}
+
+
+public stable function prefix_to_hex_bytes(p: HashPrefix, out: mutable [u8], offset: usize) -> ()
+    requires offset + 12 <= out.len()
+{
+    write_u48_hex_be(p.value, mutable out, offset)
+}
+
+public function prefix_to_hex_string(p: HashPrefix, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var buf: [u8] = allocator.alloc_array(u8, 12)?
+    prefix_to_hex_bytes(p, mutable buf, 0)
+    return string.from_owned_utf8(take buf)
+}
+
+public function prefix_parse_hex(s: String) -> Option_HashPrefix {
+    let bytes = s.bytes()
+    if bytes.len() != 12 { return Option_HashPrefix.none }
+    return match read_hex_acc(bytes, 0, 12, 0) {
+        case .some(let v) => Option_HashPrefix.some(value: HashPrefix { value: v })
+        case .none        => Option_HashPrefix.none
+    }
+}
+
+
+public stable function current_body_version() -> BodyVersion {
+    return BodyVersion { value: 9 }
+}
+
+
+function u64_from_be_bytes(bytes: [u8], offset: usize) -> u64
+    requires offset + 8 <= bytes.len()
+{
+    return  ((bytes[offset]     as u64) << 56)
+          | ((bytes[offset + 1] as u64) << 48)
+          | ((bytes[offset + 2] as u64) << 40)
+          | ((bytes[offset + 3] as u64) << 32)
+          | ((bytes[offset + 4] as u64) << 24)
+          | ((bytes[offset + 5] as u64) << 16)
+          | ((bytes[offset + 6] as u64) <<  8)
+          |  (bytes[offset + 7] as u64)
+}
+
+function write_u64_hex_be(w: u64, out: mutable [u8], offset: usize) -> ()
+    requires offset + 16 <= out.len()
+{
+    out[offset]      = nibble_to_hex(((w >> 60) & 15) as u8)
+    out[offset + 1]  = nibble_to_hex(((w >> 56) & 15) as u8)
+    out[offset + 2]  = nibble_to_hex(((w >> 52) & 15) as u8)
+    out[offset + 3]  = nibble_to_hex(((w >> 48) & 15) as u8)
+    out[offset + 4]  = nibble_to_hex(((w >> 44) & 15) as u8)
+    out[offset + 5]  = nibble_to_hex(((w >> 40) & 15) as u8)
+    out[offset + 6]  = nibble_to_hex(((w >> 36) & 15) as u8)
+    out[offset + 7]  = nibble_to_hex(((w >> 32) & 15) as u8)
+    out[offset + 8]  = nibble_to_hex(((w >> 28) & 15) as u8)
+    out[offset + 9]  = nibble_to_hex(((w >> 24) & 15) as u8)
+    out[offset + 10] = nibble_to_hex(((w >> 20) & 15) as u8)
+    out[offset + 11] = nibble_to_hex(((w >> 16) & 15) as u8)
+    out[offset + 12] = nibble_to_hex(((w >> 12) & 15) as u8)
+    out[offset + 13] = nibble_to_hex(((w >>  8) & 15) as u8)
+    out[offset + 14] = nibble_to_hex(((w >>  4) & 15) as u8)
+    out[offset + 15] = nibble_to_hex(( w        & 15) as u8)
+}
+
+function write_u48_hex_be(v: u64, out: mutable [u8], offset: usize) -> ()
+    requires offset + 12 <= out.len()
+{
+    out[offset]      = nibble_to_hex(((v >> 44) & 15) as u8)
+    out[offset + 1]  = nibble_to_hex(((v >> 40) & 15) as u8)
+    out[offset + 2]  = nibble_to_hex(((v >> 36) & 15) as u8)
+    out[offset + 3]  = nibble_to_hex(((v >> 32) & 15) as u8)
+    out[offset + 4]  = nibble_to_hex(((v >> 28) & 15) as u8)
+    out[offset + 5]  = nibble_to_hex(((v >> 24) & 15) as u8)
+    out[offset + 6]  = nibble_to_hex(((v >> 20) & 15) as u8)
+    out[offset + 7]  = nibble_to_hex(((v >> 16) & 15) as u8)
+    out[offset + 8]  = nibble_to_hex(((v >> 12) & 15) as u8)
+    out[offset + 9]  = nibble_to_hex(((v >>  8) & 15) as u8)
+    out[offset + 10] = nibble_to_hex(((v >>  4) & 15) as u8)
+    out[offset + 11] = nibble_to_hex(( v        & 15) as u8)
+}
+
+function read_hex_acc(
+    bytes: [u8],
+    offset: usize,
+    remaining: usize,
+    written: usize,
+) -> Option_u64
+    requires offset + remaining + written <= bytes.len()
+    requires remaining <= 16
+    decreases remaining
+{
+    if remaining == 0 { return Option_u64.some(value: 0) }
+    return match hex_to_nibble(bytes[offset + written]) {
+        case .none => Option_u64.none
+        case .some(let n) => match read_hex_acc(bytes, offset, remaining - 1, written + 1) {
+            case .none        => Option_u64.none
+            case .some(let r) => {
+                let shift: u64 = ((remaining - 1) as u64) * 4
+                Option_u64.some(value: (n << shift) | r)
+            }
+        }
+    }
+}
+
+function nibble_to_hex(n: u8 where n < 16) -> u8 {
+    return if n < 10 { n + 48 } else { (n - 10) + 97 }
+}
+
+function hex_to_nibble(b: u8) -> Option_u64 {
+    if b >= 48 && b <= 57  { return Option_u64.some(value: (b - 48) as u64) }
+    if b >= 97 && b <= 102 { return Option_u64.some(value: ((b - 97) + 10) as u64) }
+    if b >= 65 && b <= 70  { return Option_u64.some(value: ((b - 65) + 10) as u64) }
+    return Option_u64.none
+}

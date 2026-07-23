@@ -1,0 +1,128 @@
+
+module pgsql.client.exec.query
+
+import std.mem.alloc
+import std.collections.vec
+import std.net.socket
+import local.error
+import local.link.io
+import local.client.session.startup.connect
+import local.message.tag
+import local.message.fe.query as fe_query
+import local.message.be.data.rows as be_rows
+import local.message.be.data.command as be_command
+import local.message.be.reply.status as be_status
+import local.message.be.reply.response as be_response
+
+spec std.collections.vec.Vec(SimpleQueryRow)
+
+
+public type SimpleQueryRow {
+    columns: [be_rows.DataColumn]
+}
+
+public type SimpleQueryRows {
+    description: be_rows.RowDescription
+    rows: [SimpleQueryRow]
+    command_tag: [u8]
+}
+
+public type SimpleQueryResult {
+    case rows(payload: SimpleQueryRows)
+    case command(command_tag: [u8])
+    case empty
+}
+
+
+type _CollectorState {
+    case awaiting_first
+    case collecting(desc: be_rows.RowDescription)
+}
+
+
+public function run_simple_query(
+    conn: mutable connect.Connection,
+    sql: [u8],
+    allocator: Allocator,
+) -> SimpleQueryResult
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let q = fe_query.encode_query(sql, allocator)?
+    io.write_all(mutable conn.socket, q)?
+
+    var state: _CollectorState = _CollectorState.awaiting_first
+    uninit rows: Vec_SimpleQueryRow.Vec
+    Vec_SimpleQueryRow.new(init rows, allocator)?
+    var command_tag: [u8] = "".bytes()
+    var saw_empty: bool = false
+    var saw_error: bool = false
+    var error_sqlstate: [u8] = "".bytes()
+    var error_severity: [u8] = "".bytes()
+    var error_message: [u8] = "".bytes()
+
+    loop {
+        let msg = io.read_message(mutable conn.socket, allocator)?
+        if msg.tag == tag.be_row_description() {
+            let rd = be_rows.decode_row_description(msg.body, allocator)?
+            state = _CollectorState.collecting(desc: rd)
+        } else if msg.tag == tag.be_data_row() {
+            let dr = be_rows.decode_data_row(msg.body, allocator)?
+            Vec_SimpleQueryRow.push(
+                mutable rows,
+                take SimpleQueryRow { columns: dr.columns },
+                allocator,
+            )?
+        } else if msg.tag == tag.be_command_complete() {
+            let cc = be_command.decode_command_complete(msg.body)?
+            command_tag = cc.command_tag
+        } else if msg.tag == tag.be_empty_query_response() {
+            let _ = be_command.decode_empty_query_response(msg.body)?
+            saw_empty = true
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            saw_error = true
+            error_sqlstate = be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty)
+            error_severity = be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty)
+            error_message = be_response.field_value_or(err_resp.fields, be_response.field_message(), empty)
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else if msg.tag == tag.be_notification_response() {
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            conn.tx_status = rfq.transaction_status
+            break
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    if saw_error {
+        raise error.QueryError.sql_error(
+            sqlstate: error_sqlstate,
+            severity: error_severity,
+            message: error_message,
+        )
+    }
+
+    if saw_empty {
+        return SimpleQueryResult.empty
+    }
+    return match state {
+        case .awaiting_first => SimpleQueryResult.command(command_tag: command_tag)
+        case .collecting(let desc) => SimpleQueryResult.rows(
+            payload: SimpleQueryRows {
+                description: desc,
+                rows: Vec_SimpleQueryRow.into_array(take rows, allocator)?,
+                command_tag: command_tag,
+            }
+        )
+    }
+}

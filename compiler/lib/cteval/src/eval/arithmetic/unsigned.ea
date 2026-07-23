@@ -1,0 +1,143 @@
+
+module cteval.eval.arithmetic.unsigned
+
+import std.core.overflow
+import span.loc.pos.span as span_mod
+import syntax.ast.ops as ast_ops
+import local.state.value as value_mod
+import cteval.eval.arithmetic.outcome as outcome_mod
+
+
+public function apply(
+    op: ast_ops.BinOp,
+    av: u64,
+    bv: u64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    return match op {
+        case .add => unsigned_trap_addish(outcome_mod.AddishKind.add, av, bv, width, at)
+        case .check_add => unsigned_trap_addish(outcome_mod.AddishKind.add, av, bv, width, at)
+        case .sub => unsigned_trap_addish(outcome_mod.AddishKind.sub, av, bv, width, at)
+        case .check_sub => unsigned_trap_addish(outcome_mod.AddishKind.sub, av, bv, width, at)
+        case .mul => unsigned_trap_addish(outcome_mod.AddishKind.mul, av, bv, width, at)
+        case .check_mul => unsigned_trap_addish(outcome_mod.AddishKind.mul, av, bv, width, at)
+        case .wrap_add => unsigned_wrap_addish(outcome_mod.AddishKind.add, av, bv, width)
+        case .wrap_sub => unsigned_wrap_addish(outcome_mod.AddishKind.sub, av, bv, width)
+        case .wrap_mul => unsigned_wrap_addish(outcome_mod.AddishKind.mul, av, bv, width)
+        case .div => unsigned_div(av, bv, width, at)
+        case .mod => unsigned_mod(av, bv, width, at)
+        case .check_mod => unsigned_mod(av, bv, width, at)
+        case _ => outcome_mod.failed_arith_unsupported(at)
+    }
+}
+
+
+function unsigned_trap_addish(
+    kind: outcome_mod.AddishKind,
+    av: u64,
+    bv: u64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    return handle err: overflow.Overflow -> outcome_mod.overflow_outcome(at, unsigned_label(kind)) {
+        let raw = match kind {
+            case .add => av +? bv
+            case .sub => av -? bv
+            case .mul => av *? bv
+        }
+        let narrowed = check_unsigned_in_width(raw, width)?
+        outcome_mod.ArithOutcome.ok(
+            value: value_mod.ComptimeValue.int_unsigned(value: narrowed, width: width),
+        )
+    }
+}
+
+
+function unsigned_wrap_addish(
+    kind: outcome_mod.AddishKind,
+    av: u64,
+    bv: u64,
+    width: value_mod.IntWidth,
+) -> outcome_mod.ArithOutcome {
+    let raw = match kind {
+        case .add => av +% bv
+        case .sub => av -% bv
+        case .mul => av *% bv
+    }
+    let wrapped = wrap_unsigned_to_width(raw, width)
+    return outcome_mod.ArithOutcome.ok(
+        value: value_mod.ComptimeValue.int_unsigned(value: wrapped, width: width),
+    )
+}
+
+
+function unsigned_div(
+    av: u64,
+    bv: u64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    if bv == 0 {
+        return outcome_mod.overflow_outcome(at, "unsigned div by zero")
+    }
+    let raw = av / bv
+    return outcome_mod.ArithOutcome.ok(
+        value: value_mod.ComptimeValue.int_unsigned(value: raw, width: width),
+    )
+}
+
+function unsigned_mod(
+    av: u64,
+    bv: u64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    return handle err: overflow.Overflow -> outcome_mod.overflow_outcome(at, "unsigned mod") {
+        let raw = av %? bv
+        let narrowed = check_unsigned_in_width(raw, width)?
+        outcome_mod.ArithOutcome.ok(
+            value: value_mod.ComptimeValue.int_unsigned(value: narrowed, width: width),
+        )
+    }
+}
+
+
+function check_unsigned_in_width(v: u64, width: value_mod.IntWidth) -> u64
+    with {err: overflow.Overflow}
+{
+    return match width {
+        case .w8 => unsigned_range(v, 255)?
+        case .w16 => unsigned_range(v, 65535)?
+        case .w32 => unsigned_range(v, 4294967295)?
+        case .w64 => v
+        case .wsize => v
+    }
+}
+
+function unsigned_range(v: u64, hi: u64) -> u64 with {err: overflow.Overflow} {
+    if v > hi {
+        raise overflow.Overflow.overflow
+    }
+    return v
+}
+
+
+function wrap_unsigned_to_width(v: u64, width: value_mod.IntWidth) -> u64 {
+    return match width {
+        case .w8 => (v as u8 wrapping) as u64
+        case .w16 => (v as u16 wrapping) as u64
+        case .w32 => (v as u32 wrapping) as u64
+        case .w64 => v
+        case .wsize => v
+    }
+}
+
+
+function unsigned_label(kind: outcome_mod.AddishKind) -> String {
+    return match kind {
+        case .add => "unsigned add"
+        case .sub => "unsigned sub"
+        case .mul => "unsigned mul"
+    }
+}

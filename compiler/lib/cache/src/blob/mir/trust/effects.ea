@@ -1,0 +1,94 @@
+
+module cache.blob.mir.trust.effects
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import types.pass.ty as ty_mod
+import types.effect.row as effect_facts_mod
+import mir.body.model as body_model_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function write_trust_annotation(
+    t: body_model_mod.TrustAnnotation,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match t {
+        case .discharged => prim_mod.push_u8(mutable out, 0, allocator)?
+        case .unverified(let reason) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            symbol_codec_mod.write_symbol(it, reason, mutable out, allocator)?
+        }
+        case .site_trusted(let reason) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            symbol_codec_mod.write_symbol(it, reason, mutable out, allocator)?
+        }
+    }
+}
+
+public function read_trust_annotation(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> body_model_mod.TrustAnnotation
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => body_model_mod.TrustAnnotation.discharged
+        case 1 => body_model_mod.TrustAnnotation.unverified(
+            reason: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?,
+        )
+        case 2 => body_model_mod.TrustAnnotation.site_trusted(
+            reason: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?,
+        )
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown TrustAnnotation tag")
+    }
+}
+
+public function write_effect_facts(f: effect_facts_mod.EffectFacts, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prim_mod.push_bool(mutable out, f.pure_, allocator)?
+    prim_mod.push_bool(mutable out, f.no_alloc, allocator)?
+    prim_mod.push_bool(mutable out, f.no_io, allocator)?
+    prim_mod.push_bool(mutable out, f.nounwind, allocator)?
+    prim_mod.push_bool(mutable out, f.has_alloc_bound, allocator)?
+    prim_mod.push_u128_le(mutable out, f.alloc_bytes_max, allocator)?
+    prim_mod.push_bool(mutable out, f.raises, allocator)?
+    prim_mod.push_u32_le(mutable out, f.err_ty.raw, allocator)?
+}
+
+public function read_effect_facts(bytes: [u8], cur: mutable prim_mod.Reader) -> effect_facts_mod.EffectFacts
+    with {err: error_mod.CacheError}
+{
+    let pure_ = prim_mod.read_bool(bytes, mutable cur)?
+    let no_alloc = prim_mod.read_bool(bytes, mutable cur)?
+    let no_io = prim_mod.read_bool(bytes, mutable cur)?
+    let nounwind = prim_mod.read_bool(bytes, mutable cur)?
+    let has_alloc_bound = prim_mod.read_bool(bytes, mutable cur)?
+    let alloc_bytes_max = prim_mod.read_u128_le(bytes, mutable cur)?
+    let raises = prim_mod.read_bool(bytes, mutable cur)?
+    let err_ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    return effect_facts_mod.EffectFacts {
+        pure_: pure_,
+        no_alloc: no_alloc,
+        no_io: no_io,
+        nounwind: nounwind,
+        has_alloc_bound: has_alloc_bound,
+        alloc_bytes_max: alloc_bytes_max,
+        raises: raises,
+        err_ty: err_ty,
+    }
+}

@@ -1,0 +1,284 @@
+
+module ir.hlir.tree.body
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import types.pass.ty as ty_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import mir.id.hir as hir_file_mod
+import mir.layout.table as mir_layout_mod
+import local.hlir.id.value as value_mod
+import local.hlir.id.block as block_mod
+import local.hlir.id.op as op_mod
+import local.hlir.id.region as region_mod
+import local.hlir.op as hlir_op_mod
+import local.hlir.term as term_mod
+import local.hlir.attrs as attrs_mod
+
+
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(op_mod.OpId)
+spec std.collections.vec.Vec(HlirValue)
+spec std.collections.vec.Vec(HlirBlock)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(HlirDebugLocal)
+
+
+spec std.core.option.Option(region_mod.RegionId)
+
+
+derive eq, hash, debug for HlirValueDef
+derive eq, hash, debug for HlirValue
+derive eq, hash, debug for HlirBlock
+derive eq, hash, debug for HlirDebugLocal
+derive eq, hash, debug for HlirBody
+
+
+public type HlirDebugLocal {
+    value_raw: u32
+    name: symbol_mod.Symbol
+    ty: ty_mod.TyId
+}
+
+
+public type HlirValueDef {
+    case block_param(block: block_mod.BlockId, position: u32)
+    case op_result(op: op_mod.OpId)
+}
+
+public type HlirValue {
+    ty: ty_mod.TyId
+    def: HlirValueDef
+}
+
+
+public type HlirBlock {
+    node_id_origin: node_mod.NodeId
+    params: Vec_ValueId.Vec
+    ops: Vec_OpId.Vec
+    terminator: term_mod.HlirTerminator
+    coherence_region: Option_RegionId.Option
+}
+
+
+public type HlirBody {
+    def_id: def_mod.DefId
+    origin_file: hir_file_mod.HirFileId
+    blocks: Vec_HlirBlock.Vec
+    ops: Vec_HlirOp.Vec
+    values: Vec_HlirValue.Vec
+    n_params: u32
+    fn_attrs: attrs_mod.HlirFnAttrs
+    symbol: symbol_mod.Symbol
+    debug_locals: Vec_HlirDebugLocal.Vec
+    agg_layouts: mir_layout_mod.LayoutTable
+}
+
+
+public function new_body(
+    out: init HlirBody,
+    def_id: def_mod.DefId,
+    origin_file: hir_file_mod.HirFileId,
+    body_node_origin: node_mod.NodeId,
+    fn_attrs: attrs_mod.HlirFnAttrs,
+    symbol: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit blocks: Vec_HlirBlock.Vec
+    Vec_HlirBlock.new(init blocks, allocator)?
+    Vec_HlirBlock.push(mutable blocks, take sentinel_block(allocator)?, allocator)?
+    Vec_HlirBlock.push(mutable blocks, take entry_block(body_node_origin, allocator)?, allocator)?
+
+    uninit ops: Vec_HlirOp.Vec
+    Vec_HlirOp.new(init ops, allocator)?
+    Vec_HlirOp.push(mutable ops, take sentinel_op(), allocator)?
+
+    uninit values: Vec_HlirValue.Vec
+    Vec_HlirValue.new(init values, allocator)?
+    Vec_HlirValue.push(mutable values, take sentinel_value(), allocator)?
+
+    uninit debug_locals: Vec_HlirDebugLocal.Vec
+    Vec_HlirDebugLocal.new(init debug_locals, allocator)?
+
+    out = HlirBody {
+        def_id: def_id,
+        origin_file: origin_file,
+        blocks: blocks,
+        ops: ops,
+        values: values,
+        n_params: 0,
+        fn_attrs: fn_attrs,
+        symbol: symbol,
+        debug_locals: debug_locals,
+        agg_layouts: mir_layout_mod.new_table(allocator)?,
+    }
+}
+
+
+public function set_agg_layouts(
+    body: take HlirBody,
+    agg_layouts: mir_layout_mod.LayoutTable,
+) -> HlirBody {
+    return HlirBody {
+        def_id: body.def_id,
+        origin_file: body.origin_file,
+        blocks: body.blocks,
+        ops: body.ops,
+        values: body.values,
+        n_params: body.n_params,
+        fn_attrs: body.fn_attrs,
+        symbol: body.symbol,
+        debug_locals: body.debug_locals,
+        agg_layouts: agg_layouts,
+    }
+}
+
+
+public function push_debug_local(
+    body: mutable HlirBody,
+    value_raw: u32,
+    name: symbol_mod.Symbol,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_HlirDebugLocal.push(
+        mutable body.debug_locals,
+        take HlirDebugLocal { value_raw: value_raw, name: name, ty: ty },
+        allocator,
+    )?
+}
+
+
+function sentinel_block(allocator: Allocator) -> HlirBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValueId.Vec
+    Vec_ValueId.new(init params, allocator)?
+    uninit ops: Vec_OpId.Vec
+    Vec_OpId.new(init ops, allocator)?
+    return HlirBlock {
+        node_id_origin: node_mod.error(),
+        params: params,
+        ops: ops,
+        terminator: term_mod.HlirTerminator {
+            origin: node_mod.error(),
+            kind: term_mod.HlirTermKind.unreachable_,
+        },
+        coherence_region: Option_RegionId.none,
+    }
+}
+
+function entry_block(body_node_origin: node_mod.NodeId, allocator: Allocator) -> HlirBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValueId.Vec
+    Vec_ValueId.new(init params, allocator)?
+    uninit ops: Vec_OpId.Vec
+    Vec_OpId.new(init ops, allocator)?
+    return HlirBlock {
+        node_id_origin: body_node_origin,
+        params: params,
+        ops: ops,
+        terminator: term_mod.HlirTerminator {
+            origin: body_node_origin,
+            kind: term_mod.HlirTermKind.unreachable_,
+        },
+        coherence_region: Option_RegionId.none,
+    }
+}
+
+function sentinel_op() -> hlir_op_mod.HlirOp {
+    return hlir_op_mod.HlirOp {
+        origin: node_mod.error(),
+        kind: hlir_op_mod.HlirOpKind.literal(c: hlir_op_mod.HConstant.unit_),
+        result_: value_mod.error(),
+        flags: hlir_op_mod.OpFlags {
+            overflow_safe: false,
+            in_bounds: false,
+            nonzero_divisor: false,
+            range_safe: false,
+            intrinsic: hlir_op_mod.Intrinsic.none,
+            div_overflow: hlir_op_mod.DivOverflow.trap,
+            div_overflow_safe: false,
+            extern_call: false,
+            extern_ret_size: 0 as u32,
+        },
+    }
+}
+
+function sentinel_value() -> HlirValue {
+    return HlirValue {
+        ty: ty_mod.error(),
+        def: HlirValueDef.op_result(op: op_mod.error()),
+    }
+}
+
+
+public function push_block(
+    body: mutable HlirBody,
+    block: take HlirBlock,
+    allocator: Allocator,
+) -> block_mod.BlockId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_HlirBlock.len(body.blocks) < 4294967295
+{
+    let id = block_mod.BlockId { raw: Vec_HlirBlock.len(body.blocks) as u32 }
+    Vec_HlirBlock.push(mutable body.blocks, take block, allocator)?
+    return id
+}
+
+public function push_op(
+    body: mutable HlirBody,
+    op: take hlir_op_mod.HlirOp,
+    allocator: Allocator,
+) -> op_mod.OpId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_HlirOp.len(body.ops) < 4294967295
+{
+    let id = op_mod.OpId { raw: Vec_HlirOp.len(body.ops) as u32 }
+    Vec_HlirOp.push(mutable body.ops, take op, allocator)?
+    return id
+}
+
+public function push_value(
+    body: mutable HlirBody,
+    value: take HlirValue,
+    allocator: Allocator,
+) -> value_mod.ValueId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_HlirValue.len(body.values) < 4294967295
+{
+    let id = value_mod.ValueId { raw: Vec_HlirValue.len(body.values) as u32 }
+    Vec_HlirValue.push(mutable body.values, take value, allocator)?
+    return id
+}
+
+public function mint_param_value(
+    body: mutable HlirBody,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> value_mod.ValueId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_HlirValue.len(body.values) < 4294967295
+    requires Vec_HlirValue.len(body.values) == (body.n_params as usize) + 1
+{
+    let position = body.n_params
+    let id = value_mod.ValueId { raw: Vec_HlirValue.len(body.values) as u32 }
+    let value = HlirValue {
+        ty: ty,
+        def: HlirValueDef.block_param(
+            block: block_mod.entry(),
+            position: position,
+        ),
+    }
+    Vec_HlirValue.push(mutable body.values, take value, allocator)?
+    body.n_params = body.n_params + 1
+    return id
+}

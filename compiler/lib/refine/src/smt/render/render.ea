@@ -1,0 +1,226 @@
+
+module refine.smt.render.render
+
+import std.collections.vec
+import std.core.fmt
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import local.smt.term as term_mod
+
+
+spec std.mem.alloc.Box(term_mod.SmtSort)
+spec std.mem.alloc.Box(term_mod.SmtTerm)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function render_term(
+    t: term_mod.SmtTerm,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match t {
+        case .true_ => "true"
+        case .false_ => "false"
+        case .numeral(let value) => render_numeral(value, allocator)?
+        case .var_(let name, _) => symbol_text(name, interner, allocator)?
+        case .app(let op, let args) => render_app(op, args, interner, allocator)?
+        case .forall_(let binder, let binder_sort, let body) =>
+            render_quantifier("forall", binder, binder_sort, body, interner, allocator)?
+        case .exists_(let binder, let binder_sort, let body) =>
+            render_quantifier("exists", binder, binder_sort, body, interner, allocator)?
+    }
+}
+
+public function render_sort(
+    s: term_mod.SmtSort,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match s {
+        case .bool_ => "Bool"
+        case .int_ => "Int"
+        case .array_(let elem_box) => {
+            let elem = Box_SmtSort.get(elem_box)
+            let elem_str = render_sort(elem, interner, allocator)?
+            let p1 = string.concat("(Array Int ", elem_str, allocator)?
+            string.concat(p1, ")", allocator)?
+        }
+        case .uninterp(let name) => symbol_text(name, interner, allocator)?
+    }
+}
+
+
+function render_app(
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let head = render_op(op, interner, allocator)?
+    let n = Vec_SmtTerm.len(args)
+    if n == 0 {
+        return head
+    }
+    let p1 = string.concat("(", head, allocator)?
+    var acc: String = p1
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        let arg_str = render_term(arg, interner, allocator)?
+        let withspace = string.concat(acc, " ", allocator)?
+        acc = string.concat(withspace, arg_str, allocator)?
+        i = i + 1
+    }
+    return string.concat(acc, ")", allocator)?
+}
+
+
+function render_quantifier(
+    head: String,
+    binder: sym_mod.Symbol,
+    binder_sort: term_mod.SmtSort,
+    body_box: Box_SmtTerm,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let binder_name = symbol_text(binder, interner, allocator)?
+    let sort_str = render_sort(binder_sort, interner, allocator)?
+    let body = Box_SmtTerm.get(body_box)
+    let body_str = render_term(body, interner, allocator)?
+    let p1 = string.concat("(", head, allocator)?
+    let p2 = string.concat(p1, " ((", allocator)?
+    let p3 = string.concat(p2, binder_name, allocator)?
+    let p4 = string.concat(p3, " ", allocator)?
+    let p5 = string.concat(p4, sort_str, allocator)?
+    let p6 = string.concat(p5, ")) ", allocator)?
+    let p7 = string.concat(p6, body_str, allocator)?
+    return string.concat(p7, ")", allocator)?
+}
+
+
+function render_op(
+    op: term_mod.SmtOp,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match op {
+        case .and_      => "and"
+        case .or_       => "or"
+        case .not_      => "not"
+        case .implies_  => "=>"
+        case .eq_       => "="
+        case .distinct_ => "distinct"
+        case .ite       => "ite"
+        case .add       => "+"
+        case .sub       => "-"
+        case .mul       => "*"
+        case .neg       => "-"
+        case .div_      => "div"
+        case .mod_      => "mod"
+        case .lt        => "<"
+        case .le        => "<="
+        case .gt        => ">"
+        case .ge        => ">="
+        case .select_   => "select"
+        case .store_    => "store"
+        case .udf(let name) => symbol_text(name, interner, allocator)?
+    }
+}
+
+
+function render_numeral(value: i128, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if value >= (0 as i128) {
+        return fmt.i128_to_string(value, allocator)?
+    }
+    let positive = (0 as i128) - value
+    let pos_str = fmt.i128_to_string(positive, allocator)?
+    let p1 = string.concat("(- 0 ", pos_str, allocator)?
+    return string.concat(p1, ")", allocator)?
+}
+
+public function symbol_text(
+    sym: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+    requires (sym.raw as usize) < interner_mod.slot_count(interner)
+{
+    let bytes = interner_mod.lookup(interner, sym)
+    let n = bytes.len()
+    if !all_simple(bytes, n) {
+        return quote_symbol(bytes, n, allocator)?
+    }
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        buf[i] = bytes[i]
+        i = i + 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function is_simple_sym_byte(b: u8) -> bool {
+    if b >= 65 && b <= 90  { return true }
+    if b >= 97 && b <= 122 { return true }
+    if b >= 48 && b <= 57  { return true }
+    if b == 126 || b == 33 || b == 64 || b == 36 || b == 37 { return true }
+    if b == 94  || b == 38 || b == 42 || b == 95 || b == 45 { return true }
+    if b == 43  || b == 61 || b == 60 || b == 62 || b == 46 { return true }
+    if b == 63  || b == 47 { return true }
+    return false
+}
+
+function all_simple(bytes: [u8], n: usize) -> bool
+    requires n <= bytes.len()
+{
+    if n == 0 { return false }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if !is_simple_sym_byte(bytes[i]) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+function quote_symbol(bytes: [u8], n: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires n <= bytes.len()
+{
+    let mid_buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = bytes[i]
+        mid_buf[i] = if b == 124 || b == 92 { 46 } else { b }
+        i = i + 1
+    }
+    let mid = string.from_owned_utf8(take mid_buf)
+    let p1 = string.concat("|", mid, allocator)?
+    return string.concat(p1, "|", allocator)?
+}

@@ -1,0 +1,152 @@
+
+module refine.smt.encode.idx.idx
+
+import std.collections.vec
+import std.mem.alloc
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as ast_tree
+import types.check.env.builtins as builtins_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.term as term_mod
+import local.smt.encode.encres as result_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.mem.alloc.Box(ast_tree.Expr)
+
+
+public function encode_index(
+    receiver_box: Box_Expr,
+    index_box: Box_Expr,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_expr = Box_Expr.get(receiver_box)
+    let receiver_result = encode_fn(receiver_expr, vars, ty_interner, builtins, allocator)?
+    return match receiver_result {
+        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+        case .encoded(let receiver_term) => {
+            let index_expr = Box_Expr.get(index_box)
+            let index_result = encode_fn(index_expr, vars, ty_interner, builtins, allocator)?
+            match index_result {
+                case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+                case .encoded(let index_term) => {
+                    uninit args: Vec_SmtTerm.Vec
+                    Vec_SmtTerm.new(init args, allocator)?
+                    Vec_SmtTerm.push(mutable args, take receiver_term, allocator)?
+                    Vec_SmtTerm.push(mutable args, take index_term, allocator)?
+                    result_mod.EncodeResult.encoded(
+                        term: term_mod.SmtTerm.app(op: term_mod.SmtOp.select_, args: args),
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+public function encode_tuple_index(
+    receiver_box: Box_Expr,
+    index: u32,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_expr = Box_Expr.get(receiver_box)
+    let receiver_result = encode_fn(receiver_expr, vars, ty_interner, builtins, allocator)?
+    return match receiver_result {
+        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+        case .encoded(let receiver_term) => {
+            uninit args: Vec_SmtTerm.Vec
+            Vec_SmtTerm.new(init args, allocator)?
+            Vec_SmtTerm.push(mutable args, take receiver_term, allocator)?
+            Vec_SmtTerm.push(mutable args, take term_mod.SmtTerm.numeral(value: index as i128), allocator)?
+            result_mod.EncodeResult.encoded(
+                term: term_mod.SmtTerm.app(op: term_mod.SmtOp.select_, args: args),
+            )
+        }
+    }
+}
+
+
+public function encode_positional(
+    receiver_box: Box_Expr,
+    index_box: Box_Expr,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if receiver_is_tuple(receiver_box, vars, ty_interner) {
+        return encode_index(receiver_box, index_box, vars, ty_interner, builtins, allocator, encode_fn)?
+    }
+    return result_mod.EncodeResult.unsupported(
+        fragment: err_mod.UnsupportedFragment.other(
+            message: "positional projection on a non-tuple receiver in refinement",
+        ),
+    )
+}
+
+
+function receiver_is_tuple(
+    receiver_box: Box_Expr,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    let receiver = Box_Expr.get(receiver_box)
+    return match receiver.kind {
+        case .path(let path) => path_ty_is_tuple(path, vars, ty_interner)
+        case _ => false
+    }
+}
+
+
+function path_ty_is_tuple(
+    path: ident_mod.Path,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    if Vec_Ident.len(path.segments) != 1 {
+        return false
+    }
+    let leaf = Vec_Ident.at(path.segments, 0)
+    return match ctx_mod.lookup_variable(vars, leaf.name) {
+        case .none => false
+        case .some(let ty) => ty_is_tuple(ty, ty_interner)
+    }
+}
+
+
+function ty_is_tuple(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .tuple_(_) => true
+        case .refined(let base, _) => ty_is_tuple(base, ty_interner)
+        case _ => false
+    }
+}

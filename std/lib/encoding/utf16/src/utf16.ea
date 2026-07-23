@@ -1,0 +1,254 @@
+
+module std.encoding.utf16
+import std.text.string
+
+import std.mem.alloc
+
+spec std.mem.alloc.Array(u8)
+
+
+public stable function encoded_max_byte_length(byte_count: usize) -> usize {
+    return 4 * byte_count
+}
+
+public stable function decoded_max_byte_length(byte_count: usize where byte_count % 2 == 0) -> usize {
+    return 3 * (byte_count / 2)
+}
+
+
+public type Utf16Error {
+    case odd_byte_length
+    case unpaired_high_surrogate
+    case unpaired_low_surrogate
+}
+
+
+function scalar_utf8_length(cp: u32) -> usize
+    ensures result >= 1
+    ensures result <= 4
+{
+    if cp < 0x80 { return 1 }
+    if cp < 0x800 { return 2 }
+    if cp < 0x10000 { return 3 }
+    return 4
+}
+
+function write_unit(
+    unit: u32,
+    big: bool,
+    out: mutable [u8],
+    pos: usize where pos + 2 <= out.len(),
+) -> () {
+    let hi: u8 = ((unit / 0x100) % 0x100) as u8
+    let lo: u8 = (unit % 0x100) as u8
+    if big {
+        out[pos] = hi
+        out[pos + 1] = lo
+    } else {
+        out[pos] = lo
+        out[pos + 1] = hi
+    }
+}
+
+function read_unit(
+    bytes: [u8],
+    big: bool,
+    pos: usize where pos + 2 <= bytes.len(),
+) -> u32
+    ensures result < 0x10000
+{
+    let b0: u32 = bytes[pos] as u32
+    let b1: u32 = bytes[pos + 1] as u32
+    if big { return (b0 * 0x100) + b1 }
+    return (b1 * 0x100) + b0
+}
+
+function utf8_write(
+    cp: u32 where cp < 0x110000,
+    out: mutable [u8],
+    pos: usize where pos + scalar_utf8_length(cp) <= out.len(),
+) -> usize
+    ensures result == scalar_utf8_length(cp)
+{
+    if cp < 0x80 {
+        out[pos] = cp as u8
+        return 1
+    }
+    if cp < 0x800 {
+        out[pos] = ((cp / 0x40) + 0xC0) as u8
+        out[pos + 1] = ((cp % 0x40) + 0x80) as u8
+        return 2
+    }
+    if cp < 0x10000 {
+        out[pos] = ((cp / 0x1000) + 0xE0) as u8
+        out[pos + 1] = (((cp / 0x40) % 0x40) + 0x80) as u8
+        out[pos + 2] = ((cp % 0x40) + 0x80) as u8
+        return 3
+    }
+    out[pos] = ((cp / 0x40000) + 0xF0) as u8
+    out[pos + 1] = (((cp / 0x1000) % 0x40) + 0x80) as u8
+    out[pos + 2] = (((cp / 0x40) % 0x40) + 0x80) as u8
+    out[pos + 3] = ((cp % 0x40) + 0x80) as u8
+    return 4
+}
+
+
+function encode_units_into(
+    s: String,
+    big: bool,
+    out: mutable [u8],
+    offset: usize where offset + encoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    ensures result <= encoded_max_byte_length(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let n: usize = bytes.len()
+    var i: usize = 0
+    var w: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let b0: u32 = bytes[i] as u32
+        var cp: u32 = 0
+        if b0 < 0x80 {
+            cp = b0
+            i = i + 1
+        } else if b0 < 0xE0 {
+            if i + 1 >= n { break }
+            cp = ((b0 % 0x20) * 0x40) + ((bytes[i + 1] as u32) % 0x40)
+            i = i + 2
+        } else if b0 < 0xF0 {
+            if i + 2 >= n { break }
+            cp = ((b0 % 0x10) * 0x1000) + (((bytes[i + 1] as u32) % 0x40) * 0x40) + ((bytes[i + 2] as u32) % 0x40)
+            i = i + 3
+        } else {
+            if i + 3 >= n { break }
+            cp = ((b0 % 0x08) * 0x40000) + (((bytes[i + 1] as u32) % 0x40) * 0x1000) + (((bytes[i + 2] as u32) % 0x40) * 0x40) + ((bytes[i + 3] as u32) % 0x40)
+            i = i + 4
+        }
+        if cp < 0x10000 {
+            write_unit(cp, big, mutable out, offset + w)
+            w = w + 2
+        } else {
+            let v: u32 = cp - 0x10000
+            write_unit(0xD800 + (v / 0x400), big, mutable out, offset + w)
+            write_unit(0xDC00 + (v % 0x400), big, mutable out, offset + w + 2)
+            w = w + 4
+        }
+    }
+    return w
+}
+
+public function encode_le(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let input: [u8] = s.bytes()
+    var out: [u8] = Array_u8.alloc(allocator, encoded_max_byte_length(input.len()))?
+    let written: usize = encode_units_into(s, false, mutable out, 0)
+    return out[..written]
+}
+
+public function encode_be(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let input: [u8] = s.bytes()
+    var out: [u8] = Array_u8.alloc(allocator, encoded_max_byte_length(input.len()))?
+    let written: usize = encode_units_into(s, true, mutable out, 0)
+    return out[..written]
+}
+
+public function encode_le_into(
+    s: String,
+    out: mutable [u8],
+    offset: usize where offset + encoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    ensures result <= encoded_max_byte_length(s.len())
+{
+    return encode_units_into(s, false, mutable out, offset)
+}
+
+public function encode_be_into(
+    s: String,
+    out: mutable [u8],
+    offset: usize where offset + encoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    ensures result <= encoded_max_byte_length(s.len())
+{
+    return encode_units_into(s, true, mutable out, offset)
+}
+
+
+function decode_units_into(
+    bytes: [u8] where bytes.len() % 2 == 0,
+    big: bool,
+    out: mutable [u8],
+    offset: usize where offset + decoded_max_byte_length(bytes.len()) <= out.len(),
+) -> usize
+    with {err: Utf16Error}
+    ensures result <= decoded_max_byte_length(bytes.len())
+{
+    let units: usize = bytes.len() / 2
+    var k: usize = 0
+    var w: usize = 0
+    loop
+        decreases units - k
+    {
+        if k >= units { break }
+        let u0: u32 = read_unit(bytes, big, 2 * k)
+        if u0 >= 0xD800 && u0 < 0xDC00 {
+            if k + 1 >= units { raise Utf16Error.unpaired_high_surrogate }
+            let u1: u32 = read_unit(bytes, big, 2 * (k + 1))
+            if u1 < 0xDC00 || u1 >= 0xE000 { raise Utf16Error.unpaired_high_surrogate }
+            let cp: u32 = 0x10000 + ((u0 - 0xD800) * 0x400) + (u1 - 0xDC00)
+            w = w + utf8_write(cp, mutable out, offset + w)
+            k = k + 2
+        } else if u0 >= 0xDC00 && u0 < 0xE000 {
+            raise Utf16Error.unpaired_low_surrogate
+        } else {
+            w = w + utf8_write(u0, mutable out, offset + w)
+            k = k + 1
+        }
+    }
+    return w
+}
+
+public function decode_le(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: Utf16Error, err: alloc.AllocError}
+{
+    if bytes.len() % 2 != 0 { raise Utf16Error.odd_byte_length }
+    var out: [u8] = Array_u8.alloc(allocator, decoded_max_byte_length(bytes.len()))?
+    let written: usize = decode_units_into(bytes, false, mutable out, 0)?
+    return string.from_owned_utf8(take out[..written])
+}
+
+public function decode_be(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: Utf16Error, err: alloc.AllocError}
+{
+    if bytes.len() % 2 != 0 { raise Utf16Error.odd_byte_length }
+    var out: [u8] = Array_u8.alloc(allocator, decoded_max_byte_length(bytes.len()))?
+    let written: usize = decode_units_into(bytes, true, mutable out, 0)?
+    return string.from_owned_utf8(take out[..written])
+}
+
+public function decode_le_into(
+    bytes: [u8] where bytes.len() % 2 == 0,
+    out: mutable [u8],
+    offset: usize where offset + decoded_max_byte_length(bytes.len()) <= out.len(),
+) -> usize
+    with {err: Utf16Error}
+    ensures result <= decoded_max_byte_length(bytes.len())
+{
+    return decode_units_into(bytes, false, mutable out, offset)?
+}
+
+public function decode_be_into(
+    bytes: [u8] where bytes.len() % 2 == 0,
+    out: mutable [u8],
+    offset: usize where offset + decoded_max_byte_length(bytes.len()) <= out.len(),
+) -> usize
+    with {err: Utf16Error}
+    ensures result <= decoded_max_byte_length(bytes.len())
+{
+    return decode_units_into(bytes, true, mutable out, offset)?
+}

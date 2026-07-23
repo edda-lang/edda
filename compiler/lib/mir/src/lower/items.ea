@@ -1,0 +1,678 @@
+
+module mir.lower.items
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import hir.tree as hir_tree
+import hir.item as hir_item
+import hir.def as def_mod
+import hir.node as node_mod
+import intern.symbol as symbol_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.row as effect_facts_mod
+import types.check as check_mod
+import cteval.res.output as cteval_output_mod
+import local.body.model as body_mod
+import local.stmt as stmt_mod
+import local.term as term_mod
+import local.rvalue as rvalue_mod
+import local.id.local as local_mod
+import local.id.hir as hir_file_mod
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.build.ctx.clauses.clauses as clauses_mod
+import local.lower.build.ctx.obligation.obligation as obligation_mod
+import local.lower.build.envscan as envscan_mod
+import local.lower.walker as walker
+import local.error.diag as mir_error_mod
+import local.lower.eqmap.targets as eqmap_mod
+import local.lower.fmt.targets as fmt_targets_mod
+import target.triple as triple_mod
+import local.place as place_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(hir_tree.HClosureParam)
+spec std.collections.vec.Vec(hir_tree.HCapture)
+spec std.collections.vec.Vec(place_mod.Projection)
+spec std.collections.vec.Vec(builder_mod.PendingClosure)
+spec std.collections.vec.Vec(mir_error_mod.UnsupportedSite)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(Box_HExpr)
+
+
+public function params_have_by_ref(params: Vec_HParam.Vec) -> bool {
+    let n: usize = Vec_HParam.len(params)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let by_ref = match Vec_HParam.at(params, i).mode {
+            case .mutable_ => true
+            case .init_ => true
+            case _ => false
+        }
+        if by_ref {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+public function lower_function_item(
+    def_id: def_mod.DefId,
+    origin_file: hir_file_mod.HirFileId,
+    sig_box: Box_HFnSignature,
+    body: hir_tree.HBlock,
+    types_out: check_mod.TypeOutput,
+    comptime_out: cteval_output_mod.ComptimeOutput,
+    ty_interner: mutable ty_interner_mod.Interner,
+    overflow_info: builder_mod.OverflowInfo,
+    closure_def_base: u32,
+    pointer_width: usize,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    err_wide_map: IntMap_u32.IntMap,
+    triple: triple_mod.TargetTriple,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    outcome_buf_ty: ty_mod.TyId,
+    task_group_ty: ty_mod.TyId,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    pending_out: mutable Vec_PendingClosure.Vec,
+    unsupported_out: mutable Vec_UnsupportedSite.Vec,
+    shim_out: mutable Vec_DefId.Vec,
+    meta_alloc: Allocator,
+    allocator: Allocator,
+) -> body_mod.MirBody
+    with {meta_alloc, allocator, err: alloc.AllocError, panic, divergence}
+{
+    let sig = Box_HFnSignature.get(sig_box)
+    let sig_lookup = check_mod.signature_of(types_out, def_id)
+    let return_ty = match sig_lookup {
+        case .some(let s) => s.ret
+        case .none => ty_mod.error()
+    }
+    let effect_facts = match sig_lookup {
+        case .some(let s) => if params_have_by_ref(sig.params) {
+            effect_facts_mod.mark_impure(s.effect_facts)
+        } else {
+            s.effect_facts
+        }
+        case .none => effect_facts_mod.pure_facts()
+    }
+
+    uninit ctx: builder_mod.LowerCtx
+    builder_mod.new_ctx(
+        init ctx,
+        def_id,
+        sig.name,
+        origin_file,
+        body.node_id,
+        return_ty,
+        body_mod.TrustAnnotation.discharged,
+        effect_facts,
+        overflow_info,
+        closure_def_base,
+        pointer_width,
+        comptime_out,
+        bridge_map,
+        extern_defs,
+        err_wide_map,
+        triple,
+        box_elem_ty_map,
+        outcome_buf_ty,
+        task_group_ty,
+        fmt_targets,
+        eq_targets,
+        allocator,
+    )?
+
+    let params = sig.params
+    let n_params: usize = Vec_HParam.len(params)
+    var i: usize = 0
+    loop
+        decreases (n_params - i)
+    {
+        if i >= n_params {
+            break
+        }
+        let param = Vec_HParam.at(params, i)
+        let param_ty = check_mod.type_of_local(types_out, param.def_id)
+        let is_by_ref = match param.mode {
+            case .mutable_ => true
+            case .init_ => true
+            case _ => false
+        }
+        let local_ty = if is_by_ref { types_out.builtins.heap_ptr } else { param_ty }
+        let param_local = builder_mod.alloc_local(
+            mutable ctx,
+            local_ty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: param.name),
+            Option_NodeId.some(value: param.node_id),
+            allocator,
+        )?
+        builder_mod.bind_local(mutable ctx, param.def_id, param_local, allocator)?
+        if is_by_ref {
+            builder_mod.mark_by_ref_param(mutable ctx, param.def_id, param_ty, allocator)?
+        }
+        if param_ty.raw == types_out.builtins.allocator.raw {
+            builder_mod.set_own_allocator(mutable ctx, param_local)
+        }
+        i = i + 1
+    }
+    ctx.body.n_params = n_params as u32
+    ctx.body.requires_assumptions = clauses_mod.collect_requires_context(sig.refinements, params, allocator)?
+    builder_mod.set_ensures_clauses(mutable ctx, take sig.refinements)
+
+    envscan_mod.scan_block(mutable ctx, body, types_out, mutable ty_interner, meta_alloc)?
+    envscan_mod.mark_escaping_block(mutable ctx, body, allocator)?
+
+    let trailing = walker.lower_fn_body_block(mutable ctx, body, types_out, ty_interner, allocator)?
+    let ret_place = builder_mod.local_place(local_mod.LocalId { raw: 1 })
+    let ret_operand = if is_unit_ty(ty_interner, return_ty) {
+        rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: return_ty,
+                kind: rvalue_mod.ConstantKind.int_(bits: 0 as u128),
+            },
+        )
+    } else {
+        trailing
+    }
+    let assign_ret = stmt_mod.Statement {
+        origin: body.node_id,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: ret_place,
+            value: rvalue_mod.Rvalue.use_(operand: ret_operand),
+        ),
+    }
+    builder_mod.push_stmt(mutable ctx, take assign_ret, allocator)?
+    obligation_mod.record_return_exit(mutable ctx, ret_operand, Option_Box_HExpr.none, allocator)?
+    obligation_mod.finish_return_postconditions(mutable ctx, types_out, ty_interner, allocator)?
+
+    let return_term = term_mod.Terminator {
+        origin: body.node_id,
+        kind: term_mod.TermKind.return_,
+    }
+    builder_mod.seal_block_with(mutable ctx, take return_term, allocator)?
+
+    builder_mod.drain_pending_into(mutable ctx, mutable pending_out, allocator)?
+    builder_mod.drain_unsupported_into(mutable ctx, mutable unsupported_out, allocator)?
+    builder_mod.drain_shims_into(mutable ctx, mutable shim_out, allocator)?
+    return builder_mod.finish(take ctx)
+}
+
+
+public function lower_closure_body(
+    pc: builder_mod.PendingClosure,
+    origin_file: hir_file_mod.HirFileId,
+    types_out: check_mod.TypeOutput,
+    comptime_out: cteval_output_mod.ComptimeOutput,
+    ty_interner: mutable ty_interner_mod.Interner,
+    overflow_info: builder_mod.OverflowInfo,
+    closure_def_base: u32,
+    pointer_width: usize,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    err_wide_map: IntMap_u32.IntMap,
+    triple: triple_mod.TargetTriple,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    outcome_buf_ty: ty_mod.TyId,
+    task_group_ty: ty_mod.TyId,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    pending_out: mutable Vec_PendingClosure.Vec,
+    unsupported_out: mutable Vec_UnsupportedSite.Vec,
+    shim_out: mutable Vec_DefId.Vec,
+    meta_alloc: Allocator,
+    allocator: Allocator,
+) -> body_mod.MirBody
+    with {meta_alloc, allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit ctx: builder_mod.LowerCtx
+    builder_mod.new_ctx(
+        init ctx,
+        pc.def_id,
+        pc.name,
+        origin_file,
+        pc.body.node_id,
+        pc.return_ty,
+        body_mod.TrustAnnotation.discharged,
+        effect_facts_mod.pure_facts(),
+        overflow_info,
+        closure_def_base,
+        pointer_width,
+        comptime_out,
+        bridge_map,
+        extern_defs,
+        err_wide_map,
+        triple,
+        box_elem_ty_map,
+        outcome_buf_ty,
+        task_group_ty,
+        fmt_targets,
+        eq_targets,
+        allocator,
+    )?
+
+    let env_param_ty = if pc.pointer_backed { types_out.builtins.heap_ptr } else { types_out.builtins.usize_ }
+    var env_local: local_mod.LocalId = local_mod.LocalId { raw: 0 }
+    if pc.prepend_env {
+        env_local = builder_mod.alloc_local(
+            mutable ctx,
+            env_param_ty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.none,
+            Option_NodeId.none,
+            allocator,
+        )?
+    }
+
+    let params = pc.params
+    let n_params: usize = Vec_HClosureParam.len(params)
+    var i: usize = 0
+    loop
+        decreases (n_params - i)
+    {
+        if i >= n_params {
+            break
+        }
+        let param = Vec_HClosureParam.at(params, i)
+        let param_ty = check_mod.type_of_local(types_out, param.def_id)
+        let param_local = builder_mod.alloc_local(
+            mutable ctx,
+            param_ty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: param.name),
+            Option_NodeId.none,
+            allocator,
+        )?
+        builder_mod.bind_local(mutable ctx, param.def_id, param_local, allocator)?
+        if param_ty.raw == types_out.builtins.allocator.raw {
+            builder_mod.set_own_allocator(mutable ctx, param_local)
+        }
+        i = i + 1
+    }
+    let total_params = if pc.prepend_env { n_params + 1 as usize } else { n_params }
+    ctx.body.n_params = total_params as u32
+
+    if pc.has_capture {
+        let cap_local = builder_mod.alloc_local(
+            mutable ctx,
+            pc.capture_ty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: pc.capture_name),
+            Option_NodeId.none,
+            allocator,
+        )?
+        let env_place = builder_mod.local_place(env_local)
+        let cap_place = builder_mod.local_place(cap_local)
+        let unpack = rvalue_mod.Rvalue.cast(
+            operand: rvalue_mod.Operand.copy_(place: env_place, ty: types_out.builtins.usize_),
+            from: types_out.builtins.usize_,
+            to: pc.capture_ty,
+            kind: rvalue_mod.CastKind.int_to_int(mode: rvalue_mod.OverflowMode.wrapping_),
+        )
+        let unpack_stmt = stmt_mod.Statement {
+            origin: pc.body.node_id,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: cap_place,
+                value: unpack,
+            ),
+        }
+        builder_mod.push_stmt(mutable ctx, take unpack_stmt, allocator)?
+        builder_mod.bind_local(mutable ctx, pc.capture_def, cap_local, allocator)?
+    }
+
+    let is_spawn_body = !ty_mod.is_error(pc.spawn_result_ty)
+    var slot_ptr_local: local_mod.LocalId = local_mod.LocalId { raw: 0 }
+    if pc.pointer_backed {
+        let first_field: u32 = if is_spawn_body { 1 } else { 0 }
+        unpack_pointer_env(mutable ctx, pc, env_local, first_field, types_out, ty_interner, allocator)?
+    }
+    if is_spawn_body {
+        slot_ptr_local = unpack_spawn_slot_ptr(mutable ctx, pc, env_local, types_out, allocator)?
+    }
+
+    envscan_mod.scan_block(mutable ctx, pc.body, types_out, mutable ty_interner, meta_alloc)?
+    envscan_mod.mark_escaping_block(mutable ctx, pc.body, allocator)?
+
+    let trailing = walker.lower_block(mutable ctx, pc.body, types_out, ty_interner, allocator)?
+    let ret_place = builder_mod.local_place(local_mod.LocalId { raw: 1 })
+    if is_spawn_body {
+        if !is_unit_ty(ty_interner, pc.spawn_result_ty) {
+            var slot_place = builder_mod.local_place(slot_ptr_local)
+            place_mod.push_projection(
+                mutable slot_place,
+                place_mod.Projection { kind: place_mod.ProjectionKind.deref_, result_ty: pc.spawn_result_ty },
+                allocator,
+            )?
+            let store_result = stmt_mod.Statement {
+                origin: pc.body.node_id,
+                kind: stmt_mod.MStmtKind.assign(
+                    dest: slot_place,
+                    value: rvalue_mod.Rvalue.use_(operand: trailing),
+                ),
+            }
+            builder_mod.push_stmt(mutable ctx, take store_result, allocator)?
+        }
+        let assign_ret_ptr = stmt_mod.Statement {
+            origin: pc.body.node_id,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: ret_place,
+                value: rvalue_mod.Rvalue.use_(
+                    operand: rvalue_mod.Operand.copy_(
+                        place: builder_mod.local_place(slot_ptr_local),
+                        ty: types_out.builtins.heap_ptr,
+                    ),
+                ),
+            ),
+        }
+        builder_mod.push_stmt(mutable ctx, take assign_ret_ptr, allocator)?
+    } else {
+        let assign_ret = stmt_mod.Statement {
+            origin: pc.body.node_id,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: ret_place,
+                value: rvalue_mod.Rvalue.use_(operand: trailing),
+            ),
+        }
+        builder_mod.push_stmt(mutable ctx, take assign_ret, allocator)?
+    }
+
+    let return_term = term_mod.Terminator {
+        origin: pc.body.node_id,
+        kind: term_mod.TermKind.return_,
+    }
+    builder_mod.seal_block_with(mutable ctx, take return_term, allocator)?
+
+    builder_mod.drain_pending_into(mutable ctx, mutable pending_out, allocator)?
+    builder_mod.drain_unsupported_into(mutable ctx, mutable unsupported_out, allocator)?
+    builder_mod.drain_shims_into(mutable ctx, mutable shim_out, allocator)?
+    return builder_mod.finish(take ctx)
+}
+
+
+function unpack_spawn_slot_ptr(
+    ctx: mutable builder_mod.LowerCtx,
+    pc: builder_mod.PendingClosure,
+    env_local: local_mod.LocalId,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let heap_ptr_ty = types_out.builtins.heap_ptr
+    let slot_local = builder_mod.alloc_local(
+        mutable ctx,
+        heap_ptr_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.none,
+        allocator,
+    )?
+    var read_place = builder_mod.local_place(env_local)
+    place_mod.push_projection(
+        mutable read_place,
+        place_mod.Projection { kind: place_mod.ProjectionKind.deref_, result_ty: pc.env_ty },
+        allocator,
+    )?
+    place_mod.push_projection(
+        mutable read_place,
+        place_mod.Projection { kind: place_mod.ProjectionKind.field(idx: 0), result_ty: heap_ptr_ty },
+        allocator,
+    )?
+    let unpack_stmt = stmt_mod.Statement {
+        origin: pc.body.node_id,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(slot_local),
+            value: rvalue_mod.Rvalue.use_(operand: rvalue_mod.Operand.copy_(place: read_place, ty: heap_ptr_ty)),
+        ),
+    }
+    builder_mod.push_stmt(mutable ctx, take unpack_stmt, allocator)?
+    return slot_local
+}
+
+
+function unpack_pointer_env(
+    ctx: mutable builder_mod.LowerCtx,
+    pc: builder_mod.PendingClosure,
+    env_local: local_mod.LocalId,
+    first_field: u32,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let nc = Vec_HCapture.len(pc.captures)
+    var i: usize = 0
+    var field_idx: u32 = first_field
+    loop
+        decreases (nc - i)
+    {
+        if i >= nc {
+            break
+        }
+        let cap = Vec_HCapture.at(pc.captures, i)
+        let cty = check_mod.type_of_local(types_out, cap.def_id)
+        if check_mod.ty_is_allocator(cty, ty_interner) {
+            i = i + 1
+            continue
+        }
+        let cap_local = builder_mod.alloc_local(
+            mutable ctx,
+            cty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: cap.name),
+            Option_NodeId.none,
+            allocator,
+        )?
+        var read_place = builder_mod.local_place(env_local)
+        place_mod.push_projection(
+            mutable read_place,
+            place_mod.Projection { kind: place_mod.ProjectionKind.deref_, result_ty: pc.env_ty },
+            allocator,
+        )?
+        place_mod.push_projection(
+            mutable read_place,
+            place_mod.Projection { kind: place_mod.ProjectionKind.field(idx: field_idx), result_ty: cty },
+            allocator,
+        )?
+        let cap_place = builder_mod.local_place(cap_local)
+        let unpack_stmt = stmt_mod.Statement {
+            origin: pc.body.node_id,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: cap_place,
+                value: rvalue_mod.Rvalue.use_(operand: rvalue_mod.Operand.copy_(place: read_place, ty: cty)),
+            ),
+        }
+        builder_mod.push_stmt(mutable ctx, take unpack_stmt, allocator)?
+        builder_mod.bind_local(mutable ctx, cap.def_id, cap_local, allocator)?
+        field_idx = field_idx + 1
+        i = i + 1
+    }
+}
+
+
+public function lower_shim_body(
+    real_def: def_mod.DefId,
+    shim_def: def_mod.DefId,
+    real_has_by_ref: bool,
+    origin_file: hir_file_mod.HirFileId,
+    types_out: check_mod.TypeOutput,
+    comptime_out: cteval_output_mod.ComptimeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    overflow_info: builder_mod.OverflowInfo,
+    closure_def_base: u32,
+    pointer_width: usize,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    err_wide_map: IntMap_u32.IntMap,
+    triple: triple_mod.TargetTriple,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    outcome_buf_ty: ty_mod.TyId,
+    task_group_ty: ty_mod.TyId,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    allocator: Allocator,
+) -> body_mod.MirBody
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let sig_lookup = check_mod.signature_of(types_out, real_def)
+    let return_ty = match sig_lookup {
+        case .some(let s) => s.ret
+        case .none => ty_mod.error()
+    }
+    let fn_name = match sig_lookup {
+        case .some(let s) => s.name
+        case .none => symbol_mod.empty()
+    }
+    let effect_facts = match sig_lookup {
+        case .some(let s) => if real_has_by_ref {
+            effect_facts_mod.mark_impure(s.effect_facts)
+        } else {
+            s.effect_facts
+        }
+        case .none => effect_facts_mod.pure_facts()
+    }
+
+    uninit empty_tys: Vec_TyId.Vec
+    Vec_TyId.new(init empty_tys, allocator)?
+    let param_tys = match sig_lookup {
+        case .some(let s) => s.params
+        case .none => empty_tys
+    }
+
+    uninit ctx: builder_mod.LowerCtx
+    builder_mod.new_ctx(
+        init ctx,
+        shim_def,
+        fn_name,
+        origin_file,
+        node_mod.error(),
+        return_ty,
+        body_mod.TrustAnnotation.discharged,
+        effect_facts,
+        overflow_info,
+        closure_def_base,
+        pointer_width,
+        comptime_out,
+        bridge_map,
+        extern_defs,
+        err_wide_map,
+        triple,
+        box_elem_ty_map,
+        outcome_buf_ty,
+        task_group_ty,
+        fmt_targets,
+        eq_targets,
+        allocator,
+    )?
+
+    let _env_local = builder_mod.alloc_local(
+        mutable ctx,
+        types_out.builtins.usize_,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.none,
+        allocator,
+    )?
+
+    uninit arg_ops: Vec_Operand.Vec
+    Vec_Operand.new(init arg_ops, allocator)?
+    let n_params: usize = Vec_TyId.len(param_tys)
+    var i: usize = 0
+    loop
+        decreases (n_params - i)
+    {
+        if i >= n_params {
+            break
+        }
+        let pty = Vec_TyId.at(param_tys, i)
+        let plocal = builder_mod.alloc_local(
+            mutable ctx,
+            pty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.none,
+            Option_NodeId.none,
+            allocator,
+        )?
+        let pplace = builder_mod.local_place(plocal)
+        Vec_Operand.push(mutable arg_ops, rvalue_mod.Operand.copy_(place: pplace, ty: pty), allocator)?
+        i = i + 1
+    }
+    ctx.body.n_params = (n_params + 1 as usize) as u32
+
+    let callee_ty = check_mod.fn_ref_type(types_out, real_def)
+    let callee_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: callee_ty,
+            kind: rvalue_mod.ConstantKind.fn_ref(def: real_def),
+        },
+    )
+    let ret_op = walker.lower_call_with_operands(
+        mutable ctx,
+        node_mod.error(),
+        callee_op,
+        arg_ops,
+        return_ty,
+        types_out,
+        ty_interner,
+        allocator,
+    )?
+
+    let ret_place = builder_mod.local_place(local_mod.LocalId { raw: 1 })
+    let assign_ret = stmt_mod.Statement {
+        origin: node_mod.error(),
+        kind: stmt_mod.MStmtKind.assign(
+            dest: ret_place,
+            value: rvalue_mod.Rvalue.use_(operand: ret_op),
+        ),
+    }
+    builder_mod.push_stmt(mutable ctx, take assign_ret, allocator)?
+
+    let return_term = term_mod.Terminator {
+        origin: node_mod.error(),
+        kind: term_mod.TermKind.return_,
+    }
+    builder_mod.seal_block_with(mutable ctx, take return_term, allocator)?
+    return builder_mod.finish(take ctx)
+}
+
+
+function is_unit_ty(ty_interner: ty_interner_mod.Interner, ty: ty_mod.TyId) -> bool {
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(let prim) => match prim {
+            case .unit_ => true
+            case _ => false
+        }
+        case _ => false
+    }
+}

@@ -1,0 +1,297 @@
+
+module toml.parse.token.lex
+
+import std.mem.alloc
+import toml.error
+
+public type Token {
+    case lbracket(at: usize)
+    case rbracket(at: usize)
+    case double_lbracket(at: usize)
+    case double_rbracket(at: usize)
+    case equals(at: usize)
+    case dot(at: usize)
+    case comma(at: usize)
+    case newline(at: usize)
+    case bare_key(start: usize, end: usize)
+    case str_lit(start: usize, end: usize)
+    case int_lit(start: usize, end: usize)
+    case float_lit(start: usize, end: usize)
+    case eof(at: usize)
+}
+
+function _alloc_token_slots(allocator: Allocator, n: usize) -> [Token]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+function _is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+function _is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+function _is_alpha(c: u8) -> bool {
+    return (c >= 65 as u8 && c <= 90 as u8)
+        || (c >= 97 as u8 && c <= 122 as u8)
+}
+
+function _is_hex(c: u8) -> bool {
+    return _is_digit(c)
+        || (c >= 65 as u8 && c <= 70 as u8)
+        || (c >= 97 as u8 && c <= 102 as u8)
+}
+
+function _is_bare_key_start(c: u8) -> bool {
+    return _is_alpha(c) || c == 95 as u8
+}
+
+function _is_bare_key_char(c: u8) -> bool {
+    return _is_alpha(c) || _is_digit(c) || c == 95 as u8 || c == 45 as u8
+}
+
+
+function _scan_bare_key(src: [u8], i: usize) -> usize {
+    let n = src.len()
+    var j: usize = i + 1 as usize
+    loop decreases n - j + 1 as usize {
+        if j >= n { break }
+        if !_is_bare_key_char(src[j]) { break }
+        j = j + 1 as usize
+    }
+    return j
+}
+
+function _scan_string(src: [u8], i: usize) -> usize
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    var j: usize = i + 1 as usize
+    loop decreases n - j + 1 as usize {
+        if j >= n {
+            raise error.ParseError.unterminated_string(at: i)
+        }
+        let c = src[j]
+        if c == 34 as u8 { return j }
+        if c == 10 as u8 || c == 13 as u8 {
+            raise error.ParseError.unterminated_string(at: i)
+        }
+        if c == 92 as u8 {
+            if j + 1 as usize >= n {
+                raise error.ParseError.unterminated_string(at: i)
+            }
+            let nx = src[j + 1 as usize]
+            if nx == 34 as u8 || nx == 92 as u8 || nx == 110 as u8
+                || nx == 114 as u8 || nx == 116 as u8 {
+                j = j + 2 as usize
+            } else if nx == 117 as u8 {
+                j = _scan_u_brace(src, j)?
+            } else {
+                raise error.ParseError.bad_escape(at: j)
+            }
+        } else {
+            j = j + 1 as usize
+        }
+    }
+    return j
+}
+
+function _scan_u_brace(src: [u8], i: usize) -> usize
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    if i + 2 as usize >= n { raise error.ParseError.bad_escape(at: i) }
+    if src[i + 2 as usize] != 123 as u8 {
+        raise error.ParseError.bad_escape(at: i)
+    }
+    var j: usize = i + 3 as usize
+    var hex_count: usize = 0
+    loop decreases n - j + 1 as usize {
+        if j >= n { raise error.ParseError.bad_escape(at: i) }
+        let c = src[j]
+        if c == 125 as u8 { break }
+        if !_is_hex(c) { raise error.ParseError.bad_escape(at: j) }
+        hex_count = hex_count + 1 as usize
+        j = j + 1 as usize
+        if hex_count > 6 as usize {
+            raise error.ParseError.bad_escape(at: j)
+        }
+    }
+    if hex_count == 0 as usize { raise error.ParseError.bad_escape(at: i) }
+    return j + 1 as usize
+}
+
+function _scan_number(src: [u8], i: usize) -> (usize, bool)
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    var j: usize = i
+    var has_int_part: bool = false
+    var has_frac_part: bool = false
+    var has_exp_part: bool = false
+    var saw_dot: bool = false
+    var saw_e: bool = false
+
+    if j < n && src[j] == 45 as u8 {
+        j = j + 1 as usize
+    }
+    if j >= n { raise error.ParseError.bad_number(at: i) }
+
+    if src[j] == 48 as u8 && j + 1 as usize < n {
+        let nx = src[j + 1 as usize]
+        if nx == 120 as u8 || nx == 88 as u8
+            || nx == 111 as u8 || nx == 79 as u8
+            || nx == 98 as u8 || nx == 66 as u8 {
+            raise error.ParseError.reserved_in_subset(at: j)
+        }
+    }
+
+    loop decreases n - j + 1 as usize {
+        if j >= n { break }
+        let c = src[j]
+        if c >= 48 as u8 && c <= 57 as u8 {
+            if saw_e { has_exp_part = true }
+            else if saw_dot { has_frac_part = true }
+            else { has_int_part = true }
+            j = j + 1 as usize
+        } else if c == 95 as u8 {
+            j = j + 1 as usize
+        } else if c == 46 as u8 && !saw_dot && !saw_e {
+            saw_dot = true
+            j = j + 1 as usize
+        } else if (c == 101 as u8 || c == 69 as u8) && !saw_e && has_int_part {
+            saw_e = true
+            j = j + 1 as usize
+            if j < n && (src[j] == 43 as u8 || src[j] == 45 as u8) {
+                j = j + 1 as usize
+            }
+        } else if c == 45 as u8 || c == 58 as u8 || c == 84 as u8 || c == 90 as u8 {
+            if has_int_part {
+                raise error.ParseError.reserved_in_subset(at: j)
+            }
+            break
+        } else {
+            break
+        }
+    }
+
+    if !has_int_part {
+        raise error.ParseError.bad_number(at: i)
+    }
+    if saw_dot && !has_frac_part {
+        raise error.ParseError.bad_number(at: j)
+    }
+    if saw_e && !has_exp_part {
+        raise error.ParseError.bad_number(at: j)
+    }
+    let is_float = saw_dot || saw_e
+    return (j, is_float)
+}
+
+public function lex(
+    src: [u8],
+    allocator: Allocator,
+) -> ([Token], usize)
+    with {allocator, err: error.ParseError}
+{
+    return handle err: alloc.AllocError -> { raise error.ParseError.allocation_failed } {
+        let tokens = _alloc_token_slots(allocator, src.len() + 1 as usize)?
+        let n_src = src.len()
+        var n: usize = 0
+        var i: usize = 0
+        loop decreases n_src - i + 1 as usize {
+            if i >= n_src {
+                tokens[n] = Token.eof(at: i)
+                n = n + 1 as usize
+                break
+            }
+            let c = src[i]
+            if _is_ws(c) {
+                i = i + 1 as usize
+            } else if c == 10 as u8 {
+                tokens[n] = Token.newline(at: i)
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 13 as u8 {
+                if i + 1 as usize < n_src && src[i + 1 as usize] == 10 as u8 {
+                    tokens[n] = Token.newline(at: i)
+                    n = n + 1 as usize
+                    i = i + 2 as usize
+                } else {
+                    raise error.ParseError.unexpected_byte(at: i)
+                }
+            } else if c == 35 as u8 {
+                var k: usize = i + 1 as usize
+                loop decreases n_src - k + 1 as usize {
+                    if k >= n_src { break }
+                    if src[k] == 10 as u8 { break }
+                    k = k + 1 as usize
+                }
+                i = k
+            } else if c == 91 as u8 {
+                if i + 1 as usize < n_src && src[i + 1 as usize] == 91 as u8 {
+                    tokens[n] = Token.double_lbracket(at: i)
+                    n = n + 1 as usize
+                    i = i + 2 as usize
+                } else {
+                    tokens[n] = Token.lbracket(at: i)
+                    n = n + 1 as usize
+                    i = i + 1 as usize
+                }
+            } else if c == 93 as u8 {
+                if i + 1 as usize < n_src && src[i + 1 as usize] == 93 as u8 {
+                    tokens[n] = Token.double_rbracket(at: i)
+                    n = n + 1 as usize
+                    i = i + 2 as usize
+                } else {
+                    tokens[n] = Token.rbracket(at: i)
+                    n = n + 1 as usize
+                    i = i + 1 as usize
+                }
+            } else if c == 61 as u8 {
+                tokens[n] = Token.equals(at: i)
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 46 as u8 {
+                tokens[n] = Token.dot(at: i)
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 44 as u8 {
+                tokens[n] = Token.comma(at: i)
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 123 as u8 || c == 125 as u8 || c == 39 as u8 {
+                raise error.ParseError.reserved_in_subset(at: i)
+            } else if c == 34 as u8 {
+                if i + 2 as usize < n_src
+                    && src[i + 1 as usize] == 34 as u8
+                    && src[i + 2 as usize] == 34 as u8 {
+                    raise error.ParseError.reserved_in_subset(at: i)
+                }
+                let close = _scan_string(src, i)?
+                tokens[n] = Token.str_lit(start: i + 1 as usize, end: close)
+                n = n + 1 as usize
+                i = close + 1 as usize
+            } else if _is_bare_key_start(c) {
+                let end = _scan_bare_key(src, i)
+                tokens[n] = Token.bare_key(start: i, end: end)
+                n = n + 1 as usize
+                i = end
+            } else if _is_digit(c) || c == 45 as u8 {
+                let (end, is_float) = _scan_number(src, i)?
+                if is_float {
+                    tokens[n] = Token.float_lit(start: i, end: end)
+                } else {
+                    tokens[n] = Token.int_lit(start: i, end: end)
+                }
+                n = n + 1 as usize
+                i = end
+            } else {
+                raise error.ParseError.unexpected_byte(at: i)
+            }
+        }
+        (tokens, n)
+    }
+}

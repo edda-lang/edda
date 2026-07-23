@@ -1,0 +1,190 @@
+
+module compile.member.cache.object
+
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import cache.addr.hash as hash_mod
+import cache.addr.path.paths as paths_mod
+import cache.tier.global as global_mod
+import local.member.cache.store.blob as store_mod
+
+
+spec std.core.option.Option(global_mod.GlobalCache)
+
+
+public function object_shard_dir(
+    output_root: String,
+    module_hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = paths_mod.objects_cache_root(output_root, allocator)?
+    let shard = paths_mod.shard_string(module_hash, allocator)?
+    let with_slash = string.concat(root, "/", allocator)?
+    return string.concat(with_slash, shard, allocator)?
+}
+
+
+public function object_blob_path(
+    output_root: String,
+    module_hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let shard_dir = object_shard_dir(output_root, module_hash, allocator)?
+    let hex = hash_mod.to_hex_string(module_hash, allocator)?
+    let with_slash = string.concat(shard_dir, "/", allocator)?
+    let with_hex = string.concat(with_slash, hex, allocator)?
+    return string.concat(with_hex, ".o", allocator)?
+}
+
+
+function global_objects_shard_dir(
+    g: global_mod.GlobalCache,
+    module_hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = global_mod.root(g, allocator)?
+    let objects_root = string.concat(root, "/objects", allocator)?
+    let shard = paths_mod.shard_string(module_hash, allocator)?
+    let with_slash = string.concat(objects_root, "/", allocator)?
+    return string.concat(with_slash, shard, allocator)?
+}
+
+
+function global_object_blob_path(
+    g: global_mod.GlobalCache,
+    module_hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let shard_dir = global_objects_shard_dir(g, module_hash, allocator)?
+    let hex = hash_mod.to_hex_string(module_hash, allocator)?
+    let with_slash = string.concat(shard_dir, "/", allocator)?
+    let with_hex = string.concat(with_slash, hex, allocator)?
+    return string.concat(with_hex, ".o", allocator)?
+}
+
+
+function tmp_path_of(
+    blob_path: String,
+    output_root: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let oh = hash_mod.hash_bytes(output_root.bytes(), allocator)?
+    let oh_hex = hash_mod.to_hex_string(oh, allocator)?
+    let stem = string.concat(blob_path, ".tmp.", allocator)?
+    return string.concat(stem, oh_hex, allocator)?
+}
+
+
+function write_blob_at(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    shard_dir: String,
+    blob_path: String,
+    blob_bytes: [u8],
+    output_root: String,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if fs.path_exists(rfs, blob_path) {
+        return
+    }
+    fs.create_dir_all(wfs, shard_dir)?
+    let tmp = tmp_path_of(blob_path, output_root, allocator)?
+    fs.write_bytes(wfs, tmp, blob_bytes)?
+    if fs.path_exists(rfs, blob_path) {
+        fs.remove(wfs, tmp)?
+        return
+    }
+    fs.rename(wfs, tmp, blob_path)?
+}
+
+
+function restore_global_into_local(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    module_hash: hash_mod.ArtifactHash,
+    g: global_mod.GlobalCache,
+    loc: store_mod.ExeLocation,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let global_path = global_object_blob_path(g, module_hash, allocator)?
+    if !store_mod.restore_from_blob_path(rfs, wfs, global_path, module_hash, loc, allocator)? {
+        return false
+    }
+    let blob_bytes = fs.read_bytes(rfs, global_path, allocator)?
+    let shard_dir = object_shard_dir(output_root, module_hash, allocator)?
+    let blob_path = object_blob_path(output_root, module_hash, allocator)?
+    write_blob_at(rfs, wfs, shard_dir, blob_path, blob_bytes, output_root, allocator)?
+    return true
+}
+
+
+public function try_restore_object(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    module_hash: hash_mod.ArtifactHash,
+    loc: store_mod.ExeLocation,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let blob_path = object_blob_path(output_root, module_hash, allocator)?
+    if store_mod.restore_from_blob_path(rfs, wfs, blob_path, module_hash, loc, allocator)? {
+        return true
+    }
+    return match store_mod.resolve_global(allocator)? {
+        case .some(let g) => restore_global_into_local(rfs, wfs, output_root, module_hash, g, loc, allocator)?
+        case .none => false
+    }
+}
+
+
+public function try_store_object(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    module_hash: hash_mod.ArtifactHash,
+    object_bytes: [u8],
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let blob_path = object_blob_path(output_root, module_hash, allocator)?
+    let global_res = store_mod.resolve_global(allocator)?
+    let local_has = fs.path_exists(rfs, blob_path)
+    if local_has {
+        match global_res {
+            case .some(_) => ()
+            case .none => return
+        }
+    }
+    let blob_bytes = store_mod.build_exe_blob(module_hash, object_bytes, allocator)?
+    if !local_has {
+        let shard_dir = object_shard_dir(output_root, module_hash, allocator)?
+        write_blob_at(rfs, wfs, shard_dir, blob_path, blob_bytes, output_root, allocator)?
+    }
+    match global_res {
+        case .some(let g) => {
+            let global_shard = global_objects_shard_dir(g, module_hash, allocator)?
+            let global_path = global_object_blob_path(g, module_hash, allocator)?
+            write_blob_at(rfs, wfs, global_shard, global_path, blob_bytes, output_root, allocator)?
+        }
+        case .none => ()
+    }
+}

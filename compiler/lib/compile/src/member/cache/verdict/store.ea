@@ -1,0 +1,240 @@
+
+module compile.member.cache.verdict.store
+
+import std.mem.alloc
+import std.collections.vec
+import std.os.fs
+import std.text.string
+import cache.addr.hash as hash_mod
+import cache.addr.path.paths as paths_mod
+import cache.error as cache_error_mod
+import cache.blob.mir.prim as prim_mod
+import cache.blob.mir.ast.codec as span_codec_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.emit.severity as severity_mod
+import source.map as source_map_mod
+import local.member.cache.key.hash as key_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(diag_mod.Diagnostic)
+
+
+function verdict_magic() -> u32 {
+    return 1163084628 as u32
+}
+
+
+function verdict_format() -> u32 {
+    return 1 as u32
+}
+
+
+public function verdict_hash_of(
+    map: source_map_mod.SourceMap,
+    program_name: String,
+    project_root: String,
+    stdlib_root: String,
+    allocator: Allocator,
+) -> hash_mod.ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    return key_mod.source_hash_of(map, program_name, project_root, stdlib_root, allocator)?
+}
+
+
+function verdict_shard_dir(
+    project_root: String,
+    hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = paths_mod.typecheck_cache_root(project_root, allocator)?
+    let shard = paths_mod.shard_string(hash, allocator)?
+    let with_slash = string.concat(root, "/", allocator)?
+    return string.concat(with_slash, shard, allocator)?
+}
+
+
+function verdict_blob_path(
+    project_root: String,
+    hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let dir = verdict_shard_dir(project_root, hash, allocator)?
+    let hex = hash_mod.to_hex_string(hash, allocator)?
+    let with_slash = string.concat(dir, "/", allocator)?
+    let with_hex = string.concat(with_slash, hex, allocator)?
+    return string.concat(with_hex, ".verdict", allocator)?
+}
+
+
+function severity_tag(s: severity_mod.Severity) -> u8 {
+    return match s {
+        case .fatal => 0 as u8
+        case .error => 1 as u8
+        case .warn  => 2 as u8
+        case .note  => 3 as u8
+    }
+}
+
+
+function read_severity(payload: [u8], cur: mutable prim_mod.Reader) -> severity_mod.Severity
+    with {err: cache_error_mod.CacheError}
+{
+    let t = prim_mod.read_u8(payload, mutable cur)?
+    if t == 0 as u8 { return severity_mod.Severity.fatal }
+    if t == 1 as u8 { return severity_mod.Severity.error }
+    if t == 2 as u8 { return severity_mod.Severity.warn }
+    if t == 3 as u8 { return severity_mod.Severity.note }
+    raise cache_error_mod.CacheError.body_parse(message: "invalid severity tag in verdict blob")
+}
+
+
+function read_owned_string(
+    payload: [u8],
+    cur: mutable prim_mod.Reader,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, err: cache_error_mod.CacheError}
+{
+    let slice = prim_mod.read_bytes(payload, mutable cur)?
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    Vec_u8.extend_from_slice(mutable v, slice, allocator)?
+    let arr = Vec_u8.into_array(take v, allocator)?
+    return string.from_owned_utf8(take arr)
+}
+
+
+function skip_entry(payload: [u8], cur: mutable prim_mod.Reader) -> ()
+    with {err: cache_error_mod.CacheError}
+{
+    let _ = read_severity(payload, mutable cur)?
+    let _ = prim_mod.read_bytes(payload, mutable cur)?
+    let _ = span_codec_mod.read_span(payload, mutable cur)?
+    let _ = prim_mod.read_bytes(payload, mutable cur)?
+}
+
+
+function encode_verdict(
+    diags: diags_mod.Diagnostics,
+    base: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    prim_mod.push_u32_le(mutable out, verdict_magic(), allocator)?
+    prim_mod.push_u32_le(mutable out, verdict_format(), allocator)?
+
+    let items_len = Vec_Diagnostic.len(diags.items)
+    let start = if base > items_len { items_len } else { base }
+    let n = items_len - start
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+
+    var i: usize = start
+    loop decreases items_len - i {
+        if i >= items_len { break }
+        let d = Vec_Diagnostic.at_ref(diags.items, i)
+        prim_mod.push_u8(mutable out, severity_tag(d.severity), allocator)?
+        prim_mod.push_bytes(mutable out, d.code.bytes(), allocator)?
+        span_codec_mod.write_span(d.span, mutable out, allocator)?
+        prim_mod.push_bytes(mutable out, d.message.bytes(), allocator)?
+        i += 1
+    }
+
+    return Vec_u8.into_array(take out, allocator)?
+}
+
+
+function validate_verdict(payload: [u8]) -> ()
+    with {err: cache_error_mod.CacheError}
+{
+    var cur = prim_mod.reader_at_start()
+    let magic = prim_mod.read_u32_le(payload, mutable cur)?
+    if magic != verdict_magic() {
+        raise cache_error_mod.CacheError.body_parse(message: "verdict blob magic mismatch")
+    }
+    let fmt = prim_mod.read_u32_le(payload, mutable cur)?
+    if fmt != verdict_format() {
+        raise cache_error_mod.CacheError.body_parse(message: "verdict blob format mismatch")
+    }
+    let count = prim_mod.read_u32_le(payload, mutable cur)? as usize
+    var j: usize = 0
+    loop decreases count - j {
+        if j >= count { break }
+        skip_entry(payload, mutable cur)?
+        j += 1
+    }
+}
+
+
+function emit_verdict(
+    payload: [u8],
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: cache_error_mod.CacheError}
+{
+    var cur = prim_mod.reader_at_start()
+    let _ = prim_mod.read_u32_le(payload, mutable cur)?
+    let _ = prim_mod.read_u32_le(payload, mutable cur)?
+    let count = prim_mod.read_u32_le(payload, mutable cur)? as usize
+    var j: usize = 0
+    loop decreases count - j {
+        if j >= count { break }
+        let sev = read_severity(payload, mutable cur)?
+        let code = read_owned_string(payload, mutable cur, allocator)?
+        let span = span_codec_mod.read_span(payload, mutable cur)?
+        let message = read_owned_string(payload, mutable cur, allocator)?
+        let d = diag_mod.Diagnostic { severity: sev, code: code, span: span, message: message }
+        diags_mod.emit(mutable diags, take d, allocator)?
+        j += 1
+    }
+}
+
+
+public function try_restore_verdict(
+    rfs: ReadOnlyFilesystem,
+    project_root: String,
+    hash: hash_mod.ArtifactHash,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let path = verdict_blob_path(project_root, hash, allocator)?
+    if !fs.path_exists(rfs, path) {
+        return false
+    }
+    let bytes = fs.read_bytes(rfs, path, allocator)?
+    return handle err: cache_error_mod.CacheError as e -> false {
+        validate_verdict(bytes)?
+        emit_verdict(bytes, mutable diags, allocator)?
+        true
+    }
+}
+
+
+public function store_verdict(
+    wfs: Filesystem,
+    project_root: String,
+    hash: hash_mod.ArtifactHash,
+    diags: diags_mod.Diagnostics,
+    base: usize,
+    allocator: Allocator,
+) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let dir = verdict_shard_dir(project_root, hash, allocator)?
+    let path = verdict_blob_path(project_root, hash, allocator)?
+    let blob = encode_verdict(diags, base, allocator)?
+    fs.create_dir_all(wfs, dir)?
+    fs.write_bytes(wfs, path, blob)?
+}

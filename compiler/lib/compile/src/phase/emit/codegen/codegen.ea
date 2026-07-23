@@ -1,0 +1,376 @@
+
+module compile.phase.emit.codegen.codegen
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.text.string
+import std.core.fmt as fmt_mod
+
+import target.triple as triple_mod
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import types.ty.interner as ty_interner_mod
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import symname.lib as symname_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as mir_body_mod
+import object.coff.codeview.typetable.table as debug_table_mod
+
+import lower.lower as mir_lower_mod
+import ir.hlir.tree.node.lower as hlir_lower_mod
+import optimize.hlir.opt as hlir_opt_mod
+import x64.gen.sel.isel as isel_mod
+import arm64.gen.isel as arm64_isel_mod
+import ir.hlir.tree.node.file as hlir_file_mod
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.error as hlir_error_mod
+import ir.lir.tree.file as lir_file_mod
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.error as lir_error_mod
+import ir.emitted as emit_types_mod
+import object.lib as object_mod
+import object.coff as coff_mod
+import object.fmt.elf as elf_mod
+import object.fmt.macho as macho_mod
+import object.coff.wrap.wrap as coff_wrap_mod
+import object.coff.codeview.build.build as codeview_mod
+import object.sym.coff.multisym as multisym_mod
+import object.sym.elf.build as elfsym_mod
+import object.sym.macho.build as machosym_mod
+import local.trace.trace as trace_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(emit_types_mod.EmittedBody)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBody)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.hashmap.IntMap(String)
+
+
+public function compile_mir_file_to_object(
+    out: init Vec_u8.Vec,
+    out_obj: init object_mod.ObjectFile,
+    file: mir_file_mod.MirFile,
+    target: triple_mod.TargetTriple,
+    global_syms: IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_table_mod.DebugTypeTable,
+    source_map: source_map_mod.SourceMap,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    allocator: Allocator,
+) -> ()
+    with {
+        clock,
+        errout,
+        allocator,
+        err: alloc.AllocError,
+        err: hlir_error_mod.HlirError,
+        err: lir_error_mod.LirError,
+        err: coff_wrap_mod.WrapError,
+        err: multisym_mod.MultiSymError,
+        panic,
+    }
+{
+    let s_m2h = trace_mod.phase_begin(trace, clock, errout, "obj-mir2hlir", allocator)?
+    uninit hlir: hlir_file_mod.HlirFile
+    mir_lower_mod.lower_file(init hlir, file, ty_interner, allocator)?
+    let m2h_detail = shape_detail(file, hlir, allocator)?
+    trace_mod.phase_end_detail(s_m2h, clock, errout, m2h_detail, allocator)?
+
+    let s_hopt = trace_mod.phase_begin(trace, clock, errout, "obj-hliropt", allocator)?
+    hlir_opt_mod.optimize_file(mutable hlir, ty_interner, allocator)?
+    trace_mod.phase_end(s_hopt, clock, errout, allocator)?
+
+    let s_h2l = trace_mod.phase_begin(trace, clock, errout, "obj-hlir2lir", allocator)?
+    uninit lir: lir_file_mod.LirFile
+    handle err: lir_error_mod.LirError as le -> raise lir_error_with_body(le, hlir, file, ty_interner, target, interner, allocator)? {
+        hlir_lower_mod.lower_file(init lir, hlir, ty_interner, target, allocator)?
+    }
+    trace_mod.phase_end(s_h2l, clock, errout, allocator)?
+
+    let s_isel = trace_mod.phase_begin(trace, clock, errout, "obj-isel", allocator)?
+    uninit bodies: Vec_EmittedBody.Vec
+    match triple_mod.arch(target) {
+        case .aarch64 => arm64_isel_mod.select_file_full(init bodies, lir, target, allocator)?
+        case _        => isel_mod.select_file_full(init bodies, lir, target, allocator)?
+    }
+    trace_mod.phase_end(s_isel, clock, errout, allocator)?
+
+    let arch = triple_mod.arch(target)
+    uninit obj: object_mod.ObjectFile
+    match object_mod.format_for_triple(target) {
+        case .elf => {
+            uninit elf: elf_mod.ElfFile
+            elfsym_mod.build_elf_object(init elf, bodies, global_syms, object_mod.elf_machine_for(arch), interner, allocator)?
+            obj = object_mod.ObjectFile.elf_(file: elf)
+        }
+        case .macho => {
+            let s_macho = trace_mod.phase_begin(trace, clock, errout, "obj-macho", allocator)?
+            uninit macho: macho_mod.MachoFile
+            machosym_mod.build_macho_object(init macho, bodies, global_syms, object_mod.macho_cpu_for(arch), interner, allocator)?
+            trace_mod.phase_end(s_macho, clock, errout, allocator)?
+            obj = object_mod.ObjectFile.macho_(file: macho)
+        }
+        case _ => {
+            let s_coff = trace_mod.phase_begin(trace, clock, errout, "obj-coff", allocator)?
+            uninit coff: coff_mod.CoffFile
+            multisym_mod.build_coff_object(init coff, bodies, global_syms, object_mod.coff_machine_for(arch), interner, allocator)?
+            trace_mod.phase_end(s_coff, clock, errout, allocator)?
+            let s_cv = trace_mod.phase_begin(trace, clock, errout, "obj-cv", allocator)?
+            codeview_mod.add_debug_sections(mutable coff, bodies, lir.hir_files, global_syms, source_map, interner, ty_interner, debug_table, allocator)?
+            trace_mod.phase_end(s_cv, clock, errout, allocator)?
+            obj = object_mod.ObjectFile.coff_(file: coff)
+        }
+    }
+
+    let s_ser = trace_mod.phase_begin(trace, clock, errout, "obj-ser", allocator)?
+    uninit serialized: Vec_u8.Vec
+    Vec_u8.with_capacity(init serialized, estimate_object_capacity(bodies), allocator)?
+    object_mod.serialize_object(mutable serialized, obj, allocator)?
+    trace_mod.phase_end(s_ser, clock, errout, allocator)?
+    out = serialized
+    out_obj = obj
+}
+
+
+public function lower_mir_to_lir(
+    out: init lir_file_mod.LirFile,
+    file: mir_file_mod.MirFile,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {
+        allocator,
+        err: alloc.AllocError,
+        err: hlir_error_mod.HlirError,
+        err: lir_error_mod.LirError,
+        panic,
+    }
+{
+    uninit hlir: hlir_file_mod.HlirFile
+    mir_lower_mod.lower_file(init hlir, file, ty_interner, allocator)?
+    hlir_opt_mod.optimize_file(mutable hlir, ty_interner, allocator)?
+
+    uninit lir: lir_file_mod.LirFile
+    hlir_lower_mod.lower_file(init lir, hlir, ty_interner, target, allocator)?
+    out = lir
+}
+
+
+function lir_error_with_body(
+    e: lir_error_mod.LirError,
+    hlir: hlir_file_mod.HlirFile,
+    file: mir_file_mod.MirFile,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> lir_error_mod.LirError
+    with {allocator, err: alloc.AllocError}
+{
+    let base = match e {
+        case .internal_lowering_invariant(_, let message) => message
+        case .unsupported_hlir_form(_, _) => "unsupported HLIR form"
+    }
+    let culprit = first_failing_body_symbol(hlir, file, ty_interner, target, interner, allocator)?
+    let prefix = string.concat(base, " in `", allocator)?
+    let named = string.concat(prefix, culprit, allocator)?
+    let message = string.concat(named, "`", allocator)?
+    return lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: message)
+}
+
+
+function first_failing_body_symbol(
+    hlir: hlir_file_mod.HlirFile,
+    file: mir_file_mod.MirFile,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HlirBody.len(hlir.bodies)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let hb = Vec_HlirBody.at(hlir.bodies, i)
+        if body_lowering_fails(hb, ty_interner, target, allocator)? {
+            let name = mir_name_of(file, hb.def_id.raw)
+            let base = symname_mod.function_symbol(name, hb.def_id, interner, allocator)?
+            let verdict = if pre_opt_fails(file, hb.def_id.raw, ty_interner, target, allocator)? {
+                " [pre-opt: also fails]"
+            } else {
+                " [pre-opt: passes; introduced by hlir-opt]"
+            }
+            return string.concat(base, verdict, allocator)?
+        }
+        i += 1
+    }
+    return "<unidentified>"
+}
+
+
+function pre_opt_fails(
+    file: mir_file_mod.MirFile,
+    def_raw: u32,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    return handle err: hlir_error_mod.HlirError -> true {
+        uninit fresh: hlir_file_mod.HlirFile
+        mir_lower_mod.lower_file(init fresh, file, ty_interner, allocator)?
+        let n = Vec_HlirBody.len(fresh.bodies)
+        var i: usize = 0
+        var verdict = false
+        loop decreases n - i {
+            if i >= n { break }
+            let hb = Vec_HlirBody.at(fresh.bodies, i)
+            if hb.def_id.raw == def_raw {
+                verdict = body_lowering_fails(hb, ty_interner, target, allocator)?
+            }
+            i += 1
+        }
+        verdict
+    }
+}
+
+
+function mir_name_of(file: mir_file_mod.MirFile, def_raw: u32) -> symbol_mod.Symbol {
+    let n = Vec_MirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let mb = Vec_MirBody.at(file.bodies, i)
+        if mb.def_id.raw == def_raw {
+            return mb.name
+        }
+        i += 1
+    }
+    return symbol_mod.empty()
+}
+
+
+function body_lowering_fails(
+    hb: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    return handle err: lir_error_mod.LirError -> true {
+        uninit scratch: lir_body_mod.LirBody
+        hlir_lower_mod.lower_body(init scratch, hb, ty_interner, target, allocator)?
+        false
+    }
+}
+
+
+function estimate_object_capacity(bodies: Vec_EmittedBody.Vec) -> usize {
+    let n = Vec_EmittedBody.len(bodies)
+    var total: usize = 4096
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(bodies, i)
+        total = total +| Vec_u8.len(body.code) +| 128
+        i += 1
+    }
+    return total
+}
+
+
+function append_count(prefix: String, label: String, n: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let with_label = string.concat(prefix, label, allocator)?
+    let num = fmt_mod.usize_to_string(n, allocator)?
+    return string.concat(with_label, num, allocator)?
+}
+
+
+function body_param_count(hb: hlir_body_mod.HlirBody) -> usize {
+    let n = Vec_HlirBlock.len(hb.blocks)
+    var total: usize = 0
+    var k: usize = 0
+    loop decreases n - k {
+        if k >= n { break }
+        let blk = Vec_HlirBlock.at(hb.blocks, k)
+        total = total +| Vec_ValueId.len(blk.params)
+        k += 1
+    }
+    return total
+}
+
+
+function shape_detail(
+    file: mir_file_mod.MirFile,
+    hlir: hlir_file_mod.HlirFile,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var mir_blocks: usize = 0
+    var mir_locals: usize = 0
+    let n_mir = Vec_MirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases n_mir - i {
+        if i >= n_mir { break }
+        let mb = Vec_MirBody.at(file.bodies, i)
+        mir_blocks = mir_blocks +| Vec_BasicBlock.len(mb.blocks)
+        mir_locals = mir_locals +| Vec_Local.len(mb.locals)
+        i += 1
+    }
+
+    var hlir_blocks: usize = 0
+    var hlir_ops: usize = 0
+    var hlir_values: usize = 0
+    var hlir_params: usize = 0
+    var max_values: usize = 0
+    var max_params: usize = 0
+    let n_h = Vec_HlirBody.len(hlir.bodies)
+    var j: usize = 0
+    loop decreases n_h - j {
+        if j >= n_h { break }
+        let hb = Vec_HlirBody.at(hlir.bodies, j)
+        let nv = Vec_HlirValue.len(hb.values)
+        hlir_blocks = hlir_blocks +| Vec_HlirBlock.len(hb.blocks)
+        hlir_ops = hlir_ops +| Vec_HlirOp.len(hb.ops)
+        hlir_values = hlir_values +| nv
+        if nv > max_values { max_values = nv }
+        let body_params = body_param_count(hb)
+        hlir_params = hlir_params +| body_params
+        if body_params > max_params { max_params = body_params }
+        j += 1
+    }
+
+    let a1 = append_count("", "mbody=", n_mir, allocator)?
+    let a2 = append_count(a1, " mblk=", mir_blocks, allocator)?
+    let a3 = append_count(a2, " mloc=", mir_locals, allocator)?
+    let a4 = append_count(a3, " hblk=", hlir_blocks, allocator)?
+    let a5 = append_count(a4, " hop=", hlir_ops, allocator)?
+    let a6 = append_count(a5, " hval=", hlir_values, allocator)?
+    let a7 = append_count(a6, " hpar=", hlir_params, allocator)?
+    let a8 = append_count(a7, " maxv=", max_values, allocator)?
+    return append_count(a8, " maxp=", max_params, allocator)?
+}

@@ -1,0 +1,160 @@
+
+module lower.flow.ssa.preds
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.flow.cfg.cfg as cfg_mod
+
+
+spec std.collections.vec.Vec(cfg_mod.BlockEdge)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+
+
+public function build_pred_csr(
+    offsets_out: init Vec_usize.Vec,
+    pool_out: init Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit count: Vec_usize.Vec
+    new_usizes(init count, n_blocks, allocator)?
+    count_preds(mutable count, cfg, n_blocks)
+
+    uninit offsets: Vec_usize.Vec
+    Vec_usize.new(init offsets, allocator)?
+    var total: usize = 0
+    var b: usize = 0
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        Vec_usize.push(mutable offsets, total, allocator)?
+        total = total +| Vec_usize.at(count, b)
+        b += 1
+    }
+    Vec_usize.push(mutable offsets, total, allocator)?
+
+    uninit pool: Vec_u32.Vec
+    new_u32s(init pool, total, allocator)?
+    uninit cursor: Vec_usize.Vec
+    Vec_usize.new(init cursor, allocator)?
+    var c: usize = 0
+    loop decreases n_blocks - c {
+        if c >= n_blocks { break }
+        Vec_usize.push(mutable cursor, Vec_usize.at(offsets, c), allocator)?
+        c += 1
+    }
+    fill_preds(mutable pool, mutable cursor, cfg, n_blocks)
+
+    offsets_out = offsets
+    pool_out = pool
+}
+
+
+function count_preds(count: mutable Vec_usize.Vec, cfg: cfg_mod.Cfg, n_blocks: usize) -> () {
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        if source_reachable(cfg, b) {
+            var e = cfg_mod.succ_start(cfg, b)
+            let end = cfg_mod.succ_end(cfg, b)
+            loop decreases end - e {
+                if e >= end { break }
+                if e < Vec_BlockEdge.len(cfg.succ_edges) {
+                    let t = Vec_BlockEdge.at(cfg.succ_edges, e).target as usize
+                    if t >= 1 {
+                        if t < n_blocks {
+                            if t < Vec_usize.len(count) {
+                                Vec_usize.set_at(mutable count, t, Vec_usize.at(count, t) +| 1)
+                            }
+                        }
+                    }
+                }
+                e += 1
+            }
+        }
+        b += 1
+    }
+}
+
+
+function fill_preds(
+    pool: mutable Vec_u32.Vec,
+    cursor: mutable Vec_usize.Vec,
+    cfg: cfg_mod.Cfg,
+    n_blocks: usize,
+) -> () {
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        if source_reachable(cfg, b) {
+            var e = cfg_mod.succ_start(cfg, b)
+            let end = cfg_mod.succ_end(cfg, b)
+            loop decreases end - e {
+                if e >= end { break }
+                if e < Vec_BlockEdge.len(cfg.succ_edges) {
+                    let t = Vec_BlockEdge.at(cfg.succ_edges, e).target as usize
+                    fill_one_pred(mutable pool, mutable cursor, b, t, n_blocks)
+                }
+                e += 1
+            }
+        }
+        b += 1
+    }
+}
+
+
+function fill_one_pred(
+    pool: mutable Vec_u32.Vec,
+    cursor: mutable Vec_usize.Vec,
+    source: usize,
+    target: usize,
+    n_blocks: usize,
+) -> () {
+    if target < 1 { return }
+    if target >= n_blocks { return }
+    if target >= Vec_usize.len(cursor) { return }
+    let slot = Vec_usize.at(cursor, target)
+    if slot >= Vec_u32.len(pool) { return }
+    Vec_u32.set_at(mutable pool, slot, source as u32 wrapping)
+    Vec_usize.set_at(mutable cursor, target, slot + 1)
+}
+
+
+function source_reachable(cfg: cfg_mod.Cfg, b: usize) -> bool {
+    if b >= Vec_u32.len(cfg.rpo_pos) { return false }
+    return Vec_u32.at(cfg.rpo_pos, b) != (0 as u32)
+}
+
+
+function new_u32s(out: init Vec_u32.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u32.Vec
+    Vec_u32.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable v, 0 as u32, allocator)?
+        i += 1
+    }
+    out = v
+}
+
+
+function new_usizes(out: init Vec_usize.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_usize.Vec
+    Vec_usize.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_usize.push(mutable v, 0, allocator)?
+        i += 1
+    }
+    out = v
+}

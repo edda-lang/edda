@@ -1,0 +1,54 @@
+module csrf.session
+
+import std.mem.alloc
+import std.text.string
+import local.token as token_mod
+import session.store as session_store
+import form.urlencoded
+
+spec std.core.option.Option(String)
+
+
+public function field_name() -> String {
+    return "_csrf_token"
+}
+
+public function token(store: mutable session_store.Store, id: String, rand: Random, allocator: Allocator) -> String
+    with {rand, allocator, err: alloc.AllocError}
+{
+    let value = token_mod.generate(rand, allocator)?
+    session_store.set(mutable store, id, field_name(), value, allocator)?
+    return value
+}
+
+public function verify(store: mutable session_store.Store, id: String, submitted: String, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    return match session_store.get(store, id, field_name()) {
+        case .some(let expected) => {
+            let ok = token_mod.verify(expected, submitted)
+            session_store.remove(mutable store, id, field_name(), allocator)?
+            ok
+        }
+        case .none => false
+    }
+}
+
+public function hidden_field_html(token_value: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let prefix = "<input type=\"hidden\" name=\""
+    let with_name = string.concat(prefix, field_name(), allocator)?
+    let with_open_value = string.concat(with_name, "\" value=\"", allocator)?
+    let with_value = string.concat(with_open_value, token_value, allocator)?
+    return string.concat(with_value, "\">", allocator)?
+}
+
+public function validate_form(store: mutable session_store.Store, id: String, fields: [urlencoded.Field], allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let submitted = handle err: urlencoded.FieldError as _e -> return false {
+        urlencoded.string_field(fields, field_name(), allocator)?
+    }
+    return verify(mutable store, id, submitted, allocator)?
+}

@@ -1,0 +1,110 @@
+module structmap.budget.gate.measure.measure
+
+import std.mem.alloc
+import local.data.model as model
+import local.budget.model as bmodel
+import local.budget.token as token
+import local.budget.gate.filerows.filerows as filerows
+
+
+public function permille_of(x: f64) -> usize {
+    let p: usize = (x * 1000.0) as usize
+    return if p == 0 as usize { 1 as usize } else { p }
+}
+
+public function scaled_cost(raw: usize, cfg: bmodel.BudgetConfig) -> usize {
+    let cal: usize = permille_of(cfg.model_calibration)
+    let scaled: usize = raw *| cal
+    let rounded: usize = scaled +| (500 as usize)
+    return rounded / (1000 as usize)
+}
+
+public function measure_text(text: String, cfg: bmodel.BudgetConfig) -> usize {
+    let tk = token.new_tokenizer(permille_of(cfg.chars_per_token))
+    let raw = token.count(tk, text)
+    return scaled_cost(raw, cfg)
+}
+
+public function node_band(token_cost: usize, cfg: bmodel.BudgetConfig) -> bmodel.Band {
+    if token_cost > cfg.node_amber_max { return bmodel.Band.red }
+    if token_cost > cfg.node_green_max { return bmodel.Band.amber }
+    return bmodel.Band.green
+}
+
+public function is_red(b: bmodel.Band) -> bool {
+    return match b {
+        case .red => true
+        case .amber => false
+        case .green => false
+    }
+}
+
+public function is_green(b: bmodel.Band) -> bool {
+    return match b {
+        case .green => true
+        case .amber => false
+        case .red => false
+    }
+}
+
+public function file_interface_cost(tree: model.Tree, dir_idx: usize, file: String, cfg: bmodel.BudgetConfig, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    let rows = filerows.render_file_rows(tree, dir_idx, file, allocator)?
+    return measure_text(rows, cfg)
+}
+
+function is_header_start(b: [u8], i: usize) -> bool {
+    return i == 0 as usize || b[i - 1] == 0x0A
+}
+
+function matches_at(b: [u8], i: usize, pat: [u8]) -> bool {
+    let n: usize = b.len()
+    let m: usize = pat.len()
+    if i +| m > n { return false }
+    var k: usize = 0
+    loop decreases (m - k) {
+        if k >= m { break }
+        if b[i + k] != pat[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+function parse_count_after(b: [u8], start: usize) -> usize {
+    let n: usize = b.len()
+    var i: usize = start
+    var value: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let c = b[i]
+        if c == 0x5D { break }
+        if c >= 0x30 && c <= 0x39 {
+            let d: usize = (c - 0x30) as usize
+            value = value *| (10 as usize) +| d
+        }
+        i += 1
+    }
+    return value
+}
+
+public function parse_export_count(text: String) -> usize {
+    let b = text.bytes()
+    let n: usize = b.len()
+    let types_pat = "types[".bytes()
+    let fns_pat = "functions[".bytes()
+    var total: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if is_header_start(b, i) {
+            if matches_at(b, i, types_pat) {
+                total = total +| parse_count_after(b, i +| types_pat.len())
+            } else if matches_at(b, i, fns_pat) {
+                total = total +| parse_count_after(b, i +| fns_pat.len())
+            }
+        }
+        i += 1
+    }
+    return total
+}

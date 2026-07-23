@@ -1,0 +1,101 @@
+
+module compile.phase.pipeline.parse
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.text.string
+import intern.interner as interner_mod
+import diagnostics.emit.collection as diags_mod
+import source.map as source_map_mod
+import source.file as source_file_mod
+import syntax.lex.lexer as lexer_mod
+import syntax.parse.parser as parser_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.file as ast_file_mod
+
+
+spec std.collections.vec.Vec(lexed_mod.Lexed)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(bool)
+
+
+public function parse_sources(
+    map: source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_File.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit files: Vec_File.Vec
+    Vec_File.new(init files, allocator)?
+    let n = source_map_mod.file_count(map)
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        parse_one(map, i, mutable files, mutable interner, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+    return files
+}
+
+
+public function parse_sources_at(
+    map: source_map_mod.SourceMap,
+    indexes: Vec_usize.Vec,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_File.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit files: Vec_File.Vec
+    Vec_File.new(init files, allocator)?
+    var done = IntMap_bool.new(allocator)?
+    let n = Vec_usize.len(indexes)
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let idx = Vec_usize.at(indexes, i)
+        if idx < source_map_mod.file_count(map) && !IntMap_bool.contains(done, idx as i64) {
+            let _ = IntMap_bool.insert(mutable done, idx as i64, true, allocator)?
+            parse_one(map, idx, mutable files, mutable interner, mutable diags, allocator)?
+        }
+        i = i + 1 as usize
+    }
+    return files
+}
+
+
+function parse_one(
+    map: source_map_mod.SourceMap,
+    index: usize,
+    files: mutable Vec_File.Vec,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires index < source_map_mod.file_count(map)
+{
+    let sf = source_map_mod.file_at(map, index)
+    if !string.ends_with(source_file_mod.name(sf), ".ea") {
+        return
+    }
+    let fid = source_file_mod.id(sf)
+    let content = source_file_mod.content(sf)
+    let content_bytes = content.bytes()
+    uninit tokens: Vec_Lexed.Vec
+    Vec_Lexed.with_capacity(init tokens, content_bytes.len() / 4 + 8, allocator)?
+    lexer_mod.lex(content_bytes, fid, mutable interner, mutable diags, mutable tokens, allocator)?
+    let tokens_slice = Vec_Lexed.into_array(take tokens, allocator)?
+    uninit file: ast_file_mod.File
+    parser_mod.parse_file(tokens_slice, fid, init file, mutable diags, allocator)?
+    Vec_File.push(mutable files, take file, allocator)?
+}

@@ -1,0 +1,257 @@
+
+module optimize.refine_elim.bounds.elim
+
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.block as mir_block_mod
+import local.refine_elim.facts.facts as facts_mod
+import local.refine_elim.proven.proven as proven_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Obligation)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.core.option.Option(Vec_Projection)
+
+
+public type OptStmtKind {
+    case some(kind: mir_stmt_mod.MStmtKind)
+    case none
+}
+
+
+public function elim_bounds_checks(
+    body: mutable mir_body_mod.MirBody,
+    sf: facts_mod.SiteFacts,
+    proven: proven_mod.ProvenSet,
+) -> ()
+{
+    let n = Vec_Obligation.len(body.obligations)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ob = Vec_Obligation.at(body.obligations, i)
+        elim_obligation(mutable body, sf, proven, ob)
+        i = i + 1
+    }
+}
+
+
+function elim_obligation(
+    body: mutable mir_body_mod.MirBody,
+    sf: facts_mod.SiteFacts,
+    proven: proven_mod.ProvenSet,
+    ob: mir_body_mod.Obligation,
+) -> ()
+{
+    if !obligation_is_bounds(ob.kind) {
+        return
+    }
+    let block = ob.block
+    let s_idx = ob.stmt_index as usize
+    if !facts_mod.site_is_proven(body, sf, proven, block, s_idx, ob.kind) {
+        return
+    }
+    let want_slice = kind_is_slice(ob.kind)
+    let b_idx = mir_block_mod.index(block)
+    let new_kind = marked_kind_at(body, b_idx, s_idx, want_slice)
+    match new_kind {
+        case .some(let kind) => write_back(mutable body, b_idx, s_idx, kind)
+        case .none => return
+    }
+}
+
+
+function obligation_is_bounds(kind: mir_body_mod.ObligationKind) -> bool {
+    return match kind {
+        case .index_in_bounds => true
+        case .slice_subrange_in_bounds => true
+        case _ => false
+    }
+}
+
+function kind_is_slice(kind: mir_body_mod.ObligationKind) -> bool {
+    return match kind {
+        case .slice_subrange_in_bounds => true
+        case _ => false
+    }
+}
+
+
+function marked_kind_at(
+    body: mir_body_mod.MirBody,
+    b_idx: usize,
+    s_idx: usize,
+    want_slice: bool,
+) -> OptStmtKind
+{
+    if b_idx >= Vec_BasicBlock.len(body.blocks) {
+        return OptStmtKind.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b_idx)
+    if s_idx >= Vec_Statement.len(bb.statements) {
+        return OptStmtKind.none
+    }
+    let stmt = Vec_Statement.at(bb.statements, s_idx)
+    return match stmt.kind {
+        case .assign(let dest, let value) =>
+            OptStmtKind.some(kind: mir_stmt_mod.MStmtKind.assign(
+                dest: mark_place(dest, want_slice),
+                value: mark_rvalue(value, want_slice),
+            ))
+        case .storage_live(_) => OptStmtKind.none
+        case .storage_dead(_) => OptStmtKind.none
+        case .nop_ => OptStmtKind.none
+    }
+}
+
+
+function mark_rvalue(value: mir_rvalue_mod.Rvalue, want_slice: bool) -> mir_rvalue_mod.Rvalue {
+    return match value {
+        case .use_(let op) =>
+            mir_rvalue_mod.Rvalue.use_(operand: mark_operand(op, want_slice))
+        case .binary(let op, let lhs, let rhs) =>
+            mir_rvalue_mod.Rvalue.binary(
+                op: op,
+                lhs: mark_operand(lhs, want_slice),
+                rhs: mark_operand(rhs, want_slice),
+            )
+        case .unary(let op, let operand) =>
+            mir_rvalue_mod.Rvalue.unary(op: op, operand: mark_operand(operand, want_slice))
+        case .cast(let operand, let from, let to, let kind) =>
+            mir_rvalue_mod.Rvalue.cast(
+                operand: mark_operand(operand, want_slice),
+                from: from,
+                to: to,
+                kind: kind,
+            )
+        case .aggregate(let kind, let elems, let result_ty) =>
+            mir_rvalue_mod.Rvalue.aggregate(
+                kind: kind,
+                elems: mark_operands(elems, want_slice),
+                result_ty: result_ty,
+            )
+        case .ref_(let kind, let place) =>
+            mir_rvalue_mod.Rvalue.ref_(kind: kind, place: mark_place(place, want_slice))
+        case .len(let place) =>
+            mir_rvalue_mod.Rvalue.len(place: mark_place(place, want_slice))
+        case .discriminant(let place) =>
+            mir_rvalue_mod.Rvalue.discriminant(place: mark_place(place, want_slice))
+        case .make_closure(let code, let env) =>
+            mir_rvalue_mod.Rvalue.make_closure(code: code, env: mark_operand(env, want_slice))
+    }
+}
+
+
+function mark_operands(elems: Vec_Operand.Vec, want_slice: bool) -> Vec_Operand.Vec {
+    var out: Vec_Operand.Vec = elems
+    let n = Vec_Operand.len(out)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let op = Vec_Operand.at(out, i)
+        let new_op = mark_operand(op, want_slice)
+        Vec_Operand.set_at(mutable out, i, take new_op)
+        i = i + 1
+    }
+    return out
+}
+
+
+function mark_operand(op: mir_rvalue_mod.Operand, want_slice: bool) -> mir_rvalue_mod.Operand {
+    return match op {
+        case .copy_(let place, let ty) =>
+            mir_rvalue_mod.Operand.copy_(place: mark_place(place, want_slice), ty: ty)
+        case .move_(let place, let ty) =>
+            mir_rvalue_mod.Operand.move_(place: mark_place(place, want_slice), ty: ty)
+        case .constant(_) => op
+    }
+}
+
+
+function mark_place(p: mir_place_mod.Place, want_slice: bool) -> mir_place_mod.Place {
+    var place: mir_place_mod.Place = p
+    match Option_Vec_Projection.take_out(mutable place.projection) {
+        case .some(let v) => {
+            var projs: Vec_Projection.Vec = v
+            mark_projections(mutable projs, want_slice)
+            place.projection = Option_Vec_Projection.some(value: projs)
+        }
+        case .none => ()
+    }
+    return place
+}
+
+
+function mark_projections(projs: mutable Vec_Projection.Vec, want_slice: bool) -> () {
+    let n = Vec_Projection.len(projs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let proj = Vec_Projection.at(projs, i)
+        let new_proj = mir_place_mod.Projection {
+            kind: mark_projection_kind(proj.kind, want_slice),
+            result_ty: proj.result_ty,
+        }
+        Vec_Projection.set_at(mutable projs, i, take new_proj)
+        i = i + 1
+    }
+}
+
+
+function mark_projection_kind(
+    kind: mir_place_mod.ProjectionKind,
+    want_slice: bool,
+) -> mir_place_mod.ProjectionKind {
+    return match kind {
+        case .index(let idx_local, let proven) =>
+            mir_place_mod.ProjectionKind.index(
+                idx_local: idx_local,
+                proven: if want_slice { proven } else { true },
+            )
+        case .slice_subrange(let lo_local, let hi_local, let proven) =>
+            mir_place_mod.ProjectionKind.slice_subrange(
+                lo_local: lo_local,
+                hi_local: hi_local,
+                proven: if want_slice { true } else { proven },
+            )
+        case _ => kind
+    }
+}
+
+
+function write_back(
+    body: mutable mir_body_mod.MirBody,
+    b_idx: usize,
+    s_idx: usize,
+    new_kind: mir_stmt_mod.MStmtKind,
+) -> ()
+{
+    if b_idx >= Vec_BasicBlock.len(body.blocks) {
+        return
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b_idx)
+    if s_idx >= Vec_Statement.len(bb.statements) {
+        return
+    }
+    let stmt = Vec_Statement.at(bb.statements, s_idx)
+    let new_stmt = mir_stmt_mod.Statement {
+        origin: stmt.origin,
+        kind: new_kind,
+    }
+    var new_stmts: Vec_Statement.Vec = bb.statements
+    Vec_Statement.set_at(mutable new_stmts, s_idx, take new_stmt)
+    let new_bb = mir_body_mod.BasicBlock {
+        node_id_origin: bb.node_id_origin,
+        statements: new_stmts,
+        terminator: bb.terminator,
+        coherence_region: bb.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, b_idx, take new_bb)
+}

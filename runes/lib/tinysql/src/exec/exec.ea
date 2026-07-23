@@ -1,0 +1,236 @@
+module tinysql.exec.exec
+
+import std.mem.alloc
+import std.collections.vec
+import tinysql.model.value
+import tinysql.model.schema
+import tinysql.model.ast
+import tinysql.model.error
+import tinysql.exec.eval
+
+spec std.collections.vec.Vec(schema.Table)
+spec std.collections.vec.Vec(schema.Row)
+
+function _alloc_string_slots(allocator: Allocator, n: usize) -> [String]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_index_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_row_slots(allocator: Allocator, n: usize) -> [schema.Row]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public type ResultSet {
+    columns: [String]
+    rows: [schema.Row]
+    affected: usize
+}
+
+function _empty_strings(allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    return _alloc_string_slots(allocator, 1 as usize)?[0 as usize..<0 as usize]
+}
+
+function _empty_rows(allocator: Allocator) -> [schema.Row]
+    with {allocator, err: alloc.AllocError}
+{
+    return _alloc_row_slots(allocator, 1 as usize)?[0 as usize..<0 as usize]
+}
+
+function _status(affected: usize, allocator: Allocator) -> ResultSet
+    with {allocator, err: alloc.AllocError}
+{
+    return ResultSet { columns: _empty_strings(allocator)?, rows: _empty_rows(allocator)?, affected: affected }
+}
+
+function _require_index(db: schema.Database, name: String) -> usize
+    with {err: error.SqlError}
+{
+    return match schema.table_index(db, name) {
+        case .some(let i) => i
+        case .none        => raise error.SqlError.no_such_table
+    }
+}
+
+function _exec_create(
+    db: mutable schema.Database,
+    name: String,
+    columns: [schema.Column],
+    allocator: Allocator,
+) -> ResultSet
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let existing = match schema.table_index(db, name) {
+        case .some(_) => true
+        case .none    => false
+    }
+    if existing { raise error.SqlError.table_exists }
+    uninit rows: Vec_Row.Vec
+    Vec_Row.new(init rows, allocator)?
+    let table = schema.Table { name: name, columns: columns, rows: rows }
+    Vec_Table.push(mutable db.tables, take table, allocator)?
+    return _status(0 as usize, allocator)?
+}
+
+function _exec_insert(
+    db: mutable schema.Database,
+    name: String,
+    has_cols: bool,
+    insert_cols: [String],
+    values: [value.Value],
+    allocator: Allocator,
+) -> ResultSet
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let idx = _require_index(db, name)?
+    if idx >= Vec_Table.len(db.tables) { raise error.SqlError.no_such_table }
+    var table = Vec_Table.at(db.tables, idx)
+    let cells = eval.build_cells(table.columns, has_cols, insert_cols, values, allocator)?
+    let row = schema.Row { cells: cells }
+    Vec_Row.push(mutable table.rows, take row, allocator)?
+    Vec_Table.set_at(mutable db.tables, idx, take table)
+    return _status(1 as usize, allocator)?
+}
+
+function _exec_select(
+    db: schema.Database,
+    name: String,
+    projection: ast.Projection,
+    filter: ast.WhereClause,
+    allocator: Allocator,
+) -> ResultSet
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let tidx = _require_index(db, name)?
+    if tidx >= Vec_Table.len(db.tables) { raise error.SqlError.no_such_table }
+    let table = Vec_Table.at(db.tables, tidx)
+    let columns = table.columns
+    let ncols = columns.len()
+    let indices = _alloc_index_slots(allocator, ncols + 1 as usize)?
+    let names = _alloc_string_slots(allocator, ncols + 1 as usize)?
+    var nproj: usize = 0
+    nproj = match projection {
+        case .all => {
+            var j: usize = 0
+            loop decreases ncols - j + 1 as usize {
+                if j >= ncols { break }
+                indices[j] = j
+                names[j] = columns[j].name
+                j = j + 1 as usize
+            }
+            ncols
+        }
+        case .named(let cols) => {
+            let m = cols.len()
+            var j: usize = 0
+            loop decreases m - j + 1 as usize {
+                if j >= m { break }
+                let ci = match schema.column_index(columns, cols[j]) {
+                    case .some(let i) => i
+                    case .none        => raise error.SqlError.no_such_column
+                }
+                indices[j] = ci
+                names[j] = cols[j]
+                j = j + 1 as usize
+            }
+            m
+        }
+    }
+    let nrows = Vec_Row.len(table.rows)
+    let out = _alloc_row_slots(allocator, nrows + 1 as usize)?
+    var w: usize = 0
+    var r: usize = 0
+    loop decreases nrows - r + 1 as usize {
+        if r >= nrows { break }
+        let row = Vec_Row.at(table.rows, r)
+        if eval.row_matches(filter, columns, row)? {
+            out[w] = eval.project_row(row, indices, nproj, allocator)?
+            w = w + 1 as usize
+        }
+        r = r + 1 as usize
+    }
+    return ResultSet { columns: names[0 as usize..<nproj], rows: out[0 as usize..<w], affected: w }
+}
+
+function _exec_update(
+    db: mutable schema.Database,
+    name: String,
+    assignments: [ast.Assignment],
+    filter: ast.WhereClause,
+    allocator: Allocator,
+) -> ResultSet
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let idx = _require_index(db, name)?
+    if idx >= Vec_Table.len(db.tables) { raise error.SqlError.no_such_table }
+    var table = Vec_Table.at(db.tables, idx)
+    let columns = table.columns
+    let nrows = Vec_Row.len(table.rows)
+    var affected: usize = 0
+    var r: usize = 0
+    loop decreases nrows - r + 1 as usize {
+        if r >= nrows { break }
+        if r >= Vec_Row.len(table.rows) { break }
+        let row = Vec_Row.at(table.rows, r)
+        if eval.row_matches(filter, columns, row)? {
+            let updated = eval.apply_assignments(row, columns, assignments, allocator)?
+            Vec_Row.set_at(mutable table.rows, r, take updated)
+            affected = affected + 1 as usize
+        }
+        r = r + 1 as usize
+    }
+    Vec_Table.set_at(mutable db.tables, idx, take table)
+    return _status(affected, allocator)?
+}
+
+function _exec_delete(
+    db: mutable schema.Database,
+    name: String,
+    filter: ast.WhereClause,
+    allocator: Allocator,
+) -> ResultSet
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let idx = _require_index(db, name)?
+    if idx >= Vec_Table.len(db.tables) { raise error.SqlError.no_such_table }
+    var table = Vec_Table.at(db.tables, idx)
+    let columns = table.columns
+    let nrows = Vec_Row.len(table.rows)
+    uninit kept: Vec_Row.Vec
+    Vec_Row.new(init kept, allocator)?
+    var affected: usize = 0
+    var r: usize = 0
+    loop decreases nrows - r + 1 as usize {
+        if r >= nrows { break }
+        if r >= Vec_Row.len(table.rows) { break }
+        let row = Vec_Row.at(table.rows, r)
+        if eval.row_matches(filter, columns, row)? {
+            affected = affected + 1 as usize
+        } else {
+            Vec_Row.push(mutable kept, take row, allocator)?
+        }
+        r = r + 1 as usize
+    }
+    table.rows = kept
+    Vec_Table.set_at(mutable db.tables, idx, take table)
+    return _status(affected, allocator)?
+}
+
+public function execute(db: mutable schema.Database, stmt: ast.Statement, allocator: Allocator) -> ResultSet
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    return match stmt {
+        case .create_table(let name, let columns) => _exec_create(mutable db, name, columns, allocator)?
+        case .insert(let name, let has_cols, let cols, let values) =>
+            _exec_insert(mutable db, name, has_cols, cols, values, allocator)?
+        case .select(let name, let projection, let filter) =>
+            _exec_select(db, name, projection, filter, allocator)?
+        case .update(let name, let assignments, let filter) =>
+            _exec_update(mutable db, name, assignments, filter, allocator)?
+        case .delete(let name, let filter) => _exec_delete(mutable db, name, filter, allocator)?
+    }
+}

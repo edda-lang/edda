@@ -1,0 +1,105 @@
+
+module arm64.ops.divrem
+
+import std.mem.alloc
+import std.collections.vec
+
+import ir.hlir.op as hlir_op_mod
+
+import local.gen.regs as regs_mod
+import local.encoding.instr.dp.dp as dp_move_mod
+import local.encoding.instr.dp.reg.reg as dp_reg_mod
+import local.encoding.instr.dp.muldiv.muldiv as dp_muldiv_mod
+import local.encoding.instr.dp.condcmp.condcmp as condcmp_mod
+import local.encoding.instr.dp.condsel.condsel as condsel_mod
+import local.encoding.branch as branch_mod
+import local.encoding.instr.mem.system as system_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_div(
+    code: mutable Vec_u8.Vec,
+    dreg: regs_mod.GpReg,
+    lreg: regs_mod.GpReg,
+    divisor: regs_mod.GpReg,
+    signed_: bool,
+    div_overflow: hlir_op_mod.DivOverflow,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if signed_ && uses_value_select(div_overflow) {
+        emit_signed_div_value_select(mutable code, dreg, lreg, divisor, div_overflow, allocator)?
+        return ()
+    }
+    emit_div_trap_guards(mutable code, lreg, divisor, signed_, allocator)?
+    if signed_ {
+        dp_muldiv_mod.encode_sdiv(mutable code, true, dreg, lreg, divisor, allocator)?
+    } else {
+        dp_muldiv_mod.encode_udiv(mutable code, true, dreg, lreg, divisor, allocator)?
+    }
+}
+
+function uses_value_select(div_overflow: hlir_op_mod.DivOverflow) -> bool {
+    return match div_overflow {
+        case .trap => false
+        case .wrap => true
+        case .saturate => true
+    }
+}
+
+function emit_signed_div_value_select(
+    code: mutable Vec_u8.Vec,
+    dreg: regs_mod.GpReg,
+    lreg: regs_mod.GpReg,
+    divisor: regs_mod.GpReg,
+    div_overflow: hlir_op_mod.DivOverflow,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    branch_mod.encode_cbnz(mutable code, true, divisor, 2 as i32, allocator)?
+    system_mod.encode_brk(mutable code, 0 as u16, allocator)?
+
+    dp_muldiv_mod.encode_sdiv(mutable code, true, dreg, lreg, divisor, allocator)?
+    match div_overflow {
+        case .saturate => {
+            let neg_one = regs_mod.GpReg.x16
+            dp_move_mod.encode_movn(mutable code, true, neg_one, 0 as u16, 0 as u8, allocator)?
+            dp_reg_mod.encode_cmp_reg(mutable code, true, divisor, neg_one, allocator)?
+            let int_min = regs_mod.GpReg.x16
+            dp_move_mod.encode_movz_x(mutable code, int_min, 0x8000 as u16, 3 as u8, allocator)?
+            condcmp_mod.encode_ccmp_reg(mutable code, true, lreg, int_min, 0 as u8, branch_mod.ArmCond.eq_, allocator)?
+            let int_max = regs_mod.GpReg.x17
+            dp_move_mod.encode_movn(mutable code, true, int_max, 0x8000 as u16, 3 as u8, allocator)?
+            condsel_mod.encode_csel(mutable code, true, dreg, int_max, dreg, branch_mod.ArmCond.eq_, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+function emit_div_trap_guards(
+    code: mutable Vec_u8.Vec,
+    dividend: regs_mod.GpReg,
+    divisor: regs_mod.GpReg,
+    signed_: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    branch_mod.encode_cbnz(mutable code, true, divisor, 2 as i32, allocator)?
+    system_mod.encode_brk(mutable code, 0 as u16, allocator)?
+    if !signed_ {
+        return ()
+    }
+    let scratch = regs_mod.GpReg.x16
+    dp_move_mod.encode_movn(mutable code, true, scratch, 0 as u16, 0 as u8, allocator)?
+    dp_reg_mod.encode_cmp_reg(mutable code, true, divisor, scratch, allocator)?
+    branch_mod.encode_b_cond(mutable code, branch_mod.ArmCond.ne_, 5 as i32, allocator)?
+    dp_move_mod.encode_movz_x(mutable code, scratch, 0x8000 as u16, 3 as u8, allocator)?
+    dp_reg_mod.encode_cmp_reg(mutable code, true, dividend, scratch, allocator)?
+    branch_mod.encode_b_cond(mutable code, branch_mod.ArmCond.ne_, 2 as i32, allocator)?
+    system_mod.encode_brk(mutable code, 0 as u16, allocator)?
+}

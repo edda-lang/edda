@@ -1,0 +1,194 @@
+
+module json.parse.lexer
+
+import std.mem.alloc
+
+public type LexError {
+    case unexpected_byte(at: usize)
+    case unterminated_string(at: usize)
+    case allocation_failed
+}
+
+public type Token {
+    case lbrace
+    case rbrace
+    case lbracket
+    case rbracket
+    case comma
+    case colon
+    case true_lit
+    case false_lit
+    case null_lit
+    case str_lit(start: usize, end: usize)
+    case num_lit(start: usize, end: usize)
+    case eof
+}
+
+function _alloc_token_slots(allocator: Allocator, n: usize) -> [Token]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _is_ws(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8 || c == 10 as u8 || c == 13 as u8
+}
+
+function _is_num_start(c: u8) -> bool {
+    return c == 45 as u8 || (c >= 48 as u8 && c <= 57 as u8)
+}
+
+function _is_num_char(c: u8) -> bool {
+    return (c >= 48 as u8 && c <= 57 as u8)
+        || c == 46 as u8
+        || c == 43 as u8
+        || c == 45 as u8
+        || c == 69 as u8
+        || c == 101 as u8
+}
+
+function _match_keyword(src: [u8], i: usize, kw: [u8]) -> bool {
+    let n = kw.len()
+    if i + n > src.len() { return false }
+    var k: usize = 0
+    loop decreases n - k {
+        if k >= n { break }
+        if src[i + k] != kw[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+function _scan_string(src: [u8], i: usize) -> usize
+    with {err: LexError}
+{
+    let n = src.len()
+    var j: usize = i + 1 as usize
+    loop decreases n - j + 1 as usize {
+        if j >= n {
+            raise LexError.unterminated_string(at: i)
+        }
+        let c = src[j]
+        if c == 34 as u8 { return j + 1 as usize }
+        if c == 92 as u8 {
+            j = j + 1 as usize
+            if j >= n {
+                raise LexError.unterminated_string(at: i)
+            }
+        }
+        j = j + 1 as usize
+    }
+    return j
+}
+
+function _scan_number(src: [u8], i: usize) -> usize {
+    let n = src.len()
+    var j: usize = i + 1 as usize
+    loop decreases n - j + 1 as usize {
+        if j >= n { break }
+        if !_is_num_char(src[j]) { break }
+        j = j + 1 as usize
+    }
+    return j
+}
+
+public function tag_of(t: Token) -> u8 {
+    return match t {
+        case .lbrace             => 0 as u8
+        case .rbrace             => 1 as u8
+        case .lbracket           => 2 as u8
+        case .rbracket           => 3 as u8
+        case .comma              => 4 as u8
+        case .colon              => 5 as u8
+        case .true_lit           => 6 as u8
+        case .false_lit          => 7 as u8
+        case .null_lit           => 8 as u8
+        case .str_lit(_, _)      => 9 as u8
+        case .num_lit(_, _)      => 10 as u8
+        case .eof                => 11 as u8
+    }
+}
+
+public function lex(
+    src: [u8],
+    allocator: Allocator,
+) -> ([Token], usize)
+    with {allocator, err: LexError}
+{
+    return handle err: alloc.AllocError -> { raise LexError.allocation_failed } {
+        let tokens = _alloc_token_slots(allocator, src.len() + 1 as usize)?
+        let n_src = src.len()
+        var n: usize = 0
+        var i: usize = 0
+        loop decreases n_src - i + 1 as usize {
+            if i >= n_src {
+                tokens[n] = Token.eof
+                n = n + 1 as usize
+                break
+            }
+            let c = src[i]
+            if _is_ws(c) {
+                i = i + 1 as usize
+            } else if c == 123 as u8 {
+                tokens[n] = Token.lbrace
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 125 as u8 {
+                tokens[n] = Token.rbrace
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 91 as u8 {
+                tokens[n] = Token.lbracket
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 93 as u8 {
+                tokens[n] = Token.rbracket
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 44 as u8 {
+                tokens[n] = Token.comma
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 58 as u8 {
+                tokens[n] = Token.colon
+                n = n + 1 as usize
+                i = i + 1 as usize
+            } else if c == 116 as u8 {
+                if _match_keyword(src, i, "true".bytes()) {
+                    tokens[n] = Token.true_lit
+                    n = n + 1 as usize
+                    i = i + 4 as usize
+                } else {
+                    raise LexError.unexpected_byte(at: i)
+                }
+            } else if c == 102 as u8 {
+                if _match_keyword(src, i, "false".bytes()) {
+                    tokens[n] = Token.false_lit
+                    n = n + 1 as usize
+                    i = i + 5 as usize
+                } else {
+                    raise LexError.unexpected_byte(at: i)
+                }
+            } else if c == 110 as u8 {
+                if _match_keyword(src, i, "null".bytes()) {
+                    tokens[n] = Token.null_lit
+                    n = n + 1 as usize
+                    i = i + 4 as usize
+                } else {
+                    raise LexError.unexpected_byte(at: i)
+                }
+            } else if c == 34 as u8 {
+                let end = _scan_string(src, i)?
+                tokens[n] = Token.str_lit(start: i + 1 as usize, end: end - 1 as usize)
+                n = n + 1 as usize
+                i = end
+            } else if _is_num_start(c) {
+                let end = _scan_number(src, i)
+                tokens[n] = Token.num_lit(start: i, end: end)
+                n = n + 1 as usize
+                i = end
+            } else {
+                raise LexError.unexpected_byte(at: i)
+            }
+        }
+        (tokens, n)
+    }
+}

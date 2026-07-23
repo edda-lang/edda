@@ -1,0 +1,88 @@
+
+module types.check.diverge.diverge
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+
+
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArm)
+
+
+spec std.core.option.Option(Box_HExpr)
+
+
+public function block_falls_through(block: hir_tree.HBlock) -> bool
+    with {divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if stmt_diverges(Vec_HStmt.at(block.stmts, i)) {
+            return false
+        }
+        i = i + 1 as usize
+    }
+    match block.trailing {
+        case .some(let box_e) => {
+            return !expr_diverges(Box_HExpr.get(box_e))
+        }
+        case .none => return true
+    }
+}
+
+
+function stmt_diverges(stmt: hir_tree.HStmt) -> bool
+    with {divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, _, _, let init_) => expr_diverges(init_)
+        case .uninit_(_, _, _) => false
+        case .assign(_, _, let rhs) => expr_diverges(rhs)
+    }
+}
+
+
+public function expr_diverges(e: hir_tree.HExpr) -> bool
+    with {divergence}
+{
+    return match e.kind {
+        case .return_(_) => true
+        case .raise_(_) => true
+        case .panic_(_) => true
+        case .break_(_, _) => true
+        case .continue_(_) => true
+        case .block_(let body) => !block_falls_through(body)
+        case .if_(_, let then_b, let else_opt) => match else_opt {
+            case .some(let eb) => !block_falls_through(then_b) && !block_falls_through(eb)
+            case .none => false
+        }
+        case .match_(_, let arms) => arms_all_diverge(arms)
+        case _ => false
+    }
+}
+
+
+function arms_all_diverge(arms: Vec_HArm.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    if n == 0 as usize {
+        return false
+    }
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if !expr_diverges(Vec_HArm.at(arms, i).body) {
+            return false
+        }
+        i = i + 1 as usize
+    }
+    return true
+}

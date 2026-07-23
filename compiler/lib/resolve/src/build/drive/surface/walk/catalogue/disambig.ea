@@ -1,0 +1,277 @@
+
+module resolve.build.drive.surface.walk.catalogue.disambig
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol
+import hir.def as def_mod
+import syntax.ast.item as ast_item
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import manifest.lex.toml.val.values as values_mod
+import local.ctx as ctx_mod
+import local.paths.imports as imports_mod
+import local.paths.modules as mt_mod
+
+spec std.collections.vec.Vec(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.core.option.Option(imports_mod.ImportEntry)
+spec std.core.option.Option(Vec_Symbol.Vec)
+
+
+public function disambiguated_full(
+    ctx: ctx_mod.ResolveCtx,
+    file_mod_id: mt_mod.ModuleId,
+    file_segs: Vec_Symbol.Vec,
+    imports: imports_mod.ImportScope,
+    inv: ast_item.SpecInvocation,
+    mangled: symbol.Symbol,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> symbol.Symbol
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var suffix: String = ""
+    let n = Vec_Expr.len(inv.args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match canonical_arg_segs(ctx, file_mod_id, file_segs, imports, Vec_Expr.at(inv.args, i), interner, allocator)? {
+            case .some(let segs) => { suffix = append_path_suffix(suffix, segs, interner, allocator)? }
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return finish_disambiguated(mangled, suffix, mutable interner, allocator)?
+}
+
+
+function canonical_arg_segs(
+    ctx: ctx_mod.ResolveCtx,
+    file_mod_id: mt_mod.ModuleId,
+    file_segs: Vec_Symbol.Vec,
+    imports: imports_mod.ImportScope,
+    arg: ast_tree.Expr,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Vec_Symbol_Vec.Option
+    with {allocator, err: alloc.AllocError}
+{
+    match arg.kind {
+        case .path(let ap) => {
+            let n = Vec_Ident.len(ap.segments)
+            if n == 0 as usize {
+                return Option_Vec_Symbol_Vec.Option.none
+            }
+            let leaf = Vec_Ident.at(ap.segments, n - 1).name
+            if !is_nominal_leaf(leaf, interner, allocator)? {
+                return Option_Vec_Symbol_Vec.Option.none
+            }
+            let head = Vec_Ident.at(ap.segments, 0).name
+            if n == 1 as usize {
+                return single_seg_canonical(ctx, file_mod_id, file_segs, imports, head, allocator)?
+            }
+            match imports_mod.lookup(imports, head) {
+                case .some(let e) => {
+                    if !e.is_selected {
+                        let joined = append_rest_syms(e.path, ap, allocator)?
+                        if !def_mod.is_error(ctx_mod.lookup_path(ctx, joined)) {
+                            return Option_Vec_Symbol_Vec.Option.some(value: joined)
+                        }
+                        return Option_Vec_Symbol_Vec.Option.none
+                    }
+                }
+                case .none => ()
+            }
+            let inst = ctx_mod.instance_full(ctx, file_mod_id, head)
+            if inst.raw != symbol.empty().raw {
+                uninit base: Vec_Symbol.Vec
+                Vec_Symbol.new(init base, allocator)?
+                Vec_Symbol.push(mutable base, inst, allocator)?
+                let joined = append_rest_syms(base, ap, allocator)?
+                return Option_Vec_Symbol_Vec.Option.some(value: joined)
+            }
+            let written = path_to_syms(ap, allocator)?
+            if !def_mod.is_error(ctx_mod.lookup_path(ctx, written)) {
+                return Option_Vec_Symbol_Vec.Option.some(value: written)
+            }
+            return Option_Vec_Symbol_Vec.Option.none
+        }
+        case _ => return Option_Vec_Symbol_Vec.Option.none
+    }
+}
+
+
+function single_seg_canonical(
+    ctx: ctx_mod.ResolveCtx,
+    file_mod_id: mt_mod.ModuleId,
+    file_segs: Vec_Symbol.Vec,
+    imports: imports_mod.ImportScope,
+    head: symbol.Symbol,
+    allocator: Allocator,
+) -> Option_Vec_Symbol_Vec.Option
+    with {allocator, err: alloc.AllocError}
+{
+    match imports_mod.lookup(imports, head) {
+        case .some(let e) => {
+            if e.is_selected {
+                return Option_Vec_Symbol_Vec.Option.some(value: clone_syms(e.path, allocator)?)
+            }
+        }
+        case .none => ()
+    }
+    if !def_mod.is_error(ctx_mod.lookup_in_module(ctx, file_mod_id, head)) {
+        return Option_Vec_Symbol_Vec.Option.some(value: imports_mod.append_sym(file_segs, head, allocator)?)
+    }
+    let inst = ctx_mod.instance_full(ctx, file_mod_id, head)
+    if inst.raw != symbol.empty().raw {
+        uninit segs: Vec_Symbol.Vec
+        Vec_Symbol.new(init segs, allocator)?
+        Vec_Symbol.push(mutable segs, inst, allocator)?
+        let primary = ctx_mod.inst_primary_of(ctx, inst)
+        if primary.raw != symbol.empty().raw {
+            Vec_Symbol.push(mutable segs, primary, allocator)?
+        }
+        return Option_Vec_Symbol_Vec.Option.some(value: segs)
+    }
+    return Option_Vec_Symbol_Vec.Option.none
+}
+
+
+public function append_path_suffix(acc: String, segs: Vec_Symbol.Vec, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out = string.concat(acc, "__", allocator)?
+    let n = Vec_Symbol.len(segs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i > 0 as usize {
+            out = string.concat(out, "_", allocator)?
+        }
+        out = string.concat(out, sym_to_string(Vec_Symbol.at(segs, i), interner, allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function finish_disambiguated(base: symbol.Symbol, suffix: String, interner: mutable interner_mod.Interner, allocator: Allocator) -> symbol.Symbol
+    with {allocator, err: alloc.AllocError}
+{
+    if suffix.len() == 0 {
+        return base
+    }
+    let base_str = sym_to_string(base, interner, allocator)?
+    return interner_mod.intern(mutable interner, string.concat(base_str, suffix, allocator)?, allocator)?
+}
+
+
+public function is_nominal_leaf(leaf: symbol.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let s = sym_to_string(leaf, interner, allocator)?
+    let bs = s.bytes()
+    if bs.len() == 0 {
+        return false
+    }
+    let c = bs[0]
+    if !(c >= 65 && c <= 90) {
+        return false
+    }
+    return !is_builtin_nonnominal(s)
+}
+
+
+function is_builtin_nonnominal(s: String) -> bool {
+    if string.equals(s, "String") { return true }
+    if string.equals(s, "Codepoint") { return true }
+    if string.equals(s, "Type") { return true }
+    if string.equals(s, "HeapPtr") { return true }
+    if string.equals(s, "Filesystem") { return true }
+    if string.equals(s, "ReadOnlyFilesystem") { return true }
+    if string.equals(s, "SandboxedFilesystem") { return true }
+    if string.equals(s, "Network") { return true }
+    if string.equals(s, "LocalhostNetwork") { return true }
+    if string.equals(s, "RestrictedNetwork") { return true }
+    if string.equals(s, "Clock") { return true }
+    if string.equals(s, "MonotonicClock") { return true }
+    if string.equals(s, "Random") { return true }
+    if string.equals(s, "DeterministicRandom") { return true }
+    if string.equals(s, "Allocator") { return true }
+    if string.equals(s, "BoundedAllocator") { return true }
+    if string.equals(s, "Executor") { return true }
+    if string.equals(s, "Stdin") { return true }
+    if string.equals(s, "Stdout") { return true }
+    if string.equals(s, "Stderr") { return true }
+    if string.equals(s, "Subprocess") { return true }
+    if string.equals(s, "Debugger") { return true }
+    return false
+}
+
+
+function clone_syms(v: Vec_Symbol.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Symbol.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(v, i), allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function append_rest_syms(base: Vec_Symbol.Vec, p: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let bn = Vec_Symbol.len(base)
+    var i: usize = 0
+    loop decreases (bn - i) {
+        if i >= bn { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(base, i), allocator)?
+        i = i + 1
+    }
+    let pn = Vec_Ident.len(p.segments)
+    var j: usize = 1
+    loop decreases (pn - j) {
+        if j >= pn { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, j).name, allocator)?
+        j = j + 1
+    }
+    return out
+}
+
+
+function path_to_syms(p: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function sym_to_string(s: symbol.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = interner_mod.lookup(interner, s)
+    return values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+}

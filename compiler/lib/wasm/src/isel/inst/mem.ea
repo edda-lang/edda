@@ -1,0 +1,351 @@
+
+module wasm.isel.inst.mem
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import span.loc.pos.span as span_mod
+import ir.lir.tree.reg as reg_mod
+import ir.lir.tree.body as body_mod
+import ir.lir.id.vreg as vreg_mod
+import ir.hlir.op as hlir_op_mod
+import local.fmt.encode as enc_mod
+import local.isel.ctx.ctx as ctx_mod
+import local.isel.valtype.valtype as vt_mod
+import local.model as model_mod
+import local.isel.wenc.wenc as common_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(reg_mod.LirVReg)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(vreg_mod.LirVRegId)
+
+
+function emit_addr_component(code: mutable Vec_u8.Vec, body: body_mod.LirBody, v: vreg_mod.LirVRegId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    common_mod.get_local(mutable code, v, allocator)?
+    if vt_mod.is_i64_vreg(body, v) { enc_mod.push_byte(mutable code, 0xA7, allocator)? }
+}
+
+
+function emit_address(code: mutable Vec_u8.Vec, body: body_mod.LirBody, addr: reg_mod.MemRef, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match addr.base {
+        case .some(let b) => emit_addr_component(mutable code, body, b, allocator)?
+        case .none => {
+            enc_mod.push_byte(mutable code, 0x41, allocator)?
+            enc_mod.sleb(mutable code, 0 as i64, allocator)?
+        }
+    }
+    match addr.index {
+        case .some(let idx) => {
+            emit_addr_component(mutable code, body, idx, allocator)?
+            enc_mod.push_byte(mutable code, 0x41, allocator)?
+            enc_mod.sleb(mutable code, addr.scale as i64, allocator)?
+            enc_mod.push_byte(mutable code, 0x6C, allocator)?
+            enc_mod.push_byte(mutable code, 0x6A, allocator)?
+        }
+        case .none => ()
+    }
+    if addr.displacement != 0 {
+        enc_mod.push_byte(mutable code, 0x41, allocator)?
+        enc_mod.sleb(mutable code, addr.displacement as i64, allocator)?
+        enc_mod.push_byte(mutable code, 0x6A, allocator)?
+    }
+}
+
+
+public function emit_load(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    addr: reg_mod.MemRef,
+    dst: vreg_mod.LirVRegId,
+    width: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    emit_address(mutable code, body, addr, allocator)?
+    let signed = vreg_int_signed(body, dst)
+    let opcode = load_opcode(width, vt_mod.valtype_of_vreg(body, dst), signed)
+    enc_mod.push_byte(mutable code, opcode, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+    common_mod.set_local(mutable code, dst, allocator)?
+}
+
+
+function vreg_int_signed(body: body_mod.LirBody, dst: vreg_mod.LirVRegId) -> bool {
+    return Vec_LirVReg.at(body.vregs, dst.raw as usize).int_signed
+}
+
+
+function load_opcode(width: u32, vt: model_mod.ValType, signed: bool) -> u8 {
+    let code: u32 = match vt {
+        case .f32_ => 0x2A
+        case .f64_ => 0x2B
+        case .i64_ => {
+            if width == (8 as u32) { 0x29 }
+            else { if width == (4 as u32) { if signed { 0x34 } else { 0x35 } }
+            else { if width == (2 as u32) { if signed { 0x32 } else { 0x33 } }
+            else { if signed { 0x30 } else { 0x31 } } } }
+        }
+        case .i32_ => {
+            if width == (2 as u32) { if signed { 0x2E } else { 0x2F } }
+            else { if width == (1 as u32) { if signed { 0x2C } else { 0x2D } }
+            else { 0x28 } }
+        }
+    }
+    return code as u8
+}
+
+
+public function emit_store(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    value: vreg_mod.LirVRegId,
+    addr: reg_mod.MemRef,
+    width: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    emit_address(mutable code, body, addr, allocator)?
+    common_mod.get_local(mutable code, value, allocator)?
+    let opcode = store_opcode(width, vt_mod.valtype_of_vreg(body, value))
+    enc_mod.push_byte(mutable code, opcode, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+}
+
+
+function store_opcode(width: u32, vt: model_mod.ValType) -> u8 {
+    let code: u32 = match vt {
+        case .f32_ => 0x38
+        case .f64_ => 0x39
+        case .i64_ => {
+            if width == (8 as u32) { 0x37 }
+            else { if width == (4 as u32) { 0x3E }
+            else { if width == (2 as u32) { 0x3D } else { 0x3C } } }
+        }
+        case .i32_ => {
+            if width == (2 as u32) { 0x3B }
+            else { if width == (1 as u32) { 0x3A } else { 0x36 } }
+        }
+    }
+    return code as u8
+}
+
+
+public function emit_stack_addr(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    bctx: ctx_mod.BodyCtx,
+    op_raw: u32,
+    dst: vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let off = ctx_mod.stack_offset(bctx, op_raw)
+    enc_mod.push_byte(mutable code, 0x23, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+    enc_mod.push_byte(mutable code, 0x41, allocator)?
+    enc_mod.sleb(mutable code, off as i64, allocator)?
+    enc_mod.push_byte(mutable code, 0x6A, allocator)?
+    if vt_mod.is_i64_vreg(body, dst) { enc_mod.push_byte(mutable code, 0xAD, allocator)? }
+    common_mod.set_local(mutable code, dst, allocator)?
+}
+
+
+public function emit_call(
+    code: mutable Vec_u8.Vec,
+    mctx: ctx_mod.ModuleCtx,
+    bctx: ctx_mod.BodyCtx,
+    body: body_mod.LirBody,
+    op: lir_op_mod.LirOp,
+    callee: reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if is_intrinsic(op.flags) {
+        match op.flags.intrinsic {
+            case .syscall => raise lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: "syscall intrinsic has no wasm lowering; stdio on the browser/wasm target must route through host imports (see #277)")
+            case .slice_addr => {
+                emit_slice_addr(mutable code, args, return_, allocator)?
+                return
+            }
+            case .load_(let width) => {
+                if Vec_LirVRegId.len(args) < (1 as usize) {
+                    raise lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: "wasm.isel: load intrinsic takes one address operand")
+                }
+                match return_ {
+                    case .some(let dst) => {
+                        let ld = reg_mod.MemRef { base: Option_LirVRegId.some(value: Vec_LirVRegId.at(args, 0 as usize)), index: Option_LirVRegId.none, scale: 1 as u32, displacement: 0 as i32 }
+                        emit_load(mutable code, body, ld, dst, width, allocator)?
+                    }
+                    case .none => ()
+                }
+                return
+            }
+            case .store_(let width) => {
+                if Vec_LirVRegId.len(args) < (2 as usize) {
+                    raise lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: "wasm.isel: store intrinsic takes address and value operands")
+                }
+                let st = reg_mod.MemRef { base: Option_LirVRegId.some(value: Vec_LirVRegId.at(args, 0 as usize)), index: Option_LirVRegId.none, scale: 1 as u32, displacement: 0 as i32 }
+                emit_store(mutable code, body, Vec_LirVRegId.at(args, 1 as usize), st, width, allocator)?
+                return
+            }
+            case .bitcast(_) => {
+                emit_bitcast(mutable code, body, args, return_, allocator)?
+                return
+            }
+            case _ => {
+                enc_mod.push_byte(mutable code, 0x00, allocator)?
+                return
+            }
+        }
+    }
+    let fidx = resolve_callee(mctx, bctx, callee)
+    match fidx {
+        case .some(let idx) => {
+            emit_call_args(mutable code, args, allocator)?
+            enc_mod.push_byte(mutable code, 0x10, allocator)?
+            enc_mod.uleb(mutable code, idx as u64, allocator)?
+            match return_ {
+                case .some(let dst) => common_mod.set_local(mutable code, dst, allocator)?
+                case .none => ()
+            }
+        }
+        case .none => enc_mod.push_byte(mutable code, 0x00, allocator)?
+    }
+}
+
+
+function emit_slice_addr(
+    code: mutable Vec_u8.Vec,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: "wasm.isel: slice_addr intrinsic takes one operand")
+    }
+    match return_ {
+        case .some(let dst) => {
+            common_mod.get_local(mutable code, Vec_LirVRegId.at(args, 0 as usize), allocator)?
+            enc_mod.push_byte(mutable code, 0x42, allocator)?
+            enc_mod.sleb(mutable code, 4294967295 as i64, allocator)?
+            enc_mod.push_byte(mutable code, 0x83, allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function emit_bitcast(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: "wasm.isel: bitcast intrinsic takes one operand")
+    }
+    match return_ {
+        case .some(let dst) => {
+            let arg0 = Vec_LirVRegId.at(args, 0 as usize)
+            let from_vt = vt_mod.valtype_of_vreg(body, arg0)
+            let to_vt = vt_mod.valtype_of_vreg(body, dst)
+            common_mod.get_local(mutable code, arg0, allocator)?
+            emit_reinterpret_op(mutable code, from_vt, to_vt, allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function emit_reinterpret_op(
+    code: mutable Vec_u8.Vec,
+    from_vt: model_mod.ValType,
+    to_vt: model_mod.ValType,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match from_vt {
+        case .f32_ => match to_vt {
+            case .i32_ => enc_mod.push_byte(mutable code, 0xBC, allocator)?
+            case _ => raise reinterpret_mismatch()
+        }
+        case .f64_ => match to_vt {
+            case .i64_ => enc_mod.push_byte(mutable code, 0xBD, allocator)?
+            case _ => raise reinterpret_mismatch()
+        }
+        case .i32_ => match to_vt {
+            case .f32_ => enc_mod.push_byte(mutable code, 0xBE, allocator)?
+            case .i32_ => ()
+            case _ => raise reinterpret_mismatch()
+        }
+        case .i64_ => match to_vt {
+            case .f64_ => enc_mod.push_byte(mutable code, 0xBF, allocator)?
+            case .i64_ => ()
+            case _ => raise reinterpret_mismatch()
+        }
+    }
+}
+
+
+function reinterpret_mismatch() -> lir_error_mod.LirError {
+    return lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: "wasm.isel: bitcast between incompatible value types")
+}
+
+
+function is_intrinsic(flags: hlir_op_mod.OpFlags) -> bool {
+    return match flags.intrinsic {
+        case .none => false
+        case _     => true
+    }
+}
+
+
+function resolve_callee(mctx: ctx_mod.ModuleCtx, bctx: ctx_mod.BodyCtx, callee: reg_mod.Operand) -> Option_u32.Option {
+    match callee {
+        case .vreg(let v) => {
+            match ctx_mod.callee_def_raw(bctx, v.raw) {
+                case .some(let def_raw) => return ctx_mod.resolve_func_index_raw(mctx, def_raw)
+                case .none => return Option_u32.none
+            }
+        }
+        case _ => return Option_u32.none
+    }
+}
+
+
+function emit_call_args(code: mutable Vec_u8.Vec, args: Vec_LirVRegId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        common_mod.get_local(mutable code, Vec_LirVRegId.at(args, i), allocator)?
+        i += 1
+    }
+}

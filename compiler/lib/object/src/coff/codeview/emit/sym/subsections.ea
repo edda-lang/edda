@@ -1,0 +1,146 @@
+
+module object.coff.codeview.emit.sym.subsections
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.coff as coff_mod
+import local.bytes as bytes_mod
+import local.coff.codeview.emit.encode as enc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+spec std.collections.vec.Vec(enc_mod.CvFunction)
+spec std.collections.vec.Vec(enc_mod.CvLine)
+
+
+public function build_stringtable(
+    out: mutable Vec_u8.Vec,
+    paths: Vec_String.Vec,
+    allocator: Allocator,
+) -> Vec_u32.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u32_le(mutable out, enc_mod.subsec_stringtable(), allocator)?
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let payload_start = Vec_u8.len(out)
+
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+
+    bytes_mod.push_u8(mutable out, 0 as u8, allocator)?
+
+    let n = Vec_String.len(paths)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable offsets, (Vec_u8.len(out) - payload_start) as u32 wrapping, allocator)?
+        enc_mod.push_cstr(mutable out, Vec_String.at(paths, i), allocator)?
+        i += 1
+    }
+
+    enc_mod.patch_u32_le(mutable out, len_pos, (Vec_u8.len(out) - payload_start) as u32 wrapping)
+    enc_mod.pad_to_4(mutable out, allocator)?
+    return offsets
+}
+
+
+public function build_filechecksums(
+    out: mutable Vec_u8.Vec,
+    string_offsets: Vec_u32.Vec,
+    allocator: Allocator,
+) -> Vec_u32.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u32_le(mutable out, enc_mod.subsec_filechecksums(), allocator)?
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let payload_start = Vec_u8.len(out)
+
+    uninit file_ids: Vec_u32.Vec
+    Vec_u32.new(init file_ids, allocator)?
+
+    let n = Vec_u32.len(string_offsets)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable file_ids, (Vec_u8.len(out) - payload_start) as u32 wrapping, allocator)?
+        bytes_mod.push_u32_le(mutable out, Vec_u32.at(string_offsets, i), allocator)?
+        bytes_mod.push_u8(mutable out, 0 as u8, allocator)?
+        bytes_mod.push_u8(mutable out, 0 as u8, allocator)?
+        bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+        i += 1
+    }
+
+    enc_mod.patch_u32_le(mutable out, len_pos, (Vec_u8.len(out) - payload_start) as u32 wrapping)
+    enc_mod.pad_to_4(mutable out, allocator)?
+    return file_ids
+}
+
+
+public function build_lines(
+    out: mutable Vec_u8.Vec,
+    relocs: mutable Vec_CoffRelocation.Vec,
+    funcs: Vec_CvFunction.Vec,
+    file_ids: Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_CvFunction.len(funcs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let file_id = if i < Vec_u32.len(file_ids) { Vec_u32.at(file_ids, i) } else { 0 as u32 }
+        emit_lines_for(mutable out, mutable relocs, Vec_CvFunction.at(funcs, i), file_id, allocator)?
+        i += 1
+    }
+}
+
+
+function emit_lines_for(
+    out: mutable Vec_u8.Vec,
+    relocs: mutable Vec_CoffRelocation.Vec,
+    fn_: enc_mod.CvFunction,
+    file_id: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_lines = Vec_CvLine.len(fn_.lines)
+    if n_lines == 0 { return }
+
+    bytes_mod.push_u32_le(mutable out, enc_mod.subsec_lines(), allocator)?
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let payload_start = Vec_u8.len(out)
+
+    let secrel_site = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let section_site = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u32_le(mutable out, fn_.code_len, allocator)?
+
+    let block_len = (12 as usize) + n_lines * (8 as usize)
+    bytes_mod.push_u32_le(mutable out, file_id, allocator)?
+    bytes_mod.push_u32_le(mutable out, n_lines as u32 wrapping, allocator)?
+    bytes_mod.push_u32_le(mutable out, block_len as u32 wrapping, allocator)?
+
+    var i: usize = 0
+    loop decreases n_lines - i {
+        if i >= n_lines { break }
+        let entry = Vec_CvLine.at(fn_.lines, i)
+        bytes_mod.push_u32_le(mutable out, entry.code_offset, allocator)?
+        bytes_mod.push_u32_le(mutable out, (entry.line & (0xffffff as u32)) | enc_mod.line_is_statement(), allocator)?
+        i += 1
+    }
+
+    enc_mod.patch_u32_le(mutable out, len_pos, (Vec_u8.len(out) - payload_start) as u32 wrapping)
+    enc_mod.pad_to_4(mutable out, allocator)?
+    enc_mod.record_secref_relocs(mutable relocs, secrel_site, section_site, fn_.symbol_index, allocator)?
+}

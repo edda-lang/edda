@@ -1,0 +1,386 @@
+
+module specs.address.contract
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ops as ast_ops_mod
+import syntax.ast.attr as attr_mod
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import local.address.hash as hash_mod
+import local.address.finalize as finalize_mod
+import local.encode.bytes as bytes_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_tree_mod.Param)
+spec std.collections.vec.Vec(ast_tree_mod.RefinementClause)
+spec std.collections.vec.Vec(ast_tree_mod.EffectMember)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+spec std.collections.vec.Vec(attr_mod.AttrArg)
+spec std.core.option.Option(ast_tree_mod.Ty)
+spec std.core.option.Option(ast_tree_mod.EffectRow)
+spec std.core.option.Option(ast_item_mod.Stability)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.mem.alloc.Box(attr_mod.AttrArg)
+
+
+public function contract_hash(
+    qualified_name: String,
+    decl: ast_item_mod.FnDecl,
+    attributes: Vec_Attribute.Vec,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> hash_mod.SpecHash
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+
+    put_text(mutable buf, qualified_name.bytes(), allocator)?
+    encode_params(mutable buf, decl.params, source, allocator)?
+    encode_return(mutable buf, decl.return_ty, source, allocator)?
+    encode_effects(mutable buf, decl.effects, source, allocator)?
+    encode_clauses(mutable buf, decl.refinements, ast_ops_mod.RefinementKind.requires_, source, allocator)?
+    encode_clauses(mutable buf, decl.refinements, ast_ops_mod.RefinementKind.ensures_, source, allocator)?
+    encode_trust(mutable buf, attributes, source, allocator)?
+    encode_attribute_set(mutable buf, decl.stability, attributes, source, allocator)?
+
+    let out = Vec_u8.into_array(take buf, allocator)?
+    return finalize_mod.finalize(out, allocator)?
+}
+
+
+function put_text(buf: mutable Vec_u8.Vec, text: [u8], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.put_u32_le(mutable buf, text.len() as u32, allocator)?
+    bytes_mod.put_bytes(mutable buf, text, allocator)?
+}
+
+function span_bytes(source: source_map_mod.SourceMap, sp: span_mod.Span) -> [u8] {
+    return source_map_mod.span_text(source, sp)
+}
+
+function bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function bytes_less(a: [u8], b: [u8]) -> bool {
+    let na = a.len()
+    let nb = b.len()
+    let n = if na < nb { na } else { nb }
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] {
+            return a[i] < b[i]
+        }
+        i += 1
+    }
+    return na < nb
+}
+
+
+function encode_params(
+    buf: mutable Vec_u8.Vec,
+    params: Vec_Param.Vec,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Param.len(params)
+    bytes_mod.put_u32_le(mutable buf, n as u32, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let p = Vec_Param.at(params, i)
+        bytes_mod.put_u8(mutable buf, param_mode_tag(p.mode), allocator)?
+        put_text(mutable buf, span_bytes(source, p.name.span), allocator)?
+        put_text(mutable buf, span_bytes(source, p.ty.span), allocator)?
+        i += 1
+    }
+}
+
+function param_mode_tag(mode: ast_ops_mod.ParamMode) -> u8 {
+    return match mode {
+        case .default  => 0 as u8
+        case .mutable_ => 1 as u8
+        case .take_    => 2 as u8
+        case .init_    => 3 as u8
+    }
+}
+
+
+function encode_return(
+    buf: mutable Vec_u8.Vec,
+    return_ty: Option_Ty,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match return_ty {
+        case .some(let ty) => put_text(mutable buf, span_bytes(source, ty.span), allocator)?
+        case .none         => put_text(mutable buf, "()".bytes(), allocator)?
+    }
+}
+
+
+function encode_effects(
+    buf: mutable Vec_u8.Vec,
+    effects: Option_EffectRow,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match effects {
+        case .none => bytes_mod.put_u32_le(mutable buf, 0 as u32, allocator)?
+        case .some(let row) => {
+            var members = row.members
+            sort_members(mutable members, source)
+            encode_members(mutable buf, members, source, allocator)?
+        }
+    }
+}
+
+function encode_members(
+    buf: mutable Vec_u8.Vec,
+    members: Vec_EffectMember.Vec,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_EffectMember.len(members)
+    bytes_mod.put_u32_le(mutable buf, n as u32, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        encode_member(mutable buf, Vec_EffectMember.at(members, i), source, allocator)?
+        i += 1
+    }
+}
+
+function encode_member(
+    buf: mutable Vec_u8.Vec,
+    member: ast_tree_mod.EffectMember,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match member {
+        case .capability(let name) => {
+            bytes_mod.put_u8(mutable buf, 0 as u8, allocator)?
+            put_text(mutable buf, span_bytes(source, name.span), allocator)?
+        }
+        case .named(let name, let ty) => {
+            bytes_mod.put_u8(mutable buf, 1 as u8, allocator)?
+            put_text(mutable buf, span_bytes(source, name.span), allocator)?
+            put_text(mutable buf, span_bytes(source, ty.span), allocator)?
+        }
+        case .spread(let path) => {
+            bytes_mod.put_u8(mutable buf, 2 as u8, allocator)?
+            put_text(mutable buf, span_bytes(source, path.span), allocator)?
+        }
+        case .graded(let kind, let bound) => {
+            bytes_mod.put_u8(mutable buf, 3 as u8, allocator)?
+            put_text(mutable buf, span_bytes(source, kind.span), allocator)?
+            let bound_expr = Box_Expr.get(bound)
+            put_text(mutable buf, span_bytes(source, bound_expr.span), allocator)?
+        }
+    }
+}
+
+function member_key(member: ast_tree_mod.EffectMember, source: source_map_mod.SourceMap) -> [u8] {
+    return match member {
+        case .capability(let name) => span_bytes(source, name.span)
+        case .named(let name, _)   => span_bytes(source, name.span)
+        case .spread(let path)     => span_bytes(source, path.span)
+        case .graded(let kind, _)  => span_bytes(source, kind.span)
+    }
+}
+
+function sort_members(members: mutable Vec_EffectMember.Vec, source: source_map_mod.SourceMap) -> () {
+    let n = Vec_EffectMember.len(members)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        let current = Vec_EffectMember.at(members, i)
+        var j: usize = i
+        loop decreases j {
+            if j == 0 { break }
+            let prev = Vec_EffectMember.at(members, j - 1)
+            if bytes_less(member_key(current, source), member_key(prev, source)) {
+                Vec_EffectMember.set_at(mutable members, j, take prev)
+                j -= 1
+            } else {
+                break
+            }
+        }
+        Vec_EffectMember.set_at(mutable members, j, take current)
+        i += 1
+    }
+}
+
+
+function encode_clauses(
+    buf: mutable Vec_u8.Vec,
+    clauses: Vec_RefinementClause.Vec,
+    kind: ast_ops_mod.RefinementKind,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_RefinementClause.len(clauses)
+    var count: u32 = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_RefinementClause.at(clauses, i).kind == kind { count += 1 }
+        i += 1
+    }
+    bytes_mod.put_u32_le(mutable buf, count, allocator)?
+    i = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let clause = Vec_RefinementClause.at(clauses, i)
+        if clause.kind == kind {
+            put_text(mutable buf, span_bytes(source, clause.pred.span), allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function encode_trust(
+    buf: mutable Vec_u8.Vec,
+    attributes: Vec_Attribute.Vec,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Attribute.len(attributes)
+    var count: u32 = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if is_trust_attribute(Vec_Attribute.at(attributes, i), source) { count += 1 }
+        i += 1
+    }
+    bytes_mod.put_u32_le(mutable buf, count, allocator)?
+    i = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let attr = Vec_Attribute.at(attributes, i)
+        if is_trust_attribute(attr, source) {
+            put_text(mutable buf, span_bytes(source, attr.name.span), allocator)?
+            put_text(mutable buf, reason_text(attr, source), allocator)?
+        }
+        i += 1
+    }
+}
+
+function is_trust_attribute(attr: attr_mod.Attribute, source: source_map_mod.SourceMap) -> bool {
+    let name = span_bytes(source, attr.name.span)
+    return bytes_eq(name, "trust".bytes()) || bytes_eq(name, "unverified".bytes())
+}
+
+function reason_text(attr: attr_mod.Attribute, source: source_map_mod.SourceMap) -> [u8] {
+    let n = Vec_AttrArg.len(attr.args)
+    var i: usize = 0
+    var found: [u8] = "".bytes()
+    loop decreases n - i {
+        if i >= n { break }
+        match Vec_AttrArg.at(attr.args, i) {
+            case .named(_, let key, let value) => {
+                if bytes_eq(span_bytes(source, key.span), "reason".bytes()) {
+                    let inner = Box_AttrArg.get(value)
+                    found = span_bytes(source, attrarg_span(inner))
+                }
+            }
+            case _ => {}
+        }
+        i += 1
+    }
+    return found
+}
+
+function attrarg_span(arg: attr_mod.AttrArg) -> span_mod.Span {
+    return match arg {
+        case .ident(let id)         => id.span
+        case .lit(let span, _)      => span
+        case .named(let span, _, _) => span
+    }
+}
+
+
+function encode_attribute_set(
+    buf: mutable Vec_u8.Vec,
+    stability: Option_Stability,
+    attributes: Vec_Attribute.Vec,
+    source: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.put_u8(mutable buf, stability_tag(stability), allocator)?
+
+    var names = attributes
+    sort_attributes(mutable names, source)
+    let n = Vec_Attribute.len(names)
+    bytes_mod.put_u32_le(mutable buf, n as u32, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        put_text(mutable buf, span_bytes(source, Vec_Attribute.at(names, i).name.span), allocator)?
+        i += 1
+    }
+}
+
+function stability_tag(stability: Option_Stability) -> u8 {
+    return match stability {
+        case .none => 0 as u8
+        case .some(let s) => match s {
+            case .stable_(_) => 1 as u8
+            case .unstable_  => 2 as u8
+        }
+    }
+}
+
+function sort_attributes(attributes: mutable Vec_Attribute.Vec, source: source_map_mod.SourceMap) -> () {
+    let n = Vec_Attribute.len(attributes)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        let current = Vec_Attribute.at(attributes, i)
+        var j: usize = i
+        loop decreases j {
+            if j == 0 { break }
+            let prev = Vec_Attribute.at(attributes, j - 1)
+            if bytes_less(span_bytes(source, current.name.span), span_bytes(source, prev.name.span)) {
+                Vec_Attribute.set_at(mutable attributes, j, take prev)
+                j -= 1
+            } else {
+                break
+            }
+        }
+        Vec_Attribute.set_at(mutable attributes, j, take current)
+        i += 1
+    }
+}

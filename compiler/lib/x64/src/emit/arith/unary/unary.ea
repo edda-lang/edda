@@ -1,0 +1,131 @@
+module x64.emit.arith.unary.unary
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.control.branch as branch_mod
+import local.encoding.simd.vector as vector_mod
+import local.emit.regsel as regsel_mod
+import local.emit.arith.subwidth.subwidth as subwidth_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_unary(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LUnOp,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match op {
+        case .fsqrt => {
+            emit_fp_unary(mutable code, body, op, operand, dst, allocator)?
+            return ()
+        }
+        case .ffloor => {
+            emit_fp_unary(mutable code, body, op, operand, dst, allocator)?
+            return ()
+        }
+        case .fceil => {
+            emit_fp_unary(mutable code, body, op, operand, dst, allocator)?
+            return ()
+        }
+        case .ftrunc => {
+            emit_fp_unary(mutable code, body, op, operand, dst, allocator)?
+            return ()
+        }
+        case _ => ()
+    }
+    if regsel_mod.vreg_is_fp(body, dst)? {
+        emit_fp_unary(mutable code, body, op, operand, dst, allocator)?
+        return ()
+    }
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let sg = regsel_mod.vreg_gp(body, operand)?
+    match op {
+        case .neg => {
+            regsel_mod.mov_if_diff(mutable code, dg, sg, allocator)?
+            alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.neg_, regs_mod.OpSize.qword_, dg, allocator)?
+            subwidth_mod.canonicalize_sub_width(mutable code, body, dst, allocator)?
+        }
+        case .bit_not => {
+            regsel_mod.mov_if_diff(mutable code, dg, sg, allocator)?
+            alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.not_, regs_mod.OpSize.qword_, dg, allocator)?
+            subwidth_mod.canonicalize_sub_width(mutable code, body, dst, allocator)?
+        }
+        case .logical_not => {
+            alu_mod.encode_test_rm_r(mutable code, regs_mod.OpSize.qword_, sg, sg, allocator)?
+            branch_mod.encode_setcc_rm8(mutable code, branch_mod.Cond.e_, dg, allocator)?
+            alu_mod.encode_movzx_r_rm8(mutable code, regs_mod.OpSize.qword_, dg, dg, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: floating-point unary intrinsic routed to integer unary path",
+        )
+    }
+}
+
+
+function emit_fp_unary(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LUnOp,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dx = regsel_mod.vreg_xmm(body, dst)?
+    let sx = regsel_mod.vreg_xmm(body, operand)?
+    let dv = regsel_mod.vreg_at(body, dst)?
+    let is_f32 = dv.size == (4 as u32)
+    match op {
+        case .fsqrt => {
+            if is_f32 { vector_mod.encode_sqrtss(mutable code, dx, sx, allocator)? }
+            else { vector_mod.encode_sqrtsd(mutable code, dx, sx, allocator)? }
+        }
+        case .ffloor => {
+            if is_f32 { vector_mod.encode_roundss(mutable code, dx, sx, 0x01 as u8, allocator)? }
+            else { vector_mod.encode_roundsd(mutable code, dx, sx, 0x01 as u8, allocator)? }
+        }
+        case .fceil => {
+            if is_f32 { vector_mod.encode_roundss(mutable code, dx, sx, 0x02 as u8, allocator)? }
+            else { vector_mod.encode_roundsd(mutable code, dx, sx, 0x02 as u8, allocator)? }
+        }
+        case .ftrunc => {
+            if is_f32 { vector_mod.encode_roundss(mutable code, dx, sx, 0x03 as u8, allocator)? }
+            else { vector_mod.encode_roundsd(mutable code, dx, sx, 0x03 as u8, allocator)? }
+        }
+        case .neg => {
+            let mask_shift: u64 = if is_f32 { 31 as u64 } else { 63 as u64 }
+            let mask: u64 = (1 as u64) << mask_shift
+            let bits_reg = regs_mod.Gp64Reg.r11
+            let mask_reg = regs_mod.Gp64Reg.r10
+            if is_f32 { vector_mod.encode_movd_r32_xmm(mutable code, bits_reg, sx, allocator)? }
+            else { vector_mod.encode_movq_r64_xmm(mutable code, bits_reg, sx, allocator)? }
+            alu_mod.encode_mov_r64_imm64(mutable code, mask_reg, mask as i64 wrapping, allocator)?
+            alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.xor_, regs_mod.OpSize.qword_, bits_reg, mask_reg, allocator)?
+            if is_f32 { vector_mod.encode_movd_xmm_r32(mutable code, dx, bits_reg, allocator)? }
+            else { vector_mod.encode_movq_xmm_r64(mutable code, dx, bits_reg, allocator)? }
+        }
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: integer unary routed to floating-point unary path",
+        )
+    }
+}

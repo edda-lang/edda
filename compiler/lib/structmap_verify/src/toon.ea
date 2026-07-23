@@ -1,0 +1,121 @@
+
+module structmap_verify.toon
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string as string
+
+spec std.collections.vec.Vec(String)
+
+
+public function lines_of(text: String, allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    return string.split(text, "\n", allocator)?
+}
+
+
+function slice_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let len: usize = hi - lo
+    let buf: [u8] = allocator.alloc_array(u8, len)?
+    var i: usize = 0
+    loop
+        decreases len - i
+    {
+        if i >= len { break }
+        buf[i] = bytes[lo + i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function make_field(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    var a: usize = lo
+    var b: usize = hi
+    if b > a && bytes[a] == 0x22 && bytes[b - 1] == 0x22 {
+        a += 1
+        b -= 1
+    }
+    return slice_to_string(bytes, a, b, allocator)?
+}
+
+
+public function split_fields(line: String, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    let n: usize = bytes.len()
+    uninit fields: Vec_String.Vec
+    Vec_String.new(init fields, allocator)?
+    var start: usize = 0
+    loop
+        decreases n - start
+    {
+        if start >= n { break }
+        if bytes[start] != 0x20 { break }
+        start += 1
+    }
+    var i: usize = start
+    var field_start: usize = start
+    var in_quote: bool = false
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let b = bytes[i]
+        if b == 0x22 {
+            in_quote = !in_quote
+        } else if b == 0x2C && !in_quote {
+            let f = make_field(bytes, field_start, i, allocator)?
+            Vec_String.push(mutable fields, f, allocator)?
+            field_start = i + 1
+        }
+        i += 1
+    }
+    let last = make_field(bytes, field_start, n, allocator)?
+    Vec_String.push(mutable fields, last, allocator)?
+    return fields
+}
+
+
+public function section_rows(lines: [String], header_prefix: String, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit rows: Vec_String.Vec
+    Vec_String.new(init rows, allocator)?
+    let n: usize = lines.len()
+    var i: usize = 0
+    var found: bool = false
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if !found {
+            if string.starts_with(lines[i], header_prefix) {
+                found = true
+            }
+        } else {
+            let line = lines[i]
+            let bs = line.bytes()
+            if bs.len() == 0 {
+                break
+            }
+            if bs[0] != 0x20 {
+                break
+            }
+            let cloned = string.clone(line, allocator)?
+            Vec_String.push(mutable rows, cloned, allocator)?
+        }
+        i += 1
+    }
+    return rows
+}

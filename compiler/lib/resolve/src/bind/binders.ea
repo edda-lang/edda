@@ -1,0 +1,247 @@
+
+module resolve.bind.binders
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol
+import intern.interner as interner_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import hir.def as def_mod
+import local.ctx as ctx_mod
+import local.map.error as error_mod
+import local.bind.lookup.env.scopes.stack as scope_mod
+
+spec std.mem.alloc.Box(ast_tree.Pat)
+
+spec std.collections.vec.Vec(ast_tree.Pat)
+spec std.collections.vec.Vec(ast_tree.StructPatField)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.core.option.Option(ast_tree.SliceRest)
+
+
+public function define_one(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, id: ast_ident.Ident, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires ctx.next_def_id < 4294967295
+{
+    let def = ctx_mod.alloc_def(mutable ctx)
+    ctx_mod.record_use(mutable ctx, id.span, def, allocator)?
+    scope_mod.define(mutable stack, id.name, def, allocator)?
+}
+
+
+public function define_pat_bindings(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, pat: ast_tree.Pat, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match pat.kind {
+        case .binding(let id) => define_one(mutable ctx, mutable stack, id, allocator)?
+        case .tuple(let elements) => define_pats(mutable ctx, mutable stack, elements, interner, allocator)?
+        case .struct_(_, let fields, _) => define_struct_fields(mutable ctx, mutable stack, fields, interner, allocator)?
+        case .slice(let prefix, let rest, let suffix) => {
+            define_pats(mutable ctx, mutable stack, prefix, interner, allocator)?
+            match rest {
+                case .some(let sr) => match sr.binding {
+                    case .some(let id) => define_one(mutable ctx, mutable stack, id, allocator)?
+                    case .none => ()
+                }
+                case .none => ()
+            }
+            define_pats(mutable ctx, mutable stack, suffix, interner, allocator)?
+        }
+        case .variant(_, let payload) => match payload {
+            case .none => ()
+            case .tuple(let elements) => define_pats(mutable ctx, mutable stack, elements, interner, allocator)?
+            case .struct_(let fields) => define_struct_fields(mutable ctx, mutable stack, fields, interner, allocator)?
+        }
+        case .or_(let alternatives) => define_or_alternatives(mutable ctx, mutable stack, alternatives, interner, allocator)?
+        case .at_binding(let id, let sub) => {
+            define_one(mutable ctx, mutable stack, id, allocator)?
+            define_pat_bindings(mutable ctx, mutable stack, Box_Pat.get(sub), interner, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function define_pats(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, pats: Vec_Pat.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        define_pat_bindings(mutable ctx, mutable stack, Vec_Pat.at(pats, i), interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function define_struct_fields(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, fields: Vec_StructPatField.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_StructPatField.at(fields, i)
+        define_pat_bindings(mutable ctx, mutable stack, f.pat, interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function define_or_alternatives(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, alternatives: Vec_Pat.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(alternatives)
+    if n == 0 { return }
+    let first = Vec_Pat.at(alternatives, 0)
+    define_pat_bindings(mutable ctx, mutable stack, first, interner, allocator)?
+    uninit first_names: Vec_Ident.Vec
+    Vec_Ident.new(init first_names, allocator)?
+    collect_binder_idents(first, mutable first_names, allocator)?
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        let alt = Vec_Pat.at(alternatives, i)
+        uninit alt_names: Vec_Ident.Vec
+        Vec_Ident.new(init alt_names, allocator)?
+        collect_binder_idents(alt, mutable alt_names, allocator)?
+        rebind_alternative(mutable ctx, stack, first_names, alt_names, interner, allocator)?
+        report_missing_names(mutable ctx, first_names, alt_names, alt.span, interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function collect_binder_idents(pat: ast_tree.Pat, names: mutable Vec_Ident.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match pat.kind {
+        case .binding(let id) => Vec_Ident.push(mutable names, id, allocator)?
+        case .tuple(let elements) => collect_binder_idents_pats(elements, mutable names, allocator)?
+        case .struct_(_, let fields, _) => collect_binder_idents_fields(fields, mutable names, allocator)?
+        case .slice(let prefix, let rest, let suffix) => {
+            collect_binder_idents_pats(prefix, mutable names, allocator)?
+            match rest {
+                case .some(let sr) => match sr.binding {
+                    case .some(let id) => Vec_Ident.push(mutable names, id, allocator)?
+                    case .none => ()
+                }
+                case .none => ()
+            }
+            collect_binder_idents_pats(suffix, mutable names, allocator)?
+        }
+        case .variant(_, let payload) => match payload {
+            case .none => ()
+            case .tuple(let elements) => collect_binder_idents_pats(elements, mutable names, allocator)?
+            case .struct_(let fields) => collect_binder_idents_fields(fields, mutable names, allocator)?
+        }
+        case .or_(let alternatives) => {
+            if Vec_Pat.len(alternatives) > 0 {
+                collect_binder_idents(Vec_Pat.at(alternatives, 0), mutable names, allocator)?
+            }
+        }
+        case .at_binding(let id, let sub) => {
+            Vec_Ident.push(mutable names, id, allocator)?
+            collect_binder_idents(Box_Pat.get(sub), mutable names, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function collect_binder_idents_pats(pats: Vec_Pat.Vec, names: mutable Vec_Ident.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_binder_idents(Vec_Pat.at(pats, i), mutable names, allocator)?
+        i = i + 1
+    }
+}
+
+
+function collect_binder_idents_fields(fields: Vec_StructPatField.Vec, names: mutable Vec_Ident.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_StructPatField.at(fields, i)
+        collect_binder_idents(f.pat, mutable names, allocator)?
+        i = i + 1
+    }
+}
+
+
+function rebind_alternative(ctx: mutable ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, first_names: Vec_Ident.Vec, alt_names: Vec_Ident.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Ident.len(alt_names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(alt_names, i)
+        if contains_name(first_names, id.name) {
+            match scope_mod.lookup(stack, id.name) {
+                case .some(let def) => ctx_mod.record_use(mutable ctx, id.span, def, allocator)?
+                case .none => ()
+            }
+        } else {
+            emit_or_binding_mismatch(mutable ctx, id.span, id.name, false, interner, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function report_missing_names(ctx: mutable ctx_mod.ResolveCtx, first_names: Vec_Ident.Vec, alt_names: Vec_Ident.Vec, at: span_mod.Span, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Ident.len(first_names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(first_names, i)
+        if !contains_name(alt_names, id.name) {
+            emit_or_binding_mismatch(mutable ctx, at, id.name, true, interner, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function contains_name(names: Vec_Ident.Vec, name: symbol.Symbol) -> bool {
+    let n = Vec_Ident.len(names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(names, i)
+        if id.name.raw == name.raw { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function emit_or_binding_mismatch(ctx: mutable ctx_mod.ResolveCtx, at: span_mod.Span, name: symbol.Symbol, missing: bool, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if ctx_mod.is_quiet(ctx) {
+        return
+    }
+    let err = error_mod.ResolveError {
+        at: at,
+        kind: error_mod.ResolveErrorKind.or_binding_mismatch(name: name, missing: missing),
+    }
+    let d = error_mod.to_diagnostic(err, interner, allocator)?
+    ctx_mod.emit_diagnostic(mutable ctx, d, allocator)?
+}

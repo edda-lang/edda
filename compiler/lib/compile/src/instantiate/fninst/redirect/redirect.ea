@@ -1,0 +1,136 @@
+module compile.instantiate.fninst.redirect.redirect
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import hir.def as def_mod
+import hir.node as node_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import specs.gen.monomorphise.qualify.qualify as qualify_mod
+import specs.gen.typaths as typaths_mod
+import types.check as check_mod
+import types.ty.interner as ty_interner_mod
+import local.instantiate.fninst.table.table as table_mod
+import local.instantiate.fninst.discover.discover as discover_mod
+import local.instantiate.fninst.mangle.mangle as mangle_mod
+
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(sym_mod.Symbol)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(check_mod.TypeOutput)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(discover_mod.TemplateCall)
+spec std.collections.vec.Vec(table_mod.TemplateEntry)
+
+
+public function build_instance_fn_index(
+    files: Vec_HirFile.Vec,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var index = IntMap_u32.new(allocator)?
+    var i: usize = 0
+    loop
+        decreases Vec_HirFile.len(files) - i
+    {
+        if i >= Vec_HirFile.len(files) { break }
+        index_file(mutable index, Vec_HirFile.at(files, i), allocator)?
+        i += 1
+    }
+    return index
+}
+
+
+function index_file(
+    index: mutable IntMap_u32.IntMap,
+    file: hir_file_mod.HirFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let segs = qualify_mod.invoker_module_segments(file.source.items, allocator)?
+    if Vec_Symbol.len(segs) != 1 { return }
+    var fn_count: usize = 0
+    var fn_def_raw: u32 = 0
+    var i: usize = 0
+    loop
+        decreases Vec_HItem.len(file.items) - i
+    {
+        if i >= Vec_HItem.len(file.items) { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .function_(_, _) => {
+                fn_count += 1
+                fn_def_raw = item.def_id.raw
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    if fn_count == 1 {
+        let key = Vec_Symbol.at(segs, 0 as usize).raw as i64
+        if !IntMap_u32.contains(index, key) {
+            let _ = IntMap_u32.insert(mutable index, key, fn_def_raw, allocator)?
+        }
+    }
+}
+
+
+public function apply(
+    files: Vec_HirFile.Vec,
+    types: mutable Vec_TypeOutput.Vec,
+    t: table_mod.TemplateTable,
+    inst_index: IntMap_u32.IntMap,
+    ty_paths: typaths_mod.TyPathMap,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var i: usize = 0
+    loop
+        decreases Vec_HirFile.len(files) - i
+    {
+        if i >= Vec_HirFile.len(files) { break }
+        if i >= Vec_TypeOutput.len(types) { break }
+        var types_out = Vec_TypeOutput.at(types, i)
+        let calls = discover_mod.collect_calls(Vec_HirFile.at(files, i), types_out, t, ty_interner, allocator)?
+        if Vec_TemplateCall.len(calls) > 0 {
+            var c: usize = 0
+            loop
+                decreases Vec_TemplateCall.len(calls) - c
+            {
+                if c >= Vec_TemplateCall.len(calls) { break }
+                let call = Vec_TemplateCall.at(calls, c)
+                let entry = Vec_TemplateEntry.at(t.entries, call.entry_idx as usize)
+                match mangle_mod.mangle(entry, call.bound, ty_paths, ty_interner, mutable interner, allocator)? {
+                    case .some(let mname) => {
+                        match IntMap_u32.get(inst_index, mname.raw as i64) {
+                            case .some(let def_raw) => {
+                                check_mod.set_call_method(
+                                    mutable types_out,
+                                    node_mod.NodeId { raw: call.node_raw },
+                                    def_mod.from_raw(def_raw),
+                                )
+                            }
+                            case .none => ()
+                        }
+                    }
+                    case .none => ()
+                }
+                c += 1
+            }
+            Vec_TypeOutput.set_at(mutable types, i, take types_out)
+        }
+        i += 1
+    }
+}

@@ -1,0 +1,304 @@
+
+module regex.api.replace
+
+import std.mem.alloc
+import regex.syntax.grammar.ast
+import regex.engine.exec.vm
+import local.api as api_mod
+
+function _raw_byte_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_byte_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: vm.ExecError}
+{
+    return handle err: alloc.AllocError -> { raise vm.ExecError.allocation_failed } {
+        _raw_byte_slots(allocator, n)?
+    }
+}
+
+function _raw_match_slots(allocator: Allocator, n: usize) -> [vm.Match]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_match_slots(allocator: Allocator, n: usize) -> [vm.Match]
+    with {allocator, err: vm.ExecError}
+{
+    return handle err: alloc.AllocError -> { raise vm.ExecError.allocation_failed } {
+        _raw_match_slots(allocator, n)?
+    }
+}
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+public function replace_all(
+    re: api_mod.Regex,
+    input: [u8],
+    replacement: [u8],
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: api_mod.RegexError, divergence}
+{
+    return handle err: vm.ExecError -> { raise api_mod.RegexError.exec_failed(err: vm.ExecError.allocation_failed) } {
+        _replace_inner(re, input, replacement, false, mutable allocator)?
+    }
+}
+
+public function replace_first(
+    re: api_mod.Regex,
+    input: [u8],
+    replacement: [u8],
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: api_mod.RegexError, divergence}
+{
+    return handle err: vm.ExecError -> { raise api_mod.RegexError.exec_failed(err: vm.ExecError.allocation_failed) } {
+        _replace_inner(re, input, replacement, true, mutable allocator)?
+    }
+}
+
+function _replace_inner(
+    re: api_mod.Regex,
+    input: [u8],
+    template: [u8],
+    only_first: bool,
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: vm.ExecError, divergence}
+{
+    let matches_raw = _find_all_inner_internal(re, input, only_first, mutable allocator)?
+    let nm = matches_raw.len()
+    var total: usize = 0 as usize
+    var prev_end: usize = 0 as usize
+    var idx: usize = 0 as usize
+    loop decreases nm - idx + 1 as usize {
+        if idx >= nm { break }
+        let m = matches_raw[idx]
+        total = total + (m.start - prev_end)
+        total = total + _replacement_size(template, m, input, re.names)
+        prev_end = m.end
+        idx = idx + 1 as usize
+    }
+    total = total + (input.len() - prev_end)
+    var buf = _alloc_byte_slots(allocator, total)?
+    var p: usize = 0 as usize
+    var prev2: usize = 0 as usize
+    var k: usize = 0 as usize
+    loop decreases nm - k + 1 as usize {
+        if k >= nm { break }
+        let m = matches_raw[k]
+        p = _copy_bytes(input, prev2, m.start, mutable buf, p)
+        p = _emit_replacement(template, m, input, re.names, mutable buf, p)
+        prev2 = m.end
+        k = k + 1 as usize
+    }
+    p = _copy_bytes(input, prev2, input.len(), mutable buf, p)
+    return buf[0 as usize..<p]
+}
+
+function _find_all_inner_internal(
+    re: api_mod.Regex,
+    input: [u8],
+    only_first: bool,
+    allocator: mutable Allocator,
+) -> [vm.Match]
+    with {allocator, err: vm.ExecError, divergence}
+{
+    let n = input.len()
+    let cap = n + 1 as usize
+    let slots = _alloc_match_slots(allocator, cap)?
+    var count: usize = 0 as usize
+    var pos: usize = 0 as usize
+    loop decreases n - pos + 2 as usize {
+        if pos > n { break }
+        let m_opt = vm.exec(re.prog, input, pos, mutable allocator)?
+        let m = match m_opt {
+            case .some(let mm) => mm
+            case .none         => break
+        }
+        slots[count] = m
+        count = count + 1 as usize
+        if only_first { break }
+        if m.end == m.start {
+            pos = pos + 1 as usize
+        } else {
+            pos = m.end
+        }
+    }
+    return slots[0 as usize..<count]
+}
+
+function _scan_template_name(
+    template: [u8],
+    i: usize,
+    names: [ast.NamedCapture],
+) -> (u32, usize) {
+    let n = template.len()
+    let name_start = i + 2 as usize
+    var q: usize = name_start
+    loop decreases n - q + 1 as usize {
+        if q >= n { return (0xFFFFFFFF as u32, q) }
+        if template[q] == 62 as u8 { break }
+        q = q + 1 as usize
+    }
+    if q == name_start { return (0xFFFFFFFF as u32, q + 1 as usize) }
+    let name = template[name_start..<q]
+    let nn = names.len()
+    var k: usize = 0 as usize
+    loop decreases nn - k + 1 as usize {
+        if k >= nn { break }
+        if _bytes_eq(names[k].name.bytes(), name) {
+            return (names[k].index, q + 1 as usize)
+        }
+        k = k + 1 as usize
+    }
+    return (0xFFFFFFFF as u32, q + 1 as usize)
+}
+
+function _captured_span_bytes(m: vm.Match, group_idx: u32) -> usize {
+    let start_slot = (group_idx as usize) *% (2 as usize)
+    let end_slot = start_slot +% (1 as usize)
+    if end_slot >= m.captures.len() { return 0 as usize }
+    let s = m.captures[start_slot]
+    let e = m.captures[end_slot]
+    if s == vm.unset_slot() || e == vm.unset_slot() || e < s { return 0 as usize }
+    return e - s
+}
+
+function _replacement_size(
+    template: [u8],
+    m: vm.Match,
+    input: [u8],
+    names: [ast.NamedCapture],
+) -> usize {
+    let _ = input
+    let n = template.len()
+    var total: usize = 0 as usize
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = template[i]
+        if c == 36 as u8 && i + 1 as usize < n {
+            let nxt = template[i + 1 as usize]
+            if nxt == 36 as u8 {
+                total = total + 1 as usize
+                i = i + 2 as usize
+                continue
+            }
+            if nxt == 60 as u8 {
+                let (resolved_idx, after) = _scan_template_name(template, i, names)
+                if resolved_idx != 0xFFFFFFFF as u32 {
+                    total = total + _captured_span_bytes(m, resolved_idx)
+                }
+                i = after
+                continue
+            }
+            if nxt >= 48 as u8 && nxt <= 57 as u8 {
+                let group_idx = (nxt - 48 as u8) as u32
+                total = total + _captured_span_bytes(m, group_idx)
+                i = i + 2 as usize
+                continue
+            }
+        }
+        total = total + 1 as usize
+        i = i + 1 as usize
+    }
+    return total
+}
+
+function _emit_captured_bytes(
+    m: vm.Match,
+    group_idx: u32,
+    input: [u8],
+    buf: mutable [u8],
+    pos: usize,
+) -> usize {
+    var p = pos
+    let start_slot = (group_idx as usize) *% (2 as usize)
+    let end_slot = start_slot +% (1 as usize)
+    if end_slot >= m.captures.len() { return p }
+    let s = m.captures[start_slot]
+    let e = m.captures[end_slot]
+    if s == vm.unset_slot() || e == vm.unset_slot() || e < s { return p }
+    var k: usize = s
+    loop decreases e - k + 1 as usize {
+        if k >= e { break }
+        buf[p] = input[k]
+        p = p + 1 as usize
+        k = k + 1 as usize
+    }
+    return p
+}
+
+function _emit_replacement(
+    template: [u8],
+    m: vm.Match,
+    input: [u8],
+    names: [ast.NamedCapture],
+    buf: mutable [u8],
+    pos: usize,
+) -> usize {
+    var p = pos
+    let n = template.len()
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = template[i]
+        if c == 36 as u8 && i + 1 as usize < n {
+            let nxt = template[i + 1 as usize]
+            if nxt == 36 as u8 {
+                buf[p] = 36 as u8
+                p = p + 1 as usize
+                i = i + 2 as usize
+                continue
+            }
+            if nxt == 60 as u8 {
+                let (resolved_idx, after) = _scan_template_name(template, i, names)
+                if resolved_idx != 0xFFFFFFFF as u32 {
+                    p = _emit_captured_bytes(m, resolved_idx, input, mutable buf, p)
+                }
+                i = after
+                continue
+            }
+            if nxt >= 48 as u8 && nxt <= 57 as u8 {
+                let group_idx = (nxt - 48 as u8) as u32
+                p = _emit_captured_bytes(m, group_idx, input, mutable buf, p)
+                i = i + 2 as usize
+                continue
+            }
+        }
+        buf[p] = c
+        p = p + 1 as usize
+        i = i + 1 as usize
+    }
+    return p
+}
+
+function _copy_bytes(
+    src: [u8],
+    from: usize,
+    to: usize,
+    buf: mutable [u8],
+    pos: usize,
+) -> usize {
+    var p = pos
+    var i: usize = from
+    loop decreases to - i + 1 as usize {
+        if i >= to { break }
+        buf[p] = src[i]
+        p = p + 1 as usize
+        i = i + 1 as usize
+    }
+    return p
+}

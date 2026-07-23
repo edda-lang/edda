@@ -1,0 +1,145 @@
+
+module cache.blob.mir.local.block
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+import mir.stmt as stmt_mod
+import mir.body.model as body_model_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.ops.codec as ops_mod
+import local.blob.mir.stmt.term as stmt_term_codec_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(body_model_mod.RegionId)
+
+
+public function write_local(
+    l: body_model_mod.Local,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prim_mod.push_u32_le(mutable out, l.ty.raw, allocator)?
+    ops_mod.write_mutability(l.mutability, mutable out, allocator)?
+    ops_mod.write_consumption(l.consumption, mutable out, allocator)?
+    match l.name {
+        case .some(let sym) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            symbol_codec_mod.write_symbol(it, sym, mutable out, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+    match l.origin {
+        case .some(let n) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            prim_mod.push_u32_le(mutable out, n.raw, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_local(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> body_model_mod.Local
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let mutability = ops_mod.read_mutability(bytes, mutable cur)?
+    let consumption = ops_mod.read_consumption(bytes, mutable cur)?
+    let has_name = prim_mod.read_bool(bytes, mutable cur)?
+    let name = if has_name {
+        Option_Symbol.some(value: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+    } else {
+        Option_Symbol.none
+    }
+    let has_origin = prim_mod.read_bool(bytes, mutable cur)?
+    let origin = if has_origin {
+        Option_NodeId.some(value: node_mod.NodeId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+    } else {
+        Option_NodeId.none
+    }
+    return body_model_mod.Local {
+        ty: ty,
+        mutability: mutability,
+        consumption: consumption,
+        name: name,
+        origin: origin,
+    }
+}
+
+public function write_basic_block(
+    bb: body_model_mod.BasicBlock,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    prim_mod.push_u32_le(mutable out, bb.node_id_origin.raw, allocator)?
+    let n = Vec_Statement.len(bb.statements)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        stmt_term_codec_mod.write_statement(Vec_Statement.at(bb.statements, i), it, mutable out, allocator)?
+        i += 1
+    }
+    stmt_term_codec_mod.write_terminator(bb.terminator, it, mutable out, allocator)?
+    match bb.coherence_region {
+        case .some(let r) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            prim_mod.push_u32_le(mutable out, r.raw, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_basic_block(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> body_model_mod.BasicBlock
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let node_id_origin = node_mod.NodeId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit statements: Vec_Statement.Vec
+    Vec_Statement.new(init statements, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = stmt_term_codec_mod.read_statement(bytes, mutable cur, mutable it, allocator)?
+        Vec_Statement.push(mutable statements, take s, allocator)?
+        i += 1
+    }
+    let terminator = stmt_term_codec_mod.read_terminator(bytes, mutable cur, mutable it, allocator)?
+    let has_region = prim_mod.read_bool(bytes, mutable cur)?
+    let coherence_region = if has_region {
+        Option_RegionId.some(value: body_model_mod.RegionId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+    } else {
+        Option_RegionId.none
+    }
+    return body_model_mod.BasicBlock {
+        node_id_origin: node_id_origin,
+        statements: statements,
+        terminator: terminator,
+        coherence_region: coherence_region,
+    }
+}

@@ -1,0 +1,227 @@
+
+module specs.gen.cache.cache
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import cache.addr.hash as chash_mod
+import cache.addr.path.paths as paths_mod
+import cache.blob.header as header_mod
+import cache.blob.mir.item.codec as item_codec_mod
+import cache.error as cache_error_mod
+import cache.tier.global as global_mod
+import intern.interner as sym_interner_mod
+import syntax.ast.item as item_mod
+import local.address.hash as hash_mod
+import local.cachectx as cachectx_mod
+
+
+spec std.collections.vec.Vec(item_mod.Item)
+
+spec std.core.option.Option(global_mod.GlobalCache)
+spec std.core.option.Option(Vec_Item.Vec)
+
+
+public function try_read(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    h: hash_mod.SpecHash,
+    ctx: cachectx_mod.SpecCacheCtx,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Vec_Item_Vec
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    if !cachectx_mod.enabled(ctx) { return Option_Vec_Item_Vec.none }
+    let local_root = paths_mod.specs_cache_root(ctx.output_root, allocator)?
+    let local_path = blob_path_under(local_root, h, allocator)?
+    let local_res = read_at(rfs, local_path, mutable sym_interner, allocator)?
+    match local_res {
+        case .some(let items) => return Option_Vec_Item_Vec.some(value: items)
+        case .none => ()
+    }
+    match ctx.global {
+        case .some(let g) => {
+            let global_root = global_specs_root(g, allocator)?
+            let global_path = blob_path_under(global_root, h, allocator)?
+            return read_global_into_local(
+                rfs, wfs, global_path, local_root, h, ctx.output_root, mutable sym_interner, allocator,
+            )?
+        }
+        case .none => return Option_Vec_Item_Vec.none
+    }
+}
+
+
+function read_global_into_local(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    global_path: String,
+    local_root: String,
+    h: hash_mod.SpecHash,
+    output_root: String,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Vec_Item_Vec
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    if !fs.path_exists(rfs, global_path) { return Option_Vec_Item_Vec.none }
+    let bytes = fs.read_bytes(rfs, global_path, allocator)?
+    let decoded = handle err: cache_error_mod.CacheError as ce -> {
+        let _ = ce
+        Option_Vec_Item_Vec.none
+    } {
+        verify_and_decode(bytes, global_path, mutable sym_interner, allocator)?
+    }
+    match decoded {
+        case .some(let items) => {
+            write_at(rfs, wfs, local_root, h, bytes, output_root, allocator)?
+            return Option_Vec_Item_Vec.some(value: items)
+        }
+        case .none => return Option_Vec_Item_Vec.none
+    }
+}
+
+
+public function store(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    ctx: cachectx_mod.SpecCacheCtx,
+    h: hash_mod.SpecHash,
+    items: Vec_Item.Vec,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    if !cachectx_mod.enabled(ctx) { return }
+    let blob = handle err: cache_error_mod.CacheError as ce -> {
+        let _ = ce
+        return
+    } {
+        item_codec_mod.write_blob(items, sym_interner, allocator)?
+    }
+    let local_root = paths_mod.specs_cache_root(ctx.output_root, allocator)?
+    write_at(rfs, wfs, local_root, h, blob, ctx.output_root, allocator)?
+    match ctx.global {
+        case .some(let g) => {
+            let global_root = global_specs_root(g, allocator)?
+            write_at(rfs, wfs, global_root, h, blob, ctx.output_root, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function read_at(
+    rfs: ReadOnlyFilesystem,
+    path: String,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Vec_Item_Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    if !fs.path_exists(rfs, path) { return Option_Vec_Item_Vec.none }
+    let bytes = fs.read_bytes(rfs, path, allocator)?
+    return handle err: cache_error_mod.CacheError as ce -> {
+        let _ = ce
+        Option_Vec_Item_Vec.none
+    } {
+        verify_and_decode(bytes, path, mutable sym_interner, allocator)?
+    }
+}
+
+
+function verify_and_decode(
+    bytes: [u8],
+    path: String,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Vec_Item_Vec
+    with {allocator, err: alloc.AllocError, err: cache_error_mod.CacheError, divergence}
+{
+    if bytes.len() < 43 { return Option_Vec_Item_Vec.none }
+    let header = header_mod.parse(bytes, path, allocator)?
+    let hlen = header_mod.header_len()
+    let payload_len = header.payload_len as usize
+    if (hlen + payload_len) > bytes.len() { return Option_Vec_Item_Vec.none }
+    let actual = chash_mod.hash_bytes(bytes[hlen..<(hlen + payload_len)], allocator)?
+    if !hash_eq(actual, header.hash) { return Option_Vec_Item_Vec.none }
+    let items = item_codec_mod.read_blob(bytes, path, mutable sym_interner, allocator)?
+    return Option_Vec_Item_Vec.some(value: items)
+}
+
+
+function hash_eq(a: chash_mod.ArtifactHash, b: chash_mod.ArtifactHash) -> bool {
+    return a.w0 == b.w0 && a.w1 == b.w1 && a.w2 == b.w2 && a.w3 == b.w3
+}
+
+
+function artifact_of(h: hash_mod.SpecHash) -> chash_mod.ArtifactHash {
+    return chash_mod.ArtifactHash { w0: h.w0, w1: h.w1, w2: h.w2, w3: h.w3 }
+}
+
+
+function shard_dir_under(root: String, h: hash_mod.SpecHash, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let shard = paths_mod.shard_string(artifact_of(h), allocator)?
+    let p1 = string.concat(root, "/", allocator)?
+    return string.concat(p1, shard, allocator)?
+}
+
+
+function blob_path_under(root: String, h: hash_mod.SpecHash, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let dir = shard_dir_under(root, h, allocator)?
+    let hex = hash_mod.to_hex(h, allocator)?
+    let p1 = string.concat(dir, "/", allocator)?
+    let p2 = string.concat(p1, hex, allocator)?
+    return string.concat(p2, ".blob", allocator)?
+}
+
+
+function global_specs_root(g: global_mod.GlobalCache, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let r = global_mod.root(g, allocator)?
+    return string.concat(r, "/specs", allocator)?
+}
+
+
+function tmp_path_of(blob_path: String, output_root: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let oh = chash_mod.hash_bytes(output_root.bytes(), allocator)?
+    let oh_hex = chash_mod.to_hex_string(oh, allocator)?
+    let stem = string.concat(blob_path, ".tmp.", allocator)?
+    return string.concat(stem, oh_hex, allocator)?
+}
+
+
+function write_at(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    root: String,
+    h: hash_mod.SpecHash,
+    blob: [u8],
+    output_root: String,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let path = blob_path_under(root, h, allocator)?
+    if fs.path_exists(rfs, path) { return }
+    let dir = shard_dir_under(root, h, allocator)?
+    fs.create_dir_all(wfs, dir)?
+    let tmp = tmp_path_of(path, output_root, allocator)?
+    fs.write_bytes(wfs, tmp, blob)?
+    if fs.path_exists(rfs, path) {
+        fs.remove(wfs, tmp)?
+        return
+    }
+    fs.rename(wfs, tmp, path)?
+}

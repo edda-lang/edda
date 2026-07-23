@@ -1,0 +1,162 @@
+
+module compile.phase.emit.symbols.surface
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import mir.file.store as mir_file_mod
+import symname.lib as symname_mod
+import local.phase.emit.symbols.attr as symattr_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(String)
+
+
+public function collect_export_surface(
+    mf: mir_file_mod.MirFile,
+    extern_defs: mutable Vec_u32.Vec,
+    extern_names: mutable Vec_String.Vec,
+    abi_defs: mutable Vec_u32.Vec,
+    abi_names: mutable Vec_String.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nf = Vec_HirFile.len(mf.hir_files)
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        let hf = Vec_HirFile.at(mf.hir_files, i)
+        let ni = Vec_HItem.len(hf.items)
+        var j: usize = 0
+        loop decreases ni - j {
+            if j >= ni { break }
+            let item = Vec_HItem.at(hf.items, j)
+            match item.kind {
+                case .function_extern(_, let extern_name, _, _) => {
+                    if !symbol_mod.is_empty(extern_name) {
+                        let name = symname_mod.extern_symbol(extern_name, interner, allocator)?
+                        Vec_u32.push(mutable extern_defs, item.def_id.raw, allocator)?
+                        Vec_String.push(mutable extern_names, take name, allocator)?
+                    }
+                }
+                case _ => match symattr_mod.abi_override_sym(item, interner) {
+                    case .some(let sym) => {
+                        let name = symname_mod.extern_symbol(sym, interner, allocator)?
+                        Vec_u32.push(mutable abi_defs, item.def_id.raw, allocator)?
+                        Vec_String.push(mutable abi_names, take name, allocator)?
+                    }
+                    case .none => ()
+                }
+            }
+            j = j + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+public function collect_declared_extern_names(
+    files: Vec_MirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> StringMap_bool.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var declared = StringMap_bool.new(allocator)?
+    let nfiles = Vec_MirFile.len(files)
+    var f: usize = 0
+    loop decreases nfiles - f {
+        if f >= nfiles { break }
+        let file = Vec_MirFile.at(files, f)
+        let n = Vec_HirFile.len(file.hir_files)
+        var i: usize = 0
+        loop decreases n - i {
+            if i >= n { break }
+            let hf = Vec_HirFile.at(file.hir_files, i)
+            let ni = Vec_HItem.len(hf.items)
+            var j: usize = 0
+            loop decreases ni - j {
+                if j >= ni { break }
+                let item = Vec_HItem.at(hf.items, j)
+                match item.kind {
+                    case .function_extern(_, let extern_name, _, _) => {
+                        if !symbol_mod.is_empty(extern_name) {
+                            let sym = symname_mod.extern_symbol(extern_name, interner, allocator)?
+                            let _ = StringMap_bool.insert(mutable declared, sym, true, allocator)?
+                        }
+                    }
+                    case _ => ()
+                }
+                j += 1
+            }
+            i += 1
+        }
+        f += 1
+    }
+    return declared
+}
+
+
+public function collect_declared_extern_dlls(
+    files: Vec_MirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> StringMap_String.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var dlls = StringMap_String.new(allocator)?
+    let nfiles = Vec_MirFile.len(files)
+    var f: usize = 0
+    loop decreases nfiles - f {
+        if f >= nfiles { break }
+        let file = Vec_MirFile.at(files, f)
+        let n = Vec_HirFile.len(file.hir_files)
+        var i: usize = 0
+        loop decreases n - i {
+            if i >= n { break }
+            let hf = Vec_HirFile.at(file.hir_files, i)
+            let ni = Vec_HItem.len(hf.items)
+            var j: usize = 0
+            loop decreases ni - j {
+                if j >= ni { break }
+                let item = Vec_HItem.at(hf.items, j)
+                match item.kind {
+                    case .function_extern(_, let extern_name, _, let extern_dll) => {
+                        if !symbol_mod.is_empty(extern_name) {
+                            match extern_dll {
+                                case .some(let dll_sym) => {
+                                    if !symbol_mod.is_empty(dll_sym) {
+                                        let sym = symname_mod.extern_symbol(extern_name, interner, allocator)?
+                                        let dll_name = symname_mod.extern_symbol(dll_sym, interner, allocator)?
+                                        let _ = StringMap_String.insert(mutable dlls, sym, take dll_name, allocator)?
+                                    }
+                                }
+                                case .none => ()
+                            }
+                        }
+                    }
+                    case _ => ()
+                }
+                j += 1
+            }
+            i += 1
+        }
+        f += 1
+    }
+    return dlls
+}

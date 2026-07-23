@@ -1,0 +1,86 @@
+
+module rt_concurrency_verify.main
+
+import std.mem.rt
+import std.io.stream
+
+
+function ranges_overlap(a: u64, b: u64) -> bool {
+    if a == 0 { return false }
+    if b == 0 { return false }
+    let span: usize = rt.region_bytes()
+    let span64: u64 = span as u64
+    let diff: u64 = if a < b { b - a } else { a - b }
+    return diff < span64
+}
+
+function stress_worker(iterations: usize) -> u64 {
+    var failures: u64 = 0
+    var i: usize = 0
+    loop
+        decreases iterations - i
+    {
+        if i >= iterations { break }
+        let parent: u64 = rt.heap_create()
+        if parent == 0 {
+            failures = failures + 1
+        } else {
+            let child: u64 = rt.heap_fork(parent)
+            if child == 0 {
+                failures = failures + 1
+            } else {
+                if ranges_overlap(parent, child) { failures = failures + 1 }
+                rt.heap_destroy(child)
+            }
+            rt.heap_destroy(parent)
+        }
+        i = i + 1
+    }
+    return failures
+}
+
+function stress_round(exec: Executor, iterations: usize) -> u64
+    with {exec}
+{
+    scope(exec) group {
+        let t0 = group.spawn { stress_worker(iterations) }
+        let t1 = group.spawn { stress_worker(iterations) }
+        let t2 = group.spawn { stress_worker(iterations) }
+        let t3 = group.spawn { stress_worker(iterations) }
+        let t4 = group.spawn { stress_worker(iterations) }
+        let t5 = group.spawn { stress_worker(iterations) }
+        let t6 = group.spawn { stress_worker(iterations) }
+        let t7 = group.spawn { stress_worker(iterations) }
+        let f0 = t0.await
+        let f1 = t1.await
+        let f2 = t2.await
+        let f3 = t3.await
+        let f4 = t4.await
+        let f5 = t5.await
+        let f6 = t6.await
+        let f7 = t7.await
+        f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7
+    }
+}
+
+public function main(exec: Executor, out: Stdout, errout: Stderr) -> i32
+    with {exec, out, errout}
+{
+    let rounds: usize = 10
+    let per_task_iters: usize = 15
+    var round: usize = 0
+    var total_failures: u64 = 0
+    loop
+        decreases rounds - round
+    {
+        if round >= rounds { break }
+        total_failures = total_failures + stress_round(exec, per_task_iters)
+        round = round + 1
+    }
+    if total_failures > 0 {
+        errout.eprint_line(f"rt_concurrency_verify: {total_failures} failures (spurious heap_create()/heap_fork() zero-returns and/or cross-heap address overlaps) under contention")
+        return 1
+    }
+    out.print_line("rt_concurrency_verify: ok")
+    return 0
+}

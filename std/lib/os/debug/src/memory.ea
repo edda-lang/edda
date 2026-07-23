@@ -1,0 +1,163 @@
+
+module std.os.debug.memory
+
+import std.mem.alloc
+import std.os.raw
+import std.os.pages
+import local.debug
+import local.win
+
+function scratch() -> u64
+    with {err: debug.DebugError}
+{
+    return handle err: pages.PageError as _e -> (raise debug.DebugError.scratch_unavailable) {
+        pages.map(4096)?
+    }
+}
+
+function release(addr: u64) -> () {
+    if addr == 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(addr, 4096)?
+    }
+}
+
+function peek_byte_linux(pid: i32, addr: u64, buf: u64) -> u8
+    with {err: debug.DebugError}
+{
+    let r: i64 = raw.syscall6(101, 2, pid as u64, addr, buf, 0, 0)
+    if r < 0 { raise debug.DebugError.io_failure(reason: "PTRACE_PEEKDATA failed") }
+    return (raw.load_u64(buf) & 0xFF) as u8 wrapping
+}
+
+function poke_byte_linux(pid: i32, addr: u64, value: u8, buf: u64) -> ()
+    with {err: debug.DebugError}
+{
+    let r: i64 = raw.syscall6(101, 2, pid as u64, addr, buf, 0, 0)
+    if r < 0 { raise debug.DebugError.io_failure(reason: "PTRACE_PEEKDATA failed") }
+    let word: u64 = (raw.load_u64(buf) & 0xFFFFFFFFFFFFFF00) | (value as u64)
+    let w: i64 = raw.syscall6(101, 5, pid as u64, addr, word, 0, 0)
+    if w < 0 { raise debug.DebugError.io_failure(reason: "PTRACE_POKEDATA failed") }
+}
+
+public function read_memory(
+    d: Debugger,
+    t: debug.Tracee,
+    addr: u64,
+    len: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {d, allocator, err: debug.DebugError, err: alloc.AllocError}
+{
+    let out: [u8] = allocator.alloc_array(u8, len)?
+    comptime if target_has("windows") {
+        if win.read_process_memory(t.proc_handle, addr, raw.slice_addr(out), len as u64, 0) == 0 {
+            raise debug.DebugError.io_failure(reason: "ReadProcessMemory failed")
+        }
+        return out
+    } else {
+        let buf: u64 = scratch()?
+        var i: usize = 0
+        loop
+            decreases len - i
+        {
+            if i >= len { break }
+            let r: i64 = raw.syscall6(101, 2, t.pid as u64, addr +% (i as u64), buf, 0, 0)
+            if r < 0 {
+                release(buf)
+                raise debug.DebugError.io_failure(reason: "PTRACE_PEEKDATA failed")
+            }
+            let word: u64 = raw.load_u64(buf)
+            let remain: usize = len - i
+            let take_n: usize = if remain > 8 { 8 } else { remain }
+            var j: usize = 0
+            loop
+                decreases take_n - j
+            {
+                if j >= take_n { break }
+                out[i + j] = ((word >> ((j as u64) *% 8)) & 0xFF) as u8 wrapping
+                j = j + 1
+            }
+            i = i + take_n
+        }
+        release(buf)
+        return out
+    }
+}
+
+public function write_memory(d: Debugger, t: debug.Tracee, addr: u64, bytes: [u8]) -> ()
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        if win.write_process_memory(t.proc_handle, addr, raw.slice_addr(bytes), bytes.len() as u64, 0) == 0 {
+            raise debug.DebugError.io_failure(reason: "WriteProcessMemory failed")
+        }
+        let _ = win.flush_instruction_cache(t.proc_handle, addr, bytes.len() as u64)
+    } else {
+        let buf: u64 = scratch()?
+        var i: usize = 0
+        loop
+            decreases bytes.len() - i
+        {
+            if i >= bytes.len() { break }
+            poke_byte_linux(t.pid, addr +% (i as u64), bytes[i], buf)?
+            i = i + 1
+        }
+        release(buf)
+    }
+}
+
+public function set_breakpoint(d: Debugger, t: debug.Tracee, addr: u64) -> u8
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        let pg: u64 = scratch()?
+        if win.read_process_memory(t.proc_handle, addr, pg, 1, 0) == 0 {
+            release(pg)
+            raise debug.DebugError.io_failure(reason: "ReadProcessMemory failed")
+        }
+        let orig: u8 = raw.load_u8(pg)
+        raw.store_u8(pg, 0xCC)
+        if win.write_process_memory(t.proc_handle, addr, pg, 1, 0) == 0 {
+            release(pg)
+            raise debug.DebugError.io_failure(reason: "WriteProcessMemory failed")
+        }
+        let _ = win.flush_instruction_cache(t.proc_handle, addr, 1)
+        release(pg)
+        return orig
+    } else {
+        let buf: u64 = scratch()?
+        let orig: u8 = handle err: debug.DebugError as e -> (release_then_raise(buf, e)) {
+            peek_byte_linux(t.pid, addr, buf)?
+        }
+        poke_byte_linux(t.pid, addr, 0xCC, buf)?
+        release(buf)
+        return orig
+    }
+}
+
+public function clear_breakpoint(d: Debugger, t: debug.Tracee, addr: u64, original: u8) -> ()
+    with {d, err: debug.DebugError}
+{
+    comptime if target_has("windows") {
+        let pg: u64 = scratch()?
+        raw.store_u8(pg, original)
+        if win.write_process_memory(t.proc_handle, addr, pg, 1, 0) == 0 {
+            release(pg)
+            raise debug.DebugError.io_failure(reason: "WriteProcessMemory failed")
+        }
+        let _ = win.flush_instruction_cache(t.proc_handle, addr, 1)
+        release(pg)
+    } else {
+        let buf: u64 = scratch()?
+        poke_byte_linux(t.pid, addr, original, buf)?
+        release(buf)
+    }
+}
+
+function release_then_raise(addr: u64, e: debug.DebugError) -> u8
+    with {err: debug.DebugError}
+{
+    release(addr)
+    raise e
+}

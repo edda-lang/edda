@@ -1,0 +1,216 @@
+
+module std.collections.hashmap.table
+
+import std.mem.alloc
+import std.core.option
+
+public spec HashMap(
+    comptime K: Type,
+    comptime V: Type,
+    comptime hash_fn: function(K) -> u64,
+    comptime eq_fn: function(K, K) -> bool,
+) {
+    spec std.core.option.Option(V)
+
+    public type Entry { key: K, value: V, hash: u64, occupied: bool }
+
+    public type HashMap {
+        entries: [Entry]
+        len: usize where len <= entries.len()
+    }
+
+    public function new(allocator: Allocator) -> HashMap
+        with {allocator, err: alloc.AllocError}
+    {
+        let raw: [Entry] = allocator.alloc_array(Entry, 8)?
+        return HashMap { entries: raw, len: 0 }
+    }
+
+    public function len(map: HashMap) -> usize {
+        return map.len
+    }
+
+    public function clone(map: HashMap, allocator: Allocator) -> HashMap
+        with {allocator, err: alloc.AllocError}
+    {
+        let cap = map.entries.len()
+        var fresh: [Entry] = allocator.alloc_array(Entry, cap)?
+        var i: usize = 0
+        loop
+            decreases cap - i
+        {
+            if i >= cap { break }
+            fresh[i] = map.entries[i]
+            i += 1
+        }
+        return HashMap { entries: fresh, len: map.len }
+    }
+
+    public function is_empty(map: HashMap) -> bool {
+        return map.len == 0
+    }
+
+    public function contains(map: HashMap, key: K) -> bool {
+        let h = hash_fn(key)
+        let idx = _probe_index(map, key, h)
+        return map.entries[idx].occupied
+    }
+
+    public function get(map: HashMap, key: K) -> Option_V {
+        let h = hash_fn(key)
+        let idx = _probe_index(map, key, h)
+        if map.entries[idx].occupied {
+            return Option_V.some(value: map.entries[idx].value)
+        }
+        return Option_V.none
+    }
+
+    public function insert(map: mutable HashMap, key: K, value: take V, allocator: Allocator) -> Option_V
+        with {allocator, err: alloc.AllocError}
+    {
+        _grow_table(mutable map, map.len + 1, allocator)?
+        let h = hash_fn(key)
+        let idx = _probe_index(map, key, h)
+        if map.entries[idx].occupied {
+            let prior = map.entries[idx].value
+            map.entries[idx].value = value
+            return Option_V.some(value: prior)
+        }
+        map.entries[idx] = Entry { key: key, value: value, hash: h, occupied: true }
+        map.len += 1
+        return Option_V.none
+    }
+
+    public function remove(map: mutable HashMap, key: K) -> Option_V {
+        let h = hash_fn(key)
+        let idx = _probe_index(map, key, h)
+        if !map.entries[idx].occupied {
+            return Option_V.none
+        }
+        let prior = map.entries[idx].value
+        map.entries[idx].occupied = false
+        map.len -= 1
+        _backshift(mutable map, idx)
+        return Option_V.some(value: prior)
+    }
+
+    public function clear(map: mutable HashMap) -> () {
+        let cap = map.entries.len()
+        var i: usize = 0
+        loop
+            decreases cap - i
+        {
+            if i >= cap { break }
+            map.entries[i].occupied = false
+            i += 1
+        }
+        map.len = 0
+    }
+
+    function _probe_index(map: HashMap, key: K, hash: u64) -> usize {
+        let cap = map.entries.len()
+        let mask = cap - 1
+        var i: usize = (hash as usize) & mask
+        var probes: usize = 0
+        loop
+            decreases cap - probes
+        {
+            if probes >= cap { return i }
+            let slot = map.entries[i]
+            if !slot.occupied { return i }
+            if slot.hash == hash && eq_fn(slot.key, key) { return i }
+            i = (i + 1) & mask
+            probes += 1
+        }
+    }
+
+    function _backshift(map: mutable HashMap, idx: usize) -> () {
+        let cap = map.entries.len()
+        let mask = cap - 1
+        var current_idx: usize = idx
+        var outer_probes: usize = 0
+        loop
+            decreases cap - outer_probes
+        {
+            if outer_probes >= cap { return }
+            var i: usize = (current_idx + 1) & mask
+            var inner_probes: usize = 0
+            var moved: bool = false
+            loop
+                decreases cap - inner_probes
+            {
+                if inner_probes >= cap { return }
+                let slot = map.entries[i]
+                if !slot.occupied { return }
+                let preferred = (slot.hash as usize) & mask
+                if _in_probe_range(preferred, i, current_idx, mask) {
+                    map.entries[current_idx] = slot
+                    map.entries[i].occupied = false
+                    current_idx = i
+                    moved = true
+                    break
+                }
+                i = (i + 1) & mask
+                inner_probes += 1
+            }
+            if !moved { return }
+            outer_probes += 1
+        }
+    }
+
+    function _in_probe_range(preferred: usize, current: usize, vacant: usize, mask: usize) -> bool {
+        if preferred <= vacant {
+            return current > vacant || current < preferred
+        }
+        return current > vacant && current < preferred
+    }
+
+    function _grow_table(map: mutable HashMap, incoming: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        let cap = map.entries.len()
+        if incoming * 4 <= cap * 3 { return }
+        var new_cap: usize = if cap == 0 { 8 } else { cap * 2 }
+        let max_doublings: usize = 64
+        var doublings: usize = 0
+        loop
+            decreases max_doublings - doublings
+        {
+            if doublings >= max_doublings { break }
+            if incoming * 4 <= new_cap * 3 { break }
+            new_cap = new_cap * 2
+            doublings += 1
+        }
+        _rehash(mutable map, new_cap, allocator)?
+    }
+
+    function _rehash(map: mutable HashMap, new_cap: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        var fresh: [Entry] = allocator.alloc_array(Entry, new_cap)?
+        let mask = new_cap - 1
+        let old_cap: usize = map.entries.len()
+        var j: usize = 0
+        loop
+            decreases old_cap - j
+        {
+            if j >= old_cap { break }
+            let slot = map.entries[j]
+            if slot.occupied {
+                var probe: usize = (slot.hash as usize) & mask
+                var probes: usize = 0
+                loop
+                    decreases new_cap - probes
+                {
+                    if probes >= new_cap { break }
+                    if !fresh[probe].occupied { break }
+                    probe = (probe + 1) & mask
+                    probes += 1
+                }
+                fresh[probe] = slot
+            }
+            j += 1
+        }
+        map.entries = fresh
+    }
+}

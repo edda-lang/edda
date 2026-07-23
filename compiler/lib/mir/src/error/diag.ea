@@ -1,0 +1,108 @@
+
+module mir.error.diag
+
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+
+
+derive eq, hash, debug for UnsupportedKind
+derive eq, debug for MirError
+
+
+public type UnsupportedKind {
+    case closure_preserved
+    case spawn_preserved
+    case unlowered_expr_form
+    case closure_escapes_without_allocator
+    case fmt_target_unresolved
+}
+
+public type UnsupportedSite {
+    node_id: node_mod.NodeId
+    kind: UnsupportedKind
+}
+
+public type MirError {
+    case unsupported_expr_form(at: span_mod.Span, kind: UnsupportedKind)
+
+    case closure_escapes_without_allocator(at: span_mod.Span)
+
+    case internal_lowering_invariant(at: span_mod.Span, message: String)
+}
+
+
+public function to_diagnostic(e: MirError, allocator: Allocator) -> diag_mod.Diagnostic
+    with {allocator, err: alloc.AllocError}
+{
+    let at = span_of(e)
+    let msg = format_message(e, allocator)?
+    return match e {
+        case .unsupported_expr_form(_, _) =>
+            diag_mod.error_at(code_mod.mir_error(), at, msg)
+        case .closure_escapes_without_allocator(_) =>
+            diag_mod.error_at(code_mod.mir_error(), at, msg)
+        case .internal_lowering_invariant(_, _) =>
+            diag_mod.fatal_at(code_mod.internal_error(), at, msg)
+    }
+}
+
+
+public stable function span_of(e: MirError) -> span_mod.Span {
+    return match e {
+        case .unsupported_expr_form(let at, _) => at
+        case .closure_escapes_without_allocator(let at) => at
+        case .internal_lowering_invariant(let at, _) => at
+    }
+}
+
+
+function format_message(e: MirError, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .unsupported_expr_form(_, let kind) =>
+            fmt_unsupported_expr_form(kind, allocator)?
+        case .closure_escapes_without_allocator(_) =>
+            fmt_closure_escapes_without_allocator()
+        case .internal_lowering_invariant(_, let message) =>
+            fmt_internal_lowering_invariant(message, allocator)?
+    }
+}
+
+function fmt_unsupported_expr_form(kind: UnsupportedKind, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(
+        "HIR form has no MIR lowering: ",
+        fmt_unsupported_kind(kind),
+        allocator,
+    )?
+}
+
+function fmt_unsupported_kind(kind: UnsupportedKind) -> String {
+    return match kind {
+        case .closure_preserved => "closure literal (parses and typechecks; lowering deferred)"
+        case .spawn_preserved => "structured-concurrency spawn payload (parses and typechecks; lowering deferred)"
+        case .unlowered_expr_form => "expression form not yet lowered by the MIR walker"
+        case .closure_escapes_without_allocator => "escaping capturing closure without an Allocator capability"
+        case .fmt_target_unresolved => "f-string wide-integer slot whose stdlib fmt target (`format_i128`/`format_u128` or its to-String wrapper) resolved to def 0"
+    }
+}
+
+function fmt_closure_escapes_without_allocator() -> String {
+    return "closure captures values and escapes its constructing frame, so its environment must be heap-allocated; the closure must carry an Allocator capability (capture or take an allocator)"
+}
+
+function fmt_internal_lowering_invariant(message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(
+        "internal MIR-construction invariant violated: ",
+        message,
+        allocator,
+    )?
+}

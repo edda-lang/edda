@@ -1,0 +1,319 @@
+
+module cache.projects.registry
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import local.tier.global as global_mod
+import local.toon.lex as lex_mod
+import local.toon.emit.write as write_mod
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(usize)
+
+
+public function read_projects(
+    g: global_mod.GlobalCache,
+    rfs: ReadOnlyFilesystem,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: alloc.AllocError, err: fs.FsError, err: lex_mod.LexError}
+{
+    let path = global_mod.projects_registry_path(g, allocator)?
+    if !fs.path_exists(rfs, path) {
+        uninit empty: Vec_String.Vec
+        Vec_String.new(init empty, allocator)?
+        return empty
+    }
+    let text = fs.read_to_string(rfs, path, allocator)?
+    let lexed = lex_mod.lex(text, false, allocator)?
+    return parse_projects_list(lexed, allocator)?
+}
+
+public function register_project(
+    g: global_mod.GlobalCache,
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    project_path: String,
+    allocator: Allocator,
+) -> ()
+    with {wfs, rfs, allocator, err: alloc.AllocError, err: fs.FsError, err: lex_mod.LexError, panic}
+{
+    var current = read_projects(g, rfs, allocator)?
+    if list_contains(current, project_path) {
+        return ()
+    }
+    Vec_String.push(mutable current, project_path, allocator)?
+    write_projects(g, wfs, current, allocator)?
+}
+
+
+function write_projects(
+    g: global_mod.GlobalCache,
+    wfs: Filesystem,
+    projects: Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {wfs, allocator, err: alloc.AllocError, err: fs.FsError, panic}
+{
+    let final_path = global_mod.projects_registry_path(g, allocator)?
+    let dir = global_mod.root(g, allocator)?
+    fs.create_dir_all(wfs, dir)?
+    let staged_path = staged_path_for(final_path, allocator)?
+    let text = render_projects_toon(projects, allocator)?
+    fs.write_string(wfs, staged_path, text)?
+    fs.rename(wfs, staged_path, final_path)?
+}
+
+function render_projects_toon(projects: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit w: write_mod.Writer
+    write_mod.new(init w, allocator)?
+    write_mod.comment(mutable w, "projects.toon — global cache project registry", allocator)?
+    write_mod.comment(mutable w, "Generated automatically; do not edit by hand.", allocator)?
+    write_mod.blank_line(mutable w, allocator)?
+    let n = Vec_String.len(projects)
+    if n == 0 {
+        write_mod.empty_list(mutable w, "projects", allocator)?
+    } else {
+        write_mod.block_open(mutable w, "projects", allocator)?
+        write_project_items(mutable w, projects, 0, n, allocator)?
+        write_mod.block_close(mutable w)
+    }
+    return write_mod.finish(take w, allocator)?
+}
+
+function write_project_items(
+    w: mutable write_mod.Writer,
+    projects: Vec_String.Vec,
+    i: usize,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= Vec_String.len(projects)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let item = Vec_String.at(projects, i)
+    write_mod.list_item_scalar(mutable w, item, allocator)?
+    return write_project_items(mutable w, projects, i + 1, n, allocator)?
+}
+
+
+function parse_projects_list(lx: lex_mod.Lexed, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n = lex_mod.len(lx)
+    let opener = find_projects_opener(lx, 0, n, allocator)?
+    match opener {
+        case .none => return out
+        case .some(let body_idx) => {
+            walk_project_items(lx, body_idx, n, mutable out, allocator)?
+        }
+    }
+    return out
+}
+
+function find_projects_opener(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    allocator: Allocator,
+) -> Option_usize
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return Option_usize.none }
+    if lex_mod.indent_at(lx, i) != 0 {
+        return find_projects_opener(lx, i + 1, n, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !line_key_equals(line, "projects") {
+        return find_projects_opener(lx, i + 1, n, allocator)?
+    }
+    let tail = line_value_part(line, allocator)?
+    if string.equals(tail, "[]") { return Option_usize.none }
+    if tail.bytes().len() > 0 { return Option_usize.none }
+    return Option_usize.some(value: i + 1)
+}
+
+function walk_project_items(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth < 1 { return () }
+    if depth != 1 {
+        return walk_project_items(lx, i + 1, n, mutable out, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !is_list_item_line(line) {
+        return walk_project_items(lx, i + 1, n, mutable out, allocator)?
+    }
+    let value = strip_list_marker(line, allocator)?
+    Vec_String.push(mutable out, take value, allocator)?
+    return walk_project_items(lx, i + 1, n, mutable out, allocator)?
+}
+
+
+function staged_path_for(final_path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(final_path, ".new", allocator)?
+}
+
+
+function line_key_equals(line: String, expected: String) -> bool {
+    let bytes = line.bytes()
+    return match find_byte(bytes, 0, bytes.len(), 58) {
+        case .none            => false
+        case .some(let colon) => bytes_equal(bytes, 0, colon, expected.bytes())
+    }
+}
+
+function line_value_part(line: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    return match find_byte(bytes, 0, bytes.len(), 58) {
+        case .none           => string.clone(line, allocator)?
+        case .some(let colon) => {
+            let value_start = skip_spaces(bytes, colon + 1, bytes.len())
+            slice_to_string(bytes, value_start, bytes.len(), allocator)?
+        }
+    }
+}
+
+function is_list_item_line(line: String) -> bool {
+    let bytes = line.bytes()
+    if bytes.len() == 0 { return false }
+    if bytes[0] != 45 { return false }
+    if bytes.len() == 1 { return true }
+    return bytes[1] == 32
+}
+
+function strip_list_marker(line: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    if bytes.len() <= 2 {
+        let buf: [u8] = allocator.alloc_array(u8, 0)?
+        return string.from_owned_utf8(take buf)
+    }
+    return slice_to_string(bytes, 2, bytes.len(), allocator)?
+}
+
+
+function list_contains(v: Vec_String.Vec, value: String) -> bool {
+    let n: usize = Vec_String.len(v)
+    return list_contains_acc(v, value, 0, n)
+}
+
+function list_contains_acc(v: Vec_String.Vec, value: String, i: usize, n: usize) -> bool
+    requires i <= n
+    requires n <= Vec_String.len(v)
+    decreases n - i
+{
+    if i >= n { return false }
+    let item = Vec_String.at(v, i)
+    if string.equals(item, value) { return true }
+    return list_contains_acc(v, value, i + 1, n)
+}
+
+
+function find_byte(bytes: [u8], i: usize, end: usize, target: u8) -> Option_usize
+    requires i <= end
+    requires end <= bytes.len()
+    decreases end - i
+{
+    if i >= end { return Option_usize.none }
+    if bytes[i] == target { return Option_usize.some(value: i) }
+    return find_byte(bytes, i + 1, end, target)
+}
+
+function skip_spaces(bytes: [u8], i: usize, end: usize) -> usize
+    requires i <= end
+    requires end <= bytes.len()
+    ensures result >= i
+    ensures result <= end
+    decreases end - i
+{
+    if i >= end { return i }
+    if bytes[i] != 32 { return i }
+    return skip_spaces(bytes, i + 1, end)
+}
+
+function bytes_equal(bytes: [u8], lo: usize, hi: usize, other: [u8]) -> bool
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    if hi - lo != other.len() { return false }
+    return bytes_equal_acc(bytes, lo, other, 0, hi - lo)
+}
+
+function bytes_equal_acc(bytes: [u8], lo: usize, other: [u8], i: usize, n: usize) -> bool
+    requires lo + n <= bytes.len()
+    requires n <= other.len()
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return true }
+    if bytes[lo + i] != other[i] { return false }
+    return bytes_equal_acc(bytes, lo, other, i + 1, n)
+}
+
+function slice_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let len: usize = hi - lo
+    var buf: [u8] = allocator.alloc_array(u8, len)?
+    copy_range(bytes, lo, hi, mutable buf, 0)
+    return string.from_owned_utf8(take buf)
+}
+
+function copy_range(src: [u8], lo: usize, hi: usize, dst: mutable [u8], offset: usize) -> ()
+    requires lo <= hi
+    requires hi <= src.len()
+    requires offset + (hi - lo) <= dst.len()
+{
+    copy_range_acc(src, lo, hi, mutable dst, offset, 0)
+}
+
+function copy_range_acc(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    dst: mutable [u8],
+    offset: usize,
+    i: usize,
+) -> ()
+    requires lo <= hi
+    requires hi <= src.len()
+    requires offset + (hi - lo) <= dst.len()
+    requires i <= hi - lo
+    decreases (hi - lo) - i
+{
+    if i >= hi - lo { return () }
+    dst[offset + i] = src[lo + i]
+    copy_range_acc(src, lo, hi, mutable dst, offset, i + 1)
+}

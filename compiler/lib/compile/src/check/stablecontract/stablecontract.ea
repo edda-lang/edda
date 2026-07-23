@@ -1,0 +1,209 @@
+
+module compile.check.stablecontract.stablecontract
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import manifest.model.lockfile.lockfile as lockfile_model_mod
+import source.map as source_map_mod
+import specs.address.contract as contract_mod
+import specs.address.hash as hash_mod
+import specs.gen.monomorphise.address.address as addr_mod
+import specs.gen.monomorphise.qualify.qualify as qualify_mod
+import syntax.ast.attr as attr_mod
+import syntax.ast.item as ast_item_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+spec std.collections.vec.Vec(StableItem)
+spec std.core.option.Option(lockfile_model_mod.LoadedLockfile)
+spec std.core.option.Option(lockfile_model_mod.ContractBaseline)
+spec std.core.option.Option(String)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+
+
+public type StableItem {
+    qualified_name: String
+    decl: ast_item_mod.FnDecl
+    attributes: Vec_Attribute.Vec
+}
+
+
+public function check_stable_contract_revision(
+    hir_files: Vec_HirFile.Vec,
+    lockfile: Option_LoadedLockfile.Option,
+    current_version: Option_String.Option,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let lf = match lockfile {
+        case .none => return
+        case .some(let l) => l
+    }
+    let version = match current_version {
+        case .none => return
+        case .some(let v) => v
+    }
+    let items = collect_stable_items(hir_files, interner, allocator)?
+    let n = Vec_StableItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_stable_item(Vec_StableItem.at(items, i), lf, version, map, mutable diags, allocator)?
+        i = i + 1
+    }
+}
+
+
+public function collect_stable_items(
+    hir_files: Vec_HirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_StableItem.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_StableItem.Vec
+    Vec_StableItem.new(init out, allocator)?
+    let n = Vec_HirFile.len(hir_files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_file(Vec_HirFile.at(hir_files, i), interner, mutable out, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function collect_file(
+    file: hir_file_mod.HirFile,
+    interner: interner_mod.Interner,
+    out: mutable Vec_StableItem.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let invoker_segs = qualify_mod.invoker_module_segments(file.source.items, allocator)?
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_item(Vec_HItem.at(file.items, i), invoker_segs, interner, mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+
+function collect_item(
+    item: hir_item_mod.HItem,
+    invoker_segs: Vec_Symbol.Vec,
+    interner: interner_mod.Interner,
+    out: mutable Vec_StableItem.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match item.ast_item.kind {
+        case .function_(let decl_box) => {
+            let decl = Box_FnDecl.get(decl_box)
+            if is_stable(decl) {
+                let qualified_name = qualified_name_of(invoker_segs, decl.name.name, interner, allocator)?
+                let si = StableItem { qualified_name: qualified_name, decl: decl, attributes: item.ast_item.attributes }
+                Vec_StableItem.push(mutable out, take si, allocator)?
+            }
+        }
+        case _ => ()
+    }
+}
+
+
+function is_stable(decl: ast_item_mod.FnDecl) -> bool {
+    return match decl.stability {
+        case .some(let st) => match st {
+            case .stable_(let _since) => true
+            case .unstable_           => false
+        }
+        case .none => false
+    }
+}
+
+
+function check_stable_item(
+    item: StableItem,
+    lf: lockfile_model_mod.LoadedLockfile,
+    version: String,
+    map: source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let baseline_opt = find_baseline(lf, item.qualified_name)
+    let baseline = match baseline_opt {
+        case .none => return
+        case .some(let b) => b
+    }
+    if !string.equals(version, lockfile_model_mod.version_introduced(baseline)) {
+        return
+    }
+    let h = contract_mod.contract_hash(item.qualified_name, item.decl, item.attributes, map, allocator)?
+    let hex = hash_mod.to_hex(h, allocator)?
+    if string.equals(hex, lockfile_model_mod.contract_hash(baseline)) {
+        return
+    }
+    let detail = string.concat("stable item contract changed without a version bump: ", item.qualified_name, allocator)?
+    diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.stable_contract_revision(), item.decl.span, detail), allocator)?
+}
+
+
+function find_baseline(lf: lockfile_model_mod.LoadedLockfile, qualified_name: String) -> Option_ContractBaseline.Option {
+    let n = lockfile_model_mod.contract_baseline_count(lf)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let cb = lockfile_model_mod.contract_baseline_at(lf, i)
+        if string.equals(lockfile_model_mod.qualified_name(cb), qualified_name) {
+            return Option_ContractBaseline.some(value: cb)
+        }
+        i = i + 1
+    }
+    return Option_ContractBaseline.none
+}
+
+
+public function qualified_name_of(
+    segs: Vec_Symbol.Vec,
+    leaf: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Symbol.len(segs)
+    var out: String = ""
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let seg = addr_mod.render_symbol_string(Vec_Symbol.at(segs, i), interner, allocator)?
+        let joined = string.concat(out, seg, allocator)?
+        out = string.concat(joined, ".", allocator)?
+        i = i + 1
+    }
+    let leaf_str = addr_mod.render_symbol_string(leaf, interner, allocator)?
+    return string.concat(out, leaf_str, allocator)?
+}

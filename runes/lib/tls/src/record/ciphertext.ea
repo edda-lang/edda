@@ -1,0 +1,201 @@
+
+module tls.record.ciphertext
+
+import std.net.socket
+import std.mem.alloc
+import local.error
+import local.wire
+import local.crypto.aead
+import local.record.kind as record_kind
+
+function _max_ciphertext_len() -> usize { return 16640 as usize }
+
+function _header_len() -> usize { return 5 as usize }
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _read_exact(conn: mutable socket.Connection, buf: mutable [u8]) -> ()
+    with {err: error.TlsError}
+{
+    let need = buf.len()
+    var have: usize = 0 as usize
+    loop decreases need - have {
+        if have >= need { break }
+        let chunk = handle err: socket.SocketError -> (raise error.TlsError.socket_failed) {
+            socket.read(mutable conn, mutable buf[have..])?
+        }
+        if chunk == (0 as usize) { raise error.TlsError.bad_record }
+        have = have + chunk
+    }
+}
+
+function _read_header(conn: mutable socket.Connection, buf: mutable [u8]) -> bool
+    with {err: error.TlsError}
+{
+    let need = buf.len()
+    var have: usize = 0 as usize
+    loop decreases need - have {
+        if have >= need { break }
+        let chunk = handle err: socket.SocketError -> (raise error.TlsError.socket_failed) {
+            socket.read(mutable conn, mutable buf[have..])?
+        }
+        if chunk == (0 as usize) {
+            if have == (0 as usize) { return false }
+            raise error.TlsError.bad_record
+        }
+        have = have + chunk
+    }
+    return true
+}
+
+function _write_all(conn: mutable socket.Connection, data: [u8]) -> ()
+    with {err: error.TlsError}
+{
+    let need = data.len()
+    var sent: usize = 0 as usize
+    loop decreases need - sent {
+        if sent >= need { break }
+        let chunk = handle err: socket.SocketError -> (raise error.TlsError.socket_failed) {
+            socket.write(mutable conn, data[sent..])?
+        }
+        if chunk == (0 as usize) { raise error.TlsError.socket_failed }
+        sent = sent + chunk
+    }
+}
+
+function _outer_wire_kind() -> u8 { return 23 as u8 }
+
+function _outer_ccs_kind() -> u8 { return 20 as u8 }
+
+function _max_outer_ccs_skips() -> usize { return 4 as usize }
+
+function _write_aad(
+    aad: mutable [u8],
+    cipher_len: u16,
+) -> ()
+    with {err: error.TlsError}
+{
+    let _ = wire.write_u8(mutable aad, 0 as usize, _outer_wire_kind())?
+    let _ = wire.write_u16_be(mutable aad, 1 as usize, 0x0303 as u16)?
+    let _ = wire.write_u16_be(mutable aad, 3 as usize, cipher_len)?
+}
+
+unstable public type DecryptedRecord {
+    kind: record_kind.RecordKind
+    plaintext: [u8]
+}
+
+public function write_ciphertext(
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    key: [u8],
+    iv: [u8] where iv.len() == 12,
+    seq: u64,
+    inner_kind: record_kind.RecordKind,
+    plaintext: [u8],
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    let pt_len = plaintext.len()
+    let inner_len = pt_len + (1 as usize)
+    let tag_len = aead.cipher_tag_len(cipher)
+    let cipher_field_len = inner_len + tag_len
+    if cipher_field_len > _max_ciphertext_len() {
+        raise error.TlsError.bad_record
+    }
+    let total = _header_len() + cipher_field_len
+    var out = _alloc_bytes(allocator, total)?
+    _write_aad(mutable out, cipher_field_len as u16)?
+    var inner = _alloc_bytes(allocator, inner_len)?
+    var pos: usize = 0 as usize
+    pos = wire.write_bytes(mutable inner, pos, plaintext)?
+    pos = wire.write_u8(mutable inner, pos, record_kind.record_kind_wire(inner_kind))?
+    let _ = pos
+    var nonce = _alloc_bytes(allocator, 12 as usize)?
+    aead.compute_nonce(iv, seq, mutable nonce)
+    var tag = _alloc_bytes(allocator, tag_len)?
+    aead.seal(
+        cipher,
+        key,
+        nonce,
+        inner,
+        out[0 as usize..<_header_len()],
+        mutable out[_header_len()..<_header_len() + inner_len],
+        mutable tag,
+    )?
+    let tag_off = _header_len() + inner_len
+    let _ = wire.write_bytes(mutable out, tag_off, tag)?
+    _write_all(mutable conn, out)?
+}
+
+public function read_ciphertext(
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    key: [u8],
+    iv: [u8] where iv.len() == 12,
+    seq: u64,
+    allocator: mutable Allocator,
+) -> DecryptedRecord
+    with {allocator, err: error.TlsError}
+{
+    var header = _alloc_bytes(allocator, _header_len())?
+    var ccs_skips: usize = _max_outer_ccs_skips()
+    loop decreases ccs_skips {
+        if !(_read_header(mutable conn, mutable header)?) {
+            raise error.TlsError.peer_closed_unexpectedly
+        }
+        let outer_kind = wire.read_u8(header, 0 as usize)?
+        if outer_kind == _outer_wire_kind() { break }
+        if outer_kind != _outer_ccs_kind() { raise error.TlsError.bad_record }
+        if ccs_skips == (0 as usize) { raise error.TlsError.bad_record }
+        ccs_skips = ccs_skips - (1 as usize)
+        let ccs_len = wire.read_u16_be(header, 3 as usize)? as usize
+        if ccs_len == (0 as usize) || ccs_len > (8 as usize) { raise error.TlsError.bad_record }
+        var discard = _alloc_bytes(allocator, ccs_len)?
+        _read_exact(mutable conn, mutable discard)?
+    }
+    let _legacy_version = wire.read_u16_be(header, 1 as usize)?
+    let cipher_field_len = wire.read_u16_be(header, 3 as usize)? as usize
+    if cipher_field_len > _max_ciphertext_len() { raise error.TlsError.bad_record }
+    let tag_len = aead.cipher_tag_len(cipher)
+    if cipher_field_len < tag_len { raise error.TlsError.bad_record }
+    let ct_len = cipher_field_len - tag_len
+    var body = _alloc_bytes(allocator, cipher_field_len)?
+    _read_exact(mutable conn, mutable body)?
+    var nonce = _alloc_bytes(allocator, 12 as usize)?
+    aead.compute_nonce(iv, seq, mutable nonce)
+    var inner = _alloc_bytes(allocator, ct_len)?
+    aead.open(
+        cipher,
+        key,
+        nonce,
+        body[0 as usize..<ct_len],
+        header,
+        body[ct_len..<cipher_field_len],
+        mutable inner,
+    )?
+    var end: usize = ct_len
+    loop decreases end {
+        if end == (0 as usize) { raise error.TlsError.bad_record }
+        if inner[end - (1 as usize)] != (0 as u8) { break }
+        end = end - (1 as usize)
+    }
+    let type_byte = inner[end - (1 as usize)]
+    let real_kind = record_kind.record_kind_from_wire(type_byte)?
+    let plaintext_end = end - (1 as usize)
+    return DecryptedRecord {
+        kind: real_kind,
+        plaintext: inner[0 as usize..<plaintext_end],
+    }
+}

@@ -1,0 +1,157 @@
+
+module uri.codec.query
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import uri.error
+import uri.codec.percent
+
+spec option.Option(String)
+
+function _alloc_pair_slots(allocator: Allocator, n: usize) -> [Pair]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public type Pair {
+    key: String
+    value: Option_String
+}
+
+
+function _count_separators(src: [u8]) -> usize {
+    let n = src.len()
+    var i: usize = 0
+    var count: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if src[i] == 38 as u8 { count = count + 1 as usize }
+        i = i + 1 as usize
+    }
+    return count
+}
+
+function _find_equals(src: [u8], lo: usize, hi: usize) -> (usize, bool) {
+    var i: usize = lo
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        if src[i] == 61 as u8 { return (i, true) }
+        i = i + 1 as usize
+    }
+    return (0 as usize, false)
+}
+
+function _decode_substring(
+    src: [u8], lo: usize, hi: usize, allocator: Allocator,
+) -> String
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let decoded = percent.decode(src[lo..<hi], allocator)?
+    return string.bytes_slice_to_string(decoded, 0, decoded.len(), allocator)?
+}
+
+function _parse_pair(
+    src: [u8], lo: usize, hi: usize, allocator: Allocator,
+) -> Pair
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let (eq_pos, has_eq) = _find_equals(src, lo, hi)
+    if has_eq {
+        let k = _decode_substring(src, lo, eq_pos, allocator)?
+        let v = _decode_substring(src, eq_pos + 1 as usize, hi, allocator)?
+        return Pair { key: k, value: Option_String.some(value: v) }
+    }
+    let k = _decode_substring(src, lo, hi, allocator)?
+    return Pair { key: k, value: Option_String.none }
+}
+
+
+public function parse(src: String, allocator: Allocator) -> [Pair]
+    with {allocator, err: error.ParseError}
+{
+    return handle err: alloc.AllocError -> { raise error.ParseError.allocation_failed } {
+        let bytes = src.bytes()
+        let n = bytes.len()
+        if n == 0 as usize {
+            _alloc_pair_slots(allocator, 0 as usize)?
+        } else {
+            let need = _count_separators(bytes) + 1 as usize
+            let pairs = _alloc_pair_slots(allocator, need)?
+            var written: usize = 0
+            var lo: usize = 0
+            var i: usize = 0
+            loop decreases n - i + 1 as usize {
+                if i >= n {
+                    pairs[written] = _parse_pair(bytes, lo, n, allocator)?
+                    written = written + 1 as usize
+                    break
+                }
+                if bytes[i] == 38 as u8 {
+                    pairs[written] = _parse_pair(bytes, lo, i, allocator)?
+                    written = written + 1 as usize
+                    lo = i + 1 as usize
+                }
+                i = i + 1 as usize
+            }
+            pairs[0 as usize..<written]
+        }
+    }
+}
+
+
+function _measure_pair(p: Pair, first: bool) -> usize {
+    let sep: usize = if first { 0 as usize } else { 1 as usize }
+    let key_size = percent.measure_encoded_with(p.key.bytes(), percent.is_unreserved)
+    let value_size = match p.value {
+        case .some(let v) =>
+            1 as usize + percent.measure_encoded_with(v.bytes(), percent.is_unreserved)
+        case .none => 0 as usize
+    }
+    return sep + key_size + value_size
+}
+
+function _write_pair(buf: mutable [u8], pos: usize, p: Pair, first: bool) -> usize {
+    var w: usize = pos
+    if !first {
+        buf[w] = 38 as u8
+        w = w + 1 as usize
+    }
+    w = percent.encode_into_with(mutable buf, w, p.key.bytes(), percent.is_unreserved)
+    match p.value {
+        case .some(let v) => {
+            buf[w] = 61 as u8
+            w = w + 1 as usize
+            w = percent.encode_into_with(mutable buf, w, v.bytes(), percent.is_unreserved)
+        }
+        case .none => {}
+    }
+    return w
+}
+
+
+public function encode_pairs(pairs: [Pair], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = pairs.len()
+    var total: usize = 0
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        total = total + _measure_pair(pairs[i], i == 0 as usize)
+        i = i + 1 as usize
+    }
+    var buf = _alloc_byte_slab(allocator, total)?
+    var w: usize = 0
+    var j: usize = 0
+    loop decreases n - j + 1 as usize {
+        if j >= n { break }
+        w = _write_pair(mutable buf, w, pairs[j], j == 0 as usize)
+        j = j + 1 as usize
+    }
+    return string.bytes_slice_to_string(buf, 0, w, allocator)?
+}

@@ -1,0 +1,309 @@
+
+module pgsql.extended.portal
+
+import std.mem.alloc
+import std.collections.vec
+import std.net.socket
+import local.error
+import local.link.io
+import local.client.session.startup.connect
+import local.extended.format
+import local.extended.param
+import local.extended.prepared
+import local.client.exec.query
+import local.message.tag
+import local.message.fe.extended as fe_extended
+import local.message.be.reply.acks as be_acks
+import local.message.be.data.command as be_command
+import local.message.be.data.rows as be_rows
+import local.message.be.reply.response as be_response
+import local.message.be.reply.status as be_status
+
+spec std.collections.vec.Vec(query.SimpleQueryRow)
+
+
+public linear type Portal {
+    name: [u8]
+    row_shape: prepared.RowShape
+}
+
+
+public type PreparedQueryRows {
+    description: be_rows.RowDescription
+    rows: [query.SimpleQueryRow]
+    command_tag: [u8]
+}
+
+public type PreparedQueryResult {
+    case rows(payload: PreparedQueryRows)
+    case command(command_tag: [u8])
+    case empty
+}
+
+
+public type ExecuteOutcome {
+    case complete(payload: PreparedQueryResult)
+    case suspended(portal: Portal, rows: [query.SimpleQueryRow])
+}
+
+
+public function bind(
+    conn: mutable connect.Connection,
+    stmt: prepared.PreparedStatement,
+    portal_name: [u8],
+    params: [param.Param],
+    result_format: format.ResultFormat,
+    allocator: Allocator,
+) -> Portal
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let args = param.to_bind_args(params, allocator)?
+    let result_format_codes = format.to_format_codes(result_format, allocator)?
+    let bind_bytes = fe_extended.encode_bind(
+        portal_name,
+        stmt.name,
+        args.formats,
+        args.params,
+        result_format_codes,
+        allocator,
+    )?
+    io.write_all(mutable conn.socket, bind_bytes)?
+
+    let sync_bytes = fe_extended.encode_sync(allocator)?
+    io.write_all(mutable conn.socket, sync_bytes)?
+
+    var saw_bind_complete: bool = false
+    var saw_error: bool = false
+    var error_sqlstate: [u8] = "".bytes()
+    var error_severity: [u8] = "".bytes()
+    var error_message: [u8] = "".bytes()
+
+    loop {
+        let msg = io.read_message(mutable conn.socket, allocator)?
+        if msg.tag == tag.be_bind_complete() {
+            let _ = be_acks.decode_bind_complete(msg.body)?
+            saw_bind_complete = true
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            conn.tx_status = rfq.transaction_status
+            break
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            saw_error = true
+            error_sqlstate = be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty)
+            error_severity = be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty)
+            error_message = be_response.field_value_or(err_resp.fields, be_response.field_message(), empty)
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    if saw_error {
+        raise error.QueryError.sql_error(
+            sqlstate: error_sqlstate,
+            severity: error_severity,
+            message: error_message,
+        )
+    }
+
+    if !saw_bind_complete {
+        raise error.ProtocolError.unexpected_message_type
+    }
+
+    return Portal {
+        name: portal_name,
+        row_shape: stmt.row_shape,
+    }
+}
+
+
+public function fetch_batch(
+    conn: mutable connect.Connection,
+    portal: take Portal,
+    max_rows: i32,
+    allocator: Allocator,
+) -> ExecuteOutcome
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let execute_bytes = fe_extended.encode_execute(portal.name, max_rows, allocator)?
+    io.write_all(mutable conn.socket, execute_bytes)?
+
+    let sync_bytes = fe_extended.encode_sync(allocator)?
+    io.write_all(mutable conn.socket, sync_bytes)?
+
+    uninit rows: Vec_SimpleQueryRow.Vec
+    Vec_SimpleQueryRow.new(init rows, allocator)?
+    var command_tag: [u8] = "".bytes()
+    var saw_empty: bool = false
+    var saw_portal_suspended: bool = false
+    var saw_error: bool = false
+    var error_sqlstate: [u8] = "".bytes()
+    var error_severity: [u8] = "".bytes()
+    var error_message: [u8] = "".bytes()
+
+    loop {
+        let msg = io.read_message(mutable conn.socket, allocator)?
+        if msg.tag == tag.be_data_row() {
+            let dr = be_rows.decode_data_row(msg.body, allocator)?
+            Vec_SimpleQueryRow.push(
+                mutable rows,
+                take query.SimpleQueryRow { columns: dr.columns },
+                allocator,
+            )?
+        } else if msg.tag == tag.be_command_complete() {
+            let cc = be_command.decode_command_complete(msg.body)?
+            command_tag = cc.command_tag
+        } else if msg.tag == tag.be_empty_query_response() {
+            let _ = be_command.decode_empty_query_response(msg.body)?
+            saw_empty = true
+        } else if msg.tag == tag.be_portal_suspended() {
+            let _ = be_acks.decode_portal_suspended(msg.body)?
+            saw_portal_suspended = true
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            conn.tx_status = rfq.transaction_status
+            break
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            saw_error = true
+            error_sqlstate = be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty)
+            error_severity = be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty)
+            error_message = be_response.field_value_or(err_resp.fields, be_response.field_message(), empty)
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else if msg.tag == tag.be_notification_response() {
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    if saw_error {
+        raise error.QueryError.sql_error(
+            sqlstate: error_sqlstate,
+            severity: error_severity,
+            message: error_message,
+        )
+    }
+
+    let row_array = Vec_SimpleQueryRow.into_array(take rows, allocator)?
+
+    if saw_portal_suspended {
+        return ExecuteOutcome.suspended(portal: portal, rows: row_array)
+    }
+
+    if saw_empty {
+        return ExecuteOutcome.complete(payload: PreparedQueryResult.empty)
+    }
+
+    return ExecuteOutcome.complete(payload: match portal.row_shape {
+        case .has_rows(let desc) => PreparedQueryResult.rows(
+            payload: PreparedQueryRows {
+                description: desc,
+                rows: row_array,
+                command_tag: command_tag,
+            }
+        )
+        case .no_data => PreparedQueryResult.command(command_tag: command_tag)
+    })
+}
+
+
+public function execute(
+    conn: mutable connect.Connection,
+    portal: take Portal,
+    allocator: Allocator,
+) -> PreparedQueryResult
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let outcome = fetch_batch(mutable conn, take portal, 0 as i32, allocator)?
+    return match outcome {
+        case .complete(let payload) => payload
+        case .suspended(let leaked_portal, _) => {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+}
+
+
+public function close_portal(
+    conn: mutable connect.Connection,
+    portal: take Portal,
+    allocator: Allocator,
+) -> ()
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let close_bytes = fe_extended.encode_close(
+        fe_extended.target_portal(),
+        portal.name,
+        allocator,
+    )?
+    io.write_all(mutable conn.socket, close_bytes)?
+
+    let sync_bytes = fe_extended.encode_sync(allocator)?
+    io.write_all(mutable conn.socket, sync_bytes)?
+
+    var saw_error: bool = false
+    var error_sqlstate: [u8] = "".bytes()
+    var error_severity: [u8] = "".bytes()
+    var error_message: [u8] = "".bytes()
+
+    loop {
+        let msg = io.read_message(mutable conn.socket, allocator)?
+        if msg.tag == tag.be_close_complete() {
+            let _ = be_acks.decode_close_complete(msg.body)?
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            conn.tx_status = rfq.transaction_status
+            break
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            saw_error = true
+            error_sqlstate = be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty)
+            error_severity = be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty)
+            error_message = be_response.field_value_or(err_resp.fields, be_response.field_message(), empty)
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    if saw_error {
+        raise error.QueryError.sql_error(
+            sqlstate: error_sqlstate,
+            severity: error_severity,
+            message: error_message,
+        )
+    }
+}

@@ -1,0 +1,226 @@
+
+module optimize.refine_elim.proven.proven
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc as alloc
+
+import mir.body.model as mir_body_mod
+import mir.id.block as mir_block_mod
+import refine.discharge.output as refine_output_mod
+
+spec std.collections.vec.Vec(ProvenKey)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(usize)
+
+derive eq, hash, debug for ProvenKey
+
+public type ProvenKey {
+    def_raw: u32
+    block_index: usize
+    stmt_index: u32
+    kind_tag: u32
+}
+
+public type ProvenSet {
+    keys: Vec_ProvenKey.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+}
+
+public function tag_int_overflow() -> u32 {
+    return 1
+}
+
+public function tag_narrowing_cast_range() -> u32 {
+    return 2
+}
+
+public function tag_div_by_zero() -> u32 {
+    return 3
+}
+
+public function tag_index_in_bounds() -> u32 {
+    return 4
+}
+
+public function tag_slice_subrange_in_bounds() -> u32 {
+    return 5
+}
+
+public function tag_div_overflow() -> u32 {
+    return 6
+}
+
+public function kind_tag_of(kind: mir_body_mod.ObligationKind) -> u32 {
+    return match kind {
+        case .int_overflow => tag_int_overflow()
+        case .narrowing_cast_range => tag_narrowing_cast_range()
+        case .div_by_zero => tag_div_by_zero()
+        case .div_overflow => tag_div_overflow()
+        case .index_in_bounds => tag_index_in_bounds()
+        case .slice_subrange_in_bounds => tag_slice_subrange_in_bounds()
+        case .precondition => 0
+        case .postcondition => 0
+        case .decreases_decreasing => 0
+    }
+}
+
+function mix(acc: u64, value: u64) -> u64 {
+    return (acc ^ value) *% (1099511628211 as u64)
+}
+
+function key_hash(def_raw: u32, block_index: usize, stmt_index: u32, kind_tag: u32) -> u64 {
+    var h = 14695981039346656037 as u64
+    h = mix(h, def_raw as u64)
+    h = mix(h, block_index as u64)
+    h = mix(h, stmt_index as u64)
+    h = mix(h, kind_tag as u64)
+    return h
+}
+
+public function empty(allocator: Allocator) -> ProvenSet
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ks: Vec_ProvenKey.Vec
+    Vec_ProvenKey.new(init ks, allocator)?
+    uninit nx: Vec_usize.Vec
+    Vec_usize.new(init nx, allocator)?
+    let hd = IntMap_usize.new(allocator)?
+    return ProvenSet { keys: ks, head: hd, nexts: nx }
+}
+
+function insert_key(
+    set: mutable ProvenSet,
+    def_raw: u32,
+    block_index: usize,
+    stmt_index: u32,
+    kind_tag: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bucket = key_hash(def_raw, block_index, stmt_index, kind_tag) as i64 wrapping
+    let new_index = Vec_ProvenKey.len(set.keys)
+    let prev = match IntMap_usize.get(set.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable set.nexts, prev, allocator)?
+    let key = ProvenKey {
+        def_raw: def_raw,
+        block_index: block_index,
+        stmt_index: stmt_index,
+        kind_tag: kind_tag,
+    }
+    Vec_ProvenKey.push(mutable set.keys, take key, allocator)?
+    let _ = IntMap_usize.insert(mutable set.head, bucket, new_index + 1 as usize, allocator)?
+}
+
+public function from_refine(
+    refine_output: refine_output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ProvenSet
+    with {allocator, err: alloc.AllocError}
+{
+    var set = empty(allocator)?
+    let n = refine_output_mod.proven_count(refine_output)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let v = refine_output_mod.proven_at(refine_output, i)
+        insert_key(
+            mutable set,
+            v.def_raw,
+            v.block_index,
+            v.stmt_index,
+            kind_tag_of(v.kind),
+            allocator,
+        )?
+        i = i + 1
+    }
+    return set
+}
+
+
+public function add(
+    set: mutable ProvenSet,
+    def_raw: u32,
+    block: mir_block_mod.BlockId,
+    stmt_index: u32,
+    kind_tag: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    insert_key(
+        mutable set,
+        def_raw,
+        mir_block_mod.index(block),
+        stmt_index,
+        kind_tag,
+        allocator,
+    )?
+}
+
+public function contains(
+    set: ProvenSet,
+    def_raw: u32,
+    block: mir_block_mod.BlockId,
+    stmt_index: u32,
+    kind_tag: u32,
+) -> bool {
+    let target_block = mir_block_mod.index(block)
+    let bucket = key_hash(def_raw, target_block, stmt_index, kind_tag) as i64 wrapping
+    let start = match IntMap_usize.get(set.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    let fuel = Vec_ProvenKey.len(set.keys) + 1 as usize
+    return walk_chain(set, def_raw, target_block, stmt_index, kind_tag, start, fuel)
+}
+
+function walk_chain(
+    set: ProvenSet,
+    def_raw: u32,
+    block_index: usize,
+    stmt_index: u32,
+    kind_tag: u32,
+    slot_one_based: usize,
+    fuel: usize,
+) -> bool
+    decreases fuel
+{
+    if fuel == 0 { return false }
+    if slot_one_based == 0 { return false }
+    let idx = slot_one_based - 1
+    if idx >= Vec_ProvenKey.len(set.keys) { return false }
+    let k = Vec_ProvenKey.at(set.keys, idx)
+    if key_matches(k, def_raw, block_index, stmt_index, kind_tag) {
+        return true
+    }
+    if idx >= Vec_usize.len(set.nexts) { return false }
+    let nxt = Vec_usize.at(set.nexts, idx)
+    return walk_chain(set, def_raw, block_index, stmt_index, kind_tag, nxt, fuel - 1)
+}
+
+function key_matches(
+    k: ProvenKey,
+    def_raw: u32,
+    block_index: usize,
+    stmt_index: u32,
+    kind_tag: u32,
+) -> bool {
+    if k.def_raw != def_raw {
+        return false
+    }
+    if k.block_index != block_index {
+        return false
+    }
+    if k.stmt_index != stmt_index {
+        return false
+    }
+    return k.kind_tag == kind_tag
+}

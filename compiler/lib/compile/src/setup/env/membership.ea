@@ -1,0 +1,110 @@
+
+module compile.setup.env.membership
+
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.os.env as env
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import source.map as source_map_mod
+import manifest.manifest as manifest_mod
+import manifest.model.workspace.workspace as ws_mod
+import local.setup.env.load.load as load_mod
+
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ws_mod.Workspace)
+
+
+function is_listed_member(ws: ws_mod.Workspace, candidate: String) -> bool {
+    let n = ws_mod.member_count(ws)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(ws_mod.member_at(ws, i), candidate) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+public function current_member_of(rfs: ReadOnlyFilesystem, workspace_root: String, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let cwd = string.replace(env.current_dir(allocator), "\\", "/", allocator)?
+    let root = string.replace(workspace_root, "\\", "/", allocator)?
+    let lib_prefix = string.concat(root, "/lib/", allocator)?
+    if !string.starts_with(cwd, lib_prefix) {
+        return Option_String.none
+    }
+    let parts = string.split(cwd, lib_prefix, allocator)?
+    if parts.len() < 2 as usize {
+        return Option_String.none
+    }
+    let segs = string.split(parts[1], "/", allocator)?
+    if segs.len() == 0 as usize || string.is_empty(segs[0]) {
+        return Option_String.none
+    }
+    let candidate = segs[0]
+
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let m_opt = load_mod.manifest_load(rfs, mutable scratch_map, root, mutable scratch_diags, allocator)?
+    return match m_opt {
+        case .none => Option_String.none
+        case .some(let m) => match manifest_mod.workspace_of(m) {
+            case .none => Option_String.none
+            case .some(let ws) => if is_listed_member(ws, candidate) {
+                Option_String.some(value: candidate)
+            } else {
+                Option_String.none
+            }
+        }
+    }
+}
+
+
+public function member_project_name(
+    rfs: ReadOnlyFilesystem,
+    member_root: String,
+    fallback: String,
+    allocator: Allocator,
+) -> String
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let manifest_opt = load_mod.manifest_load(rfs, mutable scratch_map, member_root, mutable scratch_diags, allocator)?
+    return match manifest_opt {
+        case .some(let m) => match manifest_mod.package_name_of(m) {
+            case .some(let name) => name
+            case .none => fallback
+        }
+        case .none => fallback
+    }
+}
+
+
+public function primary_member_of(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    return match current_member_of(rfs, workspace_root, allocator)? {
+        case .some(let cm) => if manifest_mod.has_workspace(manifest) {
+            Option_String.some(value: cm)
+        } else {
+            Option_String.none
+        }
+        case .none => Option_String.none
+    }
+}

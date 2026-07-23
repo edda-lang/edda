@@ -1,0 +1,210 @@
+
+module std.text.csv
+
+
+public type CsvError {
+    case buffer_too_small
+    case unterminated_field
+    case unexpected_byte
+}
+
+public type ReadField {
+    value_len: usize
+    input_end: usize
+    terminator: u8
+}
+
+
+public stable function needs_quoting(field: [u8]) -> bool {
+    let n: usize = field.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { return false }
+        let byte: u8 = field[i]
+        if byte == 44 || byte == 34 || byte == 13 || byte == 10 {
+            return true
+        }
+        i += 1
+    }
+}
+
+public stable function field_quoted_length(field: [u8]) -> usize {
+    let n: usize = field.len()
+    var quote_count: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if field[i] == 34 { quote_count += 1 }
+        i += 1
+    }
+    return n + quote_count + 2
+}
+
+public stable function quote_field(
+    field: [u8],
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: CsvError}
+{
+    let n: usize = field.len()
+    let m: usize = out.len()
+    let needed: usize = field_quoted_length(field)
+    if offset + needed > m {
+        raise CsvError.buffer_too_small
+    }
+    var w: usize = offset
+    out[w] = 34
+    w += 1
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let byte: u8 = field[i]
+        if byte == 34 {
+            out[w] = 34
+            out[w + 1] = 34
+            w += 2
+        } else {
+            out[w] = byte
+            w += 1
+        }
+        i += 1
+    }
+    out[w] = 34
+    return w + 1
+}
+
+public stable function quote_field_if_needed(
+    field: [u8],
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: CsvError}
+{
+    if needs_quoting(field) {
+        return quote_field(field, mutable out, offset)?
+    }
+    let n: usize = field.len()
+    let m: usize = out.len()
+    if offset + n > m {
+        raise CsvError.buffer_too_small
+    }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        out[offset + i] = field[i]
+        i += 1
+    }
+    return offset + n
+}
+
+
+public stable function read_field(
+    input: [u8],
+    input_offset: usize,
+    out: mutable [u8],
+    out_offset: usize,
+) -> ReadField
+    with {err: CsvError}
+{
+    let n: usize = input.len()
+    let m: usize = out.len()
+    var read_p: usize = input_offset
+    var write_p: usize = out_offset
+
+    if read_p >= n {
+        return ReadField { value_len: 0, input_end: n, terminator: 0 }
+    }
+
+    if input[read_p] == 34 {
+        read_p += 1
+        loop
+            decreases n - read_p
+        {
+            if read_p >= n {
+                raise CsvError.unterminated_field
+            }
+            let byte: u8 = input[read_p]
+            if byte == 34 {
+                if read_p + 1 < n && input[read_p + 1] == 34 {
+                    if write_p >= m {
+                        raise CsvError.buffer_too_small
+                    }
+                    out[write_p] = 34
+                    write_p += 1
+                    read_p += 2
+                } else {
+                    read_p += 1
+                    break
+                }
+            } else {
+                if write_p >= m {
+                    raise CsvError.buffer_too_small
+                }
+                out[write_p] = byte
+                write_p += 1
+                read_p += 1
+            }
+        }
+    } else {
+        loop
+            decreases n - read_p
+        {
+            if read_p >= n { break }
+            let byte: u8 = input[read_p]
+            if byte == 44 || byte == 10 || byte == 13 { break }
+            if write_p >= m {
+                raise CsvError.buffer_too_small
+            }
+            out[write_p] = byte
+            write_p += 1
+            read_p += 1
+        }
+    }
+
+    if read_p >= n {
+        return ReadField {
+            value_len: write_p - out_offset,
+            input_end: n,
+            terminator: 0,
+        }
+    }
+    let byte: u8 = input[read_p]
+    if byte == 44 {
+        return ReadField {
+            value_len: write_p - out_offset,
+            input_end: read_p + 1,
+            terminator: 44,
+        }
+    }
+    if byte == 10 {
+        return ReadField {
+            value_len: write_p - out_offset,
+            input_end: read_p + 1,
+            terminator: 10,
+        }
+    }
+    if byte == 13 && read_p + 1 < n && input[read_p + 1] == 10 {
+        return ReadField {
+            value_len: write_p - out_offset,
+            input_end: read_p + 2,
+            terminator: 10,
+        }
+    }
+    if byte == 13 {
+        return ReadField {
+            value_len: write_p - out_offset,
+            input_end: read_p + 1,
+            terminator: 10,
+        }
+    }
+    raise CsvError.unexpected_byte
+}

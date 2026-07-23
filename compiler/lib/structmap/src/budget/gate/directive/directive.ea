@@ -1,0 +1,128 @@
+module structmap.budget.gate.directive.directive
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string as string
+import local.data.model as model
+import local.budget.model as bmodel
+import local.budget.cohesion.spoke.spoke as sp
+import local.budget.cohesion.classify.classify as cc
+import local.budget.gate.select.select as sel
+import local.budget.gate.measure.measure as mz
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(sp.NameCluster)
+spec std.collections.vec.Vec(bmodel.FatFile)
+spec std.collections.vec.Vec(bmodel.FileGroup)
+spec std.core.option.Option(String)
+spec std.core.option.Option(bmodel.Directive)
+
+
+function clone_strings(src: Vec_String.Vec, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n = Vec_String.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_String.push(mutable out, string.clone(Vec_String.at(src, i), allocator)?, allocator)?
+        i += 1
+    }
+    return out
+}
+
+function last_cluster_names(comps: Vec_NameCluster.Vec, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_NameCluster.len(comps)
+    if n == 0 as usize {
+        uninit empty: Vec_String.Vec
+        Vec_String.new(init empty, allocator)?
+        return empty
+    }
+    return clone_strings(Vec_NameCluster.at(comps, n - 1).names, allocator)?
+}
+
+function to_file_groups(comps: Vec_NameCluster.Vec, allocator: Allocator) -> Vec_FileGroup.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_FileGroup.Vec
+    Vec_FileGroup.new(init out, allocator)?
+    let n = Vec_NameCluster.len(comps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let files = clone_strings(Vec_NameCluster.at(comps, i).names, allocator)?
+        Vec_FileGroup.push(mutable out, bmodel.FileGroup { files: files }, allocator)?
+        i += 1
+    }
+    return out
+}
+
+public function classify_red_node(tree: model.Tree, dir_idx: usize, cfg: bmodel.BudgetConfig, allocator: Allocator) -> Option_Directive.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let files = sel.distinct_files(tree, dir_idx, allocator)?
+    let exempt = sel.exempt_files(tree, dir_idx, allocator)?
+    let ceiling = cfg.node_amber_max
+
+    uninit fats: Vec_FatFile.Vec
+    Vec_FatFile.new(init fats, allocator)?
+    let nfiles = Vec_String.len(files)
+    var i: usize = 0
+    loop decreases (nfiles - i) {
+        if i >= nfiles { break }
+        let file = Vec_String.at(files, i)
+        if !sel.contains_file(exempt, file) {
+            let cost = mz.file_interface_cost(tree, dir_idx, file, cfg, allocator)?
+            if cost > ceiling {
+                let idxs = sel.file_fn_idxs(tree, dir_idx, file, allocator)?
+                let seam = cc.classify_call_graph(tree.functions, idxs, allocator)?
+                if seam.has_seam {
+                    let cluster = last_cluster_names(seam.components, allocator)?
+                    Vec_FatFile.push(mutable fats, bmodel.FatFile {
+                        file: string.clone(file, allocator)?,
+                        tokens: cost,
+                        cluster: cluster,
+                        dispatcher: seam.dispatcher
+                    }, allocator)?
+                }
+            }
+        }
+        i += 1
+    }
+
+    let ne_idxs = sel.nonexempt_fn_idxs(tree, dir_idx, exempt, allocator)?
+    let comps = cc.dir_file_components(tree.functions, ne_idxs, allocator)?
+    let groups = to_file_groups(comps, allocator)?
+
+    if Vec_FileGroup.len(groups) >= 2 as usize || Vec_FatFile.len(fats) > 0 as usize {
+        return Option_Directive.some(value: bmodel.Directive.wide_split(bmodel.WideSplit { groups: groups, fat_files: fats }))
+    }
+
+    var j: usize = 0
+    loop decreases (nfiles - j) {
+        if j >= nfiles { break }
+        let file = Vec_String.at(files, j)
+        if !sel.contains_file(exempt, file) {
+            let idxs = sel.file_fn_idxs(tree, dir_idx, file, allocator)?
+            let seam = cc.classify_call_graph(tree.functions, idxs, allocator)?
+            if seam.has_seam {
+                let cluster = last_cluster_names(seam.components, allocator)?
+                return Option_Directive.some(value: bmodel.Directive.partition(bmodel.Partition {
+                    file: string.clone(file, allocator)?,
+                    cluster: cluster,
+                    dispatcher: seam.dispatcher
+                }))
+            }
+        }
+        j += 1
+    }
+    return Option_Directive.none()
+}

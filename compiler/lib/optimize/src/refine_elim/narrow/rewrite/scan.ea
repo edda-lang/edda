@@ -1,0 +1,155 @@
+
+module optimize.refine_elim.narrow.rewrite.scan
+
+import std.collections.vec
+import std.mem.alloc as alloc
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.term as mir_term_mod
+import mir.place as mir_place_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.id.local as mir_local_mod
+
+import local.refine_elim.narrow.util.util as util_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+
+spec std.core.option.Option(Vec_Projection)
+
+
+public function compute_blocked(
+    body: mir_body_mod.MirBody,
+    n: usize,
+    allocator: Allocator,
+) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    var blocked = util_mod.new_bools(n, allocator)?
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases (nb - b) {
+        if b >= nb { break }
+        let bb = Vec_BasicBlock.at(body.blocks, b)
+        let ns = Vec_Statement.len(bb.statements)
+        var s: usize = 0
+        loop decreases (ns - s) {
+            if s >= ns { break }
+            let st = Vec_Statement.at(bb.statements, s)
+            block_stmt(mutable blocked, st.kind)
+            s = s + 1
+        }
+        block_term(mutable blocked, bb.terminator.kind)
+        b = b + 1
+    }
+    return blocked
+}
+
+
+function block_stmt(blocked: mutable Vec_bool.Vec, kind: mir_stmt_mod.MStmtKind) -> () {
+    match kind {
+        case .assign(let dest, let value) => {
+            block_place(mutable blocked, dest)
+            block_rvalue(mutable blocked, value)
+        }
+        case _ => {}
+    }
+}
+
+
+function block_rvalue(blocked: mutable Vec_bool.Vec, value: mir_rvalue_mod.Rvalue) -> () {
+    match value {
+        case .use_(let op) => block_operand(mutable blocked, op)
+        case .binary(_, let lhs, let rhs) => {
+            block_operand(mutable blocked, lhs)
+            block_operand(mutable blocked, rhs)
+        }
+        case .unary(_, let operand) => block_operand(mutable blocked, operand)
+        case .cast(let operand, _, _, _) => block_operand(mutable blocked, operand)
+        case .aggregate(_, let elems, _) => block_operands(mutable blocked, elems)
+        case .make_closure(_, let env) => block_operand(mutable blocked, env)
+        case .ref_(_, let place) => block_place(mutable blocked, place)
+        case .len(let place) => block_place(mutable blocked, place)
+        case .discriminant(let place) => block_place(mutable blocked, place)
+    }
+}
+
+
+function block_operands(blocked: mutable Vec_bool.Vec, elems: Vec_Operand.Vec) -> () {
+    let n = Vec_Operand.len(elems)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        block_operand(mutable blocked, Vec_Operand.at(elems, i))
+        i = i + 1
+    }
+}
+
+
+function block_operand(blocked: mutable Vec_bool.Vec, op: mir_rvalue_mod.Operand) -> () {
+    match op {
+        case .copy_(let place, _) => block_place(mutable blocked, place)
+        case .move_(let place, _) => block_place(mutable blocked, place)
+        case .constant(_) => {}
+    }
+}
+
+
+function block_place(blocked: mutable Vec_bool.Vec, p: mir_place_mod.Place) -> () {
+    match p.projection {
+        case .some(let projs) => {
+            let n = Vec_Projection.len(projs)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                block_projection(mutable blocked, Vec_Projection.at(projs, i).kind)
+                i = i + 1
+            }
+        }
+        case .none => {}
+    }
+}
+
+
+function block_projection(blocked: mutable Vec_bool.Vec, kind: mir_place_mod.ProjectionKind) -> () {
+    match kind {
+        case .index(let idx_local, _) =>
+            util_mod.mark_if(mutable blocked, mir_local_mod.index(idx_local) as i64)
+        case .slice_subrange(let lo_local, let hi_local, _) => {
+            util_mod.mark_if(mutable blocked, mir_local_mod.index(lo_local) as i64)
+            util_mod.mark_if(mutable blocked, mir_local_mod.index(hi_local) as i64)
+        }
+        case _ => {}
+    }
+}
+
+
+function block_term(blocked: mutable Vec_bool.Vec, kind: mir_term_mod.TermKind) -> () {
+    match kind {
+        case .branch(let cond, _, _) => block_operand(mutable blocked, cond)
+        case .switch_(let discr, _) => block_operand(mutable blocked, discr)
+        case .raise_(let value, _) => block_operand(mutable blocked, value)
+        case .panic_(let message) => block_operand(mutable blocked, message)
+        case .call_(let callee, let args, let dest, _, _) => {
+            block_operand(mutable blocked, callee)
+            block_operands(mutable blocked, args)
+            block_place(mutable blocked, dest)
+        }
+        case .spawn_(_, let args, _, let handle_dest, _, _) => {
+            block_operands(mutable blocked, args)
+            block_place(mutable blocked, handle_dest)
+        }
+        case .await_(let handle, let dest, _, _) => {
+            block_operand(mutable blocked, handle)
+            block_place(mutable blocked, dest)
+        }
+        case .drop_(let place, _, _) => block_place(mutable blocked, place)
+        case _ => {}
+    }
+}

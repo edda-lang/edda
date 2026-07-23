@@ -1,0 +1,96 @@
+
+module structmap.lib
+
+import std.mem.alloc
+import std.collections.vec
+import source.map as source_map_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import local.data.model as model
+import local.render.doc.emit as emit_mod
+import local.walk.core.file as walk_mod
+import local.walk.count.subcounts as subcounts_mod
+import local.analyze.analyze as analyze_mod
+import local.analyze.metric.shape.cluster as cluster_mod
+import local.analyze.metric.shape.density as density_mod
+import local.budget.model as bmodel
+import local.budget.gate.analyze.analyze as budget_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(density_mod.DensityReport)
+spec std.collections.vec.Vec(cluster_mod.ClusterReport)
+
+
+public type EmitInput {
+    project_name: String
+    package_root: String
+    compiler_version: String
+    descendant_tree: bool
+}
+
+public type EmitOutput {
+    files: emit_mod.RenderedFiles
+    descendant_bodies: emit_mod.RenderedFiles
+    density_reports: Vec_DensityReport.Vec
+    cluster_reports: Vec_ClusterReport.Vec
+    budget: bmodel.BudgetReport
+    summary: model.PackageSummary
+}
+
+
+public function emit(
+    input: EmitInput,
+    hir_files: [hir_file_mod.HirFile],
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> EmitOutput
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit tree: model.Tree
+    model.new_tree(init tree, allocator)?
+    walk_mod.build_tree(
+        mutable tree,
+        input.package_root,
+        hir_files,
+        interner,
+        source_map,
+        type_outputs,
+        effect_interner,
+        allocator,
+    )?
+    analyze_mod.compute_effect_cones(mutable tree, allocator)?
+    uninit cluster_reports: Vec_ClusterReport.Vec
+    Vec_ClusterReport.new(init cluster_reports, allocator)?
+    cluster_mod.analyze_clusters(tree, mutable cluster_reports, allocator)?
+    uninit rendered: emit_mod.RenderedFiles
+    emit_mod.new_rendered(init rendered, allocator)?
+    emit_mod.render(
+        input.project_name,
+        input.compiler_version,
+        input.descendant_tree,
+        input.package_root,
+        tree,
+        mutable rendered,
+        allocator,
+    )?
+    uninit density_reports: Vec_DensityReport.Vec
+    Vec_DensityReport.new(init density_reports, allocator)?
+    density_mod.compute_density(tree, rendered, mutable density_reports, allocator)?
+    let budget = budget_mod.analyze_budget(tree, rendered, bmodel.locked_defaults(), input.package_root, allocator)?
+    let summary = subcounts_mod.package_summary(tree, allocator)?
+    let descendant_bodies = emit_mod.render_bodies(tree, allocator)?
+    return EmitOutput {
+        files: rendered,
+        descendant_bodies: descendant_bodies,
+        density_reports: density_reports,
+        cluster_reports: cluster_reports,
+        budget: budget,
+        summary: summary,
+    }
+}

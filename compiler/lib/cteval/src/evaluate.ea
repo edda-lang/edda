@@ -1,0 +1,272 @@
+
+module cteval.evaluate
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import span.loc.pos.span as span_mod
+import hir.tree as hir_tree
+import hir.item as hir_item_mod
+import hir.build.file as hir_file_mod
+import syntax.ast.item as ast_item_mod
+import hir.node as node_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import types.ty.interner as ty_interner_mod
+import local.state.env as env_mod
+import local.res.output as output_mod
+import local.state.value as value_mod
+import cteval.eval.ops.expr as expr_mod
+import cteval.eval.ctx as ctx_mod
+import cteval.body as body_mod
+import cteval.builtin.target.reg.registry as registry_mod
+import target.triple as triple_mod
+import intern.interner as symbol_interner_mod
+
+
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.mem.alloc.Box(hir_item_mod.HFnSignature)
+spec std.core.option.Option(span_mod.Span)
+spec std.core.option.Option(Vec_HirFile)
+
+
+public function evaluate_file(
+    file: hir_file_mod.HirFile,
+    files: Vec_HirFile.Vec,
+    type_output: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    symbol_interner: mutable symbol_interner_mod.Interner,
+    allocator: Allocator,
+) -> output_mod.ComptimeOutput
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    uninit env: env_mod.ComptimeEnv
+    env_mod.new_env(init env, allocator)?
+    uninit out: output_mod.ComptimeOutput
+    output_mod.new(init out, allocator)?
+    let ctx = ctx_mod.EvalCtx {
+        file: file,
+        type_output: type_output,
+        ty_interner: ty_interner,
+        effect_interner: effect_interner,
+        builtin_registry: builtin_registry,
+        triple: triple,
+        program_files: Option_Vec_HirFile.some(value: files),
+    }
+    walk_items(file.items, mutable env, ctx, mutable symbol_interner, mutable out, allocator)?
+    return out
+}
+
+
+public function evaluate_file_bodies(
+    file: hir_file_mod.HirFile,
+    files: Vec_HirFile.Vec,
+    type_output: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    symbol_interner: mutable symbol_interner_mod.Interner,
+    skip_templates: bool,
+    allocator: Allocator,
+) -> output_mod.ComptimeOutput
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    uninit env: env_mod.ComptimeEnv
+    env_mod.new_env(init env, allocator)?
+    uninit out: output_mod.ComptimeOutput
+    output_mod.new(init out, allocator)?
+    let ctx = ctx_mod.EvalCtx {
+        file: file,
+        type_output: type_output,
+        ty_interner: ty_interner,
+        effect_interner: effect_interner,
+        builtin_registry: builtin_registry,
+        triple: triple,
+        program_files: Option_Vec_HirFile.some(value: files),
+    }
+    walk_item_bodies(file.items, mutable env, ctx, mutable symbol_interner, mutable out, skip_templates, allocator)?
+    return out
+}
+
+
+function walk_item_bodies(
+    items: Vec_HItem.Vec,
+    env: mutable env_mod.ComptimeEnv,
+    ctx: ctx_mod.EvalCtx,
+    sym_interner: mutable symbol_interner_mod.Interner,
+    out: mutable output_mod.ComptimeOutput,
+    skip_templates: bool,
+    allocator: Allocator,
+) -> ()
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .function_(let sig_box, let body) => {
+                if item.has_comptime && !(skip_templates && declares_generics(sig_box)) {
+                    body_mod.walk_body(body, mutable env, ctx, mutable sym_interner, mutable out, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+function declares_generics(sig_box: Box_HFnSignature.Box) -> bool {
+    let sig = Box_HFnSignature.get(sig_box)
+    return Vec_GenericParam.len(sig.outbound_generics) > 0
+        || Vec_GenericParam.len(sig.generics) > 0
+}
+
+
+function walk_items(
+    items: Vec_HItem.Vec,
+    env: mutable env_mod.ComptimeEnv,
+    ctx: ctx_mod.EvalCtx,
+    sym_interner: mutable symbol_interner_mod.Interner,
+    out: mutable output_mod.ComptimeOutput,
+    allocator: Allocator,
+) -> ()
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let item = Vec_HItem.at(items, i)
+        walk_item(item, mutable env, ctx, mutable sym_interner, mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function walk_item(
+    item: hir_item_mod.HItem,
+    env: mutable env_mod.ComptimeEnv,
+    ctx: ctx_mod.EvalCtx,
+    sym_interner: mutable symbol_interner_mod.Interner,
+    out: mutable output_mod.ComptimeOutput,
+    allocator: Allocator,
+) -> ()
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    match item.kind {
+        case .spec_invocation(_, let args) =>
+            evaluate_spec_args(item.node_id, args, mutable env, ctx, mutable sym_interner, mutable out, allocator)?
+        case .let_decl(_, _, let init_) =>
+            evaluate_top_expr(init_, mutable env, ctx, mutable sym_interner, mutable out, allocator)?
+        case .spec_decl(_, _) => ()
+        case .function_(_, _) => ()
+        case .function_extern(_, _, _, _) => ()
+        case .type_decl(_) => ()
+        case .import_decl => ()
+        case .module_decl => ()
+        case .derive_decl(_, _) => ()
+    }
+}
+
+
+function evaluate_spec_args(
+    parent_node_id: node_mod.NodeId,
+    args: Vec_HExpr.Vec,
+    env: mutable env_mod.ComptimeEnv,
+    ctx: ctx_mod.EvalCtx,
+    sym_interner: mutable symbol_interner_mod.Interner,
+    out: mutable output_mod.ComptimeOutput,
+    allocator: Allocator,
+) -> ()
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    uninit values: Vec_ComptimeValue.Vec
+    Vec_ComptimeValue.new(init values, allocator)?
+    let n = Vec_HExpr.len(args)
+    var i: usize = 0
+    var ok_so_far: bool = true
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_HExpr.at(args, i)
+        let arg_span = span_for_form(ctx.file, arg)
+        let eval_result = expr_mod.evaluate_expr(arg, mutable env, ctx, mutable sym_interner, allocator, arg_span)?
+        match eval_result {
+            case .ok(let v) => {
+                Vec_ComptimeValue.push(mutable values, take v, allocator)?
+                if out.evaluated < 4294967295 {
+                    output_mod.record_evaluated(mutable out)
+                }
+            }
+            case .failed(let e) => {
+                output_mod.push_failure(mutable out, take e, allocator)?
+                ok_so_far = false
+            }
+        }
+        i = i + 1
+    }
+    if ok_so_far {
+        output_mod.record_spec_invocation_args(mutable out, parent_node_id, take values, allocator)?
+    }
+}
+
+
+function span_for_form(file: hir_file_mod.HirFile, e: hir_tree.HExpr) -> span_mod.Span {
+    return match hir_file_mod.span_of_opt(file, e.node_id) {
+        case .some(let s) => s
+        case .none => span_mod.dummy()
+    }
+}
+
+function evaluate_top_expr(
+    e: hir_tree.HExpr,
+    env: mutable env_mod.ComptimeEnv,
+    ctx: ctx_mod.EvalCtx,
+    sym_interner: mutable symbol_interner_mod.Interner,
+    out: mutable output_mod.ComptimeOutput,
+    allocator: Allocator,
+) -> ()
+    with {divergence, allocator, err: alloc.AllocError}
+{
+    let at = span_for_form(ctx.file, e)
+    let eval_result = expr_mod.evaluate_expr(e, mutable env, ctx, mutable sym_interner, allocator, at)?
+    record_result(eval_result, mutable out, allocator)?
+}
+
+function record_result(
+    eval_result: expr_mod.EvalResult,
+    out: mutable output_mod.ComptimeOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match eval_result {
+        case .ok(_) => {
+            if out.evaluated < 4294967295 {
+                output_mod.record_evaluated(mutable out)
+            }
+        }
+        case .failed(let e) =>
+            output_mod.push_failure(mutable out, take e, allocator)?
+    }
+}

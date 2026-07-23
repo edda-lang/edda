@@ -1,0 +1,242 @@
+module structmap.budget.cohesion.spoke.spoke
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string as string
+import local.budget.cohesion.graph.graph as cg
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(cg.IdxComponent)
+spec std.collections.vec.Vec(NameCluster)
+spec std.core.option.Option(String)
+
+
+public type NameCluster {
+    names: Vec_String.Vec
+}
+
+public type Seam {
+    has_seam: bool
+    components: Vec_NameCluster.Vec
+    dispatcher: Option_String.Option
+}
+
+public type DispatchPick {
+    found: bool
+    node: usize
+    clusters: Vec_IdxComponent.Vec
+}
+
+
+public function total_members(clusters: Vec_IdxComponent.Vec) -> usize {
+    let n = Vec_IdxComponent.len(clusters)
+    var i: usize = 0
+    var sum: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        sum = sum + Vec_usize.len(Vec_IdxComponent.at(clusters, i).members)
+        i = i + 1
+    }
+    return sum
+}
+
+public function spoke_clusters(g: cg.Graph, n: usize, dispatcher: usize, allocator: Allocator) -> Vec_IdxComponent.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let callees = cg.direct_callees(g, dispatcher, allocator)?
+    let nc = Vec_usize.len(callees)
+
+    var spoke_count = cg.zeroed_usizes(n, allocator)?
+    var ci: usize = 0
+    loop decreases (nc - ci) {
+        if ci >= nc { break }
+        let c = Vec_usize.at(callees, ci)
+        var visited = cg.zeroed_bools(n, allocator)?
+        cg.directed_reach_excluding(g, c, dispatcher, mutable visited, allocator)?
+        var node: usize = 0
+        loop decreases (n - node) {
+            if node >= n { break }
+            if Vec_bool.at(visited, node) && node != dispatcher {
+                let cur = Vec_usize.at(spoke_count, node)
+                Vec_usize.set_at(mutable spoke_count, node, cur + 1)
+            }
+            node = node + 1
+        }
+        ci = ci + 1
+    }
+
+    uninit out: Vec_IdxComponent.Vec
+    Vec_IdxComponent.new(init out, allocator)?
+    var cj: usize = 0
+    loop decreases (nc - cj) {
+        if cj >= nc { break }
+        let c = Vec_usize.at(callees, cj)
+        var visited2 = cg.zeroed_bools(n, allocator)?
+        cg.directed_reach_excluding(g, c, dispatcher, mutable visited2, allocator)?
+        uninit cluster: Vec_usize.Vec
+        Vec_usize.new(init cluster, allocator)?
+        var node2: usize = 0
+        loop decreases (n - node2) {
+            if node2 >= n { break }
+            if Vec_bool.at(visited2, node2) && node2 != dispatcher && Vec_usize.at(spoke_count, node2) == 1 as usize {
+                Vec_usize.push(mutable cluster, node2, allocator)?
+            }
+            node2 = node2 + 1
+        }
+        if Vec_usize.len(cluster) >= cg.min_residual_component_size() {
+            Vec_IdxComponent.push(mutable out, cg.IdxComponent { members: cluster }, allocator)?
+        }
+        cj = cj + 1
+    }
+    return out
+}
+
+public function find_dispatcher(g: cg.Graph, n: usize, allocator: Allocator) -> DispatchPick
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var best_found = false
+    var best_node: usize = 0
+    var best_qualifying: usize = 0
+    var best_total: usize = 0
+    uninit best_clusters: Vec_IdxComponent.Vec
+    Vec_IdxComponent.new(init best_clusters, allocator)?
+    var c: usize = 0
+    loop decreases (n - c) {
+        if c >= n { break }
+        if cg.out_degree(g, c) >= cg.min_component_count() {
+            let clusters = spoke_clusters(g, n, c, allocator)?
+            let qualifying = Vec_IdxComponent.len(clusters)
+            let total = total_members(clusters)
+            if qualifying >= cg.min_component_count() && total >= cg.min_total_cluster_coverage() {
+                let better = if !best_found {
+                    true
+                } else if qualifying > best_qualifying {
+                    true
+                } else if qualifying == best_qualifying && total > best_total {
+                    true
+                } else if qualifying == best_qualifying && total == best_total {
+                    string_less(Vec_String.at(g.names, c), Vec_String.at(g.names, best_node))
+                } else {
+                    false
+                }
+                if better {
+                    best_found = true
+                    best_node = c
+                    best_qualifying = qualifying
+                    best_total = total
+                    best_clusters = clusters
+                }
+            }
+        }
+        c = c + 1
+    }
+    return DispatchPick { found: best_found, node: best_node, clusters: best_clusters }
+}
+
+
+public function string_less(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    let m: usize = if an < bn { an } else { bn }
+    var i: usize = 0
+    loop decreases (m - i) {
+        if i >= m { break }
+        if ab[i] != bb[i] { return ab[i] < bb[i] }
+        i = i + 1
+    }
+    return an < bn
+}
+
+function sort_strings(v: mutable Vec_String.Vec) -> () {
+    let n = Vec_String.len(v)
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        var j: usize = i
+        loop decreases j {
+            if j == 0 as usize { break }
+            let cur = Vec_String.at(v, j)
+            let prev = Vec_String.at(v, j - 1)
+            if string_less(cur, prev) {
+                Vec_String.set_at(mutable v, j, prev)
+                Vec_String.set_at(mutable v, j - 1, cur)
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        i = i + 1
+    }
+}
+
+function cluster_before(a: NameCluster, b: NameCluster) -> bool {
+    let an = Vec_String.len(a.names)
+    let bn = Vec_String.len(b.names)
+    if an != bn { return an > bn }
+    if an == 0 as usize { return false }
+    return string_less(Vec_String.at(a.names, 0 as usize), Vec_String.at(b.names, 0 as usize))
+}
+
+function sort_clusters(v: mutable Vec_NameCluster.Vec) -> () {
+    let n = Vec_NameCluster.len(v)
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        var j: usize = i
+        loop decreases j {
+            if j == 0 as usize { break }
+            let cur = Vec_NameCluster.at(v, j)
+            let prev = Vec_NameCluster.at(v, j - 1)
+            if cluster_before(cur, prev) {
+                Vec_NameCluster.set_at(mutable v, j, prev)
+                Vec_NameCluster.set_at(mutable v, j - 1, cur)
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        i = i + 1
+    }
+}
+
+public function names_for_components(names: Vec_String.Vec, comps: Vec_IdxComponent.Vec, allocator: Allocator) -> Vec_NameCluster.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_NameCluster.Vec
+    Vec_NameCluster.new(init out, allocator)?
+    let nc = Vec_IdxComponent.len(comps)
+    var i: usize = 0
+    loop decreases (nc - i) {
+        if i >= nc { break }
+        let members = Vec_IdxComponent.at(comps, i).members
+        uninit cnames: Vec_String.Vec
+        Vec_String.new(init cnames, allocator)?
+        let mn = Vec_usize.len(members)
+        var k: usize = 0
+        loop decreases (mn - k) {
+            if k >= mn { break }
+            let idx = Vec_usize.at(members, k)
+            Vec_String.push(mutable cnames, string.clone(Vec_String.at(names, idx), allocator)?, allocator)?
+            k = k + 1
+        }
+        sort_strings(mutable cnames)
+        Vec_NameCluster.push(mutable out, NameCluster { names: cnames }, allocator)?
+        i = i + 1
+    }
+    sort_clusters(mutable out)
+    return out
+}
+
+public function empty_seam(allocator: Allocator) -> Seam
+    with {allocator, err: alloc.AllocError}
+{
+    uninit comps: Vec_NameCluster.Vec
+    Vec_NameCluster.new(init comps, allocator)?
+    return Seam { has_seam: false, components: comps, dispatcher: Option_String.none() }
+}

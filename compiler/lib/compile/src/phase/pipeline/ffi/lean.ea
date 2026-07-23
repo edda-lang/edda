@@ -1,0 +1,105 @@
+
+module compile.phase.pipeline.ffi.lean
+
+import std.mem.alloc
+import std.collections.vec
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+import diagnostics.emit.collection as diags_mod
+import local.phase.pipeline.ffi.consistency as consistency_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_file_mod.HirFileDecl)
+spec std.collections.vec.Vec(hir_item_mod.HDeclItem)
+spec std.collections.vec.Vec(consistency_mod.ExternDecl)
+
+
+public function check_extern_consistency_lean(
+    hir_files: Vec_HirFile.Vec,
+    dep_files: Vec_HirFileDecl.Vec,
+    decl_only_files: Vec_HirFileDecl.Vec,
+    decls: types_check_mod.DeclTables,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit seen: Vec_ExternDecl.Vec
+    Vec_ExternDecl.new(init seen, allocator)?
+    consistency_mod.collect_externs(hir_files, mutable seen, allocator)?
+    collect_externs_decl(dep_files, mutable seen, allocator)?
+    collect_externs_decl(decl_only_files, mutable seen, allocator)?
+    consistency_mod.report_conflicts(seen, decls, interner, ty_interner, mutable diags, allocator)?
+}
+
+
+public function check_extern_consistency_lean_context(
+    hir_files: Vec_HirFile.Vec,
+    dep_files: Vec_HirFile.Vec,
+    decl_only_files: Vec_HirFileDecl.Vec,
+    decls: types_check_mod.DeclTables,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit seen: Vec_ExternDecl.Vec
+    Vec_ExternDecl.new(init seen, allocator)?
+    consistency_mod.collect_externs(hir_files, mutable seen, allocator)?
+    consistency_mod.collect_externs(dep_files, mutable seen, allocator)?
+    collect_externs_decl(decl_only_files, mutable seen, allocator)?
+    consistency_mod.report_conflicts(seen, decls, interner, ty_interner, mutable diags, allocator)?
+}
+
+
+function collect_externs_decl(
+    files: Vec_HirFileDecl.Vec,
+    seen: mutable Vec_ExternDecl.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFileDecl.len(files)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = Vec_HirFileDecl.at(files, i)
+        collect_file_externs_decl(f.items, mutable seen, allocator)?
+        i += 1
+    }
+}
+
+
+function collect_file_externs_decl(
+    items: Vec_HDeclItem.Vec,
+    seen: mutable Vec_ExternDecl.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HDeclItem.len(items)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        let item = Vec_HDeclItem.at(items, j)
+        match item.kind {
+            case .function_extern(_, let name, let sp, let dll) => {
+                if !symbol_mod.is_empty(name) && !consistency_mod.contains_def(seen, item.def_id) {
+                    let d = consistency_mod.ExternDecl { name: name, def_id: item.def_id, extern_span: sp, dll: dll }
+                    Vec_ExternDecl.push(mutable seen, take d, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        j += 1
+    }
+}

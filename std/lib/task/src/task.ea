@@ -1,0 +1,150 @@
+
+module std.task
+
+import std.mem.alloc
+import std.core.outcome
+
+spec std.mem.alloc.Array(PendingSlot)
+
+public type Token {
+    raw: u32
+}
+
+public type PendingSlot {
+    token: u32
+    state: u32
+    status: u32
+    res_ptr: i32
+    res_len: i32
+    frame_ptr: i32
+    frame_len: i32
+}
+
+public type WasmReactor {
+    slots: [PendingSlot]
+}
+
+
+public spec Task(comptime T: Type) {
+
+    public linear type Task {
+        raw: i32
+    }
+
+
+    public function detach(t: take Task) -> ()
+    extern "__edda_task_detach"
+
+    public function cancel(t: mutable Task) -> ()
+    extern "__edda_task_cancel"
+
+    public function cancel_and_await(t: take Task) -> () with {cancellation}
+    extern "__edda_task_cancel_and_await"
+}
+
+
+@target_requires(Window)
+public function reactor_store(ptr: i32, len: i32) -> ()
+    extern "__edda_reactor_store"
+
+@target_requires(Window)
+public function reactor_load_ptr() -> i32
+    extern "__edda_reactor_load_ptr"
+
+@target_requires(Window)
+public function reactor_load_len() -> i32
+    extern "__edda_reactor_load_len"
+
+@target_requires(Window)
+function slots_addr(buf: [PendingSlot]) -> u64
+    extern "__edda_slice_addr"
+
+
+@target_requires(Window)
+public function of(ex: Executor, allocator: Allocator) -> WasmReactor
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = ex
+    let cap: usize = 256
+    var table: [PendingSlot] = Array_PendingSlot.alloc(allocator, cap)?
+    var i: usize = 0
+    loop decreases (cap - i) {
+        if i >= table.len() { break }
+        table[i] = PendingSlot { token: 0, state: 0, status: 0, res_ptr: 0, res_len: 0, frame_ptr: 0, frame_len: 0 }
+        i = i + 1
+    }
+    let base: u64 = slots_addr(table)
+    reactor_store(base as i32 wrapping, table.len() as i32 wrapping)
+    return WasmReactor { slots: table }
+}
+
+
+@target_requires(Window)
+public function wake(r: mutable WasmReactor, token: u32, status: u32, res_ptr: i32, res_len: i32) -> () {
+    let cap = r.slots.len()
+    if cap == 0 { return () }
+    let idx = probe_index(r, token)
+    if idx >= cap { return () }
+    var s = r.slots[idx]
+    if s.state == 0 { return () }
+    s.status = status
+    s.res_ptr = res_ptr
+    s.res_len = res_len
+    s.state = 2
+    r.slots[idx] = s
+    return ()
+}
+
+
+@target_requires(Window)
+public function dispatch_event(r: mutable WasmReactor, cb_id: u32, payload_ptr: i32, payload_len: i32) -> () {
+    let _ = r
+    let _ = cb_id
+    let _ = payload_ptr
+    let _ = payload_len
+    return ()
+}
+
+
+function probe_index(r: WasmReactor, token: u32) -> usize {
+    let cap = r.slots.len()
+    if cap == 0 { return 0 }
+    let start = (token as usize) % cap
+    var off: usize = 0
+    loop decreases (cap - off) {
+        if off >= cap { break }
+        let idx = (start + off) % cap
+        let s = r.slots[idx]
+        if s.state == 0 { return idx }
+        if s.token == token { return idx }
+        off = off + 1
+    }
+    return cap
+}
+
+
+public spec Adapt(comptime T: Type, comptime E: Type) {
+
+    spec std.core.outcome.Outcome(T, E)
+    spec std.task.Task(Outcome_T_E)
+
+    @target_requires(Window)
+    public function from_token(r: mutable WasmReactor, t: take Token) -> Task_Outcome_T_E
+        with {r}
+    {
+        let cap = r.slots.len()
+        let idx = probe_index(r, t.raw)
+        if idx < cap {
+            var s = r.slots[idx]
+            s.token = t.raw
+            s.state = 1
+            s.status = 0
+            s.res_ptr = 0
+            s.res_len = 0
+            s.frame_ptr = 0
+            s.frame_len = 0
+            r.slots[idx] = s
+        }
+        return Task_Outcome_T_E.Task { raw: t.raw as i32 wrapping }
+    }
+}

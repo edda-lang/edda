@@ -1,0 +1,783 @@
+
+module resolve.bind.lookup.env.walk.uses
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol
+import intern.interner as interner_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import hir.def as def_mod
+import local.ctx as ctx_mod
+import local.cteval.builtins as cbi_mod
+import local.bind.lookup.env.scopes.stack as scope_mod
+import local.bind.binders as binders_mod
+import local.paths.imports as imports_mod
+import local.bind.lookup.lookup as lookup_mod
+import local.map.error as error_mod
+import local.paths.path as path_mod
+
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.mem.alloc.Box(ast_tree.Pat)
+spec std.mem.alloc.Box(ast_item.FnDecl)
+spec std.mem.alloc.Box(ast_item.LetDecl)
+spec std.mem.alloc.Box(ast_item.Spec)
+spec std.mem.alloc.Box(ast_item.SpecInvocation)
+spec std.mem.alloc.Box(ast_tree.Closure)
+spec std.mem.alloc.Box(ast_tree.SpawnExpr)
+
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_tree.SpawnArg)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(ast_tree.Param)
+spec std.collections.vec.Vec(ast_item.GenericParam)
+spec std.collections.vec.Vec(ast_tree.Stmt)
+spec std.collections.vec.Vec(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_tree.CallArg)
+spec std.collections.vec.Vec(ast_tree.MatchArm)
+spec std.collections.vec.Vec(ast_tree.StructLitField)
+spec std.collections.vec.Vec(ast_tree.FStringSeg)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(ast_tree.Capture)
+spec std.collections.vec.Vec(def_mod.DefId)
+
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(ast_tree.Expr)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.core.option.Option(Vec_Capture)
+
+
+public function walk_uses(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit stack: scope_mod.ScopeStack
+    scope_mod.new_stack(init stack, allocator)?
+    ctx_mod.set_track_edges(mutable ctx, true)
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        walk_file_uses(mutable ctx, mutable stack, f, interner, allocator)?
+        i = i + 1
+    }
+    ctx_mod.set_track_edges(mutable ctx, false)
+}
+
+
+function walk_file_uses(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, file: ast_file.File, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let mp = lookup_mod.module_path_of(file.items, allocator)?
+    let root_ns = lookup_mod.first_sym(mp)
+    let std_file = imports_mod.is_std_root(root_ns, interner)
+    ctx_mod.set_quiet(mutable ctx, std_file)
+    let mod_id = ctx_mod.module_id_of(ctx, mp)
+    let imports = imports_mod.build(file.items, mp, ctx_mod.module_tree(ctx), interner, allocator)?
+    ctx_mod.enter_file(mutable ctx, mod_id, take mp, take imports)
+    walk_items(mutable ctx, mutable stack, file.items, interner, allocator)?
+}
+
+
+function walk_items(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, items: Vec_Item.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_item(mutable ctx, mutable stack, Vec_Item.at(items, i), interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_item(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, item: ast_item.Item, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    ctx_mod.clear_current_def(mutable ctx)
+    match item.kind {
+        case .function_(let decl) => walk_fn(mutable ctx, mutable stack, Box_FnDecl.get(decl), interner, allocator)?
+        case .let_(let decl) => walk_expr(mutable ctx, mutable stack, Box_LetDecl.get(decl).init_, interner, allocator)?
+        case .spec_(let decl) => walk_spec(mutable ctx, mutable stack, Box_Spec.get(decl), interner, allocator)?
+        case .spec_invocation(let inv) => walk_exprs(mutable ctx, mutable stack, Box_SpecInvocation.get(inv).args, interner, allocator)?
+        case _ => ()
+    }
+}
+
+
+function walk_fn(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, d: ast_item.FnDecl, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let own_def = ctx_mod.lookup_in_module(ctx, ctx_mod.current_module(ctx), d.name.name)
+    let before = ctx_mod.use_count_of(ctx, own_def)
+    ctx_mod.set_current_def(mutable ctx, own_def)
+    let m = scope_mod.mark(stack)
+    define_generics(mutable ctx, mutable stack, d.outbound_generics, allocator)?
+    define_generics(mutable ctx, mutable stack, d.generics, allocator)?
+    define_params(mutable ctx, mutable stack, d.params, allocator)?
+    walk_refinements(mutable ctx, mutable stack, d.refinements, interner, allocator)?
+    match d.body {
+        case .block_(let body) => walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+        case .extern_(_, _, _, _) => ()
+    }
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+    let after = ctx_mod.use_count_of(ctx, own_def)
+    if after > before {
+        ctx_mod.add_self_uses(mutable ctx, own_def, after - before, allocator)?
+    }
+}
+
+
+function walk_spec(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, d: ast_item.Spec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let m = scope_mod.mark(stack)
+    define_generics(mutable ctx, mutable stack, d.generics, allocator)?
+    walk_refinements(mutable ctx, mutable stack, d.where_clauses, interner, allocator)?
+    ctx_mod.enter_spec(mutable ctx)
+    walk_items(mutable ctx, mutable stack, d.body, interner, allocator)?
+    ctx_mod.exit_spec(mutable ctx)
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+}
+
+
+function define_params(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, params: Vec_Param.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Param.len(params)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_Param.at(params, i)
+        binders_mod.define_one(mutable ctx, mutable stack, p.name, allocator)?
+        i = i + 1
+    }
+}
+
+
+function define_generics(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, generics: Vec_GenericParam.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_GenericParam.len(generics)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let g = Vec_GenericParam.at(generics, i)
+        binders_mod.define_one(mutable ctx, mutable stack, g.name, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_refinements(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, refs: Vec_RefinementClause.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_RefinementClause.len(refs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let c = Vec_RefinementClause.at(refs, i)
+        match c.kind {
+            case .ensures_ => {
+                let m = scope_mod.mark(stack)
+                binders_mod.define_one(mutable ctx, mutable stack, ast_ident.Ident { name: symbol.from_raw(symbol.result_raw()), span: c.span }, allocator)?
+                walk_expr(mutable ctx, mutable stack, c.pred, interner, allocator)?
+                scope_mod.truncate_to(mutable stack, m, allocator)?
+            }
+            case _ => walk_expr(mutable ctx, mutable stack, c.pred, interner, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function walk_block(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, b: ast_tree.Block, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let m = scope_mod.mark(stack)
+    walk_stmts(mutable ctx, mutable stack, b.stmts, interner, allocator)?
+    match b.trailing {
+        case .some(let boxed) => walk_box_expr(mutable ctx, mutable stack, boxed, interner, allocator)?
+        case .none => ()
+    }
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+}
+
+
+function walk_stmts(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, stmts: Vec_Stmt.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Stmt.len(stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_stmt(mutable ctx, mutable stack, Vec_Stmt.at(stmts, i), interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_stmt(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, s: ast_tree.Stmt, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match s.kind {
+        case .let_(_, let pat, _, let init_opt) => {
+            match init_opt {
+                case .some(let e) => walk_expr(mutable ctx, mutable stack, e, interner, allocator)?
+                case .none => ()
+            }
+            binders_mod.define_pat_bindings(mutable ctx, mutable stack, pat, interner, allocator)?
+        }
+        case .assign(let target, _, let rhs) => {
+            walk_expr(mutable ctx, mutable stack, target, interner, allocator)?
+            walk_expr(mutable ctx, mutable stack, rhs, interner, allocator)?
+        }
+        case .expr(let v) => walk_expr(mutable ctx, mutable stack, v, interner, allocator)?
+    }
+}
+
+
+function walk_expr(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, e: ast_tree.Expr, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match e.kind {
+        case .literal(_) => ()
+        case .fstring(let segs) => walk_fstring_segs(mutable ctx, mutable stack, segs, interner, allocator)?
+        case .path(let p) => resolve_value_path(mutable ctx, stack, p, interner, allocator)?
+        case .binary(_, let l, let r) => {
+            walk_box_expr(mutable ctx, mutable stack, l, interner, allocator)?
+            walk_box_expr(mutable ctx, mutable stack, r, interner, allocator)?
+        }
+        case .unary(_, let x) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .call(let callee, let args) => {
+            walk_box_expr(mutable ctx, mutable stack, callee, interner, allocator)?
+            walk_call_args(mutable ctx, mutable stack, callee, args, interner, allocator)?
+        }
+        case .method_call(let recv, _, let args) => {
+            walk_box_expr(mutable ctx, mutable stack, recv, interner, allocator)?
+            walk_args(mutable ctx, mutable stack, args, interner, allocator)?
+        }
+        case .field(let r, _) => walk_box_expr(mutable ctx, mutable stack, r, interner, allocator)?
+        case .tuple_index(let r, _) => walk_box_expr(mutable ctx, mutable stack, r, interner, allocator)?
+        case .positional(let pr, let pix) => {
+            walk_box_expr(mutable ctx, mutable stack, pr, interner, allocator)?
+            walk_box_expr(mutable ctx, mutable stack, pix, interner, allocator)?
+        }
+        case .index(let r, let ix) => {
+            walk_box_expr(mutable ctx, mutable stack, r, interner, allocator)?
+            walk_box_expr(mutable ctx, mutable stack, ix, interner, allocator)?
+        }
+        case .if_(let c, let then_blk, let else_opt) => {
+            walk_box_expr(mutable ctx, mutable stack, c, interner, allocator)?
+            walk_block(mutable ctx, mutable stack, then_blk, interner, allocator)?
+            walk_opt_box_expr(mutable ctx, mutable stack, else_opt, interner, allocator)?
+        }
+        case .match_(let scrut, let arms) => {
+            walk_box_expr(mutable ctx, mutable stack, scrut, interner, allocator)?
+            walk_arms(mutable ctx, mutable stack, arms, interner, allocator)?
+        }
+        case .block(let body) => walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+        case .cast(let x, _, _) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .range(let lo, let hi, _) => {
+            walk_opt_box_expr(mutable ctx, mutable stack, lo, interner, allocator)?
+            walk_opt_box_expr(mutable ctx, mutable stack, hi, interner, allocator)?
+        }
+        case .tuple(let elems) => walk_exprs(mutable ctx, mutable stack, elems, interner, allocator)?
+        case .struct_lit(let lit_path, let fields) => {
+            resolve_value_path(mutable ctx, stack, lit_path, interner, allocator)?
+            walk_struct_lit_fields(mutable ctx, mutable stack, fields, interner, allocator)?
+        }
+        case .loop_(let body, _, let dec) => {
+            walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+            walk_opt_box_expr(mutable ctx, mutable stack, dec, interner, allocator)?
+        }
+        case .for_(let pat_box, let iter, let body, _) => walk_for(mutable ctx, mutable stack, pat_box, iter, body, interner, allocator)?
+        case .try_(let x) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .await_(let x) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .raise_(let x) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .panic_(let x) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .return_(let v) => walk_opt_box_expr(mutable ctx, mutable stack, v, interner, allocator)?
+        case .break_(_, let v) => walk_opt_box_expr(mutable ctx, mutable stack, v, interner, allocator)?
+        case .continue_(_) => ()
+        case .comptime_(let x) => walk_box_expr(mutable ctx, mutable stack, x, interner, allocator)?
+        case .comptime_block(let body) => walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+        case .scope_(_, _, let body) => walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+        case .effect_row(_) => ()
+        case .handle_(_, _, let binder, let recovery, let body) => {
+            let m = scope_mod.mark(stack)
+            binders_mod.define_one(mutable ctx, mutable stack, binder, allocator)?
+            walk_box_expr(mutable ctx, mutable stack, recovery, interner, allocator)?
+            scope_mod.truncate_to(mutable stack, m, allocator)?
+            walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+        }
+        case .closure(let c) => walk_closure(mutable ctx, stack, Box_Closure.get(c), interner, allocator)?
+        case .spawn(let sp) => walk_spawn(mutable ctx, mutable stack, Box_SpawnExpr.get(sp), interner, allocator)?
+        case .forall_(let bound, let iter, let body) => walk_quant(mutable ctx, mutable stack, bound, iter, body, interner, allocator)?
+        case .exists_(let bound, let iter, let body) => walk_quant(mutable ctx, mutable stack, bound, iter, body, interner, allocator)?
+        case .error => ()
+    }
+}
+
+
+function walk_fstring_segs(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, segs: Vec_FStringSeg.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let count = Vec_FStringSeg.len(segs)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let seg = Vec_FStringSeg.at(segs, i)
+        match seg {
+            case .interp(let boxed) => walk_box_expr(mutable ctx, mutable stack, boxed, interner, allocator)?
+            case .text(_) => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function walk_for(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, pat_box: Box_Pat, iter: Box_Expr, body: ast_tree.Block, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_box_expr(mutable ctx, mutable stack, iter, interner, allocator)?
+    let m = scope_mod.mark(stack)
+    binders_mod.define_pat_bindings(mutable ctx, mutable stack, Box_Pat.get(pat_box), interner, allocator)?
+    walk_block(mutable ctx, mutable stack, body, interner, allocator)?
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+}
+
+
+function walk_spawn(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, sp: ast_tree.SpawnExpr, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_SpawnArg.len(sp.args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let init_e = Vec_SpawnArg.at(sp.args, i).init_
+        walk_expr(mutable ctx, mutable stack, init_e, interner, allocator)?
+        i = i + 1
+    }
+    let m = scope_mod.mark(stack)
+    var j: usize = 0
+    loop decreases (n - j) {
+        if j >= n { break }
+        binders_mod.define_one(mutable ctx, mutable stack, Vec_SpawnArg.at(sp.args, j).name, allocator)?
+        j = j + 1
+    }
+    walk_block(mutable ctx, mutable stack, sp.body, interner, allocator)?
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+}
+
+
+function walk_quant(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, bound: ast_ident.Ident, iter: Box_Expr, body: Box_Expr, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires ctx.next_def_id < 4294967295
+{
+    walk_box_expr(mutable ctx, mutable stack, iter, interner, allocator)?
+    let m = scope_mod.mark(stack)
+    binders_mod.define_one(mutable ctx, mutable stack, bound, allocator)?
+    walk_box_expr(mutable ctx, mutable stack, body, interner, allocator)?
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+}
+
+
+function walk_closure(ctx: mutable ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, c: ast_tree.Closure, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit cap_defs: Vec_DefId.Vec
+    Vec_DefId.new(init cap_defs, allocator)?
+    match c.captures_ {
+        case .some(let caps) => resolve_captures(mutable ctx, stack, caps, mutable cap_defs, interner, allocator)?
+        case .none => ()
+    }
+    uninit body_stack: scope_mod.ScopeStack
+    scope_mod.new_stack(init body_stack, allocator)?
+    define_params(mutable ctx, mutable body_stack, c.params, allocator)?
+    match c.captures_ {
+        case .some(let caps) => rebind_captures(mutable body_stack, caps, cap_defs, allocator)?
+        case .none => ()
+    }
+    walk_block(mutable ctx, mutable body_stack, c.body, interner, allocator)?
+}
+
+
+function resolve_captures(ctx: mutable ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, caps: Vec_Capture.Vec, cap_defs: mutable Vec_DefId.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Capture.len(caps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let cap = Vec_Capture.at(caps, i)
+        match scope_mod.lookup(stack, cap.name.name) {
+            case .some(let d) => {
+                ctx_mod.record_use(mutable ctx, cap.name.span, d, allocator)?
+                Vec_DefId.push(mutable cap_defs, d, allocator)?
+            }
+            case .none => {
+                emit_capture_unresolved(mutable ctx, cap.name, interner, allocator)?
+                Vec_DefId.push(mutable cap_defs, def_mod.error(), allocator)?
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function rebind_captures(stack: mutable scope_mod.ScopeStack, caps: Vec_Capture.Vec, cap_defs: Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Capture.len(caps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let cap = Vec_Capture.at(caps, i)
+        let d = if i < Vec_DefId.len(cap_defs) { Vec_DefId.at(cap_defs, i) } else { def_mod.error() }
+        scope_mod.define(mutable stack, cap.name.name, d, allocator)?
+        i = i + 1
+    }
+}
+
+
+function emit_capture_unresolved(ctx: mutable ctx_mod.ResolveCtx, id: ast_ident.Ident, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    Vec_Ident.push(mutable segs, id, allocator)?
+    let p = ast_ident.Path { span: id.span, segments: segs }
+    emit_unresolved(mutable ctx, p, interner, allocator)?
+}
+
+
+function walk_arms(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, arms: Vec_MatchArm.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_MatchArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_arm(mutable ctx, mutable stack, Vec_MatchArm.at(arms, i), interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_arm(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, arm: ast_tree.MatchArm, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let m = scope_mod.mark(stack)
+    binders_mod.define_pat_bindings(mutable ctx, mutable stack, arm.pat, interner, allocator)?
+    match arm.guard {
+        case .some(let g) => walk_expr(mutable ctx, mutable stack, g, interner, allocator)?
+        case .none => ()
+    }
+    walk_expr(mutable ctx, mutable stack, arm.body, interner, allocator)?
+    scope_mod.truncate_to(mutable stack, m, allocator)?
+}
+
+
+function walk_args(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, args: Vec_CallArg.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_CallArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_CallArg.at(args, i)
+        walk_expr(mutable ctx, mutable stack, a.expr, interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_call_args(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, callee: Box_Expr, args: Vec_CallArg.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let skip_field_name = callee_is_offset_of(ctx, stack, callee, interner, allocator)?
+    let n = Vec_CallArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let is_field_name = skip_field_name && i == (1 as usize)
+        if !is_field_name {
+            let a = Vec_CallArg.at(args, i)
+            walk_expr(mutable ctx, mutable stack, a.expr, interner, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function callee_is_offset_of(ctx: ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, callee: Box_Expr, interner: interner_mod.Interner, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let c = Box_Expr.get(callee)
+    let d = match c.kind {
+        case .path(let p) => lookup_mod.resolve_value(ctx, stack, p, interner, allocator)?
+        case _ => return false
+    }
+    if def_mod.is_error(d) {
+        return false
+    }
+    return d.raw == cbi_mod.offset_of(ctx_mod.comptime_builtins(ctx)).raw
+}
+
+
+function walk_exprs(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, exprs: Vec_Expr.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Expr.len(exprs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_expr(mutable ctx, mutable stack, Vec_Expr.at(exprs, i), interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_struct_lit_fields(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, fields: Vec_StructLitField.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_StructLitField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_StructLitField.at(fields, i)
+        walk_expr(mutable ctx, mutable stack, f.value, interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function walk_box_expr(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, boxed: Box_Expr, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_expr(mutable ctx, mutable stack, Box_Expr.get(boxed), interner, allocator)?
+}
+
+
+function walk_opt_box_expr(ctx: mutable ctx_mod.ResolveCtx, stack: mutable scope_mod.ScopeStack, opt: Option_Box_Expr, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match opt {
+        case .some(let boxed) => walk_box_expr(mutable ctx, mutable stack, boxed, interner, allocator)?
+        case .none => ()
+    }
+}
+
+
+function resolve_value_path(ctx: mutable ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, p: ast_ident.Path, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if path_mod.path_len(p) >= 2 as usize {
+        match path_mod.first_seg_ident(p) {
+            case .some(let head) => {
+                match scope_mod.lookup(stack, head.name) {
+                    case .some(let head_def) => {
+                        ctx_mod.record_use(mutable ctx, head.span, head_def, allocator)?
+                        ctx_mod.record_local_use(mutable ctx, head.span, head_def, allocator)?
+                        return
+                    }
+                    case .none => ()
+                }
+            }
+            case .none => ()
+        }
+    }
+    let d = lookup_mod.resolve_value(ctx, stack, p, interner, allocator)?
+    if def_mod.is_error(d) {
+        if record_field_projection_head(mutable ctx, stack, p, allocator)? {
+            return
+        }
+        if record_variant_ctor_prefix(mutable ctx, stack, p, interner, allocator)? {
+            return
+        }
+        if record_spec_instance_variant(mutable ctx, p, allocator)? {
+            return
+        }
+        if record_spec_instance_primary(mutable ctx, p, allocator)? {
+            return
+        }
+        if record_qualified_module_path(mutable ctx, p, allocator)? {
+            return
+        }
+        emit_unresolved(mutable ctx, p, interner, allocator)?
+    } else {
+        ctx_mod.record_use(mutable ctx, p.span, d, allocator)?
+        if lookup_mod.value_is_scope_local(stack, p) {
+            ctx_mod.record_local_use(mutable ctx, p.span, d, allocator)?
+        }
+    }
+}
+
+
+function record_variant_ctor_prefix(ctx: mutable ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, p: ast_ident.Path, interner: interner_mod.Interner, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let n = path_mod.path_len(p)
+    if n < 2 as usize {
+        return false
+    }
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    var i: usize = 0
+    loop decreases (n - 1 - i) {
+        if i >= n - 1 { break }
+        Vec_Ident.push(mutable segs, Vec_Ident.at(p.segments, i), allocator)?
+        i = i + 1
+    }
+    let anchor = Vec_Ident.at(p.segments, n - 2)
+    let prefix = ast_ident.Path { span: anchor.span, segments: segs }
+    let d = lookup_mod.resolve_value(ctx, stack, prefix, interner, allocator)?
+    if def_mod.is_error(d) {
+        return false
+    }
+    let leaf = Vec_Ident.at(p.segments, n - 1)
+    ctx_mod.record_use(mutable ctx, leaf.span, d, allocator)?
+    return true
+}
+
+
+function record_spec_instance_variant(ctx: mutable ctx_mod.ResolveCtx, p: ast_ident.Path, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let n = path_mod.path_len(p)
+    if n < 2 as usize {
+        return false
+    }
+    let mangled_sym = Vec_Ident.at(p.segments, n - 2).name
+    let inst_full = ctx_mod.instance_full(ctx, ctx_mod.current_module(ctx), mangled_sym)
+    let eff_sym = if inst_full.raw != (0 as u32) && inst_full.raw != mangled_sym.raw { inst_full } else { mangled_sym }
+    uninit prefix: Vec_Symbol.Vec
+    Vec_Symbol.new(init prefix, allocator)?
+    var i: usize = 0
+    loop decreases (n - 1 - i) {
+        if i >= n - 1 { break }
+        if i == n - 2 as usize {
+            Vec_Symbol.push(mutable prefix, eff_sym, allocator)?
+        } else {
+            Vec_Symbol.push(mutable prefix, Vec_Ident.at(p.segments, i).name, allocator)?
+        }
+        i = i + 1
+    }
+    let mod_id = ctx_mod.module_id_of(ctx, prefix)
+    if mod_id.raw == 0 {
+        return false
+    }
+    if !ctx_mod.in_instance_mode(ctx) && !ctx_mod.file_invoked_spec(ctx, ctx_mod.current_module(ctx), mangled_sym) {
+        return false
+    }
+    let leaf = Vec_Ident.at(p.segments, n - 1)
+    let d = ctx_mod.lookup_variant_in_module(ctx, mod_id, leaf.name)
+    if def_mod.is_error(d) {
+        return false
+    }
+    ctx_mod.record_use(mutable ctx, leaf.span, d, allocator)?
+    return true
+}
+
+
+function record_spec_instance_primary(ctx: mutable ctx_mod.ResolveCtx, p: ast_ident.Path, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    if path_mod.path_len(p) != 1 as usize {
+        return false
+    }
+    let head = Vec_Ident.at(p.segments, 0)
+    let inst_full = ctx_mod.instance_full(ctx, ctx_mod.current_module(ctx), head.name)
+    let eff_sym = if inst_full.raw != (0 as u32) && inst_full.raw != head.name.raw { inst_full } else { head.name }
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    Vec_Symbol.push(mutable segs, eff_sym, allocator)?
+    let mod_id = ctx_mod.module_id_of(ctx, segs)
+    if mod_id.raw == 0 {
+        return false
+    }
+    if !ctx_mod.in_instance_mode(ctx) && !ctx_mod.file_invoked_spec(ctx, ctx_mod.current_module(ctx), head.name) {
+        return false
+    }
+    let d = ctx_mod.lookup_in_module(ctx, mod_id, eff_sym)
+    if def_mod.is_error(d) {
+        return false
+    }
+    ctx_mod.record_use(mutable ctx, p.span, d, allocator)?
+    return true
+}
+
+
+function record_qualified_module_path(ctx: mutable ctx_mod.ResolveCtx, p: ast_ident.Path, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    if !ctx_mod.in_instance_mode(ctx) {
+        return false
+    }
+    let n = path_mod.path_len(p)
+    if n < 2 as usize {
+        return false
+    }
+    uninit prefix: Vec_Symbol.Vec
+    Vec_Symbol.new(init prefix, allocator)?
+    var i: usize = 0
+    loop decreases (n - 1 - i) {
+        if i >= n - 1 { break }
+        Vec_Symbol.push(mutable prefix, Vec_Ident.at(p.segments, i).name, allocator)?
+        i = i + 1
+    }
+    let mod_id = ctx_mod.module_id_of(ctx, prefix)
+    if mod_id.raw == 0 {
+        return false
+    }
+    let leaf = Vec_Ident.at(p.segments, n - 1)
+    let d = ctx_mod.lookup_in_module(ctx, mod_id, leaf.name)
+    if def_mod.is_error(d) {
+        return false
+    }
+    ctx_mod.record_use(mutable ctx, p.span, d, allocator)?
+    return true
+}
+
+
+function record_field_projection_head(ctx: mutable ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, p: ast_ident.Path, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    if path_mod.path_len(p) <= 1 as usize {
+        return false
+    }
+    match path_mod.first_seg_ident(p) {
+        case .some(let head) => {
+            match scope_mod.lookup(stack, head.name) {
+                case .some(let head_def) => {
+                    ctx_mod.record_use(mutable ctx, head.span, head_def, allocator)?
+                    return true
+                }
+                case .none => return false
+            }
+        }
+        case .none => return false
+    }
+}
+
+
+function emit_unresolved(ctx: mutable ctx_mod.ResolveCtx, p: ast_ident.Path, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if ctx_mod.is_quiet(ctx) {
+        return
+    }
+    let err = error_mod.ResolveError {
+        at: p.span,
+        kind: error_mod.ResolveErrorKind.unresolved_path(leaf: path_mod.leaf(p)),
+    }
+    let d = error_mod.to_diagnostic(err, interner, allocator)?
+    ctx_mod.emit_diagnostic(mutable ctx, d, allocator)?
+}

@@ -1,0 +1,404 @@
+
+module structmap.walk.calls.calls
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol as sym_mod
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import local.render.toon as toon
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_tree.Stmt)
+spec std.collections.vec.Vec(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_tree.MatchArm)
+spec std.collections.vec.Vec(ast_tree.CallArg)
+spec std.collections.vec.Vec(ast_tree.StructLitField)
+spec std.collections.vec.Vec(ast_tree.FStringSeg)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.mem.alloc.Box(ast_tree.Ty)
+spec std.mem.alloc.Box(ast_tree.Pat)
+spec std.mem.alloc.Box(ast_tree.Closure)
+spec std.mem.alloc.Box(ast_tree.SpawnExpr)
+spec std.core.option.Option(ast_tree.Expr)
+
+
+public function collect_calls_block(
+    block: ast_tree.Block,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_Stmt.len(block.stmts)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        collect_calls_stmt(Vec_Stmt.at(block.stmts, i), interner, mutable out, allocator)?
+        i += 1
+    }
+    match block.trailing {
+        case .some(let tail_box) =>
+            collect_calls_expr(Box_Expr.get(tail_box), interner, mutable out, allocator)?
+        case .none => ()
+    }
+}
+
+
+function collect_calls_stmt(
+    s: ast_tree.Stmt,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match s.kind {
+        case .let_(_, _, _, let init_opt) => match init_opt {
+            case .some(let e) => collect_calls_expr(e, interner, mutable out, allocator)?
+            case .none => ()
+        }
+        case .assign(let target, _, let rhs) => {
+            collect_calls_expr(target, interner, mutable out, allocator)?
+            collect_calls_expr(rhs, interner, mutable out, allocator)?
+        }
+        case .expr(let value) => collect_calls_expr(value, interner, mutable out, allocator)?
+    }
+}
+
+
+function collect_calls_expr(
+    e: ast_tree.Expr,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match e.kind {
+        case .literal(_) => ()
+        case .path(_) => ()
+        case .error => ()
+        case .continue_(_) => ()
+        case .effect_row(_) => ()
+        case .fstring(let segments) => collect_calls_fstring(segments, interner, mutable out, allocator)?
+
+        case .binary(_, let lhs_box, let rhs_box) => {
+            collect_calls_expr(Box_Expr.get(lhs_box), interner, mutable out, allocator)?
+            collect_calls_expr(Box_Expr.get(rhs_box), interner, mutable out, allocator)?
+        }
+        case .unary(_, let inner_box) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+
+        case .call(let callee_box, let args) => {
+            let callee = Box_Expr.get(callee_box)
+            match callee.kind {
+                case .path(let p) => push_path_callee(mutable out, p, interner, allocator)?
+                case _ => collect_calls_expr(callee, interner, mutable out, allocator)?
+            }
+            collect_calls_args(args, interner, mutable out, allocator)?
+        }
+        case .method_call(let receiver_box, let name, let args) => {
+            collect_calls_expr(Box_Expr.get(receiver_box), interner, mutable out, allocator)?
+            push_method_callee(mutable out, name, interner, allocator)?
+            collect_calls_args(args, interner, mutable out, allocator)?
+        }
+        case .field(let receiver_box, _) =>
+            collect_calls_expr(Box_Expr.get(receiver_box), interner, mutable out, allocator)?
+        case .tuple_index(let receiver_box, _) =>
+            collect_calls_expr(Box_Expr.get(receiver_box), interner, mutable out, allocator)?
+        case .positional(let p_receiver_box, let p_index_box) => {
+            collect_calls_expr(Box_Expr.get(p_receiver_box), interner, mutable out, allocator)?
+            collect_calls_expr(Box_Expr.get(p_index_box), interner, mutable out, allocator)?
+        }
+        case .index(let receiver_box, let index_box) => {
+            collect_calls_expr(Box_Expr.get(receiver_box), interner, mutable out, allocator)?
+            collect_calls_expr(Box_Expr.get(index_box), interner, mutable out, allocator)?
+        }
+
+        case .if_(let cond_box, let then_block, let else_opt) => {
+            collect_calls_expr(Box_Expr.get(cond_box), interner, mutable out, allocator)?
+            collect_calls_block(then_block, interner, mutable out, allocator)?
+            match else_opt {
+                case .some(let else_box) =>
+                    collect_calls_expr(Box_Expr.get(else_box), interner, mutable out, allocator)?
+                case .none => ()
+            }
+        }
+        case .match_(let scrutinee_box, let arms) => {
+            collect_calls_expr(Box_Expr.get(scrutinee_box), interner, mutable out, allocator)?
+            collect_calls_arms(arms, interner, mutable out, allocator)?
+        }
+        case .block(let body) =>
+            collect_calls_block(body, interner, mutable out, allocator)?
+
+        case .cast(let inner_box, _, _) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+        case .range(let lo_opt, let hi_opt, _) => {
+            match lo_opt {
+                case .some(let lo_box) =>
+                    collect_calls_expr(Box_Expr.get(lo_box), interner, mutable out, allocator)?
+                case .none => ()
+            }
+            match hi_opt {
+                case .some(let hi_box) =>
+                    collect_calls_expr(Box_Expr.get(hi_box), interner, mutable out, allocator)?
+                case .none => ()
+            }
+        }
+
+        case .tuple(let elements) => collect_calls_exprs(elements, interner, mutable out, allocator)?
+        case .struct_lit(_, let fields) =>
+            collect_calls_struct_fields(fields, interner, mutable out, allocator)?
+
+        case .loop_(let body, _, let decreases_opt) => {
+            collect_calls_block(body, interner, mutable out, allocator)?
+            match decreases_opt {
+                case .some(let d_box) =>
+                    collect_calls_expr(Box_Expr.get(d_box), interner, mutable out, allocator)?
+                case .none => ()
+            }
+        }
+        case .for_(_, let iter_box, let body, _) => {
+            collect_calls_expr(Box_Expr.get(iter_box), interner, mutable out, allocator)?
+            collect_calls_block(body, interner, mutable out, allocator)?
+        }
+
+        case .try_(let inner_box) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+        case .await_(let inner_box) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+        case .raise_(let inner_box) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+        case .panic_(let inner_box) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+
+        case .return_(let opt) => match opt {
+            case .some(let v_box) =>
+                collect_calls_expr(Box_Expr.get(v_box), interner, mutable out, allocator)?
+            case .none => ()
+        }
+        case .break_(_, let opt) => match opt {
+            case .some(let v_box) =>
+                collect_calls_expr(Box_Expr.get(v_box), interner, mutable out, allocator)?
+            case .none => ()
+        }
+
+        case .comptime_(let inner_box) =>
+            collect_calls_expr(Box_Expr.get(inner_box), interner, mutable out, allocator)?
+        case .comptime_block(let body) =>
+            collect_calls_block(body, interner, mutable out, allocator)?
+
+        case .scope_(_, _, let body) =>
+            collect_calls_block(body, interner, mutable out, allocator)?
+        case .handle_(_, _, _, let recovery_box, let body) => {
+            collect_calls_expr(Box_Expr.get(recovery_box), interner, mutable out, allocator)?
+            collect_calls_block(body, interner, mutable out, allocator)?
+        }
+
+        case .closure(let closure_box) => {
+            let closure = Box_Closure.get(closure_box)
+            collect_calls_block(closure.body, interner, mutable out, allocator)?
+        }
+        case .spawn(_) => ()
+
+        case .forall_(_, let iter_box, let body_box) => {
+            collect_calls_expr(Box_Expr.get(iter_box), interner, mutable out, allocator)?
+            collect_calls_expr(Box_Expr.get(body_box), interner, mutable out, allocator)?
+        }
+        case .exists_(_, let iter_box, let body_box) => {
+            collect_calls_expr(Box_Expr.get(iter_box), interner, mutable out, allocator)?
+            collect_calls_expr(Box_Expr.get(body_box), interner, mutable out, allocator)?
+        }
+    }
+}
+
+
+function collect_calls_arms(
+    arms: Vec_MatchArm.Vec,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_MatchArm.len(arms)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let arm = Vec_MatchArm.at(arms, i)
+        match arm.guard {
+            case .some(let g) => collect_calls_expr(g, interner, mutable out, allocator)?
+            case .none => ()
+        }
+        collect_calls_expr(arm.body, interner, mutable out, allocator)?
+        i += 1
+    }
+}
+
+function collect_calls_args(
+    args: Vec_CallArg.Vec,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_CallArg.len(args)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        collect_calls_expr(Vec_CallArg.at(args, i).expr, interner, mutable out, allocator)?
+        i += 1
+    }
+}
+
+function collect_calls_exprs(
+    es: Vec_Expr.Vec,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_Expr.len(es)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        collect_calls_expr(Vec_Expr.at(es, i), interner, mutable out, allocator)?
+        i += 1
+    }
+}
+
+function collect_calls_struct_fields(
+    fields: Vec_StructLitField.Vec,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_StructLitField.len(fields)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        collect_calls_expr(Vec_StructLitField.at(fields, i).value, interner, mutable out, allocator)?
+        i += 1
+    }
+}
+
+function collect_calls_fstring(
+    segments: Vec_FStringSeg.Vec,
+    interner: interner_mod.Interner,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_FStringSeg.len(segments)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        match Vec_FStringSeg.at(segments, i) {
+            case .interp(let expr_box) =>
+                collect_calls_expr(Box_Expr.get(expr_box), interner, mutable out, allocator)?
+            case .text(_) => ()
+        }
+        i += 1
+    }
+}
+
+
+function push_path_callee(
+    out: mutable Vec_String.Vec,
+    p: ast_ident.Path,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let txt = path_text(p, interner, allocator)?
+    Vec_String.push(mutable out, txt, allocator)?
+}
+
+function push_method_callee(
+    out: mutable Vec_String.Vec,
+    name: ast_ident.Ident,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    toon.push_byte(mutable buf, 0x2E, allocator)?
+    push_sym(mutable buf, name.name, interner, allocator)?
+    let txt = toon.finish_string(take buf, allocator)?
+    Vec_String.push(mutable out, txt, allocator)?
+}
+
+function path_text(
+    p: ast_ident.Path,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let n: usize = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i > 0 {
+            toon.push_byte(mutable buf, 0x2E, allocator)?
+        }
+        push_sym(mutable buf, Vec_Ident.at(p.segments, i).name, interner, allocator)?
+        i += 1
+    }
+    return toon.finish_string(take buf, allocator)?
+}
+
+function push_sym(
+    buf: mutable Vec_u8.Vec,
+    sym: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(interner) {
+        toon.push_str(mutable buf, "<missing>", allocator)?
+        return
+    }
+    let bytes = interner_mod.lookup(interner, sym)
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        toon.push_byte(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+}
+

@@ -1,0 +1,642 @@
+
+module ir.hlir.tree.oplower.wide.wide
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+
+import local.hlir.op as hlir_op_mod
+import local.runtime as runtime_mod
+import local.hlir.tree.oplower.wide.addsub.addsub as addsub_mod
+import local.hlir.tree.oplower.wide.mul.mul as mul_mod
+import local.hlir.tree.oplower.wide.support.support as support_mod
+
+import local.lir.tree.body as lir_body_mod
+import local.lir.op as lir_op_mod
+import local.lir.error as lir_error_mod
+import local.lir.tree.reg as lir_reg_mod
+import local.lir.id.vreg as lir_vreg_mod
+import local.lir.id.op as lir_op_id_mod
+
+
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+spec std.core.option.Option(lir_reg_mod.PReg)
+
+
+public function lower_wide_binary(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    op: hlir_op_mod.HBinOp,
+    signed_: bool,
+    rhs_wide: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> Vec_LirOpId.Vec
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    if is_wide_compare(op) {
+        lower_compare(mutable out, origin, op, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        return ids
+    }
+    match op {
+        case .add => addsub_mod.lower_addsub(mutable out, origin, true, true, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .add_wrap => addsub_mod.lower_addsub(mutable out, origin, true, false, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .sub => addsub_mod.lower_addsub(mutable out, origin, false, true, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .sub_wrap => addsub_mod.lower_addsub(mutable out, origin, false, false, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .mul => mul_mod.lower_mul(mutable out, origin, signed_, true, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .mul_wrap => mul_mod.lower_mul(mutable out, origin, signed_, false, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .mul_sat => mul_mod.lower_mul_sat(mutable out, origin, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .add_sat => addsub_mod.lower_addsub_sat(mutable out, origin, true, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .sub_sat => addsub_mod.lower_addsub_sat(mutable out, origin, false, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .bit_and => lower_bitwise(mutable out, origin, lir_op_mod.LBinOp.bit_and, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .bit_or => lower_bitwise(mutable out, origin, lir_op_mod.LBinOp.bit_or, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .bit_xor => lower_bitwise(mutable out, origin, lir_op_mod.LBinOp.bit_xor, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .shl => lower_shl(mutable out, origin, rhs_wide, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .shr => lower_shr(mutable out, origin, signed_, rhs_wide, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .div => lower_div_rem(mutable out, origin, false, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case .rem => lower_div_rem(mutable out, origin, true, signed_, operand_ty, lhs, rhs, dst, mutable ids, allocator)?
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+    return ids
+}
+
+
+public function lower_wide_constant(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    c: hlir_op_mod.HConstant,
+    operand_ty: ty_mod.TyId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> Vec_LirOpId.Vec
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    match c {
+        case .int_(let value, let ty) => {
+            support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+            let lo_v: i128 = (value as u64 wrapping) as i128
+            let hi_v: i128 = ((value >> (64 as i128)) as u64 wrapping) as i128
+            let lo_half = support_mod.mint_half(mutable out, operand_ty, allocator)?
+            support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: lo_v, ty: ty), dst: lo_half), mutable ids, allocator)?
+            support_mod.store_half(mutable out, origin, dst, 0 as i32, lo_half, mutable ids, allocator)?
+            let hi_half = support_mod.mint_half(mutable out, operand_ty, allocator)?
+            support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: hi_v, ty: ty), dst: hi_half), mutable ids, allocator)?
+            support_mod.store_half(mutable out, origin, dst, 8 as i32, hi_half, mutable ids, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+    return ids
+}
+
+
+public function lower_wide_cast(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    src: lir_vreg_mod.LirVRegId,
+    from_signed: bool,
+    from_wide: bool,
+    to_wide: bool,
+    to_width: u32,
+    wide_ty: ty_mod.TyId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> Vec_LirOpId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    if from_wide && to_wide {
+        support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+        let lo = support_mod.mint_half(mutable out, wide_ty, allocator)?
+        let hi = support_mod.mint_half(mutable out, wide_ty, allocator)?
+        support_mod.load_half(mutable out, origin, src, 0 as i32, lo, mutable ids, allocator)?
+        support_mod.load_half(mutable out, origin, src, 8 as i32, hi, mutable ids, allocator)?
+        support_mod.store_half(mutable out, origin, dst, 0 as i32, lo, mutable ids, allocator)?
+        support_mod.store_half(mutable out, origin, dst, 8 as i32, hi, mutable ids, allocator)?
+        return ids
+    }
+    if to_wide {
+        support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+        let lo = support_mod.mint_half(mutable out, wide_ty, allocator)?
+        support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.convert_(
+            src: src,
+            to_width: 8 as u32,
+            to_signed: from_signed,
+            kind: lir_op_mod.LCastKind.integer,
+            dst: lo,
+        ), mutable ids, allocator)?
+        support_mod.store_half(mutable out, origin, dst, 0 as i32, lo, mutable ids, allocator)?
+        let hi = support_mod.mint_half(mutable out, wide_ty, allocator)?
+        if from_signed {
+            support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.ashr, lo, lir_reg_mod.Operand.imm(value: 63 as i64), hi, mutable ids, allocator)?
+        } else {
+            support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: 0 as i128, ty: wide_ty), dst: hi), mutable ids, allocator)?
+        }
+        support_mod.store_half(mutable out, origin, dst, 8 as i32, hi, mutable ids, allocator)?
+        return ids
+    }
+    let w = if to_width >= (8 as u32) { 8 as u32 } else if to_width >= (4 as u32) { 4 as u32 } else if to_width >= (2 as u32) { 2 as u32 } else { 1 as u32 }
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: src),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.load(addr: addr, dst: dst, width: w), mutable ids, allocator)?
+    return ids
+}
+
+
+public function lower_wide_unary(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    op: hlir_op_mod.HUnOp,
+    operand_ty: ty_mod.TyId,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> Vec_LirOpId.Vec
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, operand, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, operand, 8 as i32, a_hi, mutable ids, allocator)?
+    let n_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let n_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    un(mutable out, origin, lir_op_mod.LUnOp.bit_not, a_lo, n_lo, mutable ids, allocator)?
+    un(mutable out, origin, lir_op_mod.LUnOp.bit_not, a_hi, n_hi, mutable ids, allocator)?
+    match op {
+        case .bit_not => {
+            support_mod.store_half(mutable out, origin, dst, 0 as i32, n_lo, mutable ids, allocator)?
+            support_mod.store_half(mutable out, origin, dst, 8 as i32, n_hi, mutable ids, allocator)?
+        }
+        case .neg => {
+            let r_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+            let carry = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+            let r_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+            support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, n_lo, lir_reg_mod.Operand.imm(value: 1 as i64), r_lo, mutable ids, allocator)?
+            support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, r_lo, lir_reg_mod.Operand.vreg(id: n_lo), carry, mutable ids, allocator)?
+            support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, n_hi, lir_reg_mod.Operand.vreg(id: carry), r_hi, mutable ids, allocator)?
+            support_mod.store_half(mutable out, origin, dst, 0 as i32, r_lo, mutable ids, allocator)?
+            support_mod.store_half(mutable out, origin, dst, 8 as i32, r_hi, mutable ids, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+    return ids
+}
+
+
+function is_wide_compare(op: hlir_op_mod.HBinOp) -> bool {
+    return match op {
+        case .eq => true
+        case .ne => true
+        case .lt => true
+        case .le => true
+        case .gt => true
+        case .ge => true
+        case _ => false
+    }
+}
+
+
+function lower_bitwise(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    op: lir_op_mod.LBinOp,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 0 as i32, b_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 8 as i32, b_hi, mutable ids, allocator)?
+    let r_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let r_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, op, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), r_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, op, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), r_hi, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 0 as i32, r_lo, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 8 as i32, r_hi, mutable ids, allocator)?
+}
+
+
+function lower_compare(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    op: hlir_op_mod.HBinOp,
+    signed_: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 0 as i32, b_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 8 as i32, b_hi, mutable ids, allocator)?
+    match op {
+        case .eq => merge_eq(mutable out, origin, true, operand_ty, a_lo, a_hi, b_lo, b_hi, dst, mutable ids, allocator)?
+        case .ne => merge_eq(mutable out, origin, false, operand_ty, a_lo, a_hi, b_lo, b_hi, dst, mutable ids, allocator)?
+        case .lt => order(mutable out, origin, true, signed_, operand_ty, a_lo, a_hi, b_lo, b_hi, dst, mutable ids, allocator)?
+        case .gt => order(mutable out, origin, false, signed_, operand_ty, a_lo, a_hi, b_lo, b_hi, dst, mutable ids, allocator)?
+        case .le => {
+            let tmp = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+            order(mutable out, origin, false, signed_, operand_ty, a_lo, a_hi, b_lo, b_hi, tmp, mutable ids, allocator)?
+            support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, tmp, lir_reg_mod.Operand.imm(value: 1 as i64), dst, mutable ids, allocator)?
+        }
+        case .ge => {
+            let tmp = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+            order(mutable out, origin, true, signed_, operand_ty, a_lo, a_hi, b_lo, b_hi, tmp, mutable ids, allocator)?
+            support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, tmp, lir_reg_mod.Operand.imm(value: 1 as i64), dst, mutable ids, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+}
+
+
+function merge_eq(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    is_eq: bool,
+    operand_ty: ty_mod.TyId,
+    a_lo: lir_vreg_mod.LirVRegId,
+    a_hi: lir_vreg_mod.LirVRegId,
+    b_lo: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let lo = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let hi = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let half_op = if is_eq { lir_op_mod.LBinOp.icmp_eq } else { lir_op_mod.LBinOp.icmp_ne }
+    let merge = if is_eq { lir_op_mod.LBinOp.bit_and } else { lir_op_mod.LBinOp.bit_or }
+    support_mod.bin(mutable out, origin, half_op, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, half_op, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, merge, lo, lir_reg_mod.Operand.vreg(id: hi), dst, mutable ids, allocator)?
+}
+
+
+function order(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    is_lt: bool,
+    signed_: bool,
+    operand_ty: ty_mod.TyId,
+    a_lo: lir_vreg_mod.LirVRegId,
+    a_hi: lir_vreg_mod.LirVRegId,
+    b_lo: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let hi_cmp = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let hi_eq = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let lo_cmp = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let tmp = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let hi_op = if is_lt {
+        if signed_ { lir_op_mod.LBinOp.icmp_slt } else { lir_op_mod.LBinOp.icmp_ult }
+    } else {
+        if signed_ { lir_op_mod.LBinOp.icmp_sgt } else { lir_op_mod.LBinOp.icmp_ugt }
+    }
+    let lo_op = if is_lt { lir_op_mod.LBinOp.icmp_ult } else { lir_op_mod.LBinOp.icmp_ugt }
+    support_mod.bin(mutable out, origin, hi_op, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), hi_cmp, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_eq, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), hi_eq, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lo_op, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), lo_cmp, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, hi_eq, lir_reg_mod.Operand.vreg(id: lo_cmp), tmp, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, hi_cmp, lir_reg_mod.Operand.vreg(id: tmp), dst, mutable ids, allocator)?
+}
+
+
+function un(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    op: lir_op_mod.LUnOp,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.unary(op: op, operand: operand, dst: dst), mutable ids, allocator)?
+}
+
+
+function count_lo(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    rhs_wide: bool,
+    operand_ty: ty_mod.TyId,
+    rhs: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError}
+{
+    let n = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    if rhs_wide {
+        support_mod.load_half(mutable out, origin, rhs, 0 as i32, n, mutable ids, allocator)?
+    } else {
+        support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.copy_(src: rhs, dst: n), mutable ids, allocator)?
+    }
+    return n
+}
+
+
+type ShiftCount {
+    n6: lir_vreg_mod.LirVRegId
+    inv: lir_vreg_mod.LirVRegId
+    mask: lir_vreg_mod.LirVRegId
+    notmask: lir_vreg_mod.LirVRegId
+}
+
+
+function decode_count(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    operand_ty: ty_mod.TyId,
+    n: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ShiftCount
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n6 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, n, lir_reg_mod.Operand.imm(value: 63 as i64), n6, mutable ids, allocator)?
+    let inv = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, n6, lir_reg_mod.Operand.imm(value: 63 as i64), inv, mutable ids, allocator)?
+    let s0 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.lshr, n, lir_reg_mod.Operand.imm(value: 6 as i64), s0, mutable ids, allocator)?
+    let sel = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, s0, lir_reg_mod.Operand.imm(value: 1 as i64), sel, mutable ids, allocator)?
+    let mask = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    un(mutable out, origin, lir_op_mod.LUnOp.neg, sel, mask, mutable ids, allocator)?
+    let notmask = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    un(mutable out, origin, lir_op_mod.LUnOp.bit_not, mask, notmask, mutable ids, allocator)?
+    return ShiftCount {
+        n6: n6,
+        inv: inv,
+        mask: mask,
+        notmask: notmask,
+    }
+}
+
+
+function lower_shl(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    rhs_wide: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    let n = count_lo(mutable out, origin, rhs_wide, operand_ty, rhs, mutable ids, allocator)?
+    let c = decode_count(mutable out, origin, operand_ty, n, mutable ids, allocator)?
+    let lo_sh = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.shl, a_lo, lir_reg_mod.Operand.vreg(id: c.n6), lo_sh, mutable ids, allocator)?
+    let hi_sh = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.shl, a_hi, lir_reg_mod.Operand.vreg(id: c.n6), hi_sh, mutable ids, allocator)?
+    let half = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.lshr, a_lo, lir_reg_mod.Operand.imm(value: 1 as i64), half, mutable ids, allocator)?
+    let cross = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.lshr, half, lir_reg_mod.Operand.vreg(id: c.inv), cross, mutable ids, allocator)?
+    let hi_low = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, hi_sh, lir_reg_mod.Operand.vreg(id: cross), hi_low, mutable ids, allocator)?
+    let r_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, lo_sh, lir_reg_mod.Operand.vreg(id: c.notmask), r_lo, mutable ids, allocator)?
+    let t_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, hi_low, lir_reg_mod.Operand.vreg(id: c.notmask), t_hi, mutable ids, allocator)?
+    let hh = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, lo_sh, lir_reg_mod.Operand.vreg(id: c.mask), hh, mutable ids, allocator)?
+    let r_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, t_hi, lir_reg_mod.Operand.vreg(id: hh), r_hi, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 0 as i32, r_lo, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 8 as i32, r_hi, mutable ids, allocator)?
+}
+
+
+function lower_shr(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    signed_: bool,
+    rhs_wide: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    let n = count_lo(mutable out, origin, rhs_wide, operand_ty, rhs, mutable ids, allocator)?
+    let c = decode_count(mutable out, origin, operand_ty, n, mutable ids, allocator)?
+    let hi_op = if signed_ { lir_op_mod.LBinOp.ashr } else { lir_op_mod.LBinOp.lshr }
+    let lo_sh = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.lshr, a_lo, lir_reg_mod.Operand.vreg(id: c.n6), lo_sh, mutable ids, allocator)?
+    let hi_sh = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, hi_op, a_hi, lir_reg_mod.Operand.vreg(id: c.n6), hi_sh, mutable ids, allocator)?
+    let dbl = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.shl, a_hi, lir_reg_mod.Operand.imm(value: 1 as i64), dbl, mutable ids, allocator)?
+    let cross = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.shl, dbl, lir_reg_mod.Operand.vreg(id: c.inv), cross, mutable ids, allocator)?
+    let lo_low = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, lo_sh, lir_reg_mod.Operand.vreg(id: cross), lo_low, mutable ids, allocator)?
+    let lo_part = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, lo_low, lir_reg_mod.Operand.vreg(id: c.notmask), lo_part, mutable ids, allocator)?
+    let hi_part = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, hi_sh, lir_reg_mod.Operand.vreg(id: c.mask), hi_part, mutable ids, allocator)?
+    let r_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, lo_part, lir_reg_mod.Operand.vreg(id: hi_part), r_lo, mutable ids, allocator)?
+    let r_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    if signed_ {
+        let t_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, hi_sh, lir_reg_mod.Operand.vreg(id: c.notmask), t_hi, mutable ids, allocator)?
+        let sign = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.ashr, a_hi, lir_reg_mod.Operand.imm(value: 63 as i64), sign, mutable ids, allocator)?
+        let sm = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, sign, lir_reg_mod.Operand.vreg(id: c.mask), sm, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, t_hi, lir_reg_mod.Operand.vreg(id: sm), r_hi, mutable ids, allocator)?
+    } else {
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, hi_sh, lir_reg_mod.Operand.vreg(id: c.notmask), r_hi, mutable ids, allocator)?
+    }
+    support_mod.store_half(mutable out, origin, dst, 0 as i32, r_lo, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 8 as i32, r_hi, mutable ids, allocator)?
+}
+
+
+function lower_div_rem(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    is_rem: bool,
+    signed_: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 0 as i32, b_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 8 as i32, b_hi, mutable ids, allocator)?
+    div_zero_guard(mutable out, origin, operand_ty, b_lo, b_hi, mutable ids, allocator)?
+    if signed_ {
+        signed_overflow_guard(mutable out, origin, operand_ty, a_lo, a_hi, b_lo, b_hi, mutable ids, allocator)?
+    }
+    let fn_ = select_helper(is_rem, signed_)
+    let callee_v = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.runtime_fn(fn_: fn_), dst: callee_v), mutable ids, allocator)?
+    uninit args: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init args, allocator)?
+    Vec_LirVRegId.push(mutable args, take lhs, allocator)?
+    Vec_LirVRegId.push(mutable args, take rhs, allocator)?
+    Vec_LirVRegId.push(mutable args, take dst, allocator)?
+    let call_op = lir_op_mod.LirOp {
+        origin: origin,
+        kind: lir_op_mod.LirOpKind.call_(
+            callee: lir_reg_mod.Operand.vreg(id: callee_v),
+            args: args,
+            return_: Option_LirVRegId.none,
+        ),
+        flags: hlir_op_mod.div128_flags(),
+    }
+    let call_id = lir_body_mod.push_op(mutable out, take call_op, allocator)?
+    Vec_LirOpId.push(mutable ids, call_id, allocator)?
+}
+
+
+function div_zero_guard(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    operand_ty: ty_mod.TyId,
+    b_lo: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let b_or = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, b_lo, lir_reg_mod.Operand.vreg(id: b_hi), b_or, mutable ids, allocator)?
+    let zflag = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_eq, b_or, lir_reg_mod.Operand.imm(value: 0 as i64), zflag, mutable ids, allocator)?
+    support_mod.trap_if(mutable out, origin, zflag, mutable ids, allocator)?
+}
+
+
+function signed_overflow_guard(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    operand_ty: ty_mod.TyId,
+    a_lo: lir_vreg_mod.LirVRegId,
+    a_hi: lir_vreg_mod.LirVRegId,
+    b_lo: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let e_alo = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_eq, a_lo, lir_reg_mod.Operand.imm(value: 0 as i64), e_alo, mutable ids, allocator)?
+    let min_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: (-9223372036854775807 - 1) as i128, ty: operand_ty), dst: min_hi), mutable ids, allocator)?
+    let e_ahi = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_eq, a_hi, lir_reg_mod.Operand.vreg(id: min_hi), e_ahi, mutable ids, allocator)?
+    let e_blo = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_eq, b_lo, lir_reg_mod.Operand.imm(value: -1 as i64), e_blo, mutable ids, allocator)?
+    let e_bhi = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_eq, b_hi, lir_reg_mod.Operand.imm(value: -1 as i64), e_bhi, mutable ids, allocator)?
+    let a_is_min = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, e_alo, lir_reg_mod.Operand.vreg(id: e_ahi), a_is_min, mutable ids, allocator)?
+    let b_is_neg1 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, e_blo, lir_reg_mod.Operand.vreg(id: e_bhi), b_is_neg1, mutable ids, allocator)?
+    let ov = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, a_is_min, lir_reg_mod.Operand.vreg(id: b_is_neg1), ov, mutable ids, allocator)?
+    support_mod.trap_if(mutable out, origin, ov, mutable ids, allocator)?
+}
+
+
+function select_helper(is_rem: bool, signed_: bool) -> runtime_mod.RuntimeFn {
+    if is_rem {
+        return if signed_ { runtime_mod.RuntimeFn.modti3 } else { runtime_mod.RuntimeFn.umodti3 }
+    }
+    return if signed_ { runtime_mod.RuntimeFn.divti3 } else { runtime_mod.RuntimeFn.udivti3 }
+}

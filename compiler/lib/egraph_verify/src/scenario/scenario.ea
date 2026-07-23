@@ -1,0 +1,159 @@
+
+module egraph_verify.scenario.scenario
+
+import std.mem.alloc
+import std.io.stream
+import std.collections.vec
+import egraph.graph.graph as graph_mod
+import egraph.sat.saturate as sat_mod
+import local.reference.reference as reference_mod
+import local.build.build as build_mod
+import local.checks.checks as checks_mod
+
+
+spec std.collections.vec.Vec(u32)
+
+
+function run_checks(
+    g: mutable graph_mod.EGraph,
+    sat: mutable sat_mod.Saturator,
+    e_ids: Vec_u32.Vec,
+    refc: reference_mod.Reference,
+    errout: Stderr,
+    allocator: Allocator,
+) -> bool
+    with {errout, allocator, err: alloc.AllocError, panic}
+{
+    var ok: bool = true
+    if !checks_mod.check_partition(mutable g, e_ids, refc, errout) { ok = false }
+    if !checks_mod.check_memo_sound(mutable g, sat, errout) { ok = false }
+    if !checks_mod.check_canonical(mutable g, sat, errout) { ok = false }
+    if !checks_mod.check_lookup(mutable g, sat, errout) { ok = false }
+    if !checks_mod.check_fixpoint(mutable g, mutable sat, errout, allocator)? { ok = false }
+    return ok
+}
+
+
+public function run_congruence_binary(out: Stdout, errout: Stderr, allocator: Allocator) -> bool
+    with {out, errout, allocator, err: alloc.AllocError, panic}
+{
+    uninit g: graph_mod.EGraph
+    graph_mod.new(init g, allocator)?
+    uninit sat: sat_mod.Saturator
+    sat_mod.new(init sat, allocator)?
+    uninit e_ids: Vec_u32.Vec
+    Vec_u32.new(init e_ids, allocator)?
+    uninit refc: reference_mod.Reference
+    reference_mod.new(init refc, allocator)?
+
+    build_mod.mk_leaf(mutable g, mutable sat, mutable e_ids, mutable refc, 0 as i128, allocator)?
+    build_mod.mk_leaf(mutable g, mutable sat, mutable e_ids, mutable refc, 1 as i128, allocator)?
+    build_mod.mk_leaf(mutable g, mutable sat, mutable e_ids, mutable refc, 2 as i128, allocator)?
+    build_mod.mk_leaf(mutable g, mutable sat, mutable e_ids, mutable refc, 3 as i128, allocator)?
+    build_mod.mk_binary(mutable g, mutable sat, mutable e_ids, mutable refc, 0 as usize, 0 as usize, 1 as usize, allocator)?
+    build_mod.mk_binary(mutable g, mutable sat, mutable e_ids, mutable refc, 0 as usize, 2 as usize, 3 as usize, allocator)?
+    build_mod.mk_merge(mutable g, mutable sat, e_ids, mutable refc, 0 as usize, 2 as usize, allocator)?
+    build_mod.mk_merge(mutable g, mutable sat, e_ids, mutable refc, 1 as usize, 3 as usize, allocator)?
+    let _ = sat_mod.saturate(mutable g, mutable sat, 1000 as usize, allocator)?
+    reference_mod.close(mutable refc)
+
+    let ok = run_checks(mutable g, mutable sat, e_ids, refc, errout, allocator)?
+    if ok {
+        out.print_line("  congruence(binary): ok")
+    } else {
+        out.print_line("  congruence(binary): FAIL")
+    }
+    return ok
+}
+
+
+public function run_random(seed: u64, out: Stdout, errout: Stderr, allocator: Allocator) -> bool
+    with {out, errout, allocator, err: alloc.AllocError, panic}
+{
+    uninit g: graph_mod.EGraph
+    graph_mod.new(init g, allocator)?
+    uninit sat: sat_mod.Saturator
+    sat_mod.new(init sat, allocator)?
+    uninit e_ids: Vec_u32.Vec
+    Vec_u32.new(init e_ids, allocator)?
+    uninit refc: reference_mod.Reference
+    reference_mod.new(init refc, allocator)?
+
+    var s: u64 = seed
+    let leaves: usize = 6
+    var li: usize = 0
+    loop
+        decreases leaves - li
+    {
+        if li >= leaves { break }
+        build_mod.mk_leaf(mutable g, mutable sat, mutable e_ids, mutable refc, li as i128, allocator)?
+        li = li + 1
+    }
+
+    let steps: usize = 28
+    var st: usize = 0
+    loop
+        decreases steps - st
+    {
+        if st >= steps { break }
+        s = build_mod.rng_next(s)
+        let choice = s % (3 as u64)
+        let total = reference_mod.count(refc)
+        s = build_mod.rng_next(s)
+        let a = build_mod.pick(s, total)
+        s = build_mod.rng_next(s)
+        let b = build_mod.pick(s, total)
+        s = build_mod.rng_next(s)
+        let opk = (s % (16 as u64)) as usize
+        if choice == (0 as u64) {
+            build_mod.mk_binary(mutable g, mutable sat, mutable e_ids, mutable refc, opk, a, b, allocator)?
+        } else if choice == (1 as u64) {
+            build_mod.mk_unary(mutable g, mutable sat, mutable e_ids, mutable refc, opk, a, allocator)?
+        } else {
+            build_mod.mk_merge(mutable g, mutable sat, e_ids, mutable refc, a, b, allocator)?
+        }
+        if st % (5 as usize) == (0 as usize) {
+            let _ = sat_mod.saturate(mutable g, mutable sat, 1000 as usize, allocator)?
+        }
+        st = st + 1
+    }
+
+    let _ = sat_mod.saturate(mutable g, mutable sat, 1000 as usize, allocator)?
+    reference_mod.close(mutable refc)
+    return run_checks(mutable g, mutable sat, e_ids, refc, errout, allocator)?
+}
+
+
+public function run_all(out: Stdout, errout: Stderr, allocator: Allocator) -> bool
+    with {out, errout, allocator, err: alloc.AllocError, panic}
+{
+    out.print_line("egraph-verify: brute-force congruence cross-check")
+    var ok: bool = true
+    if !run_congruence_binary(out, errout, allocator)? { ok = false }
+
+    var seed: u64 = 88172645463325252 as u64
+    let trials: usize = 32
+    var k: usize = 0
+    loop
+        decreases trials - k
+    {
+        if k >= trials { break }
+        seed = build_mod.rng_next(seed)
+        let r = run_random(seed, out, errout, allocator)?
+        if r {
+            out.print_line(f"  trial {k}: ok")
+        } else {
+            out.print_line(f"  trial {k}: FAIL")
+            errout.eprint_line(f"  failing seed index {k} value {seed}")
+            ok = false
+        }
+        k = k + 1
+    }
+
+    if ok {
+        out.print_line("egraph-verify: ALL CHECKS PASSED")
+    } else {
+        out.print_line("egraph-verify: FAILURES DETECTED")
+    }
+    return ok
+}

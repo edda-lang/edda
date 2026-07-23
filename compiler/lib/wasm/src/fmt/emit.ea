@@ -1,0 +1,279 @@
+
+module wasm.fmt.emit
+
+import std.mem.alloc
+import std.collections.vec
+import local.model as model_mod
+import local.fmt.encode as enc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(model_mod.ValType)
+spec std.collections.vec.Vec(model_mod.FuncType)
+spec std.collections.vec.Vec(model_mod.Import)
+spec std.collections.vec.Vec(model_mod.Func)
+spec std.collections.vec.Vec(model_mod.Export)
+spec std.collections.vec.Vec(model_mod.DataSeg)
+
+
+public function serialize_module(
+    out: mutable Vec_u8.Vec,
+    wmod: model_mod.WasmModule,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let stack_size: u32 = 65536
+    let total: u32 = wmod.data_end + stack_size
+    let pages: u32 = (total / (65536 as u32)) + (1 as u32)
+    let stack_top: u32 = pages * (65536 as u32)
+
+    Vec_u8.push(mutable out, 0x00, allocator)?
+    Vec_u8.push(mutable out, 0x61, allocator)?
+    Vec_u8.push(mutable out, 0x73, allocator)?
+    Vec_u8.push(mutable out, 0x6D, allocator)?
+    Vec_u8.push(mutable out, 0x01, allocator)?
+    Vec_u8.push(mutable out, 0x00, allocator)?
+    Vec_u8.push(mutable out, 0x00, allocator)?
+    Vec_u8.push(mutable out, 0x00, allocator)?
+
+    emit_type_section(mutable out, wmod, allocator)?
+    emit_import_section(mutable out, wmod, allocator)?
+    emit_function_section(mutable out, wmod, allocator)?
+    emit_table_section(mutable out, wmod, allocator)?
+    emit_memory_section(mutable out, pages, allocator)?
+    emit_global_section(mutable out, stack_top, allocator)?
+    emit_export_section(mutable out, wmod, allocator)?
+    emit_elem_section(mutable out, wmod, allocator)?
+    emit_code_section(mutable out, wmod, allocator)?
+    emit_data_section(mutable out, wmod, allocator)?
+}
+
+
+function emit_valtype_vec(c: mutable Vec_u8.Vec, vts: Vec_ValType.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_ValType.len(vts)
+    enc_mod.uleb(mutable c, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u8.push(mutable c, enc_mod.valtype_byte(Vec_ValType.at(vts, i)), allocator)?
+        i += 1
+    }
+}
+
+
+function emit_type_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_FuncType.len(wmod.types)
+    if n == 0 as usize { return }
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let ft = Vec_FuncType.at(wmod.types, i)
+        Vec_u8.push(mutable c, 0x60, allocator)?
+        emit_valtype_vec(mutable c, ft.params, allocator)?
+        emit_valtype_vec(mutable c, ft.results, allocator)?
+        i += 1
+    }
+    enc_mod.emit_section(mutable out, 0x01, c, allocator)?
+}
+
+
+function emit_import_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_Import.len(wmod.imports)
+    if n == 0 as usize { return }
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let imp = Vec_Import.at(wmod.imports, i)
+        enc_mod.push_name(mutable c, imp.module_name, allocator)?
+        enc_mod.push_name(mutable c, imp.field_name, allocator)?
+        Vec_u8.push(mutable c, 0x00, allocator)?
+        enc_mod.uleb(mutable c, imp.type_idx as u64, allocator)?
+        i += 1
+    }
+    enc_mod.emit_section(mutable out, 0x02, c, allocator)?
+}
+
+
+function emit_function_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_Func.len(wmod.funcs)
+    if n == 0 as usize { return }
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        enc_mod.uleb(mutable c, Vec_Func.at(wmod.funcs, i).type_idx as u64, allocator)?
+        i += 1
+    }
+    enc_mod.emit_section(mutable out, 0x03, c, allocator)?
+}
+
+
+function emit_table_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let num_imports: u32 = Vec_Import.len(wmod.imports) as u32
+    let num_funcs: u32 = Vec_Func.len(wmod.funcs) as u32
+    let min: u32 = num_imports +% num_funcs
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, 1 as u64, allocator)?
+    Vec_u8.push(mutable c, 0x70, allocator)?
+    Vec_u8.push(mutable c, 0x00, allocator)?
+    enc_mod.uleb(mutable c, min as u64, allocator)?
+    enc_mod.emit_section(mutable out, 0x04, c, allocator)?
+}
+
+
+function emit_elem_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let num_imports: u32 = Vec_Import.len(wmod.imports) as u32
+    let count: usize = Vec_Func.len(wmod.funcs)
+    if count == 0 as usize { return }
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, 1 as u64, allocator)?
+    enc_mod.uleb(mutable c, 0 as u64, allocator)?
+    Vec_u8.push(mutable c, 0x41, allocator)?
+    enc_mod.sleb(mutable c, num_imports as i64, allocator)?
+    Vec_u8.push(mutable c, 0x0B, allocator)?
+    enc_mod.uleb(mutable c, count as u64, allocator)?
+    var i: usize = 0
+    loop decreases count - i {
+        if i >= count { break }
+        enc_mod.uleb(mutable c, (num_imports as u64) + (i as u64), allocator)?
+        i += 1
+    }
+    enc_mod.emit_section(mutable out, 0x09, c, allocator)?
+}
+
+
+function emit_memory_section(out: mutable Vec_u8.Vec, pages: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, 1 as u64, allocator)?
+    Vec_u8.push(mutable c, 0x00, allocator)?
+    enc_mod.uleb(mutable c, pages as u64, allocator)?
+    enc_mod.emit_section(mutable out, 0x05, c, allocator)?
+}
+
+
+function emit_global_section(out: mutable Vec_u8.Vec, stack_top: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, 1 as u64, allocator)?
+    Vec_u8.push(mutable c, 0x7F, allocator)?
+    Vec_u8.push(mutable c, 0x01, allocator)?
+    Vec_u8.push(mutable c, 0x41, allocator)?
+    enc_mod.sleb(mutable c, stack_top as i64, allocator)?
+    Vec_u8.push(mutable c, 0x0B, allocator)?
+    enc_mod.emit_section(mutable out, 0x06, c, allocator)?
+}
+
+
+function emit_export_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_Export.len(wmod.exports)
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, (n + (1 as usize)) as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = Vec_Export.at(wmod.exports, i)
+        enc_mod.push_name(mutable c, e.name, allocator)?
+        Vec_u8.push(mutable c, 0x00, allocator)?
+        enc_mod.uleb(mutable c, e.func_idx as u64, allocator)?
+        i += 1
+    }
+    enc_mod.push_name(mutable c, "memory", allocator)?
+    Vec_u8.push(mutable c, 0x02, allocator)?
+    enc_mod.uleb(mutable c, 0 as u64, allocator)?
+    enc_mod.emit_section(mutable out, 0x07, c, allocator)?
+}
+
+
+function emit_locals(body: mutable Vec_u8.Vec, locals: Vec_ValType.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_ValType.len(locals)
+    enc_mod.uleb(mutable body, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        enc_mod.uleb(mutable body, 1 as u64, allocator)?
+        Vec_u8.push(mutable body, enc_mod.valtype_byte(Vec_ValType.at(locals, i)), allocator)?
+        i += 1
+    }
+}
+
+
+function emit_code_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_Func.len(wmod.funcs)
+    if n == 0 as usize { return }
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = Vec_Func.at(wmod.funcs, i)
+        uninit body: Vec_u8.Vec
+        Vec_u8.new(init body, allocator)?
+        emit_locals(mutable body, f.locals, allocator)?
+        enc_mod.append(mutable body, f.body, allocator)?
+        Vec_u8.push(mutable body, 0x0B, allocator)?
+        enc_mod.uleb(mutable c, Vec_u8.len(body) as u64, allocator)?
+        enc_mod.append(mutable c, body, allocator)?
+        i += 1
+    }
+    enc_mod.emit_section(mutable out, 0x0A, c, allocator)?
+}
+
+
+function emit_data_section(out: mutable Vec_u8.Vec, wmod: model_mod.WasmModule, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_DataSeg.len(wmod.datas)
+    if n == 0 as usize { return }
+    uninit c: Vec_u8.Vec
+    Vec_u8.new(init c, allocator)?
+    enc_mod.uleb(mutable c, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let d = Vec_DataSeg.at(wmod.datas, i)
+        Vec_u8.push(mutable c, 0x00, allocator)?
+        Vec_u8.push(mutable c, 0x41, allocator)?
+        enc_mod.sleb(mutable c, d.offset as i64, allocator)?
+        Vec_u8.push(mutable c, 0x0B, allocator)?
+        enc_mod.uleb(mutable c, Vec_u8.len(d.bytes) as u64, allocator)?
+        enc_mod.append(mutable c, d.bytes, allocator)?
+        i += 1
+    }
+    enc_mod.emit_section(mutable out, 0x0B, c, allocator)?
+}

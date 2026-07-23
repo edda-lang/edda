@@ -1,0 +1,216 @@
+
+module parse_depth_verify.main
+
+import std.mem.alloc
+import std.core.fmt as fmt_mod
+import std.io.stream
+import std.text.string
+import intern.interner as interner_mod
+import diagnostics.emit.collection as diags_mod
+import span.file as file_mod
+import syntax.parse.parser as parser_mod
+import syntax.ast.file as file_ast
+
+
+public function main(errout: Stderr, allocator: Allocator) -> i32
+    with {errout, allocator, panic, divergence}
+{
+    return handle err: alloc.AllocError as ae -> fail_alloc(errout, ae) {
+        run(errout, allocator)?
+    }
+}
+
+
+function run(errout: Stderr, allocator: Allocator) -> i32
+    with {errout, allocator, err: alloc.AllocError, divergence}
+{
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    var total: usize = 0
+    var passed: usize = 0
+
+    total = total + 1
+    if check_expr(errout, "block", "{ ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "if-body", "if true { ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "loop-body", "loop { ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "match-arm", "match 0 { case _ => ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "for-body", "{ for x in xs { ", "0", " } }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "handle-body", "handle err: E as e -> 0 { ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "comptime-body", "comptime { ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "closure-body", "function() -> i32 { ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "forall", "forall i in xs: ", "true", "", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "exists", "exists i in xs: ", "true", "", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "struct-field", "P { x: ", "0", " }", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "call-arg", "f(", "0", ")", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "index-operand", "a[", "0", "]", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "cast-where", "1 as i32 where (", "1", ")", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_expr(errout, "fstring-interp", "f\"{", "0", "}\"", mutable interner, allocator)? { passed = passed + 1 }
+    total = total + 1
+    if check_file(errout, "spec-item-nest", "spec S(comptime T: Type) {\n", "function f() -> () {}", "\n}", mutable interner, allocator)? { passed = passed + 1 }
+
+    summarize(errout, passed, total, allocator)?
+    interner_mod.dispose(take interner)
+    if passed == total { return 0 }
+    return 1
+}
+
+
+function check_expr(
+    errout: Stderr,
+    label: String,
+    open: String,
+    inner: String,
+    close: String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {errout, allocator, err: alloc.AllocError, divergence}
+{
+    let shallow = wrap(open, inner, close, 2 as usize, allocator)?
+    let deep = wrap(open, inner, close, 2000 as usize, allocator)?
+    let shallow_err = expr_has_errors(shallow, mutable interner, allocator)?
+    let deep_err = expr_has_errors(deep, mutable interner, allocator)?
+    let ok = (!shallow_err) && deep_err
+    report(errout, ok, label, shallow_err, deep_err, allocator)?
+    return ok
+}
+
+
+function check_file(
+    errout: Stderr,
+    label: String,
+    open: String,
+    inner: String,
+    close: String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {errout, allocator, err: alloc.AllocError, divergence}
+{
+    let shallow = wrap(open, inner, close, 2 as usize, allocator)?
+    let deep = wrap(open, inner, close, 2000 as usize, allocator)?
+    let shallow_err = file_has_errors(shallow, mutable interner, allocator)?
+    let deep_err = file_has_errors(deep, mutable interner, allocator)?
+    let ok = (!shallow_err) && deep_err
+    report(errout, ok, label, shallow_err, deep_err, allocator)?
+    return ok
+}
+
+
+function expr_has_errors(
+    snippet: String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit sd: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init sd, allocator)?
+    let bytes = snippet.bytes()
+    let _ = parser_mod.parse_expr_from_bytes(bytes, file_mod.unknown(), mutable interner, mutable sd, allocator)?
+    return diags_mod.has_errors(sd)
+}
+
+
+function file_has_errors(
+    snippet: String,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit sd: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init sd, allocator)?
+    let bytes = snippet.bytes()
+    uninit parsed: file_ast.File
+    parser_mod.parse_file_from_bytes(bytes, file_mod.unknown(), mutable interner, mutable sd, init parsed, allocator)?
+    return diags_mod.has_errors(sd)
+}
+
+
+function wrap(
+    open: String,
+    inner: String,
+    close: String,
+    depth: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let pre = repeat(open, depth, allocator)?
+    let suf = repeat(close, depth, allocator)?
+    let a = string.concat(pre, inner, allocator)?
+    return string.concat(a, suf, allocator)?
+}
+
+
+function repeat(unit: String, n: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var s: String = ""
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        s = string.concat(s, unit, allocator)?
+        i = i + 1
+    }
+    return s
+}
+
+
+function report(
+    errout: Stderr,
+    ok: bool,
+    label: String,
+    shallow_err: bool,
+    deep_err: bool,
+    allocator: Allocator,
+) -> ()
+    with {errout, allocator, err: alloc.AllocError}
+{
+    let tag = if ok { "pass: " } else { "FAIL: " }
+    let se = if shallow_err { " shallow=err" } else { " shallow=ok" }
+    let de = if deep_err { " deep=err" } else { " deep=ok" }
+    let s1 = string.concat(tag, label, allocator)?
+    let s2 = string.concat(s1, se, allocator)?
+    let s3 = string.concat(s2, de, allocator)?
+    errout.eprint_line(s3)
+}
+
+
+function summarize(errout: Stderr, passed: usize, total: usize, allocator: Allocator) -> ()
+    with {errout, allocator, err: alloc.AllocError}
+{
+    let p = fmt_mod.usize_to_string(passed, allocator)?
+    let t = fmt_mod.usize_to_string(total, allocator)?
+    let s1 = string.concat("parse-depth-verify: ", p, allocator)?
+    let s2 = string.concat(s1, "/", allocator)?
+    let s3 = string.concat(s2, t, allocator)?
+    let s4 = string.concat(s3, " constructs bounded", allocator)?
+    errout.eprint_line(s4)
+}
+
+
+function fail_alloc(errout: Stderr, e: alloc.AllocError) -> i32
+    with {errout}
+{
+    match e {
+        case .out_of_memory => errout.eprint_line("parse-depth-verify: out of memory")
+    }
+    return 70
+}

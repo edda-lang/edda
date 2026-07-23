@@ -1,0 +1,255 @@
+
+module specs.gen.build.output
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import intern.symbol as sym_mod
+import syntax.ast.item as item_mod
+import types.pass.ty as ty_mod
+import local.error as err_mod
+import local.address.hash as hash_mod
+import local.address.id as id_mod
+import local.address.instance as inst_mod
+
+
+spec std.collections.vec.Vec(err_mod.SpecError)
+spec std.collections.vec.Vec(inst_mod.SpecInstance)
+spec std.collections.vec.Vec(item_mod.Item)
+spec std.collections.vec.Vec(InstanceItems)
+spec std.collections.vec.Vec(EqPair)
+spec std.collections.vec.Vec(CollEqPair)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(id_mod.ModuleId)
+spec std.core.option.Option(hash_mod.SpecHash)
+
+
+derive eq, debug for InstanceItems
+derive eq, debug for EqPair
+derive eq, debug for CollEqPair
+derive eq, debug for SpecOutput
+
+
+public type InstanceItems {
+    module_id: id_mod.ModuleId
+    module_name: sym_mod.Symbol
+    items: Vec_Item.Vec
+}
+
+
+public type EqPair {
+    target_ty: ty_mod.TyId
+    module_name: sym_mod.Symbol
+}
+
+
+public type CollEqPair {
+    coll_module: sym_mod.Symbol
+    cmp_module: sym_mod.Symbol
+}
+
+
+public type SpecOutput {
+    instances: Vec_SpecInstance.Vec
+    failures: Vec_SpecError.Vec
+    gen_items: Vec_InstanceItems.Vec
+    hash_head: IntMap_usize.IntMap
+    hash_nexts: Vec_usize.Vec
+    short_by_name: IntMap_usize.IntMap
+    eq_pairs: Vec_EqPair.Vec
+    debug_pairs: Vec_EqPair.Vec
+    coll_eq_pairs: Vec_CollEqPair.Vec
+}
+
+
+public function new(out: init SpecOutput, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit insts: Vec_SpecInstance.Vec
+    Vec_SpecInstance.new(init insts, allocator)?
+    uninit fs: Vec_SpecError.Vec
+    Vec_SpecError.new(init fs, allocator)?
+    uninit gen: Vec_InstanceItems.Vec
+    Vec_InstanceItems.new(init gen, allocator)?
+    uninit hn: Vec_usize.Vec
+    Vec_usize.new(init hn, allocator)?
+    uninit eqs: Vec_EqPair.Vec
+    Vec_EqPair.new(init eqs, allocator)?
+    uninit dbgs: Vec_EqPair.Vec
+    Vec_EqPair.new(init dbgs, allocator)?
+    uninit ceqs: Vec_CollEqPair.Vec
+    Vec_CollEqPair.new(init ceqs, allocator)?
+    let hh = IntMap_usize.new(allocator)?
+    let sbn = IntMap_usize.new(allocator)?
+    out = SpecOutput {
+        instances: insts,
+        failures: fs,
+        gen_items: gen,
+        hash_head: hh,
+        hash_nexts: hn,
+        short_by_name: sbn,
+        eq_pairs: eqs,
+        debug_pairs: dbgs,
+        coll_eq_pairs: ceqs,
+    }
+}
+
+
+public function record_eq_pair(
+    out: mutable SpecOutput,
+    target_ty: ty_mod.TyId,
+    module_name: sym_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_EqPair.push(mutable out.eq_pairs, EqPair { target_ty: target_ty, module_name: module_name }, allocator)?
+}
+
+
+public function record_debug_pair(
+    out: mutable SpecOutput,
+    target_ty: ty_mod.TyId,
+    module_name: sym_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_EqPair.push(mutable out.debug_pairs, EqPair { target_ty: target_ty, module_name: module_name }, allocator)?
+}
+
+
+public function record_coll_eq_pair(
+    out: mutable SpecOutput,
+    coll_module: sym_mod.Symbol,
+    cmp_module: sym_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_CollEqPair.push(mutable out.coll_eq_pairs, CollEqPair { coll_module: coll_module, cmp_module: cmp_module }, allocator)?
+}
+
+
+public function record_instance(
+    out: mutable SpecOutput,
+    instance: take inst_mod.SpecInstance,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bucket = hash_bucket(instance.hash)
+    let sname_key = instance.short_name.raw as i64
+    let new_index = Vec_SpecInstance.len(out.instances)
+    let prev = match IntMap_usize.get(out.hash_head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable out.hash_nexts, prev, allocator)?
+    Vec_SpecInstance.push(mutable out.instances, take instance, allocator)?
+    let _ = IntMap_usize.insert(mutable out.hash_head, bucket, new_index + 1 as usize, allocator)?
+    if !IntMap_usize.contains(out.short_by_name, sname_key) {
+        let _ = IntMap_usize.insert(mutable out.short_by_name, sname_key, new_index + 1 as usize, allocator)?
+    }
+}
+
+
+function mix(acc: u64, value: u64) -> u64 {
+    return (acc ^ value) *% (1099511628211 as u64)
+}
+
+function hash_bucket(h: hash_mod.SpecHash) -> i64 {
+    var x = mix(14695981039346656037 as u64, h.w0)
+    x = mix(x, h.w1)
+    x = mix(x, h.w2)
+    x = mix(x, h.w3)
+    return x as i64 wrapping
+}
+
+function hash_equal(a: hash_mod.SpecHash, b: hash_mod.SpecHash) -> bool {
+    return a.w0 == b.w0 && a.w1 == b.w1 && a.w2 == b.w2 && a.w3 == b.w3
+}
+
+public function lookup_by_hash(out: SpecOutput, h: hash_mod.SpecHash) -> Option_ModuleId.Option {
+    let bucket = hash_bucket(h)
+    let start = match IntMap_usize.get(out.hash_head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    let fuel = Vec_SpecInstance.len(out.instances) + 1 as usize
+    return walk_hash(out, h, start, fuel)
+}
+
+function walk_hash(
+    out: SpecOutput,
+    h: hash_mod.SpecHash,
+    slot_one_based: usize,
+    fuel: usize,
+) -> Option_ModuleId.Option
+    decreases fuel
+{
+    if fuel == 0 { return Option_ModuleId.none }
+    if slot_one_based == 0 { return Option_ModuleId.none }
+    let idx = slot_one_based - 1
+    if idx >= Vec_SpecInstance.len(out.instances) { return Option_ModuleId.none }
+    let inst = Vec_SpecInstance.at(out.instances, idx)
+    if hash_equal(inst.hash, h) {
+        return Option_ModuleId.some(value: inst.module_id)
+    }
+    if idx >= Vec_usize.len(out.hash_nexts) { return Option_ModuleId.none }
+    let nxt = Vec_usize.at(out.hash_nexts, idx)
+    return walk_hash(out, h, nxt, fuel - 1)
+}
+
+public function short_name_existing(out: SpecOutput, short_name: sym_mod.Symbol) -> Option_SpecHash.Option {
+    match IntMap_usize.get(out.short_by_name, short_name.raw as i64) {
+        case .some(let one_based) => {
+            if one_based == 0 { return Option_SpecHash.none }
+            let idx = one_based - 1
+            if idx >= Vec_SpecInstance.len(out.instances) { return Option_SpecHash.none }
+            return Option_SpecHash.some(value: Vec_SpecInstance.at(out.instances, idx).hash)
+        }
+        case .none => return Option_SpecHash.none
+    }
+}
+
+public function record_instance_items(
+    out: mutable SpecOutput,
+    module_id: id_mod.ModuleId,
+    module_name: sym_mod.Symbol,
+    items: take Vec_Item.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let entry = InstanceItems {
+        module_id: module_id,
+        module_name: module_name,
+        items: items,
+    }
+    Vec_InstanceItems.push(mutable out.gen_items, take entry, allocator)?
+}
+
+public function push_failure(
+    out: mutable SpecOutput,
+    failure: take err_mod.SpecError,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_SpecError.push(mutable out.failures, take failure, allocator)?
+}
+
+
+public stable function total(out: SpecOutput) -> usize
+    requires Vec_SpecInstance.len(out.instances) + Vec_SpecError.len(out.failures) <= 18446744073709551615
+{
+    return Vec_SpecInstance.len(out.instances) + Vec_SpecError.len(out.failures)
+}
+
+public stable function ok(out: SpecOutput) -> bool {
+    return Vec_SpecError.len(out.failures) == 0
+}

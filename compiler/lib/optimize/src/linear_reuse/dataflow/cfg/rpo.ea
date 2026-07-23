@@ -1,0 +1,122 @@
+module optimize.linear_reuse.dataflow.cfg.rpo
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import mir.body.model as mir_body_mod
+import mir.id.block as mir_block_mod
+
+import local.linear_reuse.dataflow.cfg.cfgedges as cfg_edges_mod
+import local.linear_reuse.dataflow.bitset as bitset_mod
+
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_block_mod.BlockId)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(bool)
+spec std.core.option.Option(usize)
+
+public type BlockCfg {
+    succ_off: Vec_usize.Vec
+    succ_to: Vec_usize.Vec
+    postorder: Vec_u32.Vec
+}
+
+public function build(out: init BlockCfg, body: mir_body_mod.MirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_BasicBlock.len(body.blocks)
+    uninit succ_off: Vec_usize.Vec
+    Vec_usize.new(init succ_off, allocator)?
+    Vec_usize.push(mutable succ_off, 0, allocator)?
+    uninit succ_to: Vec_usize.Vec
+    Vec_usize.new(init succ_to, allocator)?
+
+    var b: usize = 0
+    loop decreases nb - b {
+        if b >= nb { break }
+        uninit succs: Vec_BlockId.Vec
+        cfg_edges_mod.successors_into(init succs, Vec_BasicBlock.at(body.blocks, b), allocator)?
+        let ns = Vec_BlockId.len(succs)
+        var i: usize = 0
+        loop decreases ns - i {
+            if i >= ns { break }
+            let t = mir_block_mod.index(Vec_BlockId.at(succs, i))
+            if t < nb {
+                Vec_usize.push(mutable succ_to, t, allocator)?
+            }
+            i += 1
+        }
+        Vec_usize.push(mutable succ_off, Vec_usize.len(succ_to), allocator)?
+        b += 1
+    }
+
+    uninit visited: Vec_bool.Vec
+    bitset_mod.new_false(init visited, nb, allocator)?
+    uninit post: Vec_u32.Vec
+    Vec_u32.new(init post, allocator)?
+
+    if nb > 0 {
+        uninit stack_block: Vec_usize.Vec
+        Vec_usize.new(init stack_block, allocator)?
+        uninit stack_edge: Vec_usize.Vec
+        Vec_usize.new(init stack_edge, allocator)?
+        Vec_usize.push(mutable stack_block, 0, allocator)?
+        Vec_usize.push(mutable stack_edge, 0, allocator)?
+        Vec_bool.set_at(mutable visited, 0, true)
+
+        var fuel = Vec_usize.len(succ_to) + nb + nb + 4
+        loop decreases fuel {
+            if fuel == 0 { break }
+            fuel -= 1
+            let depth = Vec_usize.len(stack_block)
+            if depth == 0 { break }
+            let top = Vec_usize.at(stack_block, depth - 1)
+            let e = Vec_usize.at(stack_edge, depth - 1)
+            let e_end = if top + 1 < Vec_usize.len(succ_off) { Vec_usize.at(succ_off, top + 1) } else { 0 as usize }
+            let e_abs = if top < Vec_usize.len(succ_off) { Vec_usize.at(succ_off, top) + e } else { 0 as usize }
+            if e_abs >= e_end {
+                Vec_u32.push(mutable post, top as u32, allocator)?
+                let _ = Vec_usize.pop(mutable stack_block)
+                let _ = Vec_usize.pop(mutable stack_edge)
+            } else {
+                Vec_usize.set_at(mutable stack_edge, depth - 1, e + 1)
+                if e_abs < Vec_usize.len(succ_to) {
+                    let t = Vec_usize.at(succ_to, e_abs)
+                    if t < nb {
+                        if Vec_bool.at(visited, t) == false {
+                            Vec_bool.set_at(mutable visited, t, true)
+                            Vec_usize.push(mutable stack_block, t, allocator)?
+                            Vec_usize.push(mutable stack_edge, 0, allocator)?
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var u: usize = 0
+    loop decreases nb - u {
+        if u >= nb { break }
+        if Vec_bool.at(visited, u) == false {
+            Vec_u32.push(mutable post, u as u32, allocator)?
+        }
+        u += 1
+    }
+
+    out = BlockCfg {
+        succ_off: succ_off,
+        succ_to: succ_to,
+        postorder: post,
+    }
+}
+
+public function succ_start(cfg: BlockCfg, block: usize) -> usize {
+    if block >= Vec_usize.len(cfg.succ_off) { return 0 }
+    return Vec_usize.at(cfg.succ_off, block)
+}
+
+public function succ_end(cfg: BlockCfg, block: usize) -> usize {
+    if block + 1 >= Vec_usize.len(cfg.succ_off) { return 0 }
+    return Vec_usize.at(cfg.succ_off, block + 1)
+}

@@ -1,0 +1,331 @@
+
+module structmap.analyze.metric.callgraph.callgraph
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import local.data.model as model
+import local.analyze.lists as lists_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(lists_mod.StringList)
+spec std.collections.vec.Vec(lists_mod.UsizeList)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.hashmap.StringMap(usize)
+spec std.core.option.Option(usize)
+
+
+public function collect_function_index(
+    tree: model.Tree,
+    qnames: mutable Vec_String.Vec,
+    declared: mutable Vec_StringList.Vec,
+    callees: mutable Vec_UsizeList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_FunctionEntry.len(tree.functions)
+    uninit pkg_keys: Vec_String.Vec
+    Vec_String.new(init pkg_keys, allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let f = Vec_FunctionEntry.at(tree.functions, i)
+        Vec_String.push(mutable qnames, clone_str(f.qualified_name, allocator)?, allocator)?
+        let cloned = clone_vec_string(f.cone_leaf_keys, allocator)?
+        Vec_StringList.push(mutable declared, lists_mod.StringList { items: cloned }, allocator)?
+        uninit slot: Vec_usize.Vec
+        Vec_usize.new(init slot, allocator)?
+        Vec_UsizeList.push(mutable callees, lists_mod.UsizeList { items: slot }, allocator)?
+        let key = if f.dir_idx < Vec_String.len(tree.paths) {
+            package_key(Vec_String.at(tree.paths, f.dir_idx), allocator)?
+        } else {
+            clone_str("", allocator)?
+        }
+        Vec_String.push(mutable pkg_keys, key, allocator)?
+        i += 1
+    }
+    let qname_index = build_qname_index(qnames, allocator)?
+    var j: usize = 0
+    loop
+        decreases n - j
+    {
+        if j >= n { break }
+        let f = Vec_FunctionEntry.at(tree.functions, j)
+        let caller_module = module_of(f.qualified_name, allocator)?
+        resolve_calls_for(f.calls, caller_module, qname_index, pkg_keys, mutable callees, j, allocator)?
+        j += 1
+    }
+}
+
+function build_qname_index(qnames: Vec_String.Vec, allocator: Allocator) -> StringMap_usize.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var idx = StringMap_usize.new(allocator)?
+    let n: usize = Vec_String.len(qnames)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let q = Vec_String.at(qnames, i)
+        if !StringMap_usize.contains(idx, q) {
+            let vi = i
+            let _ = StringMap_usize.insert(mutable idx, q, take vi, allocator)?
+        }
+        i += 1
+    }
+    return idx
+}
+
+function resolve_calls_for(
+    raw_calls: Vec_String.Vec,
+    caller_module: String,
+    qname_index: StringMap_usize.StringMap,
+    pkg_keys: Vec_String.Vec,
+    callees: mutable Vec_UsizeList.Vec,
+    fn_idx: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(raw_calls)
+    if fn_idx >= Vec_UsizeList.len(callees) { return }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let call = Vec_String.at(raw_calls, i)
+        let idx_opt = resolve_call(call, caller_module, qname_index, allocator)?
+        match idx_opt {
+            case .some(let idx) => {
+                if same_package(pkg_keys, fn_idx, idx) {
+                    append_callee(mutable callees, fn_idx, idx, allocator)?
+                }
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+}
+
+function same_package(pkg_keys: Vec_String.Vec, a: usize, b: usize) -> bool {
+    let n: usize = Vec_String.len(pkg_keys)
+    if a >= n || b >= n { return false }
+    return string_equals(Vec_String.at(pkg_keys, a), Vec_String.at(pkg_keys, b))
+}
+
+function package_key(path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let b = path.bytes()
+    let n: usize = b.len()
+    var cut: usize = n
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i + 4 <= n && b[i] == 0x2F && b[i + 1] == 0x73 && b[i + 2] == 0x72 && b[i + 3] == 0x63 {
+            if i + 4 == n || b[i + 4] == 0x2F {
+                cut = i
+            }
+        }
+        i += 1
+    }
+    return slice_prefix_owned(b, cut, allocator)?
+}
+
+function append_callee(
+    callees: mutable Vec_UsizeList.Vec,
+    fn_idx: usize,
+    idx: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_UsizeList.len(callees)
+    if fn_idx >= n { return }
+    var wrapper = Vec_UsizeList.at(callees, fn_idx)
+    if vec_usize_contains(wrapper.items, idx) { return }
+    Vec_usize.push(mutable wrapper.items, idx, allocator)?
+    Vec_UsizeList.set_at(mutable callees, fn_idx, take wrapper)
+}
+
+function vec_usize_contains(v: Vec_usize.Vec, target: usize) -> bool {
+    let n: usize = Vec_usize.len(v)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if Vec_usize.at(v, i) == target { return true }
+        i += 1
+    }
+    return false
+}
+
+function resolve_call(
+    call: String,
+    caller_module: String,
+    qname_index: StringMap_usize.StringMap,
+    allocator: Allocator,
+) -> Option_usize.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let cb = call.bytes()
+    if cb.len() == 0 { return Option_usize.none() }
+    if cb[0] == 0x2E { return Option_usize.none() }
+    if contains_dot(call) {
+        return find_qname(qname_index, call)
+    }
+    let qualified = compose_qualified(caller_module, call, allocator)?
+    return find_qname(qname_index, qualified)
+}
+
+function contains_dot(s: String) -> bool {
+    let b = s.bytes()
+    let n: usize = b.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if b[i] == 0x2E { return true }
+        i += 1
+    }
+    return false
+}
+
+function find_qname(qname_index: StringMap_usize.StringMap, target: String) -> Option_usize.Option {
+    return StringMap_usize.get(qname_index, target)
+}
+
+function module_of(qualified: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = qualified.bytes()
+    let n: usize = bytes.len()
+    var i: usize = n
+    loop
+        decreases i
+    {
+        if i == 0 { break }
+        i -= 1
+        if bytes[i] == 0x2E {
+            return slice_prefix_owned(bytes, i, allocator)?
+        }
+    }
+    return clone_str("", allocator)?
+}
+
+function slice_prefix_owned(bytes: [u8], stop: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = bytes.len()
+    let bound: usize = if stop > n { n } else { stop }
+    let buf: [u8] = allocator.alloc_array(u8, bound)?
+    var i: usize = 0
+    loop
+        decreases bound - i
+    {
+        if i >= bound { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function compose_qualified(module_path: String, bare: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let mb = module_path.bytes()
+    let bb = bare.bytes()
+    let mn: usize = mb.len()
+    let bn: usize = bb.len()
+    let total: usize = if mn == 0 { bn } else { mn + 1 + bn }
+    let buf: [u8] = allocator.alloc_array(u8, total)?
+    var w: usize = 0
+    var i: usize = 0
+    loop
+        decreases mn - i
+    {
+        if i >= mn { break }
+        buf[w] = mb[i]
+        w += 1
+        i += 1
+    }
+    if mn > 0 {
+        buf[w] = 0x2E
+        w += 1
+    }
+    var j: usize = 0
+    loop
+        decreases bn - j
+    {
+        if j >= bn { break }
+        buf[w] = bb[j]
+        w += 1
+        j += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function clone_vec_string(v: Vec_String.Vec, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n: usize = Vec_String.len(v)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_String.push(mutable out, clone_str(Vec_String.at(v, i), allocator)?, allocator)?
+        i += 1
+    }
+    return out
+}
+
+function clone_str(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function string_equals(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    if an != bn { return false }
+    var i: usize = 0
+    loop
+        decreases an - i
+    {
+        if i >= an { break }
+        if ab[i] != bb[i] { return false }
+        i += 1
+    }
+    return true
+}

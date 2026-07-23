@@ -1,0 +1,85 @@
+
+module regex.api.iter
+
+import std.mem.alloc
+import std.core.option
+import regex.engine.exec.vm
+import local.api as api_mod
+import local.api.find as api_find
+
+spec std.core.option.Option(vm.Match)
+
+function _raw_usize_n(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_usize_n(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: vm.ExecError}
+{
+    return handle err: alloc.AllocError -> { raise vm.ExecError.allocation_failed } {
+        _raw_usize_n(allocator, n)?
+    }
+}
+
+function _raw_u8_n(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_u8_n(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: vm.ExecError}
+{
+    return handle err: alloc.AllocError -> { raise vm.ExecError.allocation_failed } {
+        _raw_u8_n(allocator, n)?
+    }
+}
+
+public function find_iter(
+    re: api_mod.Regex,
+    input: [u8],
+    allocator: mutable Allocator,
+) -> api_mod.FindIter
+    with {allocator, err: api_mod.RegexError}
+{
+    return handle err: vm.ExecError -> { raise api_mod.RegexError.exec_failed(err: vm.ExecError.allocation_failed) } {
+        let state = _alloc_usize_n(allocator, 1 as usize)?
+        let done = _alloc_u8_n(allocator, 1 as usize)?
+        state[0 as usize] = 0 as usize
+        done[0 as usize] = 0 as u8
+        api_mod.FindIter {
+            re: re,
+            input: input,
+            state: state,
+            done: done,
+        }
+    }
+}
+
+public function find_iter_next(
+    iter: api_mod.FindIter,
+    allocator: mutable Allocator,
+) -> Option_Match
+    with {allocator, err: api_mod.RegexError, divergence}
+{
+    if iter.done[0 as usize] != 0 as u8 { return Option_Match.none }
+    let cur = iter.state[0 as usize]
+    if cur > iter.input.len() {
+        iter.done[0 as usize] = 1 as u8
+        return Option_Match.none
+    }
+    let m_opt = api_find.find_at(iter.re, iter.input, cur, mutable allocator)?
+    return match m_opt {
+        case .none => {
+            iter.done[0 as usize] = 1 as u8
+            Option_Match.none
+        }
+        case .some(let m) => {
+            let next_pos = if m.end == m.start {
+                m.start + 1 as usize
+            } else {
+                m.end
+            }
+            iter.state[0 as usize] = next_pos
+            Option_Match.some(value: m)
+        }
+    }
+}

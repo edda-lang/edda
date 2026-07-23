@@ -1,0 +1,355 @@
+
+module refine.solver.lia.frontend.frontend
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.rational.scalar as rat_mod
+import local.solver.rational.wide as wide_mod
+import local.smt.term as term_mod
+import local.solver.theory.quant.linearize as lin_mod
+import local.solver.lia.simplex.tableau.tableau as tab_mod
+import local.solver.lia.simplex.core.search as search_mod
+
+
+spec std.collections.vec.Vec(LiaConstraint)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(lin_mod.LinearTerm)
+spec std.collections.vec.Vec(rat_mod.Rational)
+spec std.collections.vec.Vec(LiaAssignment)
+
+
+public type LiaConstraint {
+    form: lin_mod.LinearForm
+    is_upper: bool
+    bound: wide_mod.Wide
+    lit: lit_mod.Lit
+}
+
+
+public type LiaCtx {
+    constraints: Vec_LiaConstraint.Vec
+}
+
+
+public type LiaAssignment {
+    term: term_mod.SmtTerm
+    value: wide_mod.Wide
+}
+
+
+public type LiaModel {
+    assignments: Vec_LiaAssignment.Vec
+}
+
+
+type BuiltTableau {
+    tab: tab_mod.Tableau
+    vars: Vec_SmtTerm.Vec
+    n_cols: usize
+}
+
+
+type Relation {
+    is_upper: bool
+    rhs_bound: i64
+}
+
+
+public function new_ctx(out: init LiaCtx, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit cs: Vec_LiaConstraint.Vec
+    Vec_LiaConstraint.new(init cs, allocator)?
+    out = LiaCtx { constraints: cs }
+}
+
+
+public function clear_constraints(ctx: mutable LiaCtx) -> () {
+    Vec_LiaConstraint.clear(mutable ctx.constraints)
+}
+
+
+public function is_arith_compare(op: term_mod.SmtOp) -> bool {
+    return match op {
+        case .le => true
+        case .lt => true
+        case .ge => true
+        case .gt => true
+        case _ => false
+    }
+}
+
+
+function relation_of(op: term_mod.SmtOp, value: bool) -> Relation {
+    return match op {
+        case .le => if value {
+            Relation { is_upper: true, rhs_bound: 0 }
+        } else {
+            Relation { is_upper: false, rhs_bound: 1 }
+        }
+        case .lt => if value {
+            Relation { is_upper: true, rhs_bound: -1 }
+        } else {
+            Relation { is_upper: false, rhs_bound: 0 }
+        }
+        case .ge => if value {
+            Relation { is_upper: false, rhs_bound: 0 }
+        } else {
+            Relation { is_upper: true, rhs_bound: -1 }
+        }
+        case .gt => if value {
+            Relation { is_upper: false, rhs_bound: 1 }
+        } else {
+            Relation { is_upper: true, rhs_bound: 0 }
+        }
+        case _ => Relation { is_upper: true, rhs_bound: 0 }
+    }
+}
+
+
+public function diff_form(lhs: term_mod.SmtTerm, rhs: term_mod.SmtTerm, allocator: Allocator) -> lin_mod.LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let fa = match lin_mod.linearize(lhs, allocator)? {
+        case .nonlinear => return lin_mod.LinResult.nonlinear
+        case .ok(let f) => f
+    }
+    let fb = match lin_mod.linearize(rhs, allocator)? {
+        case .nonlinear => return lin_mod.LinResult.nonlinear
+        case .ok(let f) => f
+    }
+    let neg_fb = match lin_mod.negate(fb, allocator)? {
+        case .nonlinear => return lin_mod.LinResult.nonlinear
+        case .ok(let f) => f
+    }
+    return lin_mod.add(fa, neg_fb, allocator)?
+}
+
+
+public function assert_prepared_compare(
+    ctx: mutable LiaCtx,
+    form: lin_mod.LinearForm,
+    op: term_mod.SmtOp,
+    value: bool,
+    lit: lit_mod.Lit,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let rel = relation_of(op, value)
+    let rb = wide_mod.wide_from_i128(rel.rhs_bound as i128)
+    let sb = wide_mod.wide_sub(rb, form.constant)
+    if !sb.ok {
+        return false
+    }
+    let c = LiaConstraint {
+        form: form,
+        is_upper: rel.is_upper,
+        bound: sb.value,
+        lit: lit,
+    }
+    Vec_LiaConstraint.push(mutable ctx.constraints, take c, allocator)?
+    return true
+}
+
+
+public function assert_prepared_equal(
+    ctx: mutable LiaCtx,
+    form: lin_mod.LinearForm,
+    lit: lit_mod.Lit,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let bound = wide_mod.wide_neg(form.constant)
+    let cu = LiaConstraint {
+        form: form,
+        is_upper: true,
+        bound: bound,
+        lit: lit,
+    }
+    Vec_LiaConstraint.push(mutable ctx.constraints, take cu, allocator)?
+    let cl = LiaConstraint {
+        form: form,
+        is_upper: false,
+        bound: bound,
+        lit: lit,
+    }
+    Vec_LiaConstraint.push(mutable ctx.constraints, take cl, allocator)?
+    return true
+}
+
+
+function fuel() -> usize {
+    return 256
+}
+
+
+function search_node_budget() -> usize {
+    return 20000
+}
+
+
+function col_of(vars: Vec_SmtTerm.Vec, atom: term_mod.SmtTerm) -> usize {
+    let n = Vec_SmtTerm.len(vars)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if Vec_SmtTerm.at(vars, i) == atom {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+
+function register_form_vars(vars: mutable Vec_SmtTerm.Vec, form: lin_mod.LinearForm, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let m = Vec_LinearTerm.len(form.terms)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let lt = Vec_LinearTerm.at(form.terms, i)
+        if col_of(vars, lt.atom) >= Vec_SmtTerm.len(vars) {
+            Vec_SmtTerm.push(mutable vars, take lt.atom, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function build_coeffs(form: lin_mod.LinearForm, vars: Vec_SmtTerm.Vec, n: usize, allocator: Allocator) -> Vec_Rational.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit coeffs: Vec_Rational.Vec
+    Vec_Rational.new(init coeffs, allocator)?
+    var j: usize = 0
+    loop
+        decreases (n - j)
+    {
+        if j >= n {
+            break
+        }
+        let z = rat_mod.zero()
+        Vec_Rational.push(mutable coeffs, take z, allocator)?
+        j = j + 1
+    }
+    let m = Vec_LinearTerm.len(form.terms)
+    var t: usize = 0
+    loop
+        decreases (m - t)
+    {
+        if t >= m {
+            break
+        }
+        let lt = Vec_LinearTerm.at(form.terms, t)
+        let col = col_of(vars, lt.atom)
+        if col < n {
+            let cv = rat_mod.from_i128(lt.coeff)
+            Vec_Rational.set_at(mutable coeffs, col, take cv)
+        }
+        t = t + 1
+    }
+    return coeffs
+}
+
+
+function build_tableau(ctx: LiaCtx, allocator: Allocator) -> BuiltTableau
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit vars: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init vars, allocator)?
+    let nc = Vec_LiaConstraint.len(ctx.constraints)
+    var i: usize = 0
+    loop
+        decreases (nc - i)
+    {
+        if i >= nc {
+            break
+        }
+        let c = Vec_LiaConstraint.at(ctx.constraints, i)
+        register_form_vars(mutable vars, c.form, allocator)?
+        i = i + 1
+    }
+    let n_cols = Vec_SmtTerm.len(vars)
+    let n = n_cols + nc
+    uninit tab: tab_mod.Tableau
+    tab_mod.new(init tab, n, allocator)?
+    var k: usize = 0
+    loop
+        decreases (nc - k)
+    {
+        if k >= nc {
+            break
+        }
+        let c = Vec_LiaConstraint.at(ctx.constraints, k)
+        let slack = n_cols + k
+        let coeffs = build_coeffs(c.form, vars, n, allocator)?
+        tab_mod.add_row(mutable tab, slack, take coeffs, allocator)?
+        let bnd = rat_mod.from_wide(c.bound)
+        if c.is_upper {
+            tab_mod.set_upper(mutable tab, slack, bnd, c.lit)
+        } else {
+            tab_mod.set_lower(mutable tab, slack, bnd, c.lit)
+        }
+        k = k + 1
+    }
+    return BuiltTableau { tab: tab, vars: vars, n_cols: n_cols }
+}
+
+
+public function check(ctx: LiaCtx, allocator: Allocator) -> tab_mod.LiaResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let bt = build_tableau(ctx, allocator)?
+    var budget = search_mod.new_budget(search_node_budget())
+    let outcome = search_mod.solve(bt.tab, fuel(), mutable budget, allocator)?
+    return match outcome {
+        case .feasible(_) => tab_mod.LiaResult.feasible
+        case .infeasible(let e) => tab_mod.LiaResult.infeasible(explanation: e)
+        case .unknown => tab_mod.LiaResult.unknown
+    }
+}
+
+
+public function extract_model(ctx: LiaCtx, allocator: Allocator) -> LiaModel
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit assignments: Vec_LiaAssignment.Vec
+    Vec_LiaAssignment.new(init assignments, allocator)?
+    let bt = build_tableau(ctx, allocator)?
+    var budget = search_mod.new_budget(search_node_budget())
+    let outcome = search_mod.solve(bt.tab, fuel(), mutable budget, allocator)?
+    match outcome {
+        case .feasible(let m) => {
+            var j: usize = 0
+            loop
+                decreases (bt.n_cols - j)
+            {
+                if j >= bt.n_cols {
+                    break
+                }
+                let term = Vec_SmtTerm.at(bt.vars, j)
+                let iv = rat_mod.floor_wide(tab_mod.value_of(m, j))
+                if iv.ok {
+                    let a = LiaAssignment { term: term, value: iv.value }
+                    Vec_LiaAssignment.push(mutable assignments, take a, allocator)?
+                }
+                j = j + 1
+            }
+        }
+        case _ => {}
+    }
+    return LiaModel { assignments: assignments }
+}

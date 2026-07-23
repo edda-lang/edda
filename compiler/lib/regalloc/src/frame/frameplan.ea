@@ -1,0 +1,151 @@
+
+module regalloc.frame.frameplan
+
+import std.collections.vec
+import std.core.option
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+
+
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function body_has_call(body: lir_body_mod.LirBody) -> bool {
+    let n = Vec_LirOp.len(body.ops)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        match Vec_LirOp.at(body.ops, i).kind {
+            case .call_(_, _, _) => return true
+            case .call_indirect(_, _, _) => return true
+            case _ => ()
+        }
+        i += 1
+    }
+    return false
+}
+
+
+public function max_effective_call_args(body: lir_body_mod.LirBody) -> u32 {
+    var maxa: u32 = 0
+    let n = Vec_LirOp.len(body.ops)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        match Vec_LirOp.at(body.ops, i).kind {
+            case .call_(_, let args, let return_) => {
+                var a = Vec_LirVRegId.len(args) as u32
+                if call_return_by_memory(body, return_) { a = a +% (1 as u32) }
+                if a > maxa { maxa = a }
+            }
+            case .call_indirect(_, let args, let return_) => {
+                var a = (Vec_LirVRegId.len(args) as u32) +% (1 as u32)
+                if call_return_by_memory(body, return_) { a = a +% (1 as u32) }
+                if a > maxa { maxa = a }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    return maxa
+}
+
+
+public function agg_scratch_bytes(body: lir_body_mod.LirBody) -> u32 {
+    var maxb: u32 = 0
+    let n = Vec_LirOp.len(body.ops)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        match Vec_LirOp.at(body.ops, i).kind {
+            case .call_(_, let args, let return_) => {
+                let b = call_agg_bytes(body, args, return_)
+                if b > maxb { maxb = b }
+            }
+            case .call_indirect(_, let args, let return_) => {
+                let b = call_agg_bytes(body, args, return_)
+                if b > maxb { maxb = b }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    return maxb
+}
+
+
+function call_agg_bytes(
+    body: lir_body_mod.LirBody,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+) -> u32 {
+    var total: u32 = 0
+    match return_ {
+        case .some(let rv) => {
+            if lir_reg_mod.is_by_memory(vreg_size_raw(body, rv.raw)) {
+                total = total +% align16(vreg_size_raw(body, rv.raw))
+            }
+        }
+        case .none => ()
+    }
+    let n = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = Vec_LirVRegId.at(args, i)
+        if lir_reg_mod.is_by_memory(vreg_size_raw(body, a.raw)) {
+            total = total +% align16(vreg_size_raw(body, a.raw))
+        }
+        i += 1
+    }
+    return total
+}
+
+
+function call_return_by_memory(
+    body: lir_body_mod.LirBody,
+    return_: Option_LirVRegId.Option,
+) -> bool {
+    return match return_ {
+        case .some(let rv) => lir_reg_mod.is_by_memory(vreg_size_raw(body, rv.raw))
+        case .none => false
+    }
+}
+
+
+function vreg_size_raw(body: lir_body_mod.LirBody, raw: u32) -> u32 {
+    let idx = raw as usize
+    if idx == 0 { return lir_reg_mod.register_width() }
+    if idx >= Vec_LirVReg.len(body.vregs) { return lir_reg_mod.register_width() }
+    return Vec_LirVReg.at(body.vregs, idx).size
+}
+
+
+public function outgoing_bytes(has_call: bool, eff: u32) -> u32 {
+    if !has_call { return 0 as u32 }
+    let argbytes = eff *% (8 as u32)
+    let outgoing = if argbytes < (32 as u32) { 32 as u32 } else { argbytes }
+    return align16(outgoing)
+}
+
+
+public function final_frame_size(spill: u32, has_call: bool, eff: u32, agg: u32) -> u32 {
+    let s = align16(spill)
+    if !has_call { return s }
+    return s + align16(agg) + outgoing_bytes(true, eff)
+}
+
+
+function align16(value: u32) -> u32 {
+    let rem = value % (16 as u32)
+    if rem == (0 as u32) { return value }
+    return (value - rem) + (16 as u32)
+}

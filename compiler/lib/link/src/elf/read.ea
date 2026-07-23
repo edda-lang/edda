@@ -1,0 +1,341 @@
+
+module link.elf.read
+
+import std.mem.alloc
+import std.collections.vec
+import object.fmt.elf as elf_mod
+import local.coff.cursor as cursor_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(elf_mod.ElfSectionHeader)
+spec std.collections.vec.Vec(elf_mod.ElfSection)
+spec std.collections.vec.Vec(elf_mod.ElfSymbol)
+spec std.collections.vec.Vec(elf_mod.ElfRela)
+
+
+function symbol_size() -> u64 {
+    return 24 as u64
+}
+
+function rela_size() -> u64 {
+    return 24 as u64
+}
+
+
+function class_from_u8(raw: u8) -> elf_mod.ElfClass {
+    if raw == (1 as u8) { return elf_mod.ElfClass.class32 }
+    if raw == (2 as u8) { return elf_mod.ElfClass.class64 }
+    return elf_mod.ElfClass.none
+}
+
+function data_from_u8(raw: u8) -> elf_mod.ElfData {
+    if raw == (1 as u8) { return elf_mod.ElfData.lsb }
+    if raw == (2 as u8) { return elf_mod.ElfData.msb }
+    return elf_mod.ElfData.none
+}
+
+function type_from_u16(raw: u16) -> elf_mod.ElfType {
+    if raw == (1 as u16) { return elf_mod.ElfType.rel }
+    if raw == (2 as u16) { return elf_mod.ElfType.exec }
+    if raw == (3 as u16) { return elf_mod.ElfType.dyn }
+    if raw == (4 as u16) { return elf_mod.ElfType.core }
+    return elf_mod.ElfType.none
+}
+
+function machine_from_u16(raw: u16) -> elf_mod.ElfMachine {
+    if raw == (0x003E as u16) { return elf_mod.ElfMachine.amd64 }
+    if raw == (0x00B7 as u16) { return elf_mod.ElfMachine.aarch64 }
+    if raw == (0x0003 as u16) { return elf_mod.ElfMachine.i386 }
+    return elf_mod.ElfMachine.none
+}
+
+function section_type_from_u32(raw: u32) -> elf_mod.ElfSectionType {
+    if raw == (1 as u32) { return elf_mod.ElfSectionType.progbits }
+    if raw == (2 as u32) { return elf_mod.ElfSectionType.symtab }
+    if raw == (3 as u32) { return elf_mod.ElfSectionType.strtab }
+    if raw == (4 as u32) { return elf_mod.ElfSectionType.rela }
+    if raw == (8 as u32) { return elf_mod.ElfSectionType.nobits }
+    return elf_mod.ElfSectionType.null_
+}
+
+function occupies_file(t: elf_mod.ElfSectionType) -> bool {
+    return match t {
+        case .null_  => false
+        case .nobits => false
+        case _       => true
+    }
+}
+
+
+function parse_header(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> elf_mod.ElfHeader
+    with {err: cursor_mod.ReadError}
+{
+    let mag0 = cursor_mod.read_u8(bytes, mutable cur)?
+    let mag1 = cursor_mod.read_u8(bytes, mutable cur)?
+    let mag2 = cursor_mod.read_u8(bytes, mutable cur)?
+    let mag3 = cursor_mod.read_u8(bytes, mutable cur)?
+    let bad = mag0 != (0x7F as u8) || mag1 != (0x45 as u8) || mag2 != (0x4C as u8) || mag3 != (0x46 as u8)
+    if bad { raise cursor_mod.ReadError.bad_archive_magic }
+    let class_raw = cursor_mod.read_u8(bytes, mutable cur)?
+    let data_raw = cursor_mod.read_u8(bytes, mutable cur)?
+    let _ei_version = cursor_mod.read_u8(bytes, mutable cur)?
+    let os_abi = cursor_mod.read_u8(bytes, mutable cur)?
+    let abi_version = cursor_mod.read_u8(bytes, mutable cur)?
+    cursor_mod.seek(mutable cur, cur.pos + (7 as usize))
+    let type_raw = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let machine_raw = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let version = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let entry = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let phoff = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let shoff = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let flags = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let ehsize_field = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let phentsize = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let phnum = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let shentsize = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let shnum = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let shstrndx = cursor_mod.read_u16_le(bytes, mutable cur)?
+    return elf_mod.ElfHeader {
+        class: class_from_u8(class_raw),
+        data: data_from_u8(data_raw),
+        os_abi: os_abi,
+        abi_version: abi_version,
+        type_: type_from_u16(type_raw),
+        machine: machine_from_u16(machine_raw),
+        version: version,
+        entry: entry,
+        phoff: phoff,
+        shoff: shoff,
+        flags: flags,
+        ehsize: ehsize_field,
+        phentsize: phentsize,
+        phnum: phnum,
+        shentsize: shentsize,
+        shnum: shnum,
+        shstrndx: shstrndx,
+    }
+}
+
+
+function parse_section_header(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> elf_mod.ElfSectionHeader
+    with {err: cursor_mod.ReadError}
+{
+    let sh_name = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let sh_type_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let sh_flags = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let sh_addr = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let sh_offset = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let sh_size = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let sh_link = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let sh_info = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let sh_addralign = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let sh_entsize = cursor_mod.read_u64_le(bytes, mutable cur)?
+    return elf_mod.ElfSectionHeader {
+        sh_name: sh_name,
+        sh_type: section_type_from_u32(sh_type_raw),
+        sh_flags: sh_flags,
+        sh_addr: sh_addr,
+        sh_offset: sh_offset,
+        sh_size: sh_size,
+        sh_link: sh_link,
+        sh_info: sh_info,
+        sh_addralign: sh_addralign,
+        sh_entsize: sh_entsize,
+    }
+}
+
+
+function parse_symbol(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> elf_mod.ElfSymbol
+    with {err: cursor_mod.ReadError}
+{
+    let st_name = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let st_info = cursor_mod.read_u8(bytes, mutable cur)?
+    let st_other = cursor_mod.read_u8(bytes, mutable cur)?
+    let st_shndx = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let st_value = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let st_size = cursor_mod.read_u64_le(bytes, mutable cur)?
+    return elf_mod.ElfSymbol {
+        st_name: st_name,
+        st_info: st_info,
+        st_other: st_other,
+        st_shndx: st_shndx,
+        st_value: st_value,
+        st_size: st_size,
+    }
+}
+
+
+function parse_rela(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> elf_mod.ElfRela
+    with {err: cursor_mod.ReadError}
+{
+    let r_offset = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let r_info = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let addend_raw = cursor_mod.read_u64_le(bytes, mutable cur)?
+    return elf_mod.ElfRela {
+        r_offset: r_offset,
+        r_info: r_info,
+        r_addend: addend_raw as i64 wrapping,
+    }
+}
+
+
+function read_bytes_at(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    offset: u64,
+    size: u64,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    uninit out_bytes: Vec_u8.Vec
+    Vec_u8.new(init out_bytes, allocator)?
+    let count = size as usize
+    if count == (0 as usize) { return out_bytes }
+    cursor_mod.seek(mutable cur, offset as usize)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let b = cursor_mod.read_u8(bytes, mutable cur)?
+        Vec_u8.push(mutable out_bytes, take b, allocator)?
+        i = i + 1
+    }
+    return out_bytes
+}
+
+
+function read_relas_at(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    offset: u64,
+    count: usize,
+    allocator: Allocator,
+) -> Vec_ElfRela.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    uninit out_relas: Vec_ElfRela.Vec
+    Vec_ElfRela.new(init out_relas, allocator)?
+    if count == (0 as usize) { return out_relas }
+    cursor_mod.seek(mutable cur, offset as usize)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let r = parse_rela(bytes, mutable cur)?
+        Vec_ElfRela.push(mutable out_relas, take r, allocator)?
+        i = i + 1
+    }
+    return out_relas
+}
+
+
+function relocations_for_section(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    headers: Vec_ElfSectionHeader.Vec,
+    reloc_start: usize,
+    target: usize,
+    allocator: Allocator,
+) -> Vec_ElfRela.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let n = Vec_ElfSectionHeader.len(headers)
+    var k: usize = reloc_start
+    loop decreases (n - k) {
+        if k >= n { break }
+        let rh = Vec_ElfSectionHeader.at(headers, k)
+        let is_rela = match rh.sh_type {
+            case .rela => true
+            case _     => false
+        }
+        if is_rela && (rh.sh_info as usize) == target {
+            let count = (rh.sh_size / rela_size()) as usize
+            return read_relas_at(bytes, mutable cur, rh.sh_offset, count, allocator)?
+        }
+        k = k + 1
+    }
+    uninit empty: Vec_ElfRela.Vec
+    Vec_ElfRela.new(init empty, allocator)?
+    return empty
+}
+
+
+public function parse_file(bytes: Vec_u8.Vec, allocator: Allocator) -> elf_mod.ElfFile
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    var cur: cursor_mod.Cursor = cursor_mod.at_start()
+    let header = parse_header(bytes, mutable cur)?
+
+    let shnum = header.shnum as usize
+    let shstrndx = header.shstrndx as usize
+    if shnum < (3 as usize) { raise cursor_mod.ReadError.truncated }
+    if shstrndx < (2 as usize) { raise cursor_mod.ReadError.truncated }
+    let n_real = shstrndx - (2 as usize)
+    let symtab_index = n_real
+    let strtab_index = n_real + (1 as usize)
+    let reloc_start = n_real + (3 as usize)
+
+    cursor_mod.seek(mutable cur, header.shoff as usize)
+    uninit headers: Vec_ElfSectionHeader.Vec
+    Vec_ElfSectionHeader.new(init headers, allocator)?
+    var h: usize = 0
+    loop decreases (shnum - h) {
+        if h >= shnum { break }
+        let sh = parse_section_header(bytes, mutable cur)?
+        Vec_ElfSectionHeader.push(mutable headers, take sh, allocator)?
+        h = h + 1
+    }
+
+    let nh = Vec_ElfSectionHeader.len(headers)
+    if reloc_start > nh { raise cursor_mod.ReadError.truncated }
+
+    uninit sections: Vec_ElfSection.Vec
+    Vec_ElfSection.new(init sections, allocator)?
+    var m: usize = 0
+    loop decreases (n_real - m) {
+        if m >= n_real { break }
+        let sh = Vec_ElfSectionHeader.at(headers, m)
+        let data = if occupies_file(sh.sh_type) {
+            read_bytes_at(bytes, mutable cur, sh.sh_offset, sh.sh_size, allocator)?
+        } else {
+            uninit empty_data: Vec_u8.Vec
+            Vec_u8.new(init empty_data, allocator)?
+            empty_data
+        }
+        let relocations = relocations_for_section(bytes, mutable cur, headers, reloc_start, m, allocator)?
+        let section = elf_mod.ElfSection {
+            header: sh,
+            data: data,
+            relocations: relocations,
+        }
+        Vec_ElfSection.push(mutable sections, take section, allocator)?
+        m = m + 1
+    }
+
+    let symtab_header = Vec_ElfSectionHeader.at(headers, symtab_index)
+    let n_symbols = (symtab_header.sh_size / symbol_size()) as usize
+    cursor_mod.seek(mutable cur, symtab_header.sh_offset as usize)
+    uninit symbols: Vec_ElfSymbol.Vec
+    Vec_ElfSymbol.new(init symbols, allocator)?
+    var s: usize = 0
+    loop decreases (n_symbols - s) {
+        if s >= n_symbols { break }
+        let sym = parse_symbol(bytes, mutable cur)?
+        Vec_ElfSymbol.push(mutable symbols, take sym, allocator)?
+        s = s + 1
+    }
+
+    let strtab_header = Vec_ElfSectionHeader.at(headers, strtab_index)
+    let symbol_name_bytes = read_bytes_at(bytes, mutable cur, strtab_header.sh_offset, strtab_header.sh_size, allocator)?
+
+    let shstrtab_header = Vec_ElfSectionHeader.at(headers, shstrndx)
+    let section_name_bytes = read_bytes_at(bytes, mutable cur, shstrtab_header.sh_offset, shstrtab_header.sh_size, allocator)?
+
+    return elf_mod.ElfFile {
+        header: header,
+        sections: sections,
+        symbols: symbols,
+        symbol_names: elf_mod.ElfStringTable { bytes: symbol_name_bytes },
+        section_names: elf_mod.ElfStringTable { bytes: section_name_bytes },
+    }
+}

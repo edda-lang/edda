@@ -1,0 +1,116 @@
+
+module structmap.walk.emit.doc
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import source.map as source_map_mod
+import span.file as file_mod
+import intern.interner as interner_mod
+import syntax.ast.attr as ast_attr_mod
+import local.data.model as model
+import local.walk.core.util as util
+
+spec std.collections.vec.Vec(ast_attr_mod.Attribute)
+spec std.collections.vec.Vec(ast_attr_mod.AttrArg)
+spec std.collections.vec.Vec(model.TrustEntry)
+spec std.mem.alloc.Box(ast_attr_mod.AttrArg)
+spec std.core.option.Option(model.TrustKind)
+
+
+public function push_trust_attrs(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    target: String,
+    file_rel: String,
+    file_id: file_mod.FileId,
+    attrs: Vec_Attribute.Vec,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_Attribute.len(attrs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let attr = Vec_Attribute.at(attrs, i)
+        match trust_kind_for(attr, interner) {
+            case .some(let tk) => {
+                let reason = trust_reason(attr, interner, allocator)?
+                Vec_TrustEntry.push(
+                    mutable tree.trust_points,
+                    model.TrustEntry {
+                        dir_idx: dir_idx,
+                        target: util.clone_str(target, allocator)?,
+                        file: util.clone_str(file_rel, allocator)?,
+                        line: util.line_of(source_map, file_id, attr.span),
+                        kind: tk,
+                        reason: reason,
+                    },
+                    allocator,
+                )?
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+}
+
+function trust_kind_for(attr: ast_attr_mod.Attribute, interner: interner_mod.Interner) -> Option_TrustKind.Option {
+    if (attr.name.name.raw as usize) >= interner_mod.slot_count(interner) {
+        return Option_TrustKind.none()
+    }
+    let bytes = interner_mod.lookup(interner, attr.name.name)
+    if util.bytes_equals_ascii(bytes, "unverified") {
+        return Option_TrustKind.some(value: model.TrustKind.unverified())
+    }
+    if util.bytes_equals_ascii(bytes, "trust") {
+        return Option_TrustKind.some(value: model.TrustKind.trust_())
+    }
+    return Option_TrustKind.none()
+}
+
+function trust_reason(
+    attr: ast_attr_mod.Attribute,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_AttrArg.len(attr.args)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let arg = Vec_AttrArg.at(attr.args, i)
+        match arg {
+            case .named(_, let key, let value_box) => {
+                if (key.name.raw as usize) < interner_mod.slot_count(interner) {
+                    let kb = interner_mod.lookup(interner, key.name)
+                    if util.bytes_equals_ascii(kb, "reason") {
+                        let inner = Box_AttrArg.get(value_box)
+                        match inner {
+                            case .lit(_, let lit) => match lit {
+                                case .str(let sym) => return util.sym_to_string(sym, interner, allocator)?
+                                case _ => ()
+                            }
+                            case _ => ()
+                        }
+                    }
+                }
+            }
+            case .lit(_, let lit) => match lit {
+                case .str(let sym) => return util.sym_to_string(sym, interner, allocator)?
+                case _ => ()
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    return util.clone_str("", allocator)?
+}

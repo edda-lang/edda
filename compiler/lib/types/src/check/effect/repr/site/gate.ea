@@ -1,0 +1,279 @@
+
+module types.check.effect.repr.site.gate
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import hir.build.file as hir_file
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.name as ty_name_mod
+import types.effect.row as effect_row_mod
+import types.effect.interner as effect_interner_mod
+import local.check.env.sig as sig_mod
+import local.check.effect.repr.site.row as row_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+
+
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+public function check_call_effects(
+    file: hir_file.HirFile,
+    site: node_mod.NodeId,
+    callee: def_mod.DefId,
+    caller: effect_row_mod.CRow,
+    in_comptime: bool,
+    discharged: Vec_TyId.Vec,
+    fn_signatures: Vec_FnSig.Vec,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(callee) {
+        return
+    }
+    let idx = def_mod.index(callee)
+    if idx >= Vec_FnSig.len(fn_signatures) {
+        return
+    }
+    let sig = Vec_FnSig.at(fn_signatures, idx)
+    if (sig.effects.raw as usize) >= effect_interner_mod.slot_count(effect_interner) {
+        return
+    }
+    let callee_row = effect_interner_mod.lookup(effect_interner, sig.effects)
+    let is_try = hir_file.is_try_at(file, site)
+    let n = Vec_CEntry.len(callee_row.entries)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_CEntry.at(callee_row.entries, i)
+        if !(in_comptime && entry_is_comptime_envelope(e)) && !row_mod.entry_covered(caller, e) && !row_mod.entry_discharged(discharged, e) {
+            emit_effect_not_in_row(file, site, mutable diags, allocator)?
+        }
+        match e {
+            case .err_(let t) => {
+                if !is_try && !row_mod.discharged_has(discharged, t) {
+                    emit_effect_row_mismatch(file, site, sig.name, t, interner, ty_interner, mutable diags, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+public function check_dyn_call_effects(
+    file: hir_file.HirFile,
+    site: node_mod.NodeId,
+    callee_node: node_mod.NodeId,
+    caller: effect_row_mod.CRow,
+    in_comptime: bool,
+    discharged: Vec_TyId.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let callee_ty = node_type_at(node_types, callee_node)
+    if ty_mod.is_error(callee_ty) {
+        return
+    }
+    if (callee_ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return
+    }
+    let effects = match ty_interner_mod.lookup(ty_interner, callee_ty) {
+        case .fn_(_, _, let row) => row
+        case _ => return
+    }
+    if (effects.raw as usize) >= effect_interner_mod.slot_count(effect_interner) {
+        return
+    }
+    let callee_row = effect_interner_mod.lookup(effect_interner, effects)
+    let is_try = hir_file.is_try_at(file, site)
+    let n = Vec_CEntry.len(callee_row.entries)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_CEntry.at(callee_row.entries, i)
+        if !(in_comptime && entry_is_comptime_envelope(e)) && !row_mod.entry_covered(caller, e) && !row_mod.entry_discharged(discharged, e) {
+            emit_effect_not_in_row(file, site, mutable diags, allocator)?
+        }
+        match e {
+            case .err_(let t) => {
+                if !is_try && !row_mod.discharged_has(discharged, t) {
+                    emit_dyn_effect_row_mismatch(file, site, mutable diags, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+function entry_is_comptime_envelope(e: effect_row_mod.CEntry) -> bool {
+    return match e {
+        case .panic_ => true
+        case .yield_(_) => true
+        case _ => false
+    }
+}
+
+public function check_raise_effects(
+    file: hir_file.HirFile,
+    site: node_mod.NodeId,
+    inner: Box_HExpr,
+    caller: effect_row_mod.CRow,
+    discharged: Vec_TyId.Vec,
+    node_types: Vec_TyId.Vec,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let e = Box_HExpr.get(inner)
+    let t = node_type_at(node_types, e.node_id)
+    if ty_mod.is_error(t) {
+        return
+    }
+    if !row_mod.row_has_err(caller, t) && !row_mod.discharged_has(discharged, t) {
+        emit_effect_not_in_row(file, site, mutable diags, allocator)?
+    }
+}
+
+public function check_panic_effects(
+    file: hir_file.HirFile,
+    site: node_mod.NodeId,
+    caller: effect_row_mod.CRow,
+    in_comptime: bool,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if in_comptime {
+        return
+    }
+    if !row_mod.row_has_panic(caller) {
+        emit_effect_not_in_row(file, site, mutable diags, allocator)?
+    }
+}
+
+
+function node_type_at(node_types: Vec_TyId.Vec, n: node_mod.NodeId) -> ty_mod.TyId {
+    let i = node_mod.index(n)
+    if i >= Vec_TyId.len(node_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(node_types, i)
+}
+
+public function local_type_at(local_types: Vec_TyId.Vec, d: def_mod.DefId) -> ty_mod.TyId {
+    if def_mod.is_error(d) {
+        return ty_mod.error()
+    }
+    let i = def_mod.index(d)
+    if i >= Vec_TyId.len(local_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(local_types, i)
+}
+
+function sym_string(
+    sym: symbol_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = interner_mod.lookup(interner, sym)
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function emit_effect_not_in_row(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match hir_file.span_of_opt(file, node_id) {
+        case .some(let span) => {
+            let d = diag_mod.error_at(code_mod.effect_not_in_row(), span, "effect exercised here is not declared in the enclosing function's effect row; add the matching `err: T` / `panic` / `yield: T` / `cancellation` / `divergence` / `nondet` / `alloc(bytes <= N)` / `io(calls <= N)` / `time(ops <= N)` entry (graded bounds must dominate the callee's) or the forwarded capability to the `with {...}` row, or handle it")
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+function emit_effect_row_mismatch(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    callee_name: symbol_mod.Symbol,
+    err_ty: ty_mod.TyId,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match hir_file.span_of_opt(file, node_id) {
+        case .some(let span) => {
+            let name = sym_string(callee_name, interner, allocator)?
+            let ty_text = ty_name_mod.name_of(err_ty, ty_interner, allocator)?
+            var msg = string.concat("call to `", name, allocator)?
+            msg = string.concat(msg, "` propagates `err: ", allocator)?
+            msg = string.concat(msg, ty_text, allocator)?
+            msg = string.concat(msg, "` but the result is not wrapped in `?` and no enclosing `handle err: T -> recovery { ... }` admits it; declaring the err in the enclosing function's row is not enough — each fallible call needs explicit propagation", allocator)?
+            let d = diag_mod.error_at(code_mod.effect_row_mismatch(), span, msg)
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+function emit_dyn_effect_row_mismatch(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match hir_file.span_of_opt(file, node_id) {
+        case .some(let span) => {
+            let d = diag_mod.error_at(code_mod.effect_row_mismatch(), span, "indirect call through a fn-value propagates an `err: T` effect but the result is not wrapped in `?` and no enclosing `handle err: T -> recovery { ... }` admits it; declaring the err in the enclosing function's row is not enough — each fallible call needs explicit propagation")
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}

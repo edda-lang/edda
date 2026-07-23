@@ -1,0 +1,458 @@
+
+module types.check.env.lower.ty.ty
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.slice
+import std.collections.hashmap
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import types.pass.ty as ty_mod
+import types.pass.effect as effect_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.row as effect_row_mod
+import types.effect.interner as effect_interner_mod
+import target.capability as cap_mod
+import hir.item as hir_item
+import local.check.env.builtins as builtins_mod
+import local.check.env.lower.nominals as nominals_mod
+import local.check.env.lower.lookup.lookup as lookup_mod
+
+
+spec std.mem.alloc.Box(ast_tree.Ty)
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_tree.Ty)
+spec std.collections.vec.Vec(ast_tree.FnTyParam)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.collections.vec.Vec(nominals_mod.NominalEntry)
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(ty_mod.TyId)
+spec std.core.option.Option(cap_mod.Capability)
+spec std.core.option.Option(ast_tree.EffectRow)
+spec std.core.option.Option(effect_row_mod.CEntry)
+spec std.core.option.Option(u32)
+
+
+public type GenericScope {
+    names: Vec_Symbol.Vec
+    tys: Vec_TyId.Vec
+    params: Vec_HParam.Vec
+}
+
+public function empty_generic_scope(allocator: Allocator) -> GenericScope
+    with {allocator, err: alloc.AllocError}
+{
+    uninit names: Vec_Symbol.Vec
+    Vec_Symbol.new(init names, allocator)?
+    uninit tys: Vec_TyId.Vec
+    Vec_TyId.new(init tys, allocator)?
+    uninit params: Vec_HParam.Vec
+    Vec_HParam.new(init params, allocator)?
+    return GenericScope { names: names, tys: tys, params: params }
+}
+
+public function generic_scope_set_params(gscope: mutable GenericScope, params: Vec_HParam.Vec) -> () {
+    gscope.params = params
+}
+
+public function generic_scope_push(
+    gscope: mutable GenericScope,
+    name: symbol_mod.Symbol,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_Symbol.push(mutable gscope.names, name, allocator)?
+    Vec_TyId.push(mutable gscope.tys, ty, allocator)?
+}
+
+function generic_scope_lookup(gscope: GenericScope, name: symbol_mod.Symbol) -> ty_mod.TyId {
+    let n = Vec_Symbol.len(gscope.names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_Symbol.at(gscope.names, i).raw == name.raw && i < Vec_TyId.len(gscope.tys) {
+            return Vec_TyId.at(gscope.tys, i)
+        }
+        i = i + 1
+    }
+    return ty_mod.error()
+}
+
+public function first_opaque_in_scope(gscope: GenericScope, ty_interner: ty_interner_mod.Interner) -> ty_mod.TyId {
+    let n = Vec_TyId.len(gscope.tys)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let t = Vec_TyId.at(gscope.tys, i)
+        if ty_interner_mod.is_opaque(ty_interner, t) {
+            return t
+        }
+        i = i + 1
+    }
+    return ty_mod.error()
+}
+
+public function lower_ast_ty(
+    ty: ast_tree.Ty,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    gscope: GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match ty.kind {
+        case .unit => builtins.unit_
+        case .meta => builtins.type_meta
+        case .path(let p) => path_to_ty_id(p, builtins, interner, gscope)
+        case .slice(let elem_box) => lower_slice(elem_box, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        case .tuple(let elements) => lower_tuple(elements, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        case .function_(let params, let ret_box, let effects_ast) => lower_fn_type(params, ret_box, effects_ast, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        case .refined(let base_box, _) => {
+            let base_ast = Box_Ty.get(base_box)
+            lower_ast_ty(base_ast, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        }
+        case .comptime_(let inner_box) => {
+            let inner = Box_Ty.get(inner_box)
+            lower_ast_ty(inner, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        }
+        case _ => ty_mod.error()
+    }
+}
+
+function lower_fn_type(
+    params: Vec_FnTyParam.Vec,
+    ret_box: Box_Ty,
+    effects_ast: Option_EffectRow.Option,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    gscope: GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit param_tys: Vec_TyId.Vec
+    Vec_TyId.new(init param_tys, allocator)?
+    let n = Vec_FnTyParam.len(params)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_FnTyParam.at(params, i)
+        let pty = lower_ast_ty(p.ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        Vec_TyId.push(mutable param_tys, pty, allocator)?
+        i = i + 1
+    }
+    let ret_ast = Box_Ty.get(ret_box)
+    let ret_ty = lower_ast_ty(ret_ast, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+    let effects = lower_fn_type_row(effects_ast, gscope.params, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+    let cty = ty_kind_mod.CTy.fn_(params: param_tys, ret: ret_ty, effects: effects)
+    return ty_interner_mod.intern(mutable ty_interner, take cty, allocator)?
+}
+
+function lower_fn_type_row(
+    opt_row: Option_EffectRow.Option,
+    params: Vec_HParam.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> effect_mod.EffectRowId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let row_ast = match opt_row {
+        case .some(let r) => r
+        case .none => return effect_mod.empty()
+    }
+    uninit entries: Vec_CEntry.Vec
+    Vec_CEntry.new(init entries, allocator)?
+    let n = Vec_EffectMember.len(row_ast.members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member = Vec_EffectMember.at(row_ast.members, i)
+        let entry_opt = lower_fn_type_member(member, params, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        match entry_opt {
+            case .some(let e) => Vec_CEntry.push(mutable entries, take e, allocator)?
+            case .none => ()
+        }
+        i = i + 1
+    }
+    let crow = effect_row_mod.CRow { entries: entries }
+    return effect_interner_mod.intern(mutable effect_interner, take crow, allocator)?
+}
+
+function lower_fn_type_member(
+    member: ast_tree.EffectMember,
+    params: Vec_HParam.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_CEntry.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match member {
+        case .capability(let name) => fn_type_cap_member(name, params, interner)
+        case .named(let name, let ty) => fn_type_named_member(name, ty, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        case .spread(_) => Option_CEntry.none
+        case .graded(let kind, let bound_box) => fn_type_graded_member(kind, bound_box, interner)
+    }
+}
+
+function fn_type_cap_member(name: ast_ident.Ident, params: Vec_HParam.Vec, interner: interner_mod.Interner) -> Option_CEntry.Option {
+    if name.name.raw == 0 {
+        return Option_CEntry.some(value: effect_row_mod.CEntry.panic_)
+    }
+    let bytes = interner_mod.lookup(interner, name.name)
+    if slice.eq_u8(bytes, "panic".bytes())        { return Option_CEntry.some(value: effect_row_mod.CEntry.panic_) }
+    if slice.eq_u8(bytes, "divergence".bytes())   { return Option_CEntry.some(value: effect_row_mod.CEntry.divergence_) }
+    if slice.eq_u8(bytes, "cancellation".bytes()) { return Option_CEntry.some(value: effect_row_mod.CEntry.cancellation_) }
+    if slice.eq_u8(bytes, "nondet".bytes())       { return Option_CEntry.some(value: effect_row_mod.CEntry.nondet_) }
+    let idx_opt = fn_type_find_param_index(name, params)
+    return match idx_opt {
+        case .some(let idx) => Option_CEntry.some(value: effect_row_mod.CEntry.capability(local: idx))
+        case .none => Option_CEntry.none
+    }
+}
+
+function fn_type_find_param_index(name: ast_ident.Ident, params: Vec_HParam.Vec) -> Option_u32.Option {
+    let n = Vec_HParam.len(params)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_HParam.at(params, i)
+        if p.name.raw == name.name.raw {
+            return Option_u32.some(value: i as u32)
+        }
+        i = i + 1
+    }
+    return Option_u32.none
+}
+
+function fn_type_named_member(
+    name: ast_ident.Ident,
+    ty: ast_tree.Ty,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_CEntry.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let empty_gs = empty_generic_scope(allocator)?
+    if name.name.raw == 0 {
+        let payload0 = lower_ast_ty(ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        return Option_CEntry.some(value: effect_row_mod.CEntry.yield_(payload0))
+    }
+    let bytes = interner_mod.lookup(interner, name.name)
+    if slice.eq_u8(bytes, "err".bytes()) {
+        let payload = lower_ast_ty(ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        return Option_CEntry.some(value: effect_row_mod.CEntry.err_(payload))
+    }
+    if slice.eq_u8(bytes, "yield".bytes()) {
+        let payload = lower_ast_ty(ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        return Option_CEntry.some(value: effect_row_mod.CEntry.yield_(payload))
+    }
+    return Option_CEntry.none
+}
+
+function fn_type_graded_member(kind: ast_ident.Ident, bound_box: Box_Expr, interner: interner_mod.Interner) -> Option_CEntry.Option {
+    let bytes = interner_mod.lookup(interner, kind.name)
+    let bound_expr = Box_Expr.get(bound_box)
+    let bound_val = fn_type_extract_integer_literal(bound_expr)
+    if slice.eq_u8(bytes, "alloc".bytes()) { return Option_CEntry.some(value: effect_row_mod.CEntry.alloc_(bytes_max: bound_val)) }
+    if slice.eq_u8(bytes, "io".bytes())    { return Option_CEntry.some(value: effect_row_mod.CEntry.io_(calls_max: bound_val)) }
+    if slice.eq_u8(bytes, "time".bytes())  { return Option_CEntry.some(value: effect_row_mod.CEntry.time_(ops_max: bound_val)) }
+    return Option_CEntry.none
+}
+
+function fn_type_extract_integer_literal(e: ast_tree.Expr) -> u128 {
+    return match e.kind {
+        case .literal(let lit) => match lit {
+            case .int(let value, _) => value
+            case _ => 0 as u128
+        }
+        case _ => 0 as u128
+    }
+}
+
+function path_to_ty_id(
+    path: ast_ident.Path,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    gscope: GenericScope,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    let nseg = Vec_Ident.len(path.segments)
+    if nseg == 2 as usize {
+        let mod_seg = Vec_Ident.at(path.segments, 0)
+        let type_seg = Vec_Ident.at(path.segments, 1)
+        return match lookup_mod.lookup_qualified_via_alias(builtins.nominals, mod_seg.name, type_seg.name) {
+            case .some(let t) => t
+            case .none => match lookup_mod.lookup_qualified(builtins.nominals, mod_seg.name, type_seg.name) {
+                case .some(let t1) => t1
+                case .none => match lookup_mod.lookup(builtins.nominals, type_seg.name) {
+                    case .some(let t2) => t2
+                    case .none => ty_mod.error()
+                }
+            }
+        }
+    }
+    if nseg >= 3 as usize {
+        let direct = lookup_full_module_path(builtins.nominals, path.segments)
+        if !ty_mod.is_error(direct) {
+            return direct
+        }
+        let type_seg = Vec_Ident.at(path.segments, nseg - 1 as usize)
+        return match lookup_mod.lookup(builtins.nominals, type_seg.name) {
+            case .some(let t) => t
+            case .none => ty_mod.error()
+        }
+    }
+    if nseg != 1 as usize {
+        return ty_mod.error()
+    }
+    let seg = Vec_Ident.at(path.segments, 0)
+    let generic = generic_scope_lookup(gscope, seg.name)
+    if !ty_mod.is_error(generic) {
+        return generic
+    }
+    let bytes = interner_mod.lookup(interner, seg.name)
+    if slice.eq_u8(bytes, "i8".bytes())                  { return builtins.i8_ }
+    if slice.eq_u8(bytes, "i16".bytes())                 { return builtins.i16_ }
+    if slice.eq_u8(bytes, "i32".bytes())                 { return builtins.i32_ }
+    if slice.eq_u8(bytes, "i64".bytes())                 { return builtins.i64_ }
+    if slice.eq_u8(bytes, "i128".bytes())                { return builtins.i128_ }
+    if slice.eq_u8(bytes, "u8".bytes())                  { return builtins.u8_ }
+    if slice.eq_u8(bytes, "u16".bytes())                 { return builtins.u16_ }
+    if slice.eq_u8(bytes, "u32".bytes())                 { return builtins.u32_ }
+    if slice.eq_u8(bytes, "u64".bytes())                 { return builtins.u64_ }
+    if slice.eq_u8(bytes, "u128".bytes())                { return builtins.u128_ }
+    if slice.eq_u8(bytes, "isize".bytes())               { return builtins.isize_ }
+    if slice.eq_u8(bytes, "usize".bytes())               { return builtins.usize_ }
+    if slice.eq_u8(bytes, "f32".bytes())                 { return builtins.f32_ }
+    if slice.eq_u8(bytes, "f64".bytes())                 { return builtins.f64_ }
+    if slice.eq_u8(bytes, "bool".bytes())                { return builtins.bool_ }
+    if slice.eq_u8(bytes, "never".bytes())               { return builtins.never_ }
+    if slice.eq_u8(bytes, "Codepoint".bytes())           { return builtins.codepoint_ }
+    if slice.eq_u8(bytes, "Type".bytes())                { return builtins.type_meta }
+    if slice.eq_u8(bytes, "String".bytes())              { return builtins.string_ }
+    return match cap_mod.from_name_bytes(bytes) {
+        case .some(let cap) => builtins_mod.builtin_for_cap(builtins, cap)
+        case .none => match lookup_mod.lookup(builtins.nominals, seg.name) {
+            case .some(let t) => t
+            case .none => ty_mod.error()
+        }
+    }
+}
+
+function lookup_full_module_path(nominals: nominals_mod.NominalMap, segments: Vec_Ident.Vec) -> ty_mod.TyId {
+    let nseg = Vec_Ident.len(segments)
+    if nseg < 2 as usize {
+        return ty_mod.error()
+    }
+    let prefix_len = nseg - 1 as usize
+    let name = Vec_Ident.at(segments, prefix_len).name
+    let leaf = Vec_Ident.at(segments, prefix_len - 1 as usize).name
+    match IntMap_usize.get(nominals.by_qual, nominals_mod.qual_key(leaf.raw, name.raw)) {
+        case .some(let id) => {
+            if id < Vec_NominalEntry.len(nominals.entries) {
+                let e = Vec_NominalEntry.at(nominals.entries, id)
+                if entry_path_matches(e, segments, prefix_len) {
+                    return e.ty
+                }
+            }
+        }
+        case .none => return ty_mod.error()
+    }
+    let n = Vec_NominalEntry.len(nominals.entries)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_NominalEntry.at(nominals.entries, i)
+        if e.name.raw == name.raw && entry_path_matches(e, segments, prefix_len) {
+            return e.ty
+        }
+        i = i + 1 as usize
+    }
+    return ty_mod.error()
+}
+
+function entry_path_matches(e: nominals_mod.NominalEntry, segments: Vec_Ident.Vec, prefix_len: usize) -> bool
+    requires prefix_len < Vec_Ident.len(segments)
+{
+    if Vec_Symbol.len(e.module_path) != prefix_len {
+        return false
+    }
+    var j: usize = 0 as usize
+    loop decreases (prefix_len - j) {
+        if j >= prefix_len { break }
+        if Vec_Symbol.at(e.module_path, j).raw != Vec_Ident.at(segments, j).name.raw {
+            return false
+        }
+        j = j + 1 as usize
+    }
+    return true
+}
+
+function lower_slice(
+    elem_box: Box_Ty,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    gscope: GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let elem_ast = Box_Ty.get(elem_box)
+    let elem_ty = lower_ast_ty(elem_ast, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+    let cty = ty_kind_mod.CTy.slice(elem: elem_ty)
+    return ty_interner_mod.intern(mutable ty_interner, take cty, allocator)?
+}
+
+function lower_tuple(
+    elements: Vec_Ty.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    gscope: GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit elem_tys: Vec_TyId.Vec
+    Vec_TyId.new(init elem_tys, allocator)?
+    let n = Vec_Ty.len(elements)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let elem_ast = Vec_Ty.at(elements, i)
+        let elem_ty = lower_ast_ty(elem_ast, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        Vec_TyId.push(mutable elem_tys, elem_ty, allocator)?
+        i = i + 1
+    }
+    let cty = ty_kind_mod.CTy.tuple_(elems: elem_tys)
+    return ty_interner_mod.intern(mutable ty_interner, take cty, allocator)?
+}

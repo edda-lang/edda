@@ -1,0 +1,184 @@
+
+module refine.solver.theory.arrays
+
+import std.collections.vec
+import std.mem.alloc
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ArrayLit)
+spec std.collections.vec.Vec(ArrayClause)
+
+
+public type ArrayLit {
+    atom: term_mod.SmtTerm
+    positive: bool
+}
+
+
+public type ArrayClause {
+    lits: Vec_ArrayLit.Vec
+}
+
+
+type StoreParts {
+    is_store: bool
+    arr: term_mod.SmtTerm
+    idx: term_mod.SmtTerm
+    val: term_mod.SmtTerm
+}
+
+
+function mk_pair(a: term_mod.SmtTerm, b: term_mod.SmtTerm, allocator: Allocator) -> Vec_SmtTerm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit v: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init v, allocator)?
+    Vec_SmtTerm.push(mutable v, take a, allocator)?
+    Vec_SmtTerm.push(mutable v, take b, allocator)?
+    return v
+}
+
+
+function mk_eq(a: term_mod.SmtTerm, b: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.eq_, args: mk_pair(a, b, allocator)?)
+}
+
+
+function mk_select(arr: term_mod.SmtTerm, idx: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.select_, args: mk_pair(arr, idx, allocator)?)
+}
+
+
+function as_store(term: term_mod.SmtTerm) -> StoreParts {
+    return match term {
+        case .app(let op, let args) => store_parts(op, args, term)
+        case _ => no_store(term)
+    }
+}
+
+
+function store_parts(op: term_mod.SmtOp, args: Vec_SmtTerm.Vec, term: term_mod.SmtTerm) -> StoreParts {
+    return match op {
+        case .store_ => {
+            if Vec_SmtTerm.len(args) == 3 {
+                StoreParts {
+                    is_store: true,
+                    arr: Vec_SmtTerm.at(args, 0),
+                    idx: Vec_SmtTerm.at(args, 1),
+                    val: Vec_SmtTerm.at(args, 2),
+                }
+            } else {
+                no_store(term)
+            }
+        }
+        case _ => no_store(term)
+    }
+}
+
+
+function no_store(term: term_mod.SmtTerm) -> StoreParts {
+    return StoreParts {
+        is_store: false,
+        arr: term,
+        idx: term,
+        val: term,
+    }
+}
+
+
+function push_clause2(out: mutable Vec_ArrayClause.Vec, l1: ArrayLit, l2: ArrayLit, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit lits: Vec_ArrayLit.Vec
+    Vec_ArrayLit.new(init lits, allocator)?
+    Vec_ArrayLit.push(mutable lits, take l1, allocator)?
+    Vec_ArrayLit.push(mutable lits, take l2, allocator)?
+    let clause = ArrayClause { lits: lits }
+    Vec_ArrayClause.push(mutable out, take clause, allocator)?
+}
+
+
+function emit_row(
+    sel_term: term_mod.SmtTerm,
+    arr: term_mod.SmtTerm,
+    idx: term_mod.SmtTerm,
+    val: term_mod.SmtTerm,
+    j: term_mod.SmtTerm,
+    out: mutable Vec_ArrayClause.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let eq_ij = mk_eq(idx, j, allocator)?
+    let eq_sel_v = mk_eq(sel_term, val, allocator)?
+    let sel_aj = mk_select(arr, j, allocator)?
+    let eq_sel_aj = mk_eq(sel_term, sel_aj, allocator)?
+    let neg_ij = ArrayLit { atom: eq_ij, positive: false }
+    let pos_sel_v = ArrayLit { atom: eq_sel_v, positive: true }
+    push_clause2(mutable out, neg_ij, pos_sel_v, allocator)?
+    let pos_ij = ArrayLit { atom: eq_ij, positive: true }
+    let pos_sel_aj = ArrayLit { atom: eq_sel_aj, positive: true }
+    push_clause2(mutable out, pos_ij, pos_sel_aj, allocator)?
+}
+
+
+public function collect_axioms(term: term_mod.SmtTerm, out: mutable Vec_ArrayClause.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match term {
+        case .app(let op, let args) => {
+            scan_select(op, args, term, mutable out, allocator)?
+            recurse_args(args, mutable out, allocator)?
+        }
+        case _ => {}
+    }
+}
+
+
+function scan_select(
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    term: term_mod.SmtTerm,
+    out: mutable Vec_ArrayClause.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match op {
+        case .select_ => {
+            if Vec_SmtTerm.len(args) == 2 {
+                let arr = Vec_SmtTerm.at(args, 0)
+                let j = Vec_SmtTerm.at(args, 1)
+                let sp = as_store(arr)
+                if sp.is_store {
+                    emit_row(term, sp.arr, sp.idx, sp.val, j, mutable out, allocator)?
+                }
+            }
+        }
+        case _ => {}
+    }
+}
+
+
+function recurse_args(args: Vec_SmtTerm.Vec, out: mutable Vec_ArrayClause.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        collect_axioms(arg, mutable out, allocator)?
+        i = i + 1
+    }
+}

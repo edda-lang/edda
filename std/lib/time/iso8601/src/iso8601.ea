@@ -1,0 +1,344 @@
+
+module std.time.iso8601
+
+import std.time.calendar
+
+
+public type Iso8601Error {
+    case unexpected_byte
+    case truncated
+    case out_of_range
+    case buffer_too_small
+}
+
+
+public stable function min_format_len_basic() -> usize {
+    return 20
+}
+
+public stable function max_format_len() -> usize {
+    return 36
+}
+
+
+public stable function format(
+    dt: calendar.DateTime,
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: Iso8601Error}
+{
+    let n: usize = out.len()
+    var w: usize = offset
+
+    if w + 19 > n {
+        raise Iso8601Error.buffer_too_small
+    }
+
+    w = _write_year(dt.year, mutable out, w)
+    out[w] = 45; w += 1
+    w = _write_2(dt.month as u32, mutable out, w)
+    out[w] = 45; w += 1
+    w = _write_2(dt.day as u32, mutable out, w)
+    out[w] = 84; w += 1
+    w = _write_2(dt.hour as u32, mutable out, w)
+    out[w] = 58; w += 1
+    w = _write_2(dt.minute as u32, mutable out, w)
+    out[w] = 58; w += 1
+    w = _write_2(dt.second as u32, mutable out, w)
+
+    if dt.nanos > 0 {
+        w = _write_fractional(dt.nanos, mutable out, w)?
+    }
+
+    w = _write_offset(dt.offset_minutes, mutable out, w)?
+
+    return w
+}
+
+
+public stable function parse(input: [u8], offset: usize) -> ParsedDateTime
+    with {err: Iso8601Error}
+{
+    let n: usize = input.len()
+    var i: usize = offset
+
+    let year: i32 = _read_n_digits(input, i, n, 4)? as i32
+    i += 4
+    i = _expect_byte(input, i, n, 45)?
+    let month_u: u32 = _read_n_digits(input, i, n, 2)?
+    if month_u < 1 || month_u > 12 { raise Iso8601Error.out_of_range }
+    let month: u8 = month_u as u8
+    i += 2
+    i = _expect_byte(input, i, n, 45)?
+    let day_u: u32 = _read_n_digits(input, i, n, 2)?
+    if day_u < 1 || day_u > 31 { raise Iso8601Error.out_of_range }
+    let day: u8 = day_u as u8
+    i += 2
+    if !calendar.is_valid_date(year, month, day) {
+        raise Iso8601Error.out_of_range
+    }
+
+    if i >= n { raise Iso8601Error.truncated }
+    let sep: u8 = input[i]
+    if sep != 84 && sep != 32 {
+        raise Iso8601Error.unexpected_byte
+    }
+    i += 1
+
+    let hour_u: u32 = _read_n_digits(input, i, n, 2)?
+    if hour_u > 23 { raise Iso8601Error.out_of_range }
+    let hour: u8 = hour_u as u8
+    i += 2
+    i = _expect_byte(input, i, n, 58)?
+    let min_u: u32 = _read_n_digits(input, i, n, 2)?
+    if min_u > 59 { raise Iso8601Error.out_of_range }
+    let minute: u8 = min_u as u8
+    i += 2
+    i = _expect_byte(input, i, n, 58)?
+    let sec_u: u32 = _read_n_digits(input, i, n, 2)?
+    if sec_u > 60 { raise Iso8601Error.out_of_range }
+    let second: u8 = sec_u as u8
+    i += 2
+
+    var nanos: u32 = 0
+    if i < n && input[i] == 46 {
+        i += 1
+        let frac = _read_fractional(input, i, n)?
+        nanos = frac.value
+        i = frac.end
+    }
+
+    if i >= n { raise Iso8601Error.truncated }
+    var offset_minutes: i32 = 0
+    let tz: u8 = input[i]
+    if tz == 90 {
+        i += 1
+    } else if tz == 43 || tz == 45 {
+        let sign: i32 = if tz == 43 { 1 } else { -1 }
+        i += 1
+        let off_h: u32 = _read_n_digits(input, i, n, 2)?
+        if off_h > 23 { raise Iso8601Error.out_of_range }
+        i += 2
+        i = _expect_byte(input, i, n, 58)?
+        let off_m: u32 = _read_n_digits(input, i, n, 2)?
+        if off_m > 59 { raise Iso8601Error.out_of_range }
+        i += 2
+        offset_minutes = sign * ((off_h * 60 + off_m) as i32)
+    } else {
+        raise Iso8601Error.unexpected_byte
+    }
+
+    let dt = calendar.DateTime {
+        year: year, month: month, day: day,
+        hour: hour, minute: minute, second: second, nanos: nanos,
+        offset_minutes: offset_minutes,
+    }
+    return ParsedDateTime { value: dt, end: i }
+}
+
+public type ParsedDateTime {
+    value: calendar.DateTime
+    end: usize
+}
+
+public type ParsedFraction {
+    value: u32
+    end: usize
+}
+
+
+stable function _write_year(year: i32, out: mutable [u8], w: usize) -> usize {
+    let zero_i32: i32 = 0
+    let abs_year: u32 = if year < 0 { (zero_i32 - year) as u32 } else { year as u32 }
+    let pad_count: usize = if abs_year < 10 {
+        3
+    } else if abs_year < 100 {
+        2
+    } else if abs_year < 1000 {
+        1
+    } else {
+        0
+    }
+    var p: usize = w
+    if year < 0 {
+        out[p] = 45
+        p += 1
+    }
+    var i: usize = 0
+    loop
+        decreases pad_count - i
+    {
+        if i >= pad_count { break }
+        out[p] = 48
+        p += 1
+        i += 1
+    }
+    let digits: usize = _decimal_digits(abs_year)
+    var v: u32 = abs_year
+    var j: usize = 0
+    loop
+        decreases digits - j
+    {
+        if j >= digits { break }
+        let pos: usize = p + digits - 1 - j
+        out[pos] = ((v % 10) as u8) + 48
+        v = v / 10
+        j += 1
+    }
+    return p + digits
+}
+
+stable function _write_2(value: u32, out: mutable [u8], w: usize) -> usize {
+    let tens: u32 = value / 10
+    let ones: u32 = value % 10
+    out[w] = (tens as u8) + 48
+    out[w + 1] = (ones as u8) + 48
+    return w + 2
+}
+
+stable function _write_fractional(nanos: u32, out: mutable [u8], w: usize) -> usize
+    with {err: Iso8601Error}
+{
+    let n: usize = out.len()
+    if w + 10 > n {
+        raise Iso8601Error.buffer_too_small
+    }
+    out[w] = 46
+    let p: usize = w + 1
+    var divisor: u32 = 100000000
+    var v: u32 = nanos
+    let nine: usize = 9
+    var i: usize = 0
+    loop
+        decreases nine - i
+    {
+        if i >= nine { break }
+        let d: u32 = v / divisor
+        out[p + i] = (d as u8) + 48
+        v = v % divisor
+        if divisor >= 10 { divisor = divisor / 10 }
+        i += 1
+    }
+    var last: usize = p + 8
+    loop
+        decreases last + 1 - p
+    {
+        if last <= p { break }
+        if out[last] != 48 { break }
+        last -= 1
+    }
+    return last + 1
+}
+
+stable function _write_offset(offset_minutes: i32, out: mutable [u8], w: usize) -> usize
+    with {err: Iso8601Error}
+{
+    let n: usize = out.len()
+    if offset_minutes == 0 {
+        if w >= n {
+            raise Iso8601Error.buffer_too_small
+        }
+        out[w] = 90
+        return w + 1
+    }
+    if w + 6 > n {
+        raise Iso8601Error.buffer_too_small
+    }
+    let zero_i32: i32 = 0
+    let abs_min: u32 = if offset_minutes < 0 {
+        (zero_i32 - offset_minutes) as u32
+    } else {
+        offset_minutes as u32
+    }
+    out[w] = if offset_minutes < 0 { 45 } else { 43 }
+    let hh: u32 = abs_min / 60
+    let mm: u32 = abs_min % 60
+    var p: usize = _write_2(hh, mutable out, w + 1)
+    out[p] = 58
+    p += 1
+    p = _write_2(mm, mutable out, p)
+    return p
+}
+
+stable function _read_n_digits(
+    input: [u8],
+    start: usize,
+    n: usize,
+    count: usize,
+) -> u32
+    with {err: Iso8601Error}
+    requires count <= 9
+{
+    if start + count > n {
+        raise Iso8601Error.truncated
+    }
+    var value: u32 = 0
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        let byte: u8 = input[start + i]
+        if byte < 48 || byte > 57 {
+            raise Iso8601Error.unexpected_byte
+        }
+        value = value * 10 + ((byte - 48) as u32)
+        i += 1
+    }
+    return value
+}
+
+stable function _read_fractional(input: [u8], start: usize, n: usize) -> ParsedFraction
+    with {err: Iso8601Error}
+{
+    var value: u32 = 0
+    var digits: usize = 0
+    var i: usize = start
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if digits >= 9 { break }
+        let byte: u8 = input[i]
+        if byte < 48 || byte > 57 { break }
+        value = value * 10 + ((byte - 48) as u32)
+        digits += 1
+        i += 1
+    }
+    if digits == 0 {
+        raise Iso8601Error.unexpected_byte
+    }
+    var scale: u32 = 1
+    let pad: usize = 9 - digits
+    var k: usize = 0
+    loop
+        decreases pad - k
+    {
+        if k >= pad { break }
+        scale = scale * 10
+        k += 1
+    }
+    return ParsedFraction { value: value * scale, end: i }
+}
+
+stable function _expect_byte(input: [u8], i: usize, n: usize, byte: u8) -> usize
+    with {err: Iso8601Error}
+{
+    if i >= n { raise Iso8601Error.truncated }
+    if input[i] != byte { raise Iso8601Error.unexpected_byte }
+    return i + 1
+}
+
+stable function _decimal_digits(value: u32) -> usize {
+    if value < 10 { return 1 }
+    if value < 100 { return 2 }
+    if value < 1000 { return 3 }
+    if value < 10000 { return 4 }
+    if value < 100000 { return 5 }
+    if value < 1000000 { return 6 }
+    if value < 10000000 { return 7 }
+    if value < 100000000 { return 8 }
+    if value < 1000000000 { return 9 }
+    return 10
+}

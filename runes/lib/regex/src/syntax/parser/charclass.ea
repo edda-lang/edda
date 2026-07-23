@@ -1,0 +1,347 @@
+
+module regex.syntax.parser.charclass
+
+import regex.syntax.grammar.charset
+import regex.syntax.grammar.mode
+import regex.syntax.errors
+import regex.engine.exec.utf8
+import regex.syntax.parser.util
+import regex.syntax.parser.escape
+
+
+function _posix_class_ranges(
+    name: [u8],
+    pos: usize,
+    allocator: Allocator,
+) -> [charset.CharRange]
+    with {allocator, err: errors.CompileError}
+{
+    if util.bytes_eq(name, "alpha".bytes()) {
+        let s = util.alloc_range_slots(allocator, 2 as usize)?
+        s[0 as usize] = charset.char_range(0x41 as u32, 0x5A as u32)
+        s[1 as usize] = charset.char_range(0x61 as u32, 0x7A as u32)
+        return s
+    }
+    if util.bytes_eq(name, "alnum".bytes()) {
+        let s = util.alloc_range_slots(allocator, 3 as usize)?
+        s[0 as usize] = charset.char_range(0x30 as u32, 0x39 as u32)
+        s[1 as usize] = charset.char_range(0x41 as u32, 0x5A as u32)
+        s[2 as usize] = charset.char_range(0x61 as u32, 0x7A as u32)
+        return s
+    }
+    if util.bytes_eq(name, "digit".bytes()) {
+        let s = util.alloc_range_slots(allocator, 1 as usize)?
+        s[0 as usize] = charset.char_range(0x30 as u32, 0x39 as u32)
+        return s
+    }
+    if util.bytes_eq(name, "lower".bytes()) {
+        let s = util.alloc_range_slots(allocator, 1 as usize)?
+        s[0 as usize] = charset.char_range(0x61 as u32, 0x7A as u32)
+        return s
+    }
+    if util.bytes_eq(name, "upper".bytes()) {
+        let s = util.alloc_range_slots(allocator, 1 as usize)?
+        s[0 as usize] = charset.char_range(0x41 as u32, 0x5A as u32)
+        return s
+    }
+    if util.bytes_eq(name, "space".bytes()) {
+        let s = util.alloc_range_slots(allocator, 2 as usize)?
+        s[0 as usize] = charset.char_range(0x09 as u32, 0x0D as u32)
+        s[1 as usize] = charset.char_range(0x20 as u32, 0x20 as u32)
+        return s
+    }
+    if util.bytes_eq(name, "blank".bytes()) {
+        let s = util.alloc_range_slots(allocator, 2 as usize)?
+        s[0 as usize] = charset.char_range(0x09 as u32, 0x09 as u32)
+        s[1 as usize] = charset.char_range(0x20 as u32, 0x20 as u32)
+        return s
+    }
+    if util.bytes_eq(name, "xdigit".bytes()) {
+        let s = util.alloc_range_slots(allocator, 3 as usize)?
+        s[0 as usize] = charset.char_range(0x30 as u32, 0x39 as u32)
+        s[1 as usize] = charset.char_range(0x41 as u32, 0x46 as u32)
+        s[2 as usize] = charset.char_range(0x61 as u32, 0x66 as u32)
+        return s
+    }
+    if util.bytes_eq(name, "cntrl".bytes()) {
+        let s = util.alloc_range_slots(allocator, 2 as usize)?
+        s[0 as usize] = charset.char_range(0x00 as u32, 0x1F as u32)
+        s[1 as usize] = charset.char_range(0x7F as u32, 0x7F as u32)
+        return s
+    }
+    if util.bytes_eq(name, "print".bytes()) {
+        let s = util.alloc_range_slots(allocator, 1 as usize)?
+        s[0 as usize] = charset.char_range(0x20 as u32, 0x7E as u32)
+        return s
+    }
+    if util.bytes_eq(name, "graph".bytes()) {
+        let s = util.alloc_range_slots(allocator, 1 as usize)?
+        s[0 as usize] = charset.char_range(0x21 as u32, 0x7E as u32)
+        return s
+    }
+    if util.bytes_eq(name, "punct".bytes()) {
+        let s = util.alloc_range_slots(allocator, 4 as usize)?
+        s[0 as usize] = charset.char_range(0x21 as u32, 0x2F as u32)
+        s[1 as usize] = charset.char_range(0x3A as u32, 0x40 as u32)
+        s[2 as usize] = charset.char_range(0x5B as u32, 0x60 as u32)
+        s[3 as usize] = charset.char_range(0x7B as u32, 0x7E as u32)
+        return s
+    }
+    raise errors.CompileError.unknown_perl_class(at: pos)
+}
+
+function _parse_posix_class(
+    src: [u8],
+    pos: usize,
+    allocator: Allocator,
+) -> ([charset.CharRange], usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    let name_start = pos + 2 as usize
+    if name_start >= n { raise errors.CompileError.unterminated_class(at: pos) }
+    var q: usize = name_start
+    loop decreases n - q + 1 as usize {
+        if q + 1 as usize >= n {
+            raise errors.CompileError.unterminated_class(at: pos)
+        }
+        if src[q] == 58 as u8 && src[q + 1 as usize] == 93 as u8 { break }
+        q = q + 1 as usize
+    }
+    let name = src[name_start..<q]
+    if name.len() == 0 as usize {
+        raise errors.CompileError.unknown_perl_class(at: pos)
+    }
+    return (_posix_class_ranges(name, pos, allocator)?, q + 2 as usize)
+}
+
+
+function _is_class_escape_letter(b: u8) -> bool {
+    return b == 100 as u8 || b == 68 as u8
+        || b == 119 as u8 || b == 87 as u8
+        || b == 115 as u8 || b == 83 as u8
+        || b == 104 as u8 || b == 72 as u8
+        || b == 118 as u8 || b == 86 as u8
+}
+
+function _escape_class_inside_class(b: u8, allocator: Allocator) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    if b == 100 as u8 { return escape.builtin_digit_class(false, allocator)? }
+    if b == 68 as u8  { return escape.builtin_digit_class(true,  allocator)? }
+    if b == 119 as u8 { return escape.builtin_word_class(false,  allocator)? }
+    if b == 87 as u8  { return escape.builtin_word_class(true,   allocator)? }
+    if b == 115 as u8 { return escape.builtin_space_class(false, allocator)? }
+    if b == 83 as u8  { return escape.builtin_space_class(true,  allocator)? }
+    if b == 104 as u8 { return escape.builtin_hws_class(false,   allocator)? }
+    if b == 72 as u8  { return escape.builtin_hws_class(true,    allocator)? }
+    if b == 118 as u8 { return escape.builtin_vws_class(false,   allocator)? }
+    return escape.builtin_vws_class(true, allocator)?
+}
+
+function _parse_class_atom(
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (u32, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    if pos >= n {
+        raise errors.CompileError.unterminated_class(at: pos)
+    }
+    let c = src[pos]
+    if c != 92 as u8 {
+        let (cp, byte_len) = utf8.decode_at(src, pos)
+        return (cp, pos + byte_len)
+    }
+    let (node, new_pos) = escape.parse_escape(src, pos, flags, mutable allocator)?
+    let cp = match node {
+        case .literal(let v) => v
+        case _ => raise errors.CompileError.bad_escape(at: pos)
+    }
+    return (cp, new_pos)
+}
+
+function _parse_class_element(
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (u32, u32, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    let (lo_cp, after_lo) = _parse_class_atom(src, pos, flags, mutable allocator)?
+    if after_lo < n && src[after_lo] == 45 as u8 {
+        let next = after_lo + 1 as usize
+        if next < n && src[next] != 93 as u8 {
+            let (hi_cp, after_hi) = _parse_class_atom(src, next, flags, mutable allocator)?
+            return (lo_cp, hi_cp, after_hi)
+        }
+    }
+    return (lo_cp, lo_cp, after_lo)
+}
+
+
+function _normalise_ranges(
+    slots: [charset.CharRange],
+    count: usize,
+    allocator: Allocator,
+) -> [charset.CharRange]
+    with {allocator, err: errors.CompileError}
+{
+    var i: usize = 1 as usize
+    loop decreases count - i + 1 as usize {
+        if i >= count { break }
+        let target = slots[i]
+        var j: usize = i
+        loop decreases j + 1 as usize {
+            if j == 0 as usize { break }
+            let left = slots[j - 1 as usize]
+            if left.lo <= target.lo { break }
+            slots[j] = left
+            j = j - 1 as usize
+        }
+        slots[j] = target
+        i = i + 1 as usize
+    }
+    let scratch = util.alloc_range_slots(allocator, count)?
+    var write: usize = 0 as usize
+    var k: usize = 0 as usize
+    loop decreases count - k + 1 as usize {
+        if k >= count { break }
+        let r = slots[k]
+        if write == 0 as usize {
+            scratch[write] = r
+            write = write + 1 as usize
+        } else {
+            let prev = scratch[write - 1 as usize]
+            let touches = (r.lo <= prev.hi) || (prev.hi < r.lo && r.lo - prev.hi == 1 as u32)
+            if touches {
+                let new_hi = if r.hi > prev.hi { r.hi } else { prev.hi }
+                scratch[write - 1 as usize] = charset.char_range(prev.lo, new_hi)
+            } else {
+                scratch[write] = r
+                write = write + 1 as usize
+            }
+        }
+        k = k + 1 as usize
+    }
+    let out = util.alloc_range_slots(allocator, write)?
+    var c: usize = 0 as usize
+    loop decreases write - c + 1 as usize {
+        if c >= write { break }
+        out[c] = scratch[c]
+        c = c + 1 as usize
+    }
+    return out
+}
+
+
+function _fold_charset_ci(
+    cs: charset.CharSet,
+    allocator: Allocator,
+) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    let in_ranges = cs.ranges
+    let n = in_ranges.len()
+    let cap = n *% (3 as usize)
+    if cap < n { raise errors.CompileError.pattern_too_long }
+    let scratch = util.alloc_range_slots(allocator, cap)?
+    var count: usize = 0 as usize
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let r = in_ranges[i]
+        scratch[count] = r
+        count = count + 1 as usize
+        let u_lo = if r.lo > (0x41 as u32) { r.lo } else { 0x41 as u32 }
+        let u_hi = if r.hi < (0x5A as u32) { r.hi } else { 0x5A as u32 }
+        if u_lo <= u_hi {
+            scratch[count] = charset.char_range(u_lo +% (0x20 as u32), u_hi +% (0x20 as u32))
+            count = count + 1 as usize
+        }
+        let l_lo = if r.lo > (0x61 as u32) { r.lo } else { 0x61 as u32 }
+        let l_hi = if r.hi < (0x7A as u32) { r.hi } else { 0x7A as u32 }
+        if l_lo <= l_hi {
+            scratch[count] = charset.char_range(l_lo -% (0x20 as u32), l_hi -% (0x20 as u32))
+            count = count + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+    let normalised = _normalise_ranges(scratch, count, allocator)?
+    return charset.charset_from_ranges(normalised, cs.negated)
+}
+
+
+public function parse_class(
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (charset.CharSet, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    var i: usize = pos + 1 as usize
+    var negated: bool = false
+    if i < n && src[i] == 94 as u8 {
+        negated = true
+        i = i + 1 as usize
+    }
+    let max_ranges = (n - i + 1 as usize) *% (4 as usize)
+    let slots = util.alloc_range_slots(allocator, max_ranges)?
+    var count: usize = 0 as usize
+    var first: bool = true
+    loop decreases n - i + 1 as usize {
+        if i >= n { raise errors.CompileError.unterminated_class(at: pos) }
+        let c = src[i]
+        if c == 93 as u8 && !first { break }
+        first = false
+        if c == 91 as u8 && i + 1 as usize < n && src[i + 1 as usize] == 58 as u8 {
+            let (ranges, new_i) = _parse_posix_class(src, i, allocator)?
+            var k: usize = 0 as usize
+            let rn = ranges.len()
+            loop decreases rn - k + 1 as usize {
+                if k >= rn { break }
+                slots[count] = ranges[k]
+                count = count + 1 as usize
+                k = k + 1 as usize
+            }
+            i = new_i
+        } else if c == 92 as u8 && i + 1 as usize < n && _is_class_escape_letter(src[i + 1 as usize]) {
+            let cs = _escape_class_inside_class(src[i + 1 as usize], allocator)?
+            if cs.negated {
+                raise errors.CompileError.unsupported_feature(at: i)
+            }
+            let nr = cs.ranges.len()
+            var k: usize = 0 as usize
+            loop decreases nr - k + 1 as usize {
+                if k >= nr { break }
+                slots[count] = cs.ranges[k]
+                count = count + 1 as usize
+                k = k + 1 as usize
+            }
+            i = i + 2 as usize
+        } else {
+            let (lo, hi, new_i) = _parse_class_element(src, i, flags, mutable allocator)?
+            if lo > hi {
+                raise errors.CompileError.bad_class_range(at: i)
+            }
+            slots[count] = charset.char_range(lo, hi)
+            count = count + 1 as usize
+            i = new_i
+        }
+    }
+    let normalised = _normalise_ranges(slots, count, allocator)?
+    let cs = charset.charset_from_ranges(normalised, negated)
+    let folded = if flags.case_insensitive {
+        _fold_charset_ci(cs, allocator)?
+    } else {
+        cs
+    }
+    return (folded, i + 1 as usize)
+}

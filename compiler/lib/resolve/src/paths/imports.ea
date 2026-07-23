@@ -1,0 +1,298 @@
+
+module resolve.paths.imports
+
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.item as ast_item
+import syntax.ast.ident as ast_ident
+import local.paths.modules as mt_mod
+
+spec std.collections.vec.Vec(ImportEntry)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.core.option.Option(ImportEntry)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.core.option.Option(Vec_Ident)
+spec std.core.option.Option(mt_mod.PrefixMatch)
+
+
+public type ImportEntry {
+    name: symbol.Symbol
+    path: Vec_Symbol.Vec
+    is_selected: bool
+}
+
+public type ImportScope {
+    entries: Vec_ImportEntry.Vec
+}
+
+
+public function new_scope(out: init ImportScope, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_ImportEntry.Vec
+    Vec_ImportEntry.new(init entries, allocator)?
+    out = ImportScope { entries: entries }
+}
+
+
+public function build(items: Vec_Item.Vec, mp: Vec_Symbol.Vec, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, allocator: Allocator) -> ImportScope
+    with {allocator, err: alloc.AllocError}
+{
+    uninit sc: ImportScope
+    new_scope(init sc, allocator)?
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .import_(let imp) => add_import(mutable sc, imp, mp, mt, interner, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return sc
+}
+
+
+function add_import(sc: mutable ImportScope, imp: ast_item.Import, mp: Vec_Symbol.Vec, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let module_path = translate_path(imp.path, mp, mt, interner, allocator)?
+    match imp.selection {
+        case .some(let names) => {
+            let n = Vec_Ident.len(names)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let nm = Vec_Ident.at(names, i)
+                let full = append_sym(module_path, nm.name, allocator)?
+                let entry = ImportEntry { name: nm.name, path: full, is_selected: true }
+                Vec_ImportEntry.push(mutable sc.entries, take entry, allocator)?
+                i = i + 1
+            }
+        }
+        case .none => {
+            let bound = match imp.alias {
+                case .some(let a) => a.name
+                case .none => last_segment(imp.path)
+            }
+            let entry = ImportEntry { name: bound, path: module_path, is_selected: false }
+            Vec_ImportEntry.push(mutable sc.entries, take entry, allocator)?
+        }
+    }
+}
+
+
+public function translate_path(path: ast_ident.Path, mp: Vec_Symbol.Vec, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Ident.len(path.segments)
+    if n == 0 {
+        uninit empty: Vec_Symbol.Vec
+        Vec_Symbol.new(init empty, allocator)?
+        return empty
+    }
+    let first = Vec_Ident.at(path.segments, 0).name
+    if is_local_segment(first, interner) {
+        return resolve_local_path(path, mp, mt, allocator)?
+    }
+    return path_tail(path, 0, allocator)?
+}
+
+
+function resolve_local_path(path: ast_ident.Path, mp: Vec_Symbol.Vec, mt: mt_mod.ModuleTree, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let mp_len = Vec_Symbol.len(mp)
+    let collapse = tail_has_entry_file_dup(path)
+    var t: usize = 0
+    loop decreases (mp_len + 1 - t) {
+        if t > mp_len { break }
+        let k = mp_len - t
+        let candidate = prefix_then_tail(mp, k, path, allocator)?
+        if is_registered_module(mt, candidate) {
+            return candidate
+        }
+        if collapse {
+            let collapsed = prefix_then_collapsed_tail(mp, k, path, allocator)?
+            if is_registered_module(mt, collapsed) {
+                return collapsed
+            }
+        }
+        t = t + 1
+    }
+    return prefix_then_tail(mp, mp_len, path, allocator)?
+}
+
+
+function is_registered_module(mt: mt_mod.ModuleTree, segments: Vec_Symbol.Vec) -> bool {
+    return match mt_mod.find_longest_prefix(mt, segments) {
+        case .some(let pm) => pm.segments_consumed == Vec_Symbol.len(segments)
+        case .none => false
+    }
+}
+
+
+function prefix_then_tail(mp: Vec_Symbol.Vec, k: usize, path: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+    requires k <= Vec_Symbol.len(mp)
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    var i: usize = 0
+    loop decreases (k - i) {
+        if i >= k { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(mp, i), allocator)?
+        i = i + 1
+    }
+    let n = Vec_Ident.len(path.segments)
+    var j: usize = 1
+    loop decreases (n - j) {
+        if j >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(path.segments, j).name, allocator)?
+        j = j + 1
+    }
+    return out
+}
+
+
+function tail_has_entry_file_dup(path: ast_ident.Path) -> bool {
+    let n = Vec_Ident.len(path.segments)
+    if n < 3 { return false }
+    let last = Vec_Ident.at(path.segments, n - 1).name
+    let prev = Vec_Ident.at(path.segments, n - 2).name
+    return last.raw == prev.raw
+}
+
+
+function prefix_then_collapsed_tail(mp: Vec_Symbol.Vec, k: usize, path: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+    requires k <= Vec_Symbol.len(mp)
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    var i: usize = 0
+    loop decreases (k - i) {
+        if i >= k { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(mp, i), allocator)?
+        i = i + 1
+    }
+    let n = Vec_Ident.len(path.segments)
+    var j: usize = 1
+    loop decreases (n - j) {
+        if j >= n { break }
+        if j + 1 < n {
+            Vec_Symbol.push(mutable out, Vec_Ident.at(path.segments, j).name, allocator)?
+        }
+        j = j + 1
+    }
+    return out
+}
+
+
+function path_tail(path: ast_ident.Path, start: usize, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(path.segments)
+    var i: usize = start
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(path.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function append_sym(base: Vec_Symbol.Vec, extra: symbol.Symbol, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Symbol.len(base)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(base, i), allocator)?
+        i = i + 1
+    }
+    Vec_Symbol.push(mutable out, extra, allocator)?
+    return out
+}
+
+
+function is_local_segment(s: symbol.Symbol, interner: interner_mod.Interner) -> bool {
+    return slice.eq_u8(interner_mod.lookup(interner, s), "local".bytes())
+}
+
+
+public function is_std_root(root: symbol.Symbol, interner: interner_mod.Interner) -> bool {
+    return slice.eq_u8(interner_mod.lookup(interner, root), "std".bytes())
+}
+
+
+function last_segment(p: ast_ident.Path) -> symbol.Symbol {
+    let n = Vec_Ident.len(p.segments)
+    if n == 0 {
+        return symbol.empty()
+    }
+    return Vec_Ident.at(p.segments, n - 1).name
+}
+
+
+public stable function lookup(sc: ImportScope, name: symbol.Symbol) -> Option_ImportEntry.Option {
+    let n = Vec_ImportEntry.len(sc.entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_ImportEntry.at(sc.entries, i)
+        if e.name.raw == name.raw {
+            return Option_ImportEntry.some(value: e)
+        }
+        i = i + 1
+    }
+    return Option_ImportEntry.none
+}
+
+
+public function expand_path_head(sc: ImportScope, path_syms: Vec_Symbol.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Symbol.len(path_syms)
+    if n < 2 as usize {
+        return path_syms
+    }
+    match lookup(sc, Vec_Symbol.at(path_syms, 0)) {
+        case .some(let entry) => {
+            if entry.is_selected {
+                return path_syms
+            }
+            uninit out: Vec_Symbol.Vec
+            Vec_Symbol.new(init out, allocator)?
+            let pn = Vec_Symbol.len(entry.path)
+            var i: usize = 0
+            loop decreases (pn - i) {
+                if i >= pn { break }
+                Vec_Symbol.push(mutable out, Vec_Symbol.at(entry.path, i), allocator)?
+                i = i + 1
+            }
+            var j: usize = 1
+            loop decreases (n - j) {
+                if j >= n { break }
+                Vec_Symbol.push(mutable out, Vec_Symbol.at(path_syms, j), allocator)?
+                j = j + 1
+            }
+            return out
+        }
+        case .none => return path_syms
+    }
+}

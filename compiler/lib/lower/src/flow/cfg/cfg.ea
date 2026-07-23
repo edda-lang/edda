@@ -1,0 +1,364 @@
+
+module lower.flow.cfg.cfg
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.term as mir_term_mod
+import mir.id.block as mir_block_mod
+
+
+spec std.collections.vec.Vec(BlockEdge)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_block_mod.BlockId)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(usize)
+
+
+public type BlockEdge {
+    target: u32
+    arg_capable: bool
+}
+
+
+public type Cfg {
+    succ_offsets: Vec_usize.Vec
+    succ_edges: Vec_BlockEdge.Vec
+    rpo_order: Vec_u32.Vec
+    rpo_pos: Vec_u32.Vec
+    pred_count: Vec_u32.Vec
+    any_incapable_pred: Vec_bool.Vec
+    any_back_pred: Vec_bool.Vec
+    inherit_pred: Vec_u32.Vec
+}
+
+
+public function build(
+    out: init Cfg,
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_BasicBlock.len(body.blocks)
+
+    uninit succ_offsets: Vec_usize.Vec
+    Vec_usize.new(init succ_offsets, allocator)?
+    uninit succ_edges: Vec_BlockEdge.Vec
+    Vec_BlockEdge.new(init succ_edges, allocator)?
+
+    Vec_usize.push(mutable succ_offsets, 0, allocator)?
+    var b: usize = 0
+    loop decreases n - b {
+        if b >= n { break }
+        if b >= 1 {
+            let blk = Vec_BasicBlock.at(body.blocks, b)
+            push_successors(mutable succ_edges, blk.terminator, allocator)?
+        }
+        Vec_usize.push(mutable succ_offsets, Vec_BlockEdge.len(succ_edges), allocator)?
+        b += 1
+    }
+
+    uninit rpo_order: Vec_u32.Vec
+    Vec_u32.new(init rpo_order, allocator)?
+    uninit rpo_pos: Vec_u32.Vec
+    Vec_u32.new(init rpo_pos, allocator)?
+    compute_rpo(mutable rpo_order, mutable rpo_pos, succ_offsets, succ_edges, n, allocator)?
+
+    uninit pred_count: Vec_u32.Vec
+    Vec_u32.new(init pred_count, allocator)?
+    uninit any_incapable_pred: Vec_bool.Vec
+    Vec_bool.new(init any_incapable_pred, allocator)?
+    uninit any_back_pred: Vec_bool.Vec
+    Vec_bool.new(init any_back_pred, allocator)?
+    uninit inherit_pred: Vec_u32.Vec
+    Vec_u32.new(init inherit_pred, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable pred_count, 0 as u32, allocator)?
+        Vec_bool.push(mutable any_incapable_pred, false, allocator)?
+        Vec_bool.push(mutable any_back_pred, false, allocator)?
+        Vec_u32.push(mutable inherit_pred, 0 as u32, allocator)?
+        i += 1
+    }
+    summarize_preds(
+        mutable pred_count,
+        mutable any_incapable_pred,
+        mutable any_back_pred,
+        mutable inherit_pred,
+        succ_offsets,
+        succ_edges,
+        rpo_pos,
+        n,
+    )
+
+    out = Cfg {
+        succ_offsets: succ_offsets,
+        succ_edges: succ_edges,
+        rpo_order: rpo_order,
+        rpo_pos: rpo_pos,
+        pred_count: pred_count,
+        any_incapable_pred: any_incapable_pred,
+        any_back_pred: any_back_pred,
+        inherit_pred: inherit_pred,
+    }
+}
+
+
+public function succ_start(cfg: Cfg, block: usize) -> usize {
+    if block + 1 >= Vec_usize.len(cfg.succ_offsets) { return 0 }
+    return Vec_usize.at(cfg.succ_offsets, block)
+}
+
+public function succ_end(cfg: Cfg, block: usize) -> usize {
+    if block + 1 >= Vec_usize.len(cfg.succ_offsets) { return 0 }
+    return Vec_usize.at(cfg.succ_offsets, block + 1)
+}
+
+
+function push_successors(
+    out: mutable Vec_BlockEdge.Vec,
+    term: mir_term_mod.Terminator,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match term.kind {
+        case .goto_(let target) => push_edge(mutable out, target, true, allocator)?
+        case .branch(_, let true_, let false_) => {
+            push_edge(mutable out, true_, true, allocator)?
+            push_edge(mutable out, false_, true, allocator)?
+        }
+        case .switch_(_, let targets) => {
+            let nt = Vec_BlockId.len(targets.targets)
+            var i: usize = 0
+            loop decreases nt - i {
+                if i >= nt { break }
+                push_edge(mutable out, Vec_BlockId.at(targets.targets, i), true, allocator)?
+                i += 1
+            }
+            push_edge(mutable out, targets.otherwise_, true, allocator)?
+        }
+        case .return_ => ()
+        case .unreachable_ => ()
+        case .panic_(_) => ()
+        case .raise_(_, let unwind) => push_unwind(mutable out, unwind, allocator)?
+        case .call_(_, _, _, let return_, let unwind) => {
+            push_edge(mutable out, return_, true, allocator)?
+            push_unwind(mutable out, unwind, allocator)?
+        }
+        case .drop_(_, let target, let unwind) => {
+            push_edge(mutable out, target, false, allocator)?
+            push_unwind(mutable out, unwind, allocator)?
+        }
+        case .coherence_enter(let body_entry, let exit) => {
+            push_edge(mutable out, body_entry, false, allocator)?
+            push_edge(mutable out, exit, false, allocator)?
+        }
+        case .coherence_exit(let target) => push_edge(mutable out, target, false, allocator)?
+        case .spawn_(_, _, _, _, let return_, let unwind) => {
+            push_edge(mutable out, return_, false, allocator)?
+            push_unwind(mutable out, unwind, allocator)?
+        }
+        case .await_(_, _, let return_, let unwind) => {
+            push_edge(mutable out, return_, false, allocator)?
+            push_unwind(mutable out, unwind, allocator)?
+        }
+    }
+}
+
+function push_unwind(
+    out: mutable Vec_BlockEdge.Vec,
+    unwind: mir_term_mod.UnwindAction,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match unwind {
+        case .handler(let block) => push_edge(mutable out, block, false, allocator)?
+        case .propagate => ()
+        case .unreachable_ => ()
+    }
+}
+
+function push_edge(
+    out: mutable Vec_BlockEdge.Vec,
+    target: mir_block_mod.BlockId,
+    arg_capable: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let edge = BlockEdge {
+        target: target.raw,
+        arg_capable: arg_capable,
+    }
+    Vec_BlockEdge.push(mutable out, take edge, allocator)?
+}
+
+
+function compute_rpo(
+    rpo_order: mutable Vec_u32.Vec,
+    rpo_pos: mutable Vec_u32.Vec,
+    succ_offsets: Vec_usize.Vec,
+    succ_edges: Vec_BlockEdge.Vec,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit visited: Vec_bool.Vec
+    Vec_bool.new(init visited, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_bool.push(mutable visited, false, allocator)?
+        Vec_u32.push(mutable rpo_pos, 0 as u32, allocator)?
+        i += 1
+    }
+
+    uninit stack_block: Vec_u32.Vec
+    Vec_u32.new(init stack_block, allocator)?
+    uninit stack_cursor: Vec_usize.Vec
+    Vec_usize.new(init stack_cursor, allocator)?
+    uninit post: Vec_u32.Vec
+    Vec_u32.new(init post, allocator)?
+
+    if n >= 2 {
+        Vec_bool.set_at(mutable visited, 1, true)
+        Vec_u32.push(mutable stack_block, 1 as u32, allocator)?
+        Vec_usize.push(mutable stack_cursor, Vec_usize.at(succ_offsets, 1), allocator)?
+    }
+
+    var fuel: usize = n + Vec_BlockEdge.len(succ_edges) + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        let depth = Vec_u32.len(stack_block)
+        if depth == 0 { break }
+        let top = Vec_u32.at(stack_block, depth - 1) as usize
+        let cursor = Vec_usize.at(stack_cursor, depth - 1)
+        let end = if top + 1 < Vec_usize.len(succ_offsets) {
+            Vec_usize.at(succ_offsets, top + 1)
+        } else {
+            cursor
+        }
+        if cursor >= end {
+            let _ = Vec_u32.pop(mutable stack_block)
+            let _ = Vec_usize.pop(mutable stack_cursor)
+            Vec_u32.push(mutable post, top as u32 wrapping, allocator)?
+        } else {
+            Vec_usize.set_at(mutable stack_cursor, depth - 1, cursor + 1)
+            if cursor < Vec_BlockEdge.len(succ_edges) {
+                let edge = Vec_BlockEdge.at(succ_edges, cursor)
+                let t = edge.target as usize
+                if t >= 1 {
+                    if t < n {
+                        if !Vec_bool.at(visited, t) {
+                            Vec_bool.set_at(mutable visited, t, true)
+                            Vec_u32.push(mutable stack_block, edge.target, allocator)?
+                            Vec_usize.push(mutable stack_cursor, Vec_usize.at(succ_offsets, t), allocator)?
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let n_post = Vec_u32.len(post)
+    var j: usize = 0
+    loop decreases n_post - j {
+        if j >= n_post { break }
+        let block = Vec_u32.at(post, n_post - 1 - j)
+        Vec_u32.push(mutable rpo_order, block, allocator)?
+        if (block as usize) < n {
+            Vec_u32.set_at(mutable rpo_pos, block as usize, (j + 1) as u32 wrapping)
+        }
+        j += 1
+    }
+}
+
+
+function summarize_preds(
+    pred_count: mutable Vec_u32.Vec,
+    any_incapable_pred: mutable Vec_bool.Vec,
+    any_back_pred: mutable Vec_bool.Vec,
+    inherit_pred: mutable Vec_u32.Vec,
+    succ_offsets: Vec_usize.Vec,
+    succ_edges: Vec_BlockEdge.Vec,
+    rpo_pos: Vec_u32.Vec,
+    n: usize,
+) -> ()
+{
+    var b: usize = 1
+    loop decreases n - b {
+        if b >= n { break }
+        let source_pos = Vec_u32.at(rpo_pos, b)
+        if source_pos != (0 as u32) {
+            var e = Vec_usize.at(succ_offsets, b)
+            let end = Vec_usize.at(succ_offsets, b + 1)
+            loop decreases end - e {
+                if e >= end { break }
+                if e < Vec_BlockEdge.len(succ_edges) {
+                    let edge = Vec_BlockEdge.at(succ_edges, e)
+                    let t = edge.target as usize
+                    if t >= 1 {
+                        if t < n {
+                            record_pred(
+                                mutable pred_count,
+                                mutable any_incapable_pred,
+                                mutable any_back_pred,
+                                mutable inherit_pred,
+                                rpo_pos,
+                                b,
+                                t,
+                                edge.arg_capable,
+                                source_pos,
+                            )
+                        }
+                    }
+                }
+                e += 1
+            }
+        }
+        b += 1
+    }
+}
+
+function record_pred(
+    pred_count: mutable Vec_u32.Vec,
+    any_incapable_pred: mutable Vec_bool.Vec,
+    any_back_pred: mutable Vec_bool.Vec,
+    inherit_pred: mutable Vec_u32.Vec,
+    rpo_pos: Vec_u32.Vec,
+    source: usize,
+    target: usize,
+    arg_capable: bool,
+    source_pos: u32,
+) -> ()
+{
+    Vec_u32.set_at(mutable pred_count, target, Vec_u32.at(pred_count, target) +| (1 as u32))
+    if !arg_capable {
+        Vec_bool.set_at(mutable any_incapable_pred, target, true)
+    }
+    let target_pos = Vec_u32.at(rpo_pos, target)
+    if source_pos >= target_pos {
+        Vec_bool.set_at(mutable any_back_pred, target, true)
+        return
+    }
+    let current = Vec_u32.at(inherit_pred, target) as usize
+    if current == 0 {
+        Vec_u32.set_at(mutable inherit_pred, target, source as u32 wrapping)
+        return
+    }
+    if Vec_u32.at(rpo_pos, current) < source_pos {
+        Vec_u32.set_at(mutable inherit_pred, target, source as u32 wrapping)
+    }
+}

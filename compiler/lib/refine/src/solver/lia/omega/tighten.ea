@@ -1,0 +1,147 @@
+
+module refine.solver.lia.omega.tighten
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.rational.scalar as rat_mod
+import local.solver.rational.wide as wide_mod
+import local.solver.theory.quant.linearize as lin_mod
+import local.solver.lia.omega.rows as rows_mod
+
+
+spec std.collections.vec.Vec(lin_mod.LinearTerm)
+spec std.collections.vec.Vec(rows_mod.OmegaRow)
+
+
+public type TightenOutcome {
+    case ok(infeasible: bool)
+    case abort
+}
+
+
+public function tighten(rows: mutable Vec_OmegaRow.Vec, allocator: Allocator) -> TightenOutcome
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_OmegaRow.len(rows)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let row = Vec_OmegaRow.at(rows, i)
+        if !row.alive {
+            i = i + 1
+            continue
+        }
+        if Vec_LinearTerm.len(row.terms) == 0 {
+            if constant_row_infeasible(row) {
+                return TightenOutcome.ok(infeasible: true)
+            }
+            i = i + 1
+            continue
+        }
+        let g = row_gcd(row.terms)
+        if g > (1 as u128) {
+            if !tighten_row(mutable rows, i, g, allocator)? {
+                return TightenOutcome.abort
+            }
+        }
+        i = i + 1
+    }
+    return TightenOutcome.ok(infeasible: false)
+}
+
+
+function constant_row_infeasible(row: rows_mod.OmegaRow) -> bool {
+    if row.is_upper {
+        return row.bound.neg
+    }
+    return !row.bound.neg && row.bound.mag > (0 as u128)
+}
+
+
+function row_gcd(terms: Vec_LinearTerm.Vec) -> u128
+    with {divergence}
+{
+    let n = Vec_LinearTerm.len(terms)
+    var g: u128 = 0 as u128
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let c = Vec_LinearTerm.at(terms, i).coeff
+        g = gcd_u128(g, wide_mod.mag_u128(c))
+        i = i + 1
+    }
+    return g
+}
+
+
+function gcd_u128(a: u128, b: u128) -> u128 {
+    var x = a
+    var y = b
+    loop
+        decreases y
+    {
+        if y == (0 as u128) {
+            break
+        }
+        let r = x % y
+        x = y
+        y = r
+    }
+    return x
+}
+
+
+function tighten_row(rows: mutable Vec_OmegaRow.Vec, i: usize, g: u128, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let top_mag = wide_mod.mag_u128(rows_mod.i128_top())
+    if g > top_mag {
+        return false
+    }
+    var row = Vec_OmegaRow.at(rows, i)
+    let gi = g as i128
+    if gi <= (1 as i128) {
+        return false
+    }
+    uninit scaled: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init scaled, allocator)?
+    let n = Vec_LinearTerm.len(row.terms)
+    var t: usize = 0
+    loop
+        decreases (n - t)
+    {
+        if t >= n {
+            break
+        }
+        let lt = Vec_LinearTerm.at(row.terms, t)
+        let nt = lin_mod.LinearTerm { atom: lt.atom, coeff: lt.coeff / gi }
+        Vec_LinearTerm.push(mutable scaled, take nt, allocator)?
+        t = t + 1
+    }
+    let br = rat_mod.from_wide(row.bound)
+    let gr = rat_mod.from_i128(gi)
+    let q = rat_mod.div_checked(br, gr)
+    if !q.ok {
+        return false
+    }
+    let rounded = if row.is_upper {
+        rat_mod.floor_wide(q.value)
+    } else {
+        rat_mod.ceil_wide(q.value)
+    }
+    if !rounded.ok {
+        return false
+    }
+    row.terms = scaled
+    row.bound = rounded.value
+    Vec_OmegaRow.set_at(mutable rows, i, take row)
+    return true
+}

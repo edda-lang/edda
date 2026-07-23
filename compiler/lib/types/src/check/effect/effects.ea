@@ -1,0 +1,284 @@
+
+module types.check.effect.effects
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import hir.item as hir_item
+import hir.tree as hir_tree
+import types.pass.effect as effect_mod
+import types.effect.row as effect_row_mod
+import types.effect.interner as effect_interner_mod
+import types.ty.interner as ty_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.env.lower.ty.ty as ty_lower_mod
+
+
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(hir_tree.HClosureParam)
+spec std.collections.vec.Vec(hir_tree.HCapture)
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+spec std.core.option.Option(ast_tree.EffectRow)
+spec std.core.option.Option(effect_row_mod.CEntry)
+spec std.core.option.Option(u32)
+
+
+public type RowLowering {
+    row: effect_mod.EffectRowId
+    facts: effect_row_mod.EffectFacts
+}
+
+
+public function lower_effect_row(
+    opt_row: Option_EffectRow.Option,
+    params: Vec_HParam.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> RowLowering
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let row_ast = match opt_row {
+        case .some(let r) => r
+        case .none => return RowLowering {
+            row: effect_mod.empty(),
+            facts: effect_row_mod.pure_facts(),
+        }
+    }
+    uninit entries: Vec_CEntry.Vec
+    Vec_CEntry.new(init entries, allocator)?
+    let n = Vec_EffectMember.len(row_ast.members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member = Vec_EffectMember.at(row_ast.members, i)
+        let entry_opt = lower_member(member, params, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        match entry_opt {
+            case .some(let e) => {
+                Vec_CEntry.push(mutable entries, take e, allocator)?
+            }
+            case .none => ()
+        }
+        i = i + 1
+    }
+    let crow = effect_row_mod.CRow { entries: entries }
+    let facts = effect_row_mod.summarize(crow)
+    let row = effect_interner_mod.intern(mutable effect_interner, take crow, allocator)?
+    return RowLowering { row: row, facts: facts }
+}
+
+
+function lower_member(
+    member: ast_tree.EffectMember,
+    params: Vec_HParam.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_CEntry.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match member {
+        case .capability(let name) => cap_member(name, params, interner)
+        case .named(let name, let ty) => named_member(name, ty, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        case .spread(_) => Option_CEntry.none
+        case .graded(let kind, let bound_box) => graded_member(kind, bound_box, interner)
+    }
+}
+
+function cap_member(
+    name: ast_ident.Ident,
+    params: Vec_HParam.Vec,
+    interner: interner_mod.Interner,
+) -> Option_CEntry.Option
+{
+    if name.name.raw == 0 {
+        return Option_CEntry.some(value: effect_row_mod.CEntry.panic_)
+    }
+    let bytes = interner_mod.lookup(interner, name.name)
+    if slice.eq_u8(bytes, "panic".bytes())        { return Option_CEntry.some(value: effect_row_mod.CEntry.panic_) }
+    if slice.eq_u8(bytes, "divergence".bytes())   { return Option_CEntry.some(value: effect_row_mod.CEntry.divergence_) }
+    if slice.eq_u8(bytes, "cancellation".bytes()) { return Option_CEntry.some(value: effect_row_mod.CEntry.cancellation_) }
+    if slice.eq_u8(bytes, "nondet".bytes())       { return Option_CEntry.some(value: effect_row_mod.CEntry.nondet_) }
+    let idx_opt = find_param_index(name, params)
+    return match idx_opt {
+        case .some(let idx) => Option_CEntry.some(value: effect_row_mod.CEntry.capability(local: idx))
+        case .none => Option_CEntry.none
+    }
+}
+
+function find_param_index(name: ast_ident.Ident, params: Vec_HParam.Vec) -> Option_u32.Option {
+    let n = Vec_HParam.len(params)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_HParam.at(params, i)
+        if p.name.raw == name.name.raw {
+            return Option_u32.some(value: i as u32)
+        }
+        i = i + 1
+    }
+    return Option_u32.none
+}
+
+function named_member(
+    name: ast_ident.Ident,
+    ty: ast_tree.Ty,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_CEntry.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let empty_gs = ty_lower_mod.empty_generic_scope(allocator)?
+    if name.name.raw == 0 {
+        let payload0 = ty_lower_mod.lower_ast_ty(ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        return Option_CEntry.some(value: effect_row_mod.CEntry.yield_(payload0))
+    }
+    let bytes = interner_mod.lookup(interner, name.name)
+    if slice.eq_u8(bytes, "err".bytes()) {
+        let payload = ty_lower_mod.lower_ast_ty(ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        return Option_CEntry.some(value: effect_row_mod.CEntry.err_(payload))
+    }
+    if slice.eq_u8(bytes, "yield".bytes()) {
+        let payload = ty_lower_mod.lower_ast_ty(ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        return Option_CEntry.some(value: effect_row_mod.CEntry.yield_(payload))
+    }
+    return Option_CEntry.none
+}
+
+function graded_member(
+    kind: ast_ident.Ident,
+    bound_box: Box_Expr,
+    interner: interner_mod.Interner,
+) -> Option_CEntry.Option
+{
+    let bytes = interner_mod.lookup(interner, kind.name)
+    let bound_expr = Box_Expr.get(bound_box)
+    let bound_val = extract_integer_literal(bound_expr)
+    if slice.eq_u8(bytes, "alloc".bytes()) {
+        return Option_CEntry.some(value: effect_row_mod.CEntry.alloc_(bytes_max: bound_val))
+    }
+    if slice.eq_u8(bytes, "io".bytes()) {
+        return Option_CEntry.some(value: effect_row_mod.CEntry.io_(calls_max: bound_val))
+    }
+    if slice.eq_u8(bytes, "time".bytes()) {
+        return Option_CEntry.some(value: effect_row_mod.CEntry.time_(ops_max: bound_val))
+    }
+    return Option_CEntry.none
+}
+
+function extract_integer_literal(e: ast_tree.Expr) -> u128 {
+    return match e.kind {
+        case .literal(let lit) => match lit {
+            case .int(let value, _) => value
+            case _ => 0 as u128
+        }
+        case _ => 0 as u128
+    }
+}
+
+
+public function lower_closure_effect_row(
+    opt_row: Option_EffectRow.Option,
+    params: Vec_HClosureParam.Vec,
+    captures: Vec_HCapture.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> effect_mod.EffectRowId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let row_ast = match opt_row {
+        case .some(let r) => r
+        case .none => return effect_mod.empty()
+    }
+    uninit entries: Vec_CEntry.Vec
+    Vec_CEntry.new(init entries, allocator)?
+    let n = Vec_EffectMember.len(row_ast.members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member = Vec_EffectMember.at(row_ast.members, i)
+        let entry_opt = lower_closure_member(member, params, captures, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        match entry_opt {
+            case .some(let e) => {
+                Vec_CEntry.push(mutable entries, take e, allocator)?
+            }
+            case .none => ()
+        }
+        i = i + 1
+    }
+    let crow = effect_row_mod.CRow { entries: entries }
+    let row = effect_interner_mod.intern(mutable effect_interner, take crow, allocator)?
+    return row
+}
+
+function lower_closure_member(
+    member: ast_tree.EffectMember,
+    params: Vec_HClosureParam.Vec,
+    captures: Vec_HCapture.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_CEntry.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match member {
+        case .capability(let name) => cap_closure_member(name, params, captures, interner)
+        case .named(let name, let ty) => named_member(name, ty, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        case .spread(_) => Option_CEntry.none
+        case .graded(let kind, let bound_box) => graded_member(kind, bound_box, interner)
+    }
+}
+
+function cap_closure_member(
+    name: ast_ident.Ident,
+    params: Vec_HClosureParam.Vec,
+    captures: Vec_HCapture.Vec,
+    interner: interner_mod.Interner,
+) -> Option_CEntry.Option
+{
+    if name.name.raw == 0 {
+        return Option_CEntry.some(value: effect_row_mod.CEntry.panic_)
+    }
+    let bytes = interner_mod.lookup(interner, name.name)
+    if slice.eq_u8(bytes, "panic".bytes())        { return Option_CEntry.some(value: effect_row_mod.CEntry.panic_) }
+    if slice.eq_u8(bytes, "divergence".bytes())   { return Option_CEntry.some(value: effect_row_mod.CEntry.divergence_) }
+    if slice.eq_u8(bytes, "cancellation".bytes()) { return Option_CEntry.some(value: effect_row_mod.CEntry.cancellation_) }
+    if slice.eq_u8(bytes, "nondet".bytes())       { return Option_CEntry.some(value: effect_row_mod.CEntry.nondet_) }
+    let param_opt = find_closure_param_index(name, params)
+    return match param_opt {
+        case .some(let idx) => Option_CEntry.some(value: effect_row_mod.CEntry.capability(local: idx))
+        case .none => Option_CEntry.none
+    }
+}
+
+function find_closure_param_index(name: ast_ident.Ident, params: Vec_HClosureParam.Vec) -> Option_u32.Option {
+    let n = Vec_HClosureParam.len(params)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_HClosureParam.at(params, i)
+        if p.name.raw == name.name.raw {
+            return Option_u32.some(value: i as u32)
+        }
+        i = i + 1
+    }
+    return Option_u32.none
+}

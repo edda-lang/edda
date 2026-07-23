@@ -1,0 +1,212 @@
+
+module cteval.eval.binary
+
+import std.core.option
+import span.loc.pos.span as span_mod
+import syntax.ast.ops as ast_ops
+import local.error as err_mod
+import local.state.value as value_mod
+import cteval.eval.arithmetic.dispatch as arithmetic_mod
+import cteval.eval.arithmetic.outcome as arith_outcome_mod
+
+
+spec std.core.option.Option(bool)
+
+
+derive eq, debug for BinaryOutcome
+derive eq, debug for BoolOp
+derive eq, debug for OrdOp
+
+
+public type BinaryOutcome {
+    case ok(value: value_mod.ComptimeValue)
+    case failed(error: err_mod.ComptimeError)
+}
+
+public type BoolOp {
+    case and
+    case or
+}
+
+public type OrdOp {
+    case lt
+    case le
+    case gt
+    case ge
+}
+
+
+public function apply_binary(
+    op: ast_ops.BinOp,
+    lv: value_mod.ComptimeValue,
+    rv: value_mod.ComptimeValue,
+    at: span_mod.Span,
+) -> BinaryOutcome {
+    return match op {
+        case .and => apply_bool_op(BoolOp.and, lv, rv, at)
+        case .or => apply_bool_op(BoolOp.or, lv, rv, at)
+        case .eq => apply_equality(true, lv, rv, at)
+        case .ne => apply_equality(false, lv, rv, at)
+        case .lt => apply_ordering(OrdOp.lt, lv, rv, at)
+        case .le => apply_ordering(OrdOp.le, lv, rv, at)
+        case .gt => apply_ordering(OrdOp.gt, lv, rv, at)
+        case .ge => apply_ordering(OrdOp.ge, lv, rv, at)
+        case .add => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .sub => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .mul => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .div => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .mod => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .wrap_add => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .wrap_sub => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .wrap_mul => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .sat_add => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .sat_sub => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .sat_mul => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .check_add => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .check_sub => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .check_mul => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case .check_mod => arith_outcome_to_binary_outcome(arithmetic_mod.apply_arithmetic(op, lv, rv, at))
+        case _ => BinaryOutcome.failed(
+            error: err_mod.ComptimeError.evaluation_failed(
+                at: at,
+                message: "bitwise operators are reserved for post-V1.0",
+            ),
+        )
+    }
+}
+
+
+function arith_outcome_to_binary_outcome(o: arith_outcome_mod.ArithOutcome) -> BinaryOutcome {
+    return match o {
+        case .ok(let v) => BinaryOutcome.ok(value: v)
+        case .failed(let e) => BinaryOutcome.failed(error: e)
+    }
+}
+
+
+function apply_bool_op(
+    op: BoolOp,
+    lv: value_mod.ComptimeValue,
+    rv: value_mod.ComptimeValue,
+    at: span_mod.Span,
+) -> BinaryOutcome {
+    return match lv {
+        case .bool_(let a) => match rv {
+            case .bool_(let b) => match op {
+                case .and => BinaryOutcome.ok(value: value_mod.ComptimeValue.bool_(value: a && b))
+                case .or => BinaryOutcome.ok(value: value_mod.ComptimeValue.bool_(value: a || b))
+            }
+            case _ => failed_bool_operands(at)
+        }
+        case _ => failed_bool_operands(at)
+    }
+}
+
+function failed_bool_operands(at: span_mod.Span) -> BinaryOutcome {
+    return BinaryOutcome.failed(
+        error: err_mod.ComptimeError.evaluation_failed(
+            at: at,
+            message: "boolean operator requires bool operands",
+        ),
+    )
+}
+
+
+function apply_equality(
+    positive: bool,
+    lv: value_mod.ComptimeValue,
+    rv: value_mod.ComptimeValue,
+    at: span_mod.Span,
+) -> BinaryOutcome {
+    let eq_opt = primitive_equal(lv, rv)
+    return match eq_opt {
+        case .some(let are_equal) => {
+            let outcome = if positive { are_equal } else { !are_equal }
+            BinaryOutcome.ok(value: value_mod.ComptimeValue.bool_(value: outcome))
+        }
+        case .none => BinaryOutcome.failed(
+            error: err_mod.ComptimeError.evaluation_failed(
+                at: at,
+                message: "equality operands must be of the same primitive shape",
+            ),
+        )
+    }
+}
+
+function primitive_equal(
+    a: value_mod.ComptimeValue,
+    b: value_mod.ComptimeValue,
+) -> Option_bool.Option {
+    return match a {
+        case .bool_(let av) => match b {
+            case .bool_(let bv) => Option_bool.some(value: av == bv)
+            case _ => Option_bool.none
+        }
+        case .int_signed(let av, _) => match b {
+            case .int_signed(let bv, _) => Option_bool.some(value: av == bv)
+            case _ => Option_bool.none
+        }
+        case .int_unsigned(let av, _) => match b {
+            case .int_unsigned(let bv, _) => Option_bool.some(value: av == bv)
+            case _ => Option_bool.none
+        }
+        case .unit_ => match b {
+            case .unit_ => Option_bool.some(value: true)
+            case _ => Option_bool.none
+        }
+        case .type_meta(let at) => match b {
+            case .type_meta(let bt) => Option_bool.some(value: at.raw == bt.raw)
+            case _ => Option_bool.none
+        }
+        case _ => Option_bool.none
+    }
+}
+
+
+function apply_ordering(
+    op: OrdOp,
+    lv: value_mod.ComptimeValue,
+    rv: value_mod.ComptimeValue,
+    at: span_mod.Span,
+) -> BinaryOutcome {
+    return match lv {
+        case .int_signed(let av, _) => match rv {
+            case .int_signed(let bv, _) =>
+                BinaryOutcome.ok(value: value_mod.ComptimeValue.bool_(value: compare_signed(op, av, bv)))
+            case _ => failed_ord_operands(at)
+        }
+        case .int_unsigned(let av, _) => match rv {
+            case .int_unsigned(let bv, _) =>
+                BinaryOutcome.ok(value: value_mod.ComptimeValue.bool_(value: compare_unsigned(op, av, bv)))
+            case _ => failed_ord_operands(at)
+        }
+        case _ => failed_ord_operands(at)
+    }
+}
+
+function failed_ord_operands(at: span_mod.Span) -> BinaryOutcome {
+    return BinaryOutcome.failed(
+        error: err_mod.ComptimeError.evaluation_failed(
+            at: at,
+            message: "ordering operands must be same-kind integers",
+        ),
+    )
+}
+
+function compare_signed(op: OrdOp, a: i64, b: i64) -> bool {
+    return match op {
+        case .lt => a < b
+        case .le => a <= b
+        case .gt => a > b
+        case .ge => a >= b
+    }
+}
+
+function compare_unsigned(op: OrdOp, a: u64, b: u64) -> bool {
+    return match op {
+        case .lt => a < b
+        case .le => a <= b
+        case .gt => a > b
+        case .ge => a >= b
+    }
+}

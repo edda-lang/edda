@@ -1,0 +1,202 @@
+
+module link.invoke
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.text.string
+import object.coff as coff_mod
+import local.error as error_mod
+import local.emit.image.fix.res.resolve as resolve_mod
+import local.emit.layout as layout_mod
+import local.emit.image.fix.reloc.reloc as reloc_mod
+import local.emit.image.fix.reloc.defs.defs as reloc_defs_mod
+import local.pe.emit.write as pe_mod
+import local.pe.imports as imports_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(reloc_defs_mod.MergedSection)
+spec std.collections.vec.Vec(pe_mod.PeSection)
+spec std.collections.vec.Vec(imports_mod.ImportDll)
+spec std.collections.vec.Vec(imports_mod.ImportSymbol)
+spec std.core.option.Option(resolve_mod.Definition)
+spec std.core.option.Option(u32)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(u32)
+spec std.collections.hashmap.StringMap(resolve_mod.Definition)
+
+
+function class_name(c: layout_mod.SectionClass) -> String {
+    return match c {
+        case .text   => ".text"
+        case .rdata  => ".rdata"
+        case .data   => ".data"
+        case .tls    => ".tls"
+        case .crt    => ".crt"
+        case .bss    => ".bss"
+        case .other_ => ".other"
+    }
+}
+
+
+function build_imports_map(symbols: Vec_ImportSymbol.Vec, allocator: Allocator) -> StringMap_u32.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var m = StringMap_u32.new(allocator)?
+    let n = Vec_ImportSymbol.len(symbols)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let s = Vec_ImportSymbol.at(symbols, i)
+        let key = string.concat("__imp_", s.name, allocator)?
+        let rva = s.iat_rva
+        let _ = StringMap_u32.insert(mutable m, key, take rva, allocator)?
+        i = i + 1
+    }
+    return m
+}
+
+
+function entry_rva_of(
+    table: StringMap_Definition.StringMap,
+    plan: layout_mod.LayoutPlan,
+    entry_symbol: String,
+) -> u32
+    with {err: error_mod.LinkError}
+{
+    return match StringMap_Definition.get(table, entry_symbol) {
+        case .none => raise error_mod.LinkError.entry_not_found(name: entry_symbol)
+        case .some(let def) => match layout_mod.section_rva(plan, def.object_index, def.section_number, def.value) {
+            case .some(let r) => r
+            case .none        => raise error_mod.LinkError.entry_not_found(name: entry_symbol)
+        }
+    }
+}
+
+
+function build_pe_sections(
+    merged: Vec_MergedSection.Vec,
+    plan: layout_mod.LayoutPlan,
+    idata: imports_mod.IdataResult,
+    idata_rva: u32,
+    allocator: Allocator,
+) -> Vec_PeSection.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_PeSection.Vec
+    Vec_PeSection.new(init out, allocator)?
+    let n = Vec_MergedSection.len(merged)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ms = Vec_MergedSection.at(merged, i)
+        let ps = pe_mod.PeSection {
+            name: class_name(ms.class_),
+            rva: ms.rva,
+            virtual_size: ms.size,
+            characteristics: ms.characteristics,
+            data: ms.data,
+        }
+        Vec_PeSection.push(mutable out, take ps, allocator)?
+        i = i + 1
+    }
+    if plan.bss_size > (0 as u32) {
+        uninit empty: Vec_u8.Vec
+        Vec_u8.new(init empty, allocator)?
+        let bss_section = pe_mod.PeSection {
+            name: ".bss",
+            rva: plan.bss_rva,
+            virtual_size: plan.bss_size,
+            characteristics: 0xC0000080 as u32,
+            data: empty,
+        }
+        Vec_PeSection.push(mutable out, take bss_section, allocator)?
+    }
+    let idata_size = Vec_u8.len(idata.data) as u32
+    let idata_section = pe_mod.PeSection {
+        name: ".idata",
+        rva: idata_rva,
+        virtual_size: idata_size,
+        characteristics: 0xC0000040 as u32,
+        data: idata.data,
+    }
+    Vec_PeSection.push(mutable out, take idata_section, allocator)?
+    return out
+}
+
+
+function tls_directory_rva(table: StringMap_Definition.StringMap, plan: layout_mod.LayoutPlan) -> u32 {
+    return match StringMap_Definition.get(table, "_tls_used") {
+        case .none => 0 as u32
+        case .some(let def) => match layout_mod.section_rva(plan, def.object_index, def.section_number, def.value) {
+            case .some(let r) => r
+            case .none        => 0 as u32
+        }
+    }
+}
+
+
+function join_sample(names: Vec_String.Vec, cap: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(names)
+    let limit = if n < cap { n } else { cap }
+    var acc: String = ""
+    var i: usize = 0
+    loop decreases limit - i {
+        if i >= limit { break }
+        if i != 0 as usize {
+            acc = string.concat(acc, ", ", allocator)?
+        }
+        acc = string.concat(acc, Vec_String.at(names, i), allocator)?
+        i += 1
+    }
+    return acc
+}
+
+
+public function link_image(
+    objects: Vec_CoffFile.Vec,
+    provided: StringMap_bool.StringMap,
+    dlls: Vec_ImportDll.Vec,
+    entry_symbol: String,
+    image_base: u64,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {allocator, err: error_mod.LinkError, err: reloc_defs_mod.RelocError, err: alloc.AllocError}
+{
+    let resolved = resolve_mod.resolve(objects, provided, allocator)?
+    if Vec_String.len(resolved.duplicates) > (0 as usize) {
+        let sample = join_sample(resolved.duplicates, 20 as usize, allocator)?
+        raise error_mod.LinkError.duplicate_symbols(count: Vec_String.len(resolved.duplicates), sample: sample)
+    }
+    if Vec_String.len(resolved.unresolved) > (0 as usize) {
+        let sample = Vec_String.at(resolved.unresolved, 0 as usize)
+        raise error_mod.LinkError.unresolved_symbols(count: Vec_String.len(resolved.unresolved), sample: sample)
+    }
+
+    let plan = layout_mod.plan_layout(objects, image_base, allocator)?
+    let page: u32 = 0x1000
+    let idata_rva = layout_mod.align_up(plan.bss_rva + plan.bss_size, page)
+    let idata = imports_mod.build_idata(dlls, idata_rva, allocator)?
+    let imports_map = build_imports_map(idata.symbols, allocator)?
+
+    let merged = reloc_mod.build_relocated_sections(objects, plan, resolved.table, imports_map, allocator)?
+    let entry_rva = entry_rva_of(resolved.table, plan, entry_symbol)?
+    let pe_sections = build_pe_sections(merged, plan, idata, idata_rva, allocator)?
+
+    let tls_dir_rva = tls_directory_rva(resolved.table, plan)
+    let tls_dir_size: u32 = if tls_dir_rva == (0 as u32) { 0 } else { 40 }
+    let dirs = pe_mod.DataDirectories {
+        import_rva: idata.import_dir_rva,
+        import_size: idata.import_dir_size,
+        iat_rva: idata.iat_rva,
+        iat_size: idata.iat_size,
+        tls_rva: tls_dir_rva,
+        tls_size: tls_dir_size,
+    }
+    return pe_mod.write_pe(pe_sections, entry_rva, image_base, dirs, allocator)?
+}

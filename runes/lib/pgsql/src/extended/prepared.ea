@@ -1,0 +1,190 @@
+
+module pgsql.extended.prepared
+
+import std.mem.alloc
+import std.core.option
+import std.net.socket
+import local.error
+import local.link.io
+import local.client.session.startup.connect
+import local.message.tag
+import local.message.fe.extended as fe_extended
+import local.message.be.reply.acks as be_acks
+import local.message.be.data.command as be_command
+import local.message.be.data.rows as be_rows
+import local.message.be.reply.response as be_response
+import local.message.be.reply.status as be_status
+
+spec std.core.option.Option(be_rows.ParameterDescription)
+spec std.core.option.Option(RowShape)
+
+
+public type RowShape {
+    case has_rows(description: be_rows.RowDescription)
+    case no_data
+}
+
+
+public linear type PreparedStatement {
+    name: [u8]
+    parameters: be_rows.ParameterDescription
+    row_shape: RowShape
+}
+
+
+public function prepare(
+    conn: mutable connect.Connection,
+    name: [u8],
+    sql: [u8],
+    param_types: [u32],
+    allocator: Allocator,
+) -> PreparedStatement
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let parse_bytes = fe_extended.encode_parse(name, sql, param_types, allocator)?
+    io.write_all(mutable conn.socket, parse_bytes)?
+
+    let describe_bytes = fe_extended.encode_describe(
+        fe_extended.target_statement(),
+        name,
+        allocator,
+    )?
+    io.write_all(mutable conn.socket, describe_bytes)?
+
+    let sync_bytes = fe_extended.encode_sync(allocator)?
+    io.write_all(mutable conn.socket, sync_bytes)?
+
+    var saw_parse_complete: bool = false
+    var param_desc: Option_ParameterDescription = Option_ParameterDescription.none
+    var shape_opt: Option_RowShape = Option_RowShape.none
+    var saw_error: bool = false
+    var error_sqlstate: [u8] = "".bytes()
+    var error_severity: [u8] = "".bytes()
+    var error_message: [u8] = "".bytes()
+
+    loop {
+        let msg = io.read_message(mutable conn.socket, allocator)?
+        if msg.tag == tag.be_parse_complete() {
+            let _ = be_acks.decode_parse_complete(msg.body)?
+            saw_parse_complete = true
+        } else if msg.tag == tag.be_parameter_description() {
+            let pd = be_rows.decode_parameter_description(msg.body, allocator)?
+            param_desc = Option_ParameterDescription.some(value: pd)
+        } else if msg.tag == tag.be_row_description() {
+            let rd = be_rows.decode_row_description(msg.body, allocator)?
+            shape_opt = Option_RowShape.some(value: RowShape.has_rows(description: rd))
+        } else if msg.tag == tag.be_no_data() {
+            let _ = be_command.decode_no_data(msg.body)?
+            shape_opt = Option_RowShape.some(value: RowShape.no_data)
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            conn.tx_status = rfq.transaction_status
+            break
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            saw_error = true
+            error_sqlstate = be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty)
+            error_severity = be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty)
+            error_message = be_response.field_value_or(err_resp.fields, be_response.field_message(), empty)
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    if saw_error {
+        raise error.QueryError.sql_error(
+            sqlstate: error_sqlstate,
+            severity: error_severity,
+            message: error_message,
+        )
+    }
+
+    if !saw_parse_complete {
+        raise error.ProtocolError.unexpected_message_type
+    }
+    let final_params = match param_desc {
+        case .some(let v) => v
+        case .none => raise error.ProtocolError.unexpected_message_type
+    }
+    let final_shape = match shape_opt {
+        case .some(let v) => v
+        case .none => raise error.ProtocolError.unexpected_message_type
+    }
+
+    return PreparedStatement {
+        name: name,
+        parameters: final_params,
+        row_shape: final_shape,
+    }
+}
+
+
+public function close_prepared(
+    conn: mutable connect.Connection,
+    stmt: take PreparedStatement,
+    allocator: Allocator,
+) -> ()
+    with {
+        allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.QueryError,
+        divergence,
+    }
+{
+    let close_bytes = fe_extended.encode_close(
+        fe_extended.target_statement(),
+        stmt.name,
+        allocator,
+    )?
+    io.write_all(mutable conn.socket, close_bytes)?
+
+    let sync_bytes = fe_extended.encode_sync(allocator)?
+    io.write_all(mutable conn.socket, sync_bytes)?
+
+    var saw_error: bool = false
+    var error_sqlstate: [u8] = "".bytes()
+    var error_severity: [u8] = "".bytes()
+    var error_message: [u8] = "".bytes()
+
+    loop {
+        let msg = io.read_message(mutable conn.socket, allocator)?
+        if msg.tag == tag.be_close_complete() {
+            let _ = be_acks.decode_close_complete(msg.body)?
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            conn.tx_status = rfq.transaction_status
+            break
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            saw_error = true
+            error_sqlstate = be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty)
+            error_severity = be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty)
+            error_message = be_response.field_value_or(err_resp.fields, be_response.field_message(), empty)
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    if saw_error {
+        raise error.QueryError.sql_error(
+            sqlstate: error_sqlstate,
+            severity: error_severity,
+            message: error_message,
+        )
+    }
+}

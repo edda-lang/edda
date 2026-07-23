@@ -1,0 +1,842 @@
+
+module compile.check.check
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import std.core.fmt as fmt_mod
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import cache.addr.hash as hash_mod
+import hir.build.file as hir_file_mod
+import hir.dump.dump as hir_dump_mod
+import intern.interner as interner_mod
+import manifest.manifest as manifest_mod
+import manifest.model.build.build as manifest_build_mod
+import manifest.model.structmap.structmap as structmap_config_mod
+import mir.file.store as mir_file_mod
+import mir.lower.entry.caps as entry_mod
+import object.coff.codeview.typetable.table as debug_table_mod
+import link.emit.image.output as output_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as resolve_specsurface_mod
+import resolve.build.drive.surface.walk.catalogue.collisions as resolve_collisions_mod
+import resolve.bind.lookup.env.walk.uses as resolve_uses_mod
+import resolve.lints.run as resolve_lints_mod
+import resolve.build.drive.surface.walk.binding.walker as resolve_walker_mod
+import source.map as source_map_mod
+import target.triple as triple_mod
+import target.arch as arch_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import local.setup.build as build_phase_mod
+import local.phase.emit.emit as emit_phase_mod
+import local.phase.emit.library.library as library_mod
+import local.phase.emit.prune.prune as prune_mod
+import local.setup.env.discover as discover_mod
+import local.setup.env.closure as closure_mod
+import local.setup.env.deps.deps as deps_mod
+import local.setup.env.membership as membership_mod
+import local.setup.env.stdreach.stdreach as stdreach_mod
+import local.member.filter as filter_mod
+import local.instantiate.iter.enumerate.enumerate as enumerate_mod
+import local.member.cache.plan as member_cache_mod
+import local.member.cache.store.blob as blob_store_mod
+import specs.cachectx as cachectx_mod
+import local.member.cache.objindex as objindex_mod
+import local.member.cache.verdict.store as verdict_mod
+import local.setup.env.load.load as load_mod
+import local.phase.pipeline.parse as parse_mod
+import local.phase.pipeline.lower as lower_mod
+import local.phase.pipeline.refine as refine_phase_mod
+import local.setup.env.load.triple as triple_phase_mod
+import local.phase.analyze.analyze as analyze_mod
+import local.phase.depjit.depjit as depjit_mod
+import local.phase.depstream.depstream as depstream_mod
+import local.phase.emit.reach.reach as reach_mod
+import local.phase.derives as derives_mod
+import local.dump.dump as dump_mod
+import local.trace.trace as trace_mod
+import local.stdlib.resolve as resolve_mod
+import local.check.stablecontract.stablecontract as stablecontract_mod
+import local.check.stablecontract.upsert as upsert_mod
+import local.check.structdiag.structdiag as structdiag_mod
+import local.check.runes.runes as runes_mod
+import local.check.runes.resolve.git.git as git_mod
+import manifest.build.lockfile.parse.parse as lockfile_parse_mod
+import manifest.build.lockfile.write.write as lockfile_write_mod
+import manifest.model.lockfile.lockfile as lockfile_model_mod
+import source.read as source_read_mod
+import structmap.lib as structmap_mod
+import local.check.wsmap.wsmap as wsmap_mod
+import local.check.version.version as version_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(diag_mod.Diagnostic)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(reach_mod.FileRefs)
+spec std.collections.hashmap.StringMap(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(triple_mod.TargetTriple)
+spec std.core.option.Option(library_mod.LinkRequest)
+spec std.core.option.Option(lockfile_model_mod.LoadedLockfile)
+spec std.collections.vec.Vec(lockfile_model_mod.ContractBaseline)
+spec std.collections.vec.Vec(lockfile_model_mod.Rune)
+
+
+public type PipelineMode {
+    case check_
+    case build_
+}
+
+
+public type PipelineSummary {
+    modules: usize
+    artifacts_cached: usize
+    artifacts_generated: usize
+    link_request: Option_LinkRequest.Option
+}
+
+
+public function empty_summary() -> PipelineSummary {
+    return PipelineSummary { modules: 0, artifacts_cached: 0, artifacts_generated: 0, link_request: Option_LinkRequest.none }
+}
+
+
+public function check(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    source_paths: [String],
+    manifest: manifest_mod.LoadedManifest,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> PipelineSummary
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let triple_opt = triple_phase_mod.resolve_triple_from_manifest(manifest, mutable diags, allocator)?
+    let current_version = version_mod.current_version_of(manifest, allocator)?
+    var pkg_files_memo = StringMap_String.new(allocator)?
+    var file_edges_memo = StringMap_String.new(allocator)?
+    return run_pipeline(rfs, wfs, source_paths, Option_String.none, member_cache_mod.no_deps(allocator)?, "", "", "", current_version, Option_String.none, "program", false, triple_opt, PipelineMode.check_, output_mod.OutputKind.executable, dump_mod.no_dumps(), clock, errout, trace, mutable map, mutable interner, mutable diags, mutable pkg_files_memo, mutable file_edges_memo, allocator, allocator)?
+}
+
+
+public function check_with_triple(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    source_paths: [String],
+    triple: triple_mod.TargetTriple,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> PipelineSummary
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    var pkg_files_memo = StringMap_String.new(allocator)?
+    var file_edges_memo = StringMap_String.new(allocator)?
+    return run_pipeline(rfs, wfs, source_paths, Option_String.none, member_cache_mod.no_deps(allocator)?, "", "", "", Option_String.none, Option_String.none, "program", false, Option_TargetTriple.some(value: triple), PipelineMode.check_, output_mod.OutputKind.executable, dump_mod.no_dumps(), clock, errout, trace, mutable map, mutable interner, mutable diags, mutable pkg_files_memo, mutable file_edges_memo, allocator, allocator)?
+}
+
+
+public function run_pipeline(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    source_paths: [String],
+    primary_member: Option_String.Option,
+    member_deps: member_cache_mod.MemberDeps,
+    stdlib_root: String,
+    output_root: String,
+    workspace_root: String,
+    current_version: Option_String.Option,
+    entry_filter: Option_String.Option,
+    program_name: String,
+    descendant_tree: bool,
+    triple_opt: Option_TargetTriple.Option,
+    mode: PipelineMode,
+    output_kind: output_mod.OutputKind,
+    dump: dump_mod.DumpFlags,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    pkg_files_memo: mutable StringMap_String.StringMap,
+    file_edges_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> PipelineSummary
+    with {rfs, wfs, clock, errout, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let lockfile_opt = load_package_lockfile(rfs, workspace_root, allocator)?
+
+    let s_enum = trace_mod.phase_begin(trace, clock, errout, "enumerate", allocator)?
+    uninit run_files: Vec_usize.Vec
+    Vec_usize.new(init run_files, allocator)?
+    enumerate_mod.enumerate_collect(rfs, source_paths, mutable map, mutable run_files, allocator)?
+    if stdlib_root.len() != 0 {
+        let stdlib_files = stdreach_mod.stdlib_reachable(rfs, stdlib_root, source_paths, mutable pkg_files_memo, mutable file_edges_memo, memo_alloc, allocator)?
+        let stdlib_array = Vec_String.into_array(take stdlib_files, allocator)?
+        enumerate_mod.enumerate_collect(rfs, stdlib_array, mutable map, mutable run_files, allocator)?
+    }
+    let module_count = source_map_mod.file_count(map)
+    trace_mod.phase_end_n(s_enum, clock, errout, Vec_usize.len(run_files), "files", allocator)?
+
+    let s_parse = trace_mod.phase_begin(trace, clock, errout, "parse", allocator)?
+    let parsed = parse_mod.parse_sources_at(map, run_files, mutable interner, mutable diags, allocator)?
+    var files = derives_mod.expand_derives(take parsed, mutable interner, allocator)?
+    trace_mod.phase_end(s_parse, clock, errout, allocator)?
+    if dump.ast {
+        let ast_dump = dump_mod.dump_ast_files(files, allocator)?
+        diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.internal_error(), span_mod.dummy(), ast_dump), allocator)?
+    }
+
+    let s_resolve = trace_mod.phase_begin(trace, clock, errout, "resolve", allocator)?
+    uninit ctx: resolve_ctx_mod.ResolveCtx
+    resolve_ctx_mod.new_ctx(init ctx, allocator)?
+    let wl = resolve_walker_mod.new_derive_whitelist(mutable interner, allocator)?
+    let cat = resolve_specsurface_mod.walk_package_with_catalogue(mutable ctx, files, wl, interner, allocator)?
+    resolve_collisions_mod.detect_collisions(mutable ctx, files, mutable interner, allocator)?
+    resolve_specsurface_mod.register_invocations(mutable ctx, cat, files, mutable interner, allocator)?
+    resolve_uses_mod.walk_uses(mutable ctx, files, interner, allocator)?
+    resolve_lints_mod.run_all(mutable ctx, files, map, interner, allocator)?
+    drain_diagnostics(mutable diags, ctx.diags.items, allocator)?
+    let output = resolve_ctx_mod.finish(take ctx)
+    let is_build_for_objcache = match mode {
+        case .build_ => true
+        case .check_ => false
+    }
+    let object_index = if is_build_for_objcache {
+        objindex_mod.build_object_index(files, map, output.module_tree, interner, allocator)?
+    } else {
+        objindex_mod.empty_object_index(allocator)?
+    }
+    trace_mod.phase_end(s_resolve, clock, errout, allocator)?
+
+    let part = analyze_mod.partition_files(mutable files, primary_member, mutable interner, allocator)?
+    let s_lower = trace_mod.phase_begin(trace, clock, errout, "lower-hir", allocator)?
+    let dep_ast = depjit_mod.copy_ast_files(part.deps, allocator)?
+    let dep_def_base = output.next_def_id
+    let dep_alloc = alloc.fork(allocator)
+    let dep_hir_files = lower_mod.lower_to_hir(take part.deps, output, dep_def_base, mutable interner, allocator, dep_alloc)?
+    let hir_files = lower_mod.lower_to_hir(take part.primary, output, output.next_def_id, mutable interner, allocator, allocator)?
+    let hir_module_count = Vec_HirFile.len(hir_files) + Vec_HirFile.len(dep_hir_files)
+    trace_mod.phase_end_n(s_lower, clock, errout, hir_module_count, "modules", allocator)?
+    if dump.hir {
+        let hir_dump = hir_dump_mod.dump_hir_files(hir_files, interner, allocator)?
+        diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.internal_error(), span_mod.dummy(), hir_dump), allocator)?
+        let dep_hir_dump = hir_dump_mod.dump_hir_files(dep_hir_files, interner, allocator)?
+        diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.internal_error(), span_mod.dummy(), dep_hir_dump), allocator)?
+    }
+    stablecontract_mod.check_stable_contract_revision(hir_files, lockfile_opt, current_version, map, interner, mutable diags, allocator)?
+    stablecontract_mod.check_stable_contract_revision(dep_hir_files, lockfile_opt, current_version, map, interner, mutable diags, allocator)?
+    var computed_baselines = match current_version {
+        case .none => upsert_mod.empty_contract_baselines(allocator)?
+        case .some(let v) => upsert_mod.compute_contract_baselines(hir_files, v, map, interner, allocator)?
+    }
+    match current_version {
+        case .none => ()
+        case .some(let v) => {
+            var dep_baselines = upsert_mod.compute_contract_baselines(dep_hir_files, v, map, interner, allocator)?
+            append_baselines(mutable computed_baselines, mutable dep_baselines, allocator)?
+        }
+    }
+    var artifacts_cached: usize = 0
+    var artifacts_generated: usize = 0
+    var link_request: Option_LinkRequest.Option = Option_LinkRequest.none
+    match triple_opt {
+        case .none => alloc.close(take dep_alloc)
+        case .some(let triple) => {
+            let is_build = match mode {
+                case .build_ => true
+                case .check_ => false
+            }
+            let s_cache = trace_mod.phase_begin(trace, clock, errout, "cache-check", allocator)?
+            let plan = member_cache_mod.plan_for(is_build, primary_member, output_root, stdlib_root, triple, program_name, map, allocator)?
+            let cache_hit = if plan.eligible { member_cache_mod.try_restore(rfs, wfs, output_root, plan.hash, plan.loc, plan.member, allocator)? } else { false }
+            let cache_status = if !plan.eligible { "skip" } else if cache_hit { "hit" } else { "miss" }
+            trace_mod.phase_end_detail(s_cache, clock, errout, cache_status, allocator)?
+            if plan.eligible {
+                if cache_hit { artifacts_cached = 1 } else { artifacts_generated = 1 }
+            }
+
+            let is_check_mode = match mode {
+                case .check_ => true
+                case .build_ => false
+            }
+            let verdict_enabled = is_check_mode && workspace_root.len() != 0 && !dump.hir && !dump.types && !dump.mir
+            let verdict_base = diags_mod.count(diags)
+            let verdict_hash = if verdict_enabled {
+                verdict_mod.verdict_hash_of(map, program_name, workspace_root, stdlib_root, allocator)?
+            } else {
+                hash_mod.zero()
+            }
+            var verdict_hit = false
+            if verdict_enabled {
+                verdict_hit = verdict_mod.try_restore_verdict(rfs, workspace_root, verdict_hash, mutable diags, allocator)?
+                if verdict_hit { artifacts_cached = 1 } else { artifacts_generated = 1 }
+            }
+
+            if cache_hit || verdict_hit {
+                alloc.close(take dep_alloc)
+            } else {
+            let s_analyze = trace_mod.phase_begin(trace, clock, errout, "typecheck", allocator)?
+
+            uninit ty_interner: ty_interner_mod.Interner
+            ty_interner_mod.new_interner(init ty_interner, allocator)?
+            uninit effect_interner: effect_interner_mod.Interner
+            effect_interner_mod.new_interner(init effect_interner, allocator)?
+
+            let is_check = match mode {
+                case .check_ => true
+                case .build_ => false
+            }
+            var spec_cache_ctx = cachectx_mod.SpecCacheCtx {
+                global: blob_store_mod.resolve_global(allocator)?,
+                output_root: string.clone(output_root, allocator)?,
+                hits: 0 as usize,
+                misses: 0 as usize,
+            }
+            let analysis = analyze_mod.analyze_seed(
+                take hir_files, take dep_hir_files, take dep_ast, dep_def_base, dep_alloc, take output, cat, triple, is_check, rfs, wfs, trace, clock, errout, mutable spec_cache_ctx,
+                mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable map, allocator,
+            )?
+            alloc.close(take dep_alloc)
+            if dump.types {
+                let types_dump = dump_mod.dump_types_files(analysis.hir_files, analysis.type_outputs, ty_interner, allocator)?
+                diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.internal_error(), span_mod.dummy(), types_dump), allocator)?
+            }
+            let spec_cache_detail = f"spec-cache {spec_cache_ctx.hits} hit / {spec_cache_ctx.misses} miss"
+            trace_mod.phase_end_detail(s_analyze, clock, errout, spec_cache_detail, allocator)?
+
+            if !diags_mod.has_errors(diags) {
+                if is_build && workspace_root.len() != 0 {
+                    let s_structmap = trace_mod.phase_begin(trace, clock, errout, "structmap", allocator)?
+                    let hir_slice = Vec_HirFile.as_slice(analysis.hir_files)
+                    match primary_member {
+                        case .some(let pm) => {
+                            let structmap_root = string.concat(string.concat(workspace_root, "/lib/", allocator)?, pm, allocator)?
+                            let structmap_project = membership_mod.member_project_name(rfs, structmap_root, program_name, allocator)?
+                            let structmap_input = structmap_mod.EmitInput {
+                                project_name: structmap_project,
+                                package_root: structmap_root,
+                                compiler_version: "0.0.0",
+                                descendant_tree: descendant_tree,
+                            }
+                            let structmap_out = structmap_mod.emit(structmap_input, hir_slice, interner, map, analysis.type_outputs, effect_interner, allocator)?
+                            write_structmap_files(wfs, structmap_out)?
+                            structdiag_mod.push_structmap_diagnostics(mutable diags, structmap_out, allocator)?
+                        }
+                        case .none => {
+                            wsmap_mod.emit_workspace_structmaps(rfs, wfs, hir_slice, workspace_root, program_name, descendant_tree, interner, mutable map, analysis.type_outputs, effect_interner, mutable diags, allocator)?
+                        }
+                    }
+                    trace_mod.phase_end(s_structmap, clock, errout, allocator)?
+                }
+                match mode {
+                    case .check_ => {
+                        let s_mir = trace_mod.phase_begin(trace, clock, errout, "mir", allocator)?
+                        let lowered = analyze_mod.lower_instances(
+                            take analysis, triple,
+                            mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, allocator,
+                        )?
+                        trace_mod.phase_end_n(s_mir, clock, errout, Vec_MirFile.len(lowered.mir_files), "functions", allocator)?
+                        if dump.mir {
+                            let mir_dump = dump_mod.dump_mir_files(lowered.mir_files, interner, allocator)?
+                            diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.internal_error(), span_mod.dummy(), mir_dump), allocator)?
+                        }
+                        let mir_files = lowered.mir_files
+                        let type_outputs = lowered.type_outputs
+                        if !diags_mod.has_errors(diags) {
+                            let s_refine = trace_mod.phase_begin(trace, clock, errout, "refine", allocator)?
+                            let ptr_width = arch_mod.pointer_width(triple_mod.arch(triple))
+                            let tally = refine_phase_mod.discharge_files(
+                                mir_files,
+                                type_outputs,
+                                ty_interner,
+                                mutable interner,
+                                ptr_width,
+                                mutable diags,
+                                allocator,
+                            )?
+                            match tally {
+                                case (let discharged, let skipped, let proven) => {
+                                    let detail = refine_summary(discharged, skipped, proven, allocator)?
+                                    trace_mod.phase_end_detail(s_refine, clock, errout, detail, allocator)?
+                                }
+                            }
+                        }
+                    }
+                    case .build_ => {
+                        let s_mir = trace_mod.phase_begin(trace, clock, errout, "mir", allocator)?
+                        let lowered = analyze_mod.lower_instances_build(
+                            take analysis, triple, trace, clock, errout,
+                            mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, allocator,
+                        )?
+                        trace_mod.phase_end_n(s_mir, clock, errout, Vec_MirFile.len(lowered.mir_files), "functions", allocator)?
+                        if dump.mir {
+                            let mir_dump = dump_mod.dump_mir_files(lowered.mir_files, interner, allocator)?
+                            diags_mod.emit(mutable diags, diag_mod.warn_at(diag_code_mod.internal_error(), span_mod.dummy(), mir_dump), allocator)?
+                        }
+                        var mir_files = lowered.mir_files
+                        let type_outputs = lowered.type_outputs
+                        if !diags_mod.has_errors(diags) {
+                            let ptr_width = arch_mod.pointer_width(triple_mod.arch(triple))
+                            match entry_filter {
+                                case .some(let prefix) => filter_mod.demote_foreign_mains(mutable mir_files, prefix, map, interner, allocator)?
+                                case .none => ()
+                            }
+                            let has_entry = entry_mod.materialize_entries(mutable mir_files, mutable ty_interner, interner, allocator)?
+
+                            let s_preprune = trace_mod.phase_begin(trace, clock, errout, "prune-pre", allocator)?
+                            let marks = prune_mod.compute_marks_with_extra(mir_files, lowered.stream.dep_refs, source_paths, map, interner, allocator)?
+                            let live_files = prune_mod.filter_bodies_with_marks(take mir_files, marks, source_paths, map, allocator)?
+                            trace_mod.phase_end_n(s_preprune, clock, errout, prune_mod.body_count(live_files), "bodies", allocator)?
+
+                            let s_refine = trace_mod.phase_begin(trace, clock, errout, "refine", allocator)?
+                            uninit optimized: Vec_MirFile.Vec
+                            let tally = build_phase_mod.optimize_mir_files(
+                                take live_files,
+                                type_outputs,
+                                mutable ty_interner,
+                                mutable interner,
+                                ptr_width,
+                                mutable diags,
+                                allocator,
+                                init optimized,
+                            )?
+                            let dep_fork = alloc.fork(allocator)
+                            let dep_stream = lowered.stream
+                            let dep_emit = depstream_mod.lower_optimize_dep(
+                                take dep_stream, marks, entry_filter, source_paths, triple, ptr_width,
+                                trace, clock, errout, map,
+                                mutable interner, mutable ty_interner, effect_interner, mutable diags,
+                                dep_fork, allocator,
+                            )?
+                            match tally {
+                                case (let discharged, let skipped, let proven) => {
+                                    let detail = refine_summary(discharged +| dep_emit.discharged, skipped +| dep_emit.skipped, proven +| dep_emit.proven, allocator)?
+                                    trace_mod.phase_end_detail(s_refine, clock, errout, detail, allocator)?
+                                }
+                            }
+
+                            if !diags_mod.has_errors(diags) {
+                                let s_emit = trace_mod.phase_begin(trace, clock, errout, "codegen", allocator)?
+                                let s_cdbg = trace_mod.phase_begin(trace, clock, errout, "codegen-debugtable", allocator)?
+                                let debug_table = debug_table_mod.build_debug_table(
+                                    ty_interner,
+                                    type_outputs,
+                                    lowered.inst_types,
+                                    triple,
+                                    interner,
+                                    allocator,
+                                )?
+                                trace_mod.phase_end(s_cdbg, clock, errout, allocator)?
+                                var dep_files = dep_emit.files
+                                append_mir_files(mutable optimized, mutable dep_files, allocator)?
+                                let s_cprune = trace_mod.phase_begin(trace, clock, errout, "codegen-prune", allocator)?
+                                let pruned = prune_mod.prune_unreachable(take optimized, source_paths, map, interner, allocator)?
+                                trace_mod.phase_end_n(s_cprune, clock, errout, Vec_MirFile.len(pruned), "files", allocator)?
+                                let s_cemit = trace_mod.phase_begin(trace, clock, errout, "codegen-emit", allocator)?
+                                link_request = emit_phase_mod.emit_and_link(
+                                    take pruned,
+                                    triple,
+                                    output_root,
+                                    rfs,
+                                    wfs,
+                                    interner,
+                                    ty_interner,
+                                    debug_table,
+                                    map,
+                                    object_index,
+                                    program_name,
+                                    has_entry || dep_emit.has_entry,
+                                    output_kind,
+                                    clock,
+                                    errout,
+                                    trace,
+                                    mutable diags,
+                                    allocator,
+                                )?
+                                trace_mod.phase_end(s_cemit, clock, errout, allocator)?
+                                if plan.eligible && !diags_mod.has_errors(diags) {
+                                    let s_cstore = trace_mod.phase_begin(trace, clock, errout, "codegen-store", allocator)?
+                                    member_cache_mod.try_store(rfs, wfs, output_root, plan.hash, plan.loc, plan.member, member_deps, allocator)?
+                                    trace_mod.phase_end(s_cstore, clock, errout, allocator)?
+                                }
+                                trace_mod.phase_end(s_emit, clock, errout, allocator)?
+                            }
+                            alloc.close(take dep_fork)
+                        }
+                    }
+                }
+            }
+
+            ty_interner_mod.dispose(take ty_interner)
+            effect_interner_mod.dispose(take effect_interner)
+            }
+            if verdict_enabled && !verdict_hit {
+                verdict_mod.store_verdict(wfs, workspace_root, verdict_hash, diags, verdict_base, allocator)?
+            }
+        }
+    }
+    let is_build = match mode {
+        case .build_ => true
+        case .check_ => false
+    }
+    if is_build && workspace_root.len() != 0 && !diags_mod.has_errors(diags) {
+        let computed_runes = runes_mod.compute_runes(rfs, workspace_root, mutable interner, mutable diags, allocator)?
+        write_package_lockfile(wfs, workspace_root, lockfile_opt, take computed_runes, take computed_baselines, allocator)?
+    }
+    return PipelineSummary { modules: module_count, artifacts_cached: artifacts_cached, artifacts_generated: artifacts_generated, link_request: link_request }
+}
+
+
+function write_structmap_files(wfs: Filesystem, output: structmap_mod.EmitOutput) -> ()
+    with {wfs, err: fs.FsError}
+{
+    let files = output.files
+    let n: usize = Vec_String.len(files.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let path = Vec_String.at(files.paths, i)
+        let text = Vec_String.at(files.texts, i)
+        fs.write_string(wfs, path, text)?
+        i += 1
+    }
+}
+
+
+function write_package_lockfile(
+    wfs: Filesystem,
+    workspace_root: String,
+    lockfile_opt: Option_LoadedLockfile.Option,
+    computed_runes: take Vec_Rune.Vec,
+    computed_baselines: take Vec_ContractBaseline.Vec,
+    allocator: Allocator,
+) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let merged_lf = upsert_mod.upsert_lockfile(lockfile_opt, take computed_runes, take computed_baselines, allocator)?
+    let rendered = lockfile_write_mod.write_lockfile(merged_lf, allocator)?
+    let lock_path = string.concat(workspace_root, "/package.lock.toml", allocator)?
+    fs.write_string(wfs, lock_path, rendered)?
+}
+
+
+function load_package_lockfile(rfs: ReadOnlyFilesystem, workspace_root: String, allocator: Allocator) -> Option_LoadedLockfile
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if workspace_root.len() == 0 {
+        return Option_LoadedLockfile.none
+    }
+    let lock_path = string.concat(workspace_root, "/package.lock.toml", allocator)?
+    if !fs.path_exists(rfs, lock_path) {
+        return Option_LoadedLockfile.none
+    }
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let fid = source_read_mod.read_file(rfs, mutable scratch_map, take lock_path, allocator)?
+    let content = source_map_mod.file_content_of(scratch_map, fid)
+    return lockfile_parse_mod.parse_lockfile(content, fid, mutable scratch_diags, allocator)?
+}
+
+
+public function check_workspace(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    workspace_root: String,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> PipelineSummary
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    return check_workspace_with_target(rfs, wfs, workspace_root, Option_String.none, Option_String.none, dump_mod.no_dumps(), clock, errout, trace, mutable map, mutable interner, mutable diags, allocator)?
+}
+
+
+public function check_workspace_with_target(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    workspace_root: String,
+    target_override: Option_String.Option,
+    stdlib_override: Option_String.Option,
+    dump: dump_mod.DumpFlags,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> PipelineSummary
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return empty_summary()
+    }
+    let sources = select_sources(rfs, workspace_root, manifest, allocator)?
+    let source_paths = Vec_String.into_array(take sources, allocator)?
+
+    let primary_member = membership_mod.primary_member_of(rfs, workspace_root, manifest, allocator)?
+    let triple_opt = match target_override {
+        case .some(let s) => triple_phase_mod.resolve_triple_from_string(s, mutable diags, allocator)?
+        case .none => member_or_root_triple(rfs, workspace_root, manifest, primary_member, mutable map, mutable diags, allocator)?
+    }
+    let stdlib_lib_opt = resolve_mod.resolve_stdlib_lib(rfs, workspace_root, stdlib_override, mutable diags, allocator)?
+    let stdlib_lib = match stdlib_lib_opt {
+        case .some(let l) => l
+        case .none => return empty_summary()
+    }
+    let current_version = version_mod.current_version_of(manifest, allocator)?
+    let descendant_tree = structmap_config_mod.descendant_tree(manifest_mod.structmap_of(manifest))
+    var pkg_files_memo = StringMap_String.new(allocator)?
+    var file_edges_memo = StringMap_String.new(allocator)?
+    return run_pipeline(rfs, wfs, source_paths, primary_member, member_cache_mod.no_deps(allocator)?, stdlib_lib, "", workspace_root, current_version, Option_String.none, "program", descendant_tree, triple_opt, PipelineMode.check_, output_mod.OutputKind.executable, dump, clock, errout, trace, mutable map, mutable interner, mutable diags, mutable pkg_files_memo, mutable file_edges_memo, allocator, allocator)?
+}
+
+
+public function build_workspace_with_target(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    workspace_root: String,
+    target_override: Option_String.Option,
+    stdlib_override: Option_String.Option,
+    dump: dump_mod.DumpFlags,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> PipelineSummary
+    with {rfs, wfs, subprocess, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return empty_summary()
+    }
+    let output_kind = manifest_mod.kind_of(manifest)
+    let git_lockfile_opt = load_package_lockfile(rfs, workspace_root, allocator)?
+    git_mod.materialize_git_deps(subprocess, rfs, wfs, workspace_root, manifest, git_lockfile_opt, mutable diags, allocator)?
+    let sources = select_sources(rfs, workspace_root, manifest, allocator)?
+    let source_paths = Vec_String.into_array(take sources, allocator)?
+
+    let primary_member = membership_mod.primary_member_of(rfs, workspace_root, manifest, allocator)?
+    let triple_opt = match target_override {
+        case .some(let s) => triple_phase_mod.resolve_triple_from_string(s, mutable diags, allocator)?
+        case .none => member_or_root_triple(rfs, workspace_root, manifest, primary_member, mutable map, mutable diags, allocator)?
+    }
+    let stdlib_lib_opt = resolve_mod.resolve_stdlib_lib(rfs, workspace_root, stdlib_override, mutable diags, allocator)?
+    let stdlib_lib = match stdlib_lib_opt {
+        case .some(let l) => l
+        case .none => return empty_summary()
+    }
+    let program_name = closure_mod.program_name_of(primary_member, manifest)
+    let member_deps = match primary_member {
+        case .some(let pm) => member_deps_of(rfs, workspace_root, manifest, pm, allocator)?
+        case .none => member_cache_mod.no_deps(allocator)?
+    }
+    let current_version = version_mod.current_version_of(manifest, allocator)?
+    let descendant_tree = structmap_config_mod.descendant_tree(manifest_mod.structmap_of(manifest))
+    var pkg_files_memo = StringMap_String.new(allocator)?
+    var file_edges_memo = StringMap_String.new(allocator)?
+    let summary = run_pipeline(rfs, wfs, source_paths, primary_member, member_deps, stdlib_lib, workspace_root, workspace_root, current_version, Option_String.none, program_name, descendant_tree, triple_opt, PipelineMode.build_, output_kind, dump, clock, errout, trace, mutable map, mutable interner, mutable diags, mutable pkg_files_memo, mutable file_edges_memo, allocator, allocator)?
+    finish_link(rfs, subprocess, summary, mutable diags, allocator)?
+    return summary
+}
+
+
+function member_or_root_triple(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    primary_member: Option_String.Option,
+    map: mutable source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_TargetTriple.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    match primary_member {
+        case .some(let pm) => {
+            let lib_prefix = string.concat(workspace_root, "/lib/", allocator)?
+            let member_root = string.concat(lib_prefix, pm, allocator)?
+            uninit scratch: diags_mod.Diagnostics
+            diags_mod.new_diagnostics(init scratch, allocator)?
+            let member_manifest_opt = load_mod.manifest_load(rfs, mutable map, member_root, mutable scratch, allocator)?
+            match member_manifest_opt {
+                case .some(let m) => match manifest_build_mod.default_target(manifest_mod.build_of(m)) {
+                    case .some(let s) => return triple_phase_mod.resolve_triple_from_string(s, mutable diags, allocator)?
+                    case .none => ()
+                }
+                case .none => ()
+            }
+        }
+        case .none => ()
+    }
+    return triple_phase_mod.resolve_triple_from_manifest(manifest, mutable diags, allocator)?
+}
+
+
+public function member_deps_of(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    member: String,
+    allocator: Allocator,
+) -> member_cache_mod.MemberDeps
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let members = closure_mod.member_closure_of(rfs, workspace_root, manifest, member, allocator)?
+    let packages = closure_mod.member_package_dep_names(rfs, workspace_root, manifest, member, allocator)?
+    return member_cache_mod.MemberDeps { members: members, packages: packages }
+}
+
+
+public function finish_link(
+    rfs: ReadOnlyFilesystem,
+    subprocess: Subprocess,
+    summary: PipelineSummary,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, subprocess, allocator, err: alloc.AllocError}
+{
+    match summary.link_request {
+        case .some(let req) => library_mod.link_library(subprocess, req, rfs, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+
+function select_sources(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let current_member = membership_mod.current_member_of(rfs, workspace_root, allocator)?
+    var results = match current_member {
+        case .some(let cm) =>
+            if manifest_mod.has_workspace(manifest) {
+                closure_mod.scoped_member_sources(rfs, workspace_root, manifest, cm, allocator)?
+            } else {
+                discover_mod.workspace_sources(rfs, workspace_root, manifest, allocator)?
+            }
+        case .none =>
+            discover_mod.workspace_sources(rfs, workspace_root, manifest, allocator)?
+    }
+    deps_mod.append_dependency_sources(rfs, workspace_root, manifest, current_member, mutable results, allocator)?
+    return results
+}
+
+
+function refine_summary(
+    discharged: usize,
+    skipped: usize,
+    proven: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let d = fmt_mod.usize_to_string(discharged, allocator)?
+    let s = fmt_mod.usize_to_string(skipped, allocator)?
+    let p = fmt_mod.usize_to_string(proven, allocator)?
+    let a1 = string.concat(d, " discharged, ", allocator)?
+    let a2 = string.concat(a1, s, allocator)?
+    let a3 = string.concat(a2, " skipped, ", allocator)?
+    let a4 = string.concat(a3, p, allocator)?
+    return string.concat(a4, " proven", allocator)?
+}
+
+
+function append_baselines(
+    all: mutable Vec_ContractBaseline.Vec,
+    batch: mutable Vec_ContractBaseline.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_ContractBaseline.len(batch)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = Vec_ContractBaseline.at(batch, i)
+        Vec_ContractBaseline.push(mutable all, take b, allocator)?
+        i = i + 1
+    }
+    Vec_ContractBaseline.clear(mutable batch)
+}
+
+
+function append_mir_files(
+    all: mutable Vec_MirFile.Vec,
+    batch: mutable Vec_MirFile.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_MirFile.len(batch)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let mf = Vec_MirFile.at(batch, i)
+        Vec_MirFile.push(mutable all, take mf, allocator)?
+        i = i + 1 as usize
+    }
+    Vec_MirFile.clear(mutable batch)
+}
+
+
+function drain_diagnostics(
+    target: mutable diags_mod.Diagnostics,
+    source: Vec_Diagnostic.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Diagnostic.len(source)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let d = Vec_Diagnostic.at(source, i)
+        diags_mod.emit(mutable target, take d, allocator)?
+        i = i + 1
+    }
+}

@@ -1,0 +1,121 @@
+module tinysql.store.write
+
+import std.mem.alloc
+import std.collections.vec
+import tinysql.model.value
+import tinysql.model.schema
+import textbuilder.builder as tb
+
+spec std.collections.vec.Vec(schema.Table)
+spec std.collections.vec.Vec(schema.Row)
+
+function _coltype_char(t: value.ColumnType) -> u8 {
+    return match t {
+        case .int_type  => 105 as u8
+        case .text_type => 116 as u8
+        case .bool_type => 98 as u8
+    }
+}
+
+function _nl(b: mutable tb.Builder, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    tb.push_byte(mutable b, 10 as u8, allocator)?
+}
+
+function _u(b: mutable tb.Builder, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    tb.push_str(mutable b, f"{n}", allocator)?
+    _nl(mutable b, allocator)?
+}
+
+function _i(b: mutable tb.Builder, v: i64, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    tb.push_str(mutable b, f"{v}", allocator)?
+    _nl(mutable b, allocator)?
+}
+
+function _s(b: mutable tb.Builder, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bs = s.bytes()
+    _u(mutable b, bs.len(), allocator)?
+    tb.push_bytes(mutable b, bs, allocator)?
+}
+
+function _val(b: mutable tb.Builder, v: value.Value, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    return match v {
+        case .integer(let x) => {
+            tb.push_byte(mutable b, 105 as u8, allocator)?
+            _i(mutable b, x, allocator)?
+        }
+        case .text(let s) => {
+            tb.push_byte(mutable b, 116 as u8, allocator)?
+            _s(mutable b, s, allocator)?
+        }
+        case .boolean(let bo) => {
+            tb.push_byte(mutable b, 98 as u8, allocator)?
+            tb.push_byte(mutable b, if bo { 49 as u8 } else { 48 as u8 }, allocator)?
+            _nl(mutable b, allocator)?
+        }
+        case .null_value => {
+            tb.push_byte(mutable b, 110 as u8, allocator)?
+            _nl(mutable b, allocator)?
+        }
+    }
+}
+
+function _write_table(b: mutable tb.Builder, t: schema.Table, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    _s(mutable b, t.name, allocator)?
+    let nc = t.columns.len()
+    _u(mutable b, nc, allocator)?
+    var ci: usize = 0
+    loop decreases nc - ci + 1 as usize {
+        if ci >= nc { break }
+        _s(mutable b, t.columns[ci].name, allocator)?
+        tb.push_byte(mutable b, _coltype_char(t.columns[ci].col_type), allocator)?
+        _nl(mutable b, allocator)?
+        ci = ci + 1 as usize
+    }
+    let nr = Vec_Row.len(t.rows)
+    _u(mutable b, nr, allocator)?
+    var ri: usize = 0
+    loop decreases nr - ri + 1 as usize {
+        if ri >= nr { break }
+        let row = Vec_Row.at(t.rows, ri)
+        let ncell = row.cells.len()
+        var k: usize = 0
+        loop decreases ncell - k + 1 as usize {
+            if k >= ncell { break }
+            _val(mutable b, row.cells[k], allocator)?
+            k = k + 1 as usize
+        }
+        ri = ri + 1 as usize
+    }
+}
+
+public function serialize(db: schema.Database, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    var b = tb.new(allocator)?
+    tb.push_byte(mutable b, 84 as u8, allocator)?
+    tb.push_byte(mutable b, 83 as u8, allocator)?
+    tb.push_byte(mutable b, 81 as u8, allocator)?
+    tb.push_byte(mutable b, 76 as u8, allocator)?
+    _nl(mutable b, allocator)?
+    let nt = Vec_Table.len(db.tables)
+    _u(mutable b, nt, allocator)?
+    var ti: usize = 0
+    loop decreases nt - ti + 1 as usize {
+        if ti >= nt { break }
+        _write_table(mutable b, Vec_Table.at(db.tables, ti), allocator)?
+        ti = ti + 1 as usize
+    }
+    return tb.to_bytes(b, allocator)?
+}

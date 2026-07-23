@@ -1,0 +1,472 @@
+
+module mir.render
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import hir.def as def_mod
+import local.id.local as local_mod
+import local.id.block as block_mod
+import local.body.model as body_mod
+import local.file.store as file_mod
+import local.place as place_mod
+import local.rvalue as rvalue_mod
+import local.stmt as stmt_mod
+import local.term as term_mod
+
+
+spec std.collections.vec.Vec(body_mod.MirBody)
+spec std.collections.vec.Vec(body_mod.Local)
+spec std.collections.vec.Vec(body_mod.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+spec std.collections.vec.Vec(rvalue_mod.Constant)
+spec std.collections.vec.Vec(block_mod.BlockId)
+spec std.collections.vec.Vec(u128)
+spec std.core.option.Option(symbol_mod.Symbol)
+
+
+public function render_file(
+    file: file_mod.MirFile,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_MirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let body = Vec_MirBody.at(file.bodies, i)
+        out = string.concat(out, render_body(body, it, allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function render_body(
+    body: body_mod.MirBody,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nl = Vec_Local.len(body.locals)
+    let nb = Vec_BasicBlock.len(body.blocks)
+    let name = sym_text(it, body.name, allocator)?
+    var out: String = string.concat("fn _", render_usize(def_mod.index(body.def_id), allocator)?, allocator)?
+    out = string.concat(out, " ", allocator)?
+    out = string.concat(out, name, allocator)?
+    out = string.concat(out, f" (params={body.n_params}, locals={nl}, blocks={nb})", allocator)?
+    out = string.concat(out, "\n", allocator)?
+
+    var li: usize = 0
+    loop decreases (nl - li) {
+        if li >= nl { break }
+        out = string.concat(out, render_local(Vec_Local.at(body.locals, li), li, it, allocator)?, allocator)?
+        li = li + 1
+    }
+
+    var bi: usize = 0
+    loop decreases (nb - bi) {
+        if bi >= nb { break }
+        out = string.concat(out, render_block(bi, Vec_BasicBlock.at(body.blocks, bi), it, allocator)?, allocator)?
+        bi = bi + 1
+    }
+    return string.concat(out, "\n", allocator)?
+}
+
+
+function render_local(
+    local: body_mod.Local,
+    idx: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = string.concat("  _", render_usize(idx, allocator)?, allocator)?
+    out = string.concat(out, f": t{local.ty.raw}", allocator)?
+    out = match local.mutability {
+        case .mutable_   => string.concat(out, " mut", allocator)?
+        case .immutable_ => out
+    }
+    return match local.name {
+        case .some(let sym) => {
+            let n = sym_text(it, sym, allocator)?
+            string.concat(out, string.concat(" \"", string.concat(n, "\"\n", allocator)?, allocator)?, allocator)?
+        }
+        case .none => string.concat(out, "\n", allocator)?
+    }
+}
+
+
+function render_block(
+    idx: usize,
+    bb: body_mod.BasicBlock,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = string.concat("  bb", render_usize(idx, allocator)?, allocator)?
+    out = string.concat(out, ":\n", allocator)?
+    let ns = Vec_Statement.len(bb.statements)
+    var i: usize = 0
+    loop decreases (ns - i) {
+        if i >= ns { break }
+        let line = render_stmt(Vec_Statement.at(bb.statements, i), it, allocator)?
+        out = string.concat(out, string.concat("    ", string.concat(line, "\n", allocator)?, allocator)?, allocator)?
+        i = i + 1
+    }
+    let term = render_term(bb.terminator, it, allocator)?
+    return string.concat(out, string.concat("    ", string.concat(term, "\n", allocator)?, allocator)?, allocator)?
+}
+
+
+function render_stmt(
+    s: stmt_mod.Statement,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match s.kind {
+        case .assign(let dest, let value) => {
+            let lhs = render_place(dest, allocator)?
+            string.concat(lhs, string.concat(" = ", render_rvalue(value, it, allocator)?, allocator)?, allocator)?
+        }
+        case .storage_live(let local) => f"StorageLive(_{local_mod.index(local)})"
+        case .storage_dead(let local) => f"StorageDead(_{local_mod.index(local)})"
+        case .nop_ => "nop"
+    }
+}
+
+
+function render_term(
+    t: term_mod.Terminator,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match t.kind {
+        case .goto_(let target) => f"goto bb{block_mod.index(target)}"
+        case .branch(let cond, let true_, let false_) => {
+            let c = render_operand(cond, it, allocator)?
+            string.concat("branch ", string.concat(c, f" ? bb{block_mod.index(true_)} : bb{block_mod.index(false_)}", allocator)?, allocator)?
+        }
+        case .switch_(let discr, let targets) => {
+            let d = render_operand(discr, it, allocator)?
+            string.concat("switch ", string.concat(d, render_switch(targets, allocator)?, allocator)?, allocator)?
+        }
+        case .return_ => "return"
+        case .unreachable_ => "unreachable"
+        case .raise_(let value, _) => string.concat("raise ", render_operand(value, it, allocator)?, allocator)?
+        case .panic_(let message) => string.concat("panic ", render_operand(message, it, allocator)?, allocator)?
+        case .call_(let callee, let args, let dest, let return_, _) => render_call(callee, args, dest, return_, it, allocator)?
+        case .drop_(let place, let target, _) => {
+            let p = render_place(place, allocator)?
+            string.concat("drop ", string.concat(p, f" -> bb{block_mod.index(target)}", allocator)?, allocator)?
+        }
+        case .coherence_enter(let body_entry, let exit) => f"coherence_enter bb{block_mod.index(body_entry)} exit bb{block_mod.index(exit)}"
+        case .coherence_exit(let target) => f"coherence_exit -> bb{block_mod.index(target)}"
+        case .spawn_(let child, let args, let group_local, let handle_dest, let return_, _) => render_spawn(child, args, handle_dest, return_, it, allocator)?
+        case .await_(let handle, let dest, let return_, _) => {
+            let d = render_place(dest, allocator)?
+            let h = render_operand(handle, it, allocator)?
+            string.concat(d, string.concat(" = await ", string.concat(h, f" -> bb{block_mod.index(return_)}", allocator)?, allocator)?, allocator)?
+        }
+    }
+}
+
+
+function render_call(
+    callee: rvalue_mod.Operand,
+    args: Vec_Operand.Vec,
+    dest: place_mod.Place,
+    return_: block_mod.BlockId,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let d = render_place(dest, allocator)?
+    let c = render_operand(callee, it, allocator)?
+    let a = render_operands(args, it, allocator)?
+    var out: String = string.concat(d, " = call ", allocator)?
+    out = string.concat(out, c, allocator)?
+    out = string.concat(out, "(", allocator)?
+    out = string.concat(out, a, allocator)?
+    return string.concat(out, f") -> bb{block_mod.index(return_)}", allocator)?
+}
+
+
+function render_spawn(
+    child: def_mod.DefId,
+    args: Vec_Operand.Vec,
+    handle_dest: place_mod.Place,
+    return_: block_mod.BlockId,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let d = render_place(handle_dest, allocator)?
+    let a = render_operands(args, it, allocator)?
+    var out: String = string.concat(d, f" = spawn fn#{def_mod.index(child)}(", allocator)?
+    out = string.concat(out, a, allocator)?
+    return string.concat(out, f") -> bb{block_mod.index(return_)}", allocator)?
+}
+
+
+function render_switch(
+    targets: term_mod.SwitchTargets,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = " ["
+    let n = Vec_u128.len(targets.values)
+    let nt = Vec_BlockId.len(targets.targets)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i >= nt { break }
+        let v = Vec_u128.at(targets.values, i)
+        let bb = block_mod.index(Vec_BlockId.at(targets.targets, i))
+        out = string.concat(out, f"{v} => bb{bb}, ", allocator)?
+        i = i + 1
+    }
+    return string.concat(out, f"_ => bb{block_mod.index(targets.otherwise_)}]", allocator)?
+}
+
+
+function render_operands(
+    ops: Vec_Operand.Vec,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sep = if i == 0 { "" } else { ", " }
+        out = string.concat(out, string.concat(sep, render_operand(Vec_Operand.at(ops, i), it, allocator)?, allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function render_rvalue(
+    rv: rvalue_mod.Rvalue,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match rv {
+        case .use_(let operand) => render_operand(operand, it, allocator)?
+        case .binary(let op, let lhs, let rhs) => {
+            let l = render_operand(lhs, it, allocator)?
+            let r = render_operand(rhs, it, allocator)?
+            var out: String = string.concat(render_binop(op), " ", allocator)?
+            out = string.concat(out, l, allocator)?
+            string.concat(out, string.concat(", ", r, allocator)?, allocator)?
+        }
+        case .unary(let op, let operand) => string.concat(render_unop(op), string.concat(" ", render_operand(operand, it, allocator)?, allocator)?, allocator)?
+        case .cast(let operand, _, let to, let kind) => {
+            let o = render_operand(operand, it, allocator)?
+            string.concat("cast ", string.concat(o, f" as t{to.raw} ({render_cast(kind)})", allocator)?, allocator)?
+        }
+        case .aggregate(let kind, let elems, _) => {
+            let e = render_operands(elems, it, allocator)?
+            string.concat("agg [", string.concat(e, "]", allocator)?, allocator)?
+        }
+        case .ref_(let kind, let place) => string.concat("&", render_place(place, allocator)?, allocator)?
+        case .len(let place) => string.concat("len ", render_place(place, allocator)?, allocator)?
+        case .discriminant(let place) => string.concat("discriminant ", render_place(place, allocator)?, allocator)?
+        case .make_closure(let code, let env) => {
+            let e = render_operand(env, it, allocator)?
+            string.concat(f"closure fn#{def_mod.index(code)} env=", e, allocator)?
+        }
+    }
+}
+
+
+function render_operand(
+    op: rvalue_mod.Operand,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match op {
+        case .copy_(let place, _) => string.concat("copy ", render_place(place, allocator)?, allocator)?
+        case .move_(let place, _) => string.concat("move ", render_place(place, allocator)?, allocator)?
+        case .constant(let c) => render_constant(c, it, allocator)?
+    }
+}
+
+
+function render_constant(
+    c: rvalue_mod.Constant,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match c.kind {
+        case .int_(let bits) => f"const {bits}_i"
+        case .float_(let bits, let width) => f"const {bits}_{render_fwidth(width)}"
+        case .bool_(let value) => f"const {value}"
+        case .str_(let symbol) => {
+            let s = sym_text(it, symbol, allocator)?
+            string.concat("const \"", string.concat(s, "\"", allocator)?, allocator)?
+        }
+        case .unit_ => "const ()"
+        case .zero_init => "const zero_init"
+        case .aggregate(let elems) => render_const_agg(elems, it, allocator)?
+        case .fn_ref(let def) => f"const fn#{def_mod.index(def)}"
+    }
+}
+
+
+function render_const_agg(
+    elems: Vec_Constant.Vec,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = "const agg ["
+    let n = Vec_Constant.len(elems)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sep = if i == 0 { "" } else { ", " }
+        out = string.concat(out, string.concat(sep, render_constant(Vec_Constant.at(elems, i), it, allocator)?, allocator)?, allocator)?
+        i = i + 1
+    }
+    return string.concat(out, "]", allocator)?
+}
+
+
+function render_place(
+    p: place_mod.Place,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = f"_{local_mod.index(p.local)}"
+    let n = place_mod.proj_len(p)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        out = string.concat(out, render_proj(place_mod.proj_at(p, i).kind, allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function render_proj(kind: place_mod.ProjectionKind, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match kind {
+        case .field(let idx)                    => f".field{idx}"
+        case .index(let idx_local, _)           => f"[_{local_mod.index(idx_local)}]"
+        case .deref_                            => ".*"
+        case .variant_payload(let v)            => f".payload{v}"
+        case .slice_subrange(let lo, let hi, _) => f"[_{local_mod.index(lo)}.._{local_mod.index(hi)}]"
+    }
+}
+
+
+function render_binop(op: rvalue_mod.MBinOp) -> String {
+    return match op {
+        case .add(_) => "add"
+        case .sub(_) => "sub"
+        case .mul(_) => "mul"
+        case .div(_, _, _) => "div"
+        case .mod_(_, _, _) => "mod"
+        case .bit_and => "bitand"
+        case .bit_or => "bitor"
+        case .bit_xor => "bitxor"
+        case .shl => "shl"
+        case .shr => "shr"
+        case .eq => "eq"
+        case .ne => "ne"
+        case .lt => "lt"
+        case .le => "le"
+        case .gt => "gt"
+        case .ge => "ge"
+        case .logical_and => "and"
+        case .logical_or => "or"
+    }
+}
+
+
+function render_unop(op: rvalue_mod.MUnOp) -> String {
+    return match op {
+        case .neg => "neg"
+        case .not_ => "not"
+        case .bit_not => "bitnot"
+    }
+}
+
+
+function render_cast(kind: rvalue_mod.CastKind) -> String {
+    return match kind {
+        case .int_to_int(_) => "int->int"
+        case .int_to_float => "int->float"
+        case .float_to_int(_) => "float->int"
+        case .float_to_float => "float->float"
+        case .bool_to_int => "bool->int"
+    }
+}
+
+
+function render_fwidth(w: rvalue_mod.FloatWidth) -> String {
+    return match w {
+        case .f32_ => "f32"
+        case .f64_ => "f64"
+    }
+}
+
+
+function render_usize(n: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return f"{n}"
+}
+
+
+function sym_text(
+    it: interner_mod.Interner,
+    sym: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(it) { return "?" }
+    let bytes = interner_mod.lookup(it, sym)
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i = i + 1
+    }
+    return string.from_owned_utf8(take buf)
+}

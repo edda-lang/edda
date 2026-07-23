@@ -1,0 +1,138 @@
+
+module compile.member.detect
+
+import std.collections.vec
+import std.collections.slice as slice
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import manifest.manifest as manifest_mod
+import source.map as source_map_mod
+import diagnostics.emit.collection as diags_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ident as ast_ident_mod
+import local.setup.env.load.load as load_mod
+import local.setup.env.discover as discover_mod
+import local.instantiate.iter.enumerate.enumerate as enumerate_mod
+import local.phase.pipeline.parse as parse_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ast_tree_mod.Ty)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+
+
+public function parse_workspace_files(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_File.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => {
+            uninit files: Vec_File.Vec
+            Vec_File.new(init files, allocator)?
+            return files
+        }
+    }
+    let sources = discover_mod.workspace_sources(rfs, workspace_root, manifest, allocator)?
+    let source_paths = Vec_String.into_array(take sources, allocator)?
+    enumerate_mod.enumerate(rfs, source_paths, mutable map, allocator)?
+    return parse_mod.parse_sources(map, mutable interner, mutable diags, allocator)?
+}
+
+
+public function any_i32_main_under_prefix(
+    files: Vec_File.Vec,
+    member_src_prefix: String,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+) -> bool {
+    let nf = Vec_File.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let file = Vec_File.at(files, fi)
+        if file_under_prefix(file, member_src_prefix, map) && file_has_i32_main(file, interner) {
+            return true
+        }
+        fi += 1
+    }
+    return false
+}
+
+
+function file_under_prefix(
+    file: ast_file_mod.File,
+    member_src_prefix: String,
+    map: source_map_mod.SourceMap,
+) -> bool {
+    let path = source_map_mod.file_name_of(map, file.span.file)
+    return string.starts_with(path, member_src_prefix)
+}
+
+
+function file_has_i32_main(file: ast_file_mod.File, interner: interner_mod.Interner) -> bool {
+    let ni = Vec_Item.len(file.items)
+    var ii: usize = 0
+    loop decreases ni - ii {
+        if ii >= ni { break }
+        let item = Vec_Item.at(file.items, ii)
+        if item_is_i32_main(item, interner) {
+            return true
+        }
+        ii += 1
+    }
+    return false
+}
+
+
+function item_is_i32_main(item: ast_item_mod.Item, interner: interner_mod.Interner) -> bool {
+    return match item.kind {
+        case .function_(let decl) => {
+            let d = Box_FnDecl.get(decl)
+            is_main_name(d.name.name, interner) && return_ty_is_i32(d.return_ty, interner)
+        }
+        case _ => false
+    }
+}
+
+
+function is_main_name(name: symbol_mod.Symbol, interner: interner_mod.Interner) -> bool {
+    return slice.eq_u8(interner_mod.lookup(interner, name), "main".bytes())
+}
+
+
+function return_ty_is_i32(rt: Option_Ty.Option, interner: interner_mod.Interner) -> bool {
+    return match rt {
+        case .some(let ty) => ty_is_i32(ty, interner)
+        case .none => false
+    }
+}
+
+
+function ty_is_i32(ty: ast_tree_mod.Ty, interner: interner_mod.Interner) -> bool {
+    return match ty.kind {
+        case .path(let p) where Vec_Ident.len(p.segments) == 1 as usize => {
+            let seg = Vec_Ident.at(p.segments, 0 as usize)
+            slice.eq_u8(interner_mod.lookup(interner, seg.name), "i32".bytes())
+        }
+        case _ => false
+    }
+}

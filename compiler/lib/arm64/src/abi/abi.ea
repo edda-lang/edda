@@ -1,0 +1,82 @@
+
+module arm64.abi.abi
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import target.triple as triple_mod
+import hir.node as node_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+
+import local.gen.regs as regs_mod
+import local.abi.shared as shared_mod
+import local.abi.params as params_mod
+import local.abi.returns as returns_mod
+
+
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+
+
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function lower_abi(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    validate_os(target)?
+    params_mod.pin_parameters(mutable body, allocator)?
+
+    var sret_ptr: Option_LirVRegId.Option = Option_LirVRegId.none
+    if returns_mod.returns_by_memory(body) || body.fn_attrs.err_bymem {
+        let arrival = lir_body_mod.push_vreg(
+            mutable body,
+            take shared_mod.pinned_vreg(lir_reg_mod.RegClass.gp, regs_mod.preg_of(regs_mod.GpReg.x8)),
+            allocator,
+        )?
+        let home = lir_body_mod.push_vreg(
+            mutable body,
+            take shared_mod.unpinned_vreg(lir_reg_mod.RegClass.gp),
+            allocator,
+        )?
+        let copy_op = lir_op_mod.LirOp {
+            origin: node_mod.error(),
+            kind: lir_op_mod.LirOpKind.copy_(src: arrival, dst: home),
+            flags: shared_mod.stack_flags(),
+        }
+        let copy_id = lir_body_mod.push_op(mutable body, take copy_op, allocator)?
+        uninit sret_prefix: Vec_LirOpId.Vec
+        Vec_LirOpId.new(init sret_prefix, allocator)?
+        Vec_LirOpId.push(mutable sret_prefix, copy_id, allocator)?
+        params_mod.prepend_entry_ops(mutable body, sret_prefix, allocator)?
+        sret_ptr = Option_LirVRegId.some(value: home)
+    }
+    returns_mod.pin_return_values(mutable body, sret_ptr, allocator)?
+}
+
+
+function validate_os(target: triple_mod.TargetTriple) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    return match triple_mod.os(target) {
+        case .linux => ()
+        case .macos => ()
+        case .windows => ()
+        case .freebsd => ()
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.abi.abi: no AArch64 calling convention locked for this OS",
+        )
+    }
+}

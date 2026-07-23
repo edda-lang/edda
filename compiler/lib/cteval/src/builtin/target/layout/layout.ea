@@ -1,0 +1,266 @@
+module cteval.builtin.target.layout.layout
+
+import std.collections.vec
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import intern.symbol
+import target.triple as triple_mod
+import local.builtin.target.layout.compute.engine as compute_mod
+import local.builtin.target.layout.reflect.introspect as reflect_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+derive eq, debug for LayoutResult
+derive eq, debug for FieldTypeResult
+derive eq, debug for FieldNameResult
+
+
+public type LayoutResult {
+    case ok(value: usize)
+    case unsupported(message: String)
+}
+
+public type FieldTypeResult {
+    case ok(ty: ty_mod.TyId)
+    case out_of_range(got: usize, max: usize)
+    case unsupported(message: String)
+}
+
+public type FieldNameResult {
+    case ok(name: symbol.Symbol)
+    case out_of_range(got: usize, max: usize)
+    case unsupported(message: String)
+}
+
+
+public function size_of(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutResult
+    with {divergence}
+{
+    if is_capability(t, ty_interner) {
+        return LayoutResult.unsupported(message: "layout not defined for capability types (nominal handles carry no comptime-observable layout)")
+    }
+    return match compute_mod.compute_layout(t, ty_interner, out, triple) {
+        case .ok(let l) => LayoutResult.ok(value: l.size)
+        case .unsupported(let msg) => LayoutResult.unsupported(message: msg)
+    }
+}
+
+public function align_of(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutResult
+    with {divergence}
+{
+    if is_capability(t, ty_interner) {
+        return LayoutResult.unsupported(message: "layout not defined for capability types (nominal handles carry no comptime-observable layout)")
+    }
+    return match compute_mod.compute_layout(t, ty_interner, out, triple) {
+        case .ok(let l) => LayoutResult.ok(value: l.align)
+        case .unsupported(let msg) => LayoutResult.unsupported(message: msg)
+    }
+}
+
+function is_capability(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool {
+    if ty_mod.is_error(t) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .capability(_) => true
+        case _ => false
+    }
+}
+
+function count_to_layout_result(c: reflect_mod.CountResult) -> LayoutResult {
+    return match c {
+        case .ok(let v) => LayoutResult.ok(value: v)
+        case .unsupported(let msg) => LayoutResult.unsupported(message: msg)
+    }
+}
+
+function name_to_field_name_result(n: reflect_mod.NameResult) -> FieldNameResult {
+    return match n {
+        case .ok(let name) => FieldNameResult.ok(name: name)
+        case .out_of_range(let got, let max) => FieldNameResult.out_of_range(got: got, max: max)
+        case .unsupported(let msg) => FieldNameResult.unsupported(message: msg)
+    }
+}
+
+function type_to_field_type_result(ty: reflect_mod.TypeResult) -> FieldTypeResult {
+    return match ty {
+        case .ok(let t) => FieldTypeResult.ok(ty: t)
+        case .out_of_range(let got, let max) => FieldTypeResult.out_of_range(got: got, max: max)
+        case .unsupported(let msg) => FieldTypeResult.unsupported(message: msg)
+    }
+}
+
+public function field_count(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+) -> LayoutResult
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return LayoutResult.unsupported(message: "type-check error sentinel")
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .tuple_(let elems) => LayoutResult.ok(value: Vec_TyId.len(elems))
+        case .refined(let base, _) => field_count(base, ty_interner, out)
+        case .record(let def) => count_to_layout_result(reflect_mod.record_field_count(def, out))
+        case .sum_(let def) => count_to_layout_result(reflect_mod.sum_variant_count(def, out))
+        case .primitive(_) =>
+            LayoutResult.unsupported(message: "field_count not defined for primitive types (primitives have no fields)")
+        case .string_ =>
+            LayoutResult.unsupported(message: "field_count not defined for String (atomic primitive)")
+        case .slice(_) =>
+            LayoutResult.unsupported(message: "field_count not defined for slice types — use .len() at runtime for the element count")
+        case .array(_, _) =>
+            LayoutResult.unsupported(message: "field_count for arrays gated on per-element introspection (post-V1.0)")
+        case .fn_(_, _, _) =>
+            LayoutResult.unsupported(message: "field_count not defined for function types")
+        case .spec_instance(_, _) =>
+            LayoutResult.unsupported(message: "field_count on unmonomorphised spec instance — specs pass missed it")
+        case .capability(_) =>
+            LayoutResult.unsupported(message: "field_count not defined for capability types (nominal handles have no introspectable fields)")
+        case .opaque(_) =>
+            LayoutResult.unsupported(message: "field_count not defined for opaque types (representation is hidden — no introspectable fields)")
+        case .error_ =>
+            LayoutResult.unsupported(message: "type-check error sentinel")
+    }
+}
+
+public function field_name_at(
+    t: ty_mod.TyId,
+    i: usize,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+) -> FieldNameResult
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return FieldNameResult.unsupported(message: "type-check error sentinel")
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .refined(let base, _) => field_name_at(base, i, ty_interner, out)
+        case .record(let def) => name_to_field_name_result(reflect_mod.record_field_name(def, i, out))
+        case .sum_(let def) => name_to_field_name_result(reflect_mod.sum_variant_name(def, i, out))
+        case .tuple_(_) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for tuple types — tuple positions are anonymous; use field_type_at(T, i) for the positional element type")
+        case .primitive(_) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for primitive types")
+        case .string_ =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for String")
+        case .slice(_) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for slice types")
+        case .array(_, _) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for array types (positional elements)")
+        case .fn_(_, _, _) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for function types")
+        case .spec_instance(_, _) =>
+            FieldNameResult.unsupported(message: "field_name_at on unmonomorphised spec instance — specs pass missed it")
+        case .capability(_) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for capability types (nominal handles have no introspectable fields)")
+        case .opaque(_) =>
+            FieldNameResult.unsupported(message: "field_name_at not defined for opaque types (representation is hidden — no introspectable fields)")
+        case .error_ =>
+            FieldNameResult.unsupported(message: "type-check error sentinel")
+    }
+}
+
+public function field_type_at(
+    t: ty_mod.TyId,
+    i: usize,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+) -> FieldTypeResult
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return FieldTypeResult.unsupported(message: "type-check error sentinel")
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .tuple_(let elems) => {
+            let n = Vec_TyId.len(elems)
+            if i >= n {
+                FieldTypeResult.out_of_range(got: i, max: n)
+            } else {
+                FieldTypeResult.ok(ty: Vec_TyId.at(elems, i))
+            }
+        }
+        case .refined(let base, _) => field_type_at(base, i, ty_interner, out)
+        case .primitive(_) =>
+            FieldTypeResult.unsupported(message: "field_type_at not defined for primitive types")
+        case .string_ =>
+            FieldTypeResult.unsupported(message: "field_type_at not defined for String")
+        case .slice(_) =>
+            FieldTypeResult.unsupported(message: "field_type_at not defined for slice types — slices have a uniform element type, not indexed fields")
+        case .array(_, _) =>
+            FieldTypeResult.unsupported(message: "field_type_at for arrays gated on the container field-introspection arms")
+        case .record(let def) => type_to_field_type_result(reflect_mod.field_type_from_table(def, i, out))
+        case .sum_(let def) => type_to_field_type_result(reflect_mod.field_type_from_table(def, i, out))
+        case .fn_(_, _, _) =>
+            FieldTypeResult.unsupported(message: "field_type_at not defined for function types")
+        case .spec_instance(_, _) =>
+            FieldTypeResult.unsupported(message: "field_type_at on unmonomorphised spec instance — specs pass missed it")
+        case .capability(_) =>
+            FieldTypeResult.unsupported(message: "field_type_at not defined for capability types (nominal handles have no introspectable fields)")
+        case .opaque(_) =>
+            FieldTypeResult.unsupported(message: "field_type_at not defined for opaque types (representation is hidden — no introspectable fields)")
+        case .error_ =>
+            FieldTypeResult.unsupported(message: "type-check error sentinel")
+    }
+}
+
+public function offset_of(
+    t: ty_mod.TyId,
+    field_name: symbol.Symbol,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutResult
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return LayoutResult.unsupported(message: "type-check error sentinel")
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .refined(let base, _) => offset_of(base, field_name, ty_interner, out, triple)
+        case .record(let def) => count_to_layout_result(reflect_mod.record_offset_of(def, field_name, ty_interner, out, triple))
+        case .sum_(_) =>
+            LayoutResult.unsupported(message: "offset_of not defined for sum types — variant payloads overlay after the discriminant; use field_type_at(T, i) for a variant's payload type")
+        case .tuple_(_) =>
+            LayoutResult.unsupported(message: "offset_of not defined for tuple types — positions are anonymous; offset_of takes a named field")
+        case .primitive(_) =>
+            LayoutResult.unsupported(message: "offset_of not defined for primitive types (no named fields)")
+        case .string_ =>
+            LayoutResult.unsupported(message: "offset_of not defined for String")
+        case .slice(_) =>
+            LayoutResult.unsupported(message: "offset_of not defined for slice types")
+        case .array(_, _) =>
+            LayoutResult.unsupported(message: "offset_of not defined for array types (positional elements)")
+        case .fn_(_, _, _) =>
+            LayoutResult.unsupported(message: "offset_of not defined for function types")
+        case .spec_instance(_, _) =>
+            LayoutResult.unsupported(message: "offset_of on unmonomorphised spec instance — specs pass missed it")
+        case .capability(_) =>
+            LayoutResult.unsupported(message: "offset_of not defined for capability types (nominal handles have no introspectable fields)")
+        case .opaque(_) =>
+            LayoutResult.unsupported(message: "offset_of not defined for opaque types (representation is hidden — no named fields)")
+        case .error_ =>
+            LayoutResult.unsupported(message: "type-check error sentinel")
+    }
+}

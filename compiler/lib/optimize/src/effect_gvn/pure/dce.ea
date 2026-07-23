@@ -1,0 +1,385 @@
+
+module optimize.effect_gvn.pure.dce
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.op as op_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as term_mod
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.analysis.purity as purity_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+
+
+spec std.collections.vec.Vec(op_mod.OpId)
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(term_mod.SwitchCase)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.hashmap.IntMap(u8)
+spec std.core.option.Option(u8)
+
+
+public type DcePlan {
+    dead_ops: Vec_OpId.Vec
+}
+
+
+public function analyze(
+    body: hlir_body_mod.HlirBody,
+    built: mutable mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> DcePlan
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var live_set: IntMap_u8.IntMap = IntMap_u8.new(allocator)?
+    mark_roots(mutable live_set, body, built, allocator)?
+    propagate(mutable live_set, body, built, allocator)?
+    let dead_ops = collect_dead(body, built, live_set, allocator)?
+    return DcePlan { dead_ops: dead_ops }
+}
+
+
+function mark_value(
+    live: mutable IntMap_u8.IntMap,
+    v: value_mod.ValueId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if v.raw == 0 { return () }
+    let _ = IntMap_u8.insert(mutable live, v.raw as i64, 1 as u8, allocator)?
+}
+
+
+function is_live(live: IntMap_u8.IntMap, v: value_mod.ValueId) -> bool {
+    return IntMap_u8.contains(live, v.raw as i64)
+}
+
+
+function mark_value_vec(
+    live: mutable IntMap_u8.IntMap,
+    values: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_ValueId.len(values)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let v = Vec_ValueId.at(values, i)
+        mark_value(mutable live, v, allocator)?
+        i = i + 1
+    }
+}
+
+
+function mark_roots(
+    live: mutable IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    mark_block_roots(mutable live, body, allocator)?
+    mark_kept_op_operands(mutable live, body, built, allocator)?
+}
+
+
+function mark_block_roots(
+    live: mutable IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirBlock.len(body.blocks)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let block = Vec_HlirBlock.at(body.blocks, i)
+        mark_value_vec(mutable live, block.params, allocator)?
+        mark_term_operands(mutable live, block.terminator, allocator)?
+        i = i + 1
+    }
+}
+
+
+function mark_term_operands(
+    live: mutable IntMap_u8.IntMap,
+    term: term_mod.HlirTerminator,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match term.kind {
+        case .goto_(let target, let args) =>
+            mark_value_vec(mutable live, args, allocator)?
+        case .branch(let cond, let t, let ta, let f, let fa) =>
+            mark_branch_operands(mutable live, cond, ta, fa, allocator)?
+        case .switch_(let discr, let targets) =>
+            mark_switch_operands(mutable live, discr, targets, allocator)?
+        case .return_(let values) =>
+            mark_value_vec(mutable live, values, allocator)?
+        case .unreachable_ => ()
+        case .raise_(let value, let unwind) =>
+            mark_value(mutable live, value, allocator)?
+        case .panic_(let message) =>
+            mark_value(mutable live, message, allocator)?
+        case .drop_(let value, let dtor, let target, let unwind) =>
+            mark_value(mutable live, value, allocator)?
+        case .coherence_enter(let entry, let exit) => ()
+        case .coherence_exit(let target) => ()
+    }
+}
+
+
+function mark_branch_operands(
+    live: mutable IntMap_u8.IntMap,
+    cond: value_mod.ValueId,
+    true_args: Vec_ValueId.Vec,
+    false_args: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    mark_value(mutable live, cond, allocator)?
+    mark_value_vec(mutable live, true_args, allocator)?
+    mark_value_vec(mutable live, false_args, allocator)?
+}
+
+
+function mark_switch_operands(
+    live: mutable IntMap_u8.IntMap,
+    discr: value_mod.ValueId,
+    targets: term_mod.SwitchTargets,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    mark_value(mutable live, discr, allocator)?
+    mark_value_vec(mutable live, targets.default_args, allocator)?
+    let n = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let case_ = Vec_SwitchCase.at(targets.cases, i)
+        mark_value_vec(mutable live, case_.args, allocator)?
+        i = i + 1
+    }
+}
+
+
+function mark_kept_op_operands(
+    live: mutable IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        if op.result_.raw == 0 {
+            i = i + 1
+            continue
+        }
+        let purity = mapping_mod.purity_of_value(built, op.result_)
+        if !purity_mod.is_droppable(purity) {
+            mark_op_operands(mutable live, op.kind, op.flags, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function mark_op_operands(
+    live: mutable IntMap_u8.IntMap,
+    kind: hlir_op_mod.HlirOpKind,
+    flags: hlir_op_mod.OpFlags,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match kind {
+        case .literal(let c) => ()
+        case .binary(let bop, let lhs, let rhs) =>
+            mark_pair(mutable live, lhs, rhs, allocator)?
+        case .unary(let uop, let operand) =>
+            mark_value(mutable live, operand, allocator)?
+        case .cast(let value, let from, let to, let ck) =>
+            mark_value(mutable live, value, allocator)?
+        case .call_(let callee, let args) =>
+            match flags.intrinsic {
+                case .slice_from_raw => mark_value_vec(mutable live, args, allocator)?
+                case _ => mark_call(mutable live, callee, args, allocator)?
+            }
+        case .call_indirect(let callee, let args) =>
+            mark_call(mutable live, callee, args, allocator)?
+        case .make_closure(let code, let env) =>
+            mark_value(mutable live, env, allocator)?
+        case .field(let operand, let index) =>
+            mark_value(mutable live, operand, allocator)?
+        case .index(let operand, let index_v) =>
+            mark_pair(mutable live, operand, index_v, allocator)?
+        case .slice_subrange(let operand, let lo_v, let hi_v) => {
+            mark_value(mutable live, operand, allocator)?
+            mark_pair(mutable live, lo_v, hi_v, allocator)?
+        }
+        case .len(let operand) =>
+            mark_value(mutable live, operand, allocator)?
+        case .discriminant(let operand) =>
+            mark_value(mutable live, operand, allocator)?
+        case .aggregate(let akind, let elems) =>
+            mark_value_vec(mutable live, elems, allocator)?
+        case .ref_(let bkind, let operand) =>
+            mark_value(mutable live, operand, allocator)?
+        case .deref_(let operand) =>
+            mark_value(mutable live, operand, allocator)?
+        case .field_addr(let operand, let index) =>
+            mark_value(mutable live, operand, allocator)?
+        case .index_addr(let operand, let index_v) =>
+            mark_pair(mutable live, operand, index_v, allocator)?
+        case .subrange_addr(let operand, let lo_v, let hi_v) => {
+            mark_value(mutable live, operand, allocator)?
+            mark_pair(mutable live, lo_v, hi_v, allocator)?
+        }
+        case .deref_addr(let operand) =>
+            mark_value(mutable live, operand, allocator)?
+        case .store_(let addr, let value) =>
+            mark_pair(mutable live, addr, value, allocator)?
+        case .stack_alloc(let bytes) => ()
+        case .err_flag => ()
+    }
+}
+
+
+function mark_pair(
+    live: mutable IntMap_u8.IntMap,
+    a: value_mod.ValueId,
+    b: value_mod.ValueId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    mark_value(mutable live, a, allocator)?
+    mark_value(mutable live, b, allocator)?
+}
+
+
+function mark_call(
+    live: mutable IntMap_u8.IntMap,
+    callee: value_mod.ValueId,
+    args: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    mark_value(mutable live, callee, allocator)?
+    mark_value_vec(mutable live, args, allocator)?
+}
+
+
+function propagate(
+    live: mutable IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var rounds: usize = 0
+    loop
+        decreases n - rounds
+    {
+        if rounds >= n { break }
+        let before = IntMap_u8.len(live)
+        propagate_once(mutable live, body, built, allocator)?
+        let after = IntMap_u8.len(live)
+        if after == before { break }
+        rounds = rounds + 1
+    }
+}
+
+
+function propagate_once(
+    live: mutable IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        if op.result_.raw == 0 {
+            i = i + 1
+            continue
+        }
+        if is_live(live, op.result_) {
+            mark_op_operands(mutable live, op.kind, op.flags, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function collect_dead(
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    live: IntMap_u8.IntMap,
+    allocator: Allocator,
+) -> Vec_OpId.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit dead: Vec_OpId.Vec
+    Vec_OpId.new(init dead, allocator)?
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        if is_dead_op(op, built, live) {
+            let id = op_mod.OpId { raw: i as u32 }
+            Vec_OpId.push(mutable dead, take id, allocator)?
+        }
+        i = i + 1
+    }
+    return dead
+}
+
+
+function is_dead_op(
+    op: hlir_op_mod.HlirOp,
+    built: mapping_mod.BuildResult,
+    live: IntMap_u8.IntMap,
+) -> bool {
+    if op.result_.raw == 0 { return false }
+    let purity = mapping_mod.purity_of_value(built, op.result_)
+    if !purity_mod.is_droppable(purity) { return false }
+    return !is_live(live, op.result_)
+}

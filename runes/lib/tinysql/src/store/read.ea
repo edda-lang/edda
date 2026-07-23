@@ -1,0 +1,182 @@
+module tinysql.store.read
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import tinysql.model.value
+import tinysql.model.schema
+import tinysql.model.error
+
+spec std.collections.vec.Vec(schema.Table)
+spec std.collections.vec.Vec(schema.Row)
+
+function _alloc_column_slots(allocator: Allocator, n: usize) -> [schema.Column]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_value_slots(allocator: Allocator, n: usize) -> [value.Value]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public type Reader {
+    src: [u8]
+    pos: usize
+}
+
+function _byte(r: mutable Reader) -> u8
+    with {err: error.SqlError}
+{
+    if r.pos >= r.src.len() { raise error.SqlError.corrupt_store }
+    let c = r.src[r.pos]
+    r.pos = r.pos + 1 as usize
+    return c
+}
+
+function _read_uint(r: mutable Reader) -> usize
+    with {err: error.SqlError}
+{
+    var v: usize = 0
+    var seen: bool = false
+    var guard: usize = r.src.len() + 1 as usize
+    loop decreases guard {
+        if guard == 0 as usize { raise error.SqlError.corrupt_store }
+        guard = guard - 1 as usize
+        let c = _byte(mutable r)?
+        if c == 10 as u8 { break }
+        if c < 48 as u8 || c > 57 as u8 { raise error.SqlError.corrupt_store }
+        v = v * 10 as usize + (c - 48 as u8) as usize
+        seen = true
+    }
+    if !seen { raise error.SqlError.corrupt_store }
+    return v
+}
+
+function _read_int(r: mutable Reader) -> i64
+    with {err: error.SqlError}
+{
+    var neg: bool = false
+    var v: i64 = 0
+    var seen: bool = false
+    var guard: usize = r.src.len() + 1 as usize
+    loop decreases guard {
+        if guard == 0 as usize { raise error.SqlError.corrupt_store }
+        guard = guard - 1 as usize
+        let c = _byte(mutable r)?
+        if c == 10 as u8 { break }
+        if c == 45 as u8 && !seen {
+            neg = true
+            seen = true
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            v = v * 10 as i64 + (c - 48 as u8) as i64
+            seen = true
+        } else {
+            raise error.SqlError.corrupt_store
+        }
+    }
+    if !seen { raise error.SqlError.corrupt_store }
+    return if neg { 0 as i64 - v } else { v }
+}
+
+function _read_string(r: mutable Reader, allocator: Allocator) -> String
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let n = _read_uint(mutable r)?
+    if r.pos + n > r.src.len() { raise error.SqlError.corrupt_store }
+    let slice = r.src[r.pos..<r.pos + n]
+    r.pos = r.pos + n
+    return string.bytes_slice_to_string(slice, 0 as usize, slice.len(), allocator)?
+}
+
+function _read_value(r: mutable Reader, allocator: Allocator) -> value.Value
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let tag = _byte(mutable r)?
+    if tag == 105 as u8 {
+        return value.Value.integer(_read_int(mutable r)?)
+    }
+    if tag == 116 as u8 {
+        return value.Value.text(_read_string(mutable r, allocator)?)
+    }
+    if tag == 98 as u8 {
+        let c = _byte(mutable r)?
+        let _nl = _byte(mutable r)?
+        return value.Value.boolean(c == 49 as u8)
+    }
+    if tag == 110 as u8 {
+        let _nl = _byte(mutable r)?
+        return value.Value.null_value
+    }
+    raise error.SqlError.corrupt_store
+}
+
+function _char_coltype(c: u8) -> value.ColumnType
+    with {err: error.SqlError}
+{
+    if c == 105 as u8 { return value.ColumnType.int_type }
+    if c == 116 as u8 { return value.ColumnType.text_type }
+    if c == 98 as u8 { return value.ColumnType.bool_type }
+    raise error.SqlError.corrupt_store
+}
+
+function _read_table(r: mutable Reader, allocator: Allocator) -> schema.Table
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let name = _read_string(mutable r, allocator)?
+    let nc = _read_uint(mutable r)?
+    let cols = _alloc_column_slots(allocator, nc + 1 as usize)?
+    var ci: usize = 0
+    loop decreases nc - ci + 1 as usize {
+        if ci >= nc { break }
+        let cn = _read_string(mutable r, allocator)?
+        let tc = _byte(mutable r)?
+        let _nl = _byte(mutable r)?
+        cols[ci] = schema.Column { name: cn, col_type: _char_coltype(tc)? }
+        ci = ci + 1 as usize
+    }
+    let nr = _read_uint(mutable r)?
+    uninit rows: Vec_Row.Vec
+    Vec_Row.new(init rows, allocator)?
+    var ri: usize = 0
+    loop decreases nr - ri + 1 as usize {
+        if ri >= nr { break }
+        let cells = _alloc_value_slots(allocator, nc + 1 as usize)?
+        var k: usize = 0
+        loop decreases nc - k + 1 as usize {
+            if k >= nc { break }
+            cells[k] = _read_value(mutable r, allocator)?
+            k = k + 1 as usize
+        }
+        let row = schema.Row { cells: cells[0 as usize..<nc] }
+        Vec_Row.push(mutable rows, take row, allocator)?
+        ri = ri + 1 as usize
+    }
+    return schema.Table { name: name, columns: cols[0 as usize..<nc], rows: rows }
+}
+
+function _expect_magic(r: mutable Reader) -> ()
+    with {err: error.SqlError}
+{
+    if _byte(mutable r)? != 84 as u8 { raise error.SqlError.corrupt_store }
+    if _byte(mutable r)? != 83 as u8 { raise error.SqlError.corrupt_store }
+    if _byte(mutable r)? != 81 as u8 { raise error.SqlError.corrupt_store }
+    if _byte(mutable r)? != 76 as u8 { raise error.SqlError.corrupt_store }
+    if _byte(mutable r)? != 10 as u8 { raise error.SqlError.corrupt_store }
+}
+
+public function deserialize(bytes: [u8], allocator: Allocator) -> schema.Database
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    var r = Reader { src: bytes, pos: 0 as usize }
+    _expect_magic(mutable r)?
+    let nt = _read_uint(mutable r)?
+    uninit db: schema.Database
+    schema.new_database(init db, allocator)?
+    var ti: usize = 0
+    loop decreases nt - ti + 1 as usize {
+        if ti >= nt { break }
+        let table = _read_table(mutable r, allocator)?
+        Vec_Table.push(mutable db.tables, take table, allocator)?
+        ti = ti + 1 as usize
+    }
+    return db
+}

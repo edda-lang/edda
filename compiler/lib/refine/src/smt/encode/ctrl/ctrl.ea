@@ -1,0 +1,101 @@
+
+module refine.smt.encode.ctrl.ctrl
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import syntax.ast.tree as ast_tree
+import types.check.env.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.term as term_mod
+import local.smt.encode.encres as result_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.collections.vec.Vec(ast_tree.Stmt)
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.core.option.Option(Box_Expr)
+
+
+public function encode_block(
+    body: ast_tree.Block,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_Stmt.len(body.stmts) != 0 {
+        return result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "block with statements in refinement",
+            ),
+        )
+    }
+    return match body.trailing {
+        case .none => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "block without trailing expression in refinement",
+            ),
+        )
+        case .some(let trailing_box) => {
+            let trailing_expr = Box_Expr.get(trailing_box)
+            encode_fn(trailing_expr, vars, ty_interner, builtins, allocator)?
+        }
+    }
+}
+
+public function encode_if(
+    cond_box: Box_Expr,
+    then_block: ast_tree.Block,
+    else_branch: Option_Box_Expr.Option,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let else_box = match else_branch {
+        case .none => return result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "if without else in refinement (value-producing if requires both branches)",
+            ),
+        )
+        case .some(let b) => b
+    }
+    let cond_expr = Box_Expr.get(cond_box)
+    let cond_result = encode_fn(cond_expr, vars, ty_interner, builtins, allocator)?
+    return match cond_result {
+        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+        case .encoded(let cond_term) => {
+            let then_result = encode_block(then_block, vars, ty_interner, builtins, allocator, encode_fn)?
+            match then_result {
+                case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+                case .encoded(let then_term) => {
+                    let else_expr = Box_Expr.get(else_box)
+                    let else_result = encode_fn(else_expr, vars, ty_interner, builtins, allocator)?
+                    match else_result {
+                        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+                        case .encoded(let else_term) => {
+                            uninit args: Vec_SmtTerm.Vec
+                            Vec_SmtTerm.new(init args, allocator)?
+                            Vec_SmtTerm.push(mutable args, take cond_term, allocator)?
+                            Vec_SmtTerm.push(mutable args, take then_term, allocator)?
+                            Vec_SmtTerm.push(mutable args, take else_term, allocator)?
+                            result_mod.EncodeResult.encoded(
+                                term: term_mod.SmtTerm.app(op: term_mod.SmtOp.ite, args: args),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

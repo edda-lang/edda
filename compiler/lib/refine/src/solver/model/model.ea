@@ -1,0 +1,176 @@
+
+module refine.solver.model.model
+
+import std.collections.vec
+import std.core.option
+import std.core.fmt
+import std.text.string
+import std.mem.alloc
+import intern.interner as interner_mod
+import local.solver.atom.atom as atom_mod
+import local.solver.cdcl.core.trail as trail_mod
+import local.solver.theory.theory as theory_mod
+import local.solver.lia.frontend.frontend as lia_mod
+import local.solver.rational.wide as wide_mod
+import local.solver.theory.engine.euf as euf_mod
+import local.smt.render.render as render_mod
+import local.smt.term as term_mod
+
+
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(lia_mod.LiaAssignment)
+spec std.collections.vec.Vec(euf_mod.EufClass)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function extract(
+    atoms: atom_mod.AtomTable,
+    trail: trail_mod.Trail,
+    theory: theory_mod.Theory,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = atom_mod.atom_count(atoms)
+    var acc: String = ""
+    var count: usize = 0
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        match assignment_entry(atoms, trail, i, interner, allocator)? {
+            case .some(let entry) => {
+                acc = append_entry(acc, entry, count, allocator)?
+                count = count + 1
+            }
+            case .none => {}
+        }
+        i = i + 1
+    }
+    let lia_model = lia_mod.extract_model(theory.lia, allocator)?
+    let na = Vec_LiaAssignment.len(lia_model.assignments)
+    var j: usize = 0
+    loop
+        decreases (na - j)
+    {
+        if j >= na {
+            break
+        }
+        let asg = Vec_LiaAssignment.at(lia_model.assignments, j)
+        let entry = int_entry(asg.term, asg.value, interner, allocator)?
+        acc = append_entry(acc, entry, count, allocator)?
+        count = count + 1
+        j = j + 1
+    }
+    var euf_work = theory.euf
+    let euf_model = euf_mod.extract_model(mutable euf_work, allocator)?
+    let nc = Vec_EufClass.len(euf_model.classes)
+    var c: usize = 0
+    loop
+        decreases (nc - c)
+    {
+        if c >= nc {
+            break
+        }
+        let cls = Vec_EufClass.at(euf_model.classes, c)
+        let entry = euf_class_entry(cls, interner, allocator)?
+        acc = append_entry(acc, entry, count, allocator)?
+        count = count + 1
+        c = c + 1
+    }
+    if count == 0 {
+        return "(no assigned atoms)"
+    }
+    return acc
+}
+
+
+function euf_class_entry(
+    cls: euf_mod.EufClass,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_SmtTerm.len(cls.members)
+    var acc: String = ""
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let term_str = render_mod.render_term(Vec_SmtTerm.at(cls.members, i), interner, allocator)?
+        acc = if i == 0 {
+            term_str
+        } else {
+            let withsep = string.concat(acc, " = ", allocator)?
+            string.concat(withsep, term_str, allocator)?
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+
+function append_entry(acc: String, entry: String, count: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if count == 0 {
+        return entry
+    }
+    let withsep = string.concat(acc, ", ", allocator)?
+    return string.concat(withsep, entry, allocator)?
+}
+
+
+function assignment_entry(
+    atoms: atom_mod.AtomTable,
+    trail: trail_mod.Trail,
+    variable: usize,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let term = atom_mod.term_at(atoms, variable)
+    match term {
+        case .true_ => return Option_String.none
+        case .false_ => return Option_String.none
+        case _ => {}
+    }
+    let val_str = match trail_mod.var_value(trail, variable) {
+        case .ltrue => "true"
+        case .lfalse => "false"
+        case .lundef => return Option_String.none
+    }
+    let term_str = render_mod.render_term(term, interner, allocator)?
+    let p1 = string.concat(term_str, " = ", allocator)?
+    let entry = string.concat(p1, val_str, allocator)?
+    return Option_String.some(value: entry)
+}
+
+
+function int_entry(
+    term: term_mod.SmtTerm,
+    value: wide_mod.Wide,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let term_str = render_mod.render_term(term, interner, allocator)?
+    let mag_str = fmt.u128_to_string(value.mag, allocator)?
+    let val_str = if value.neg {
+        string.concat("-", mag_str, allocator)?
+    } else {
+        mag_str
+    }
+    let p1 = string.concat(term_str, " = ", allocator)?
+    return string.concat(p1, val_str, allocator)?
+}

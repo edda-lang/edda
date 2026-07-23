@@ -1,0 +1,155 @@
+
+module lower.flow.plan.place
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.flow.cfg.cfg as cfg_mod
+import local.flow.live.live as live_mod
+import local.flow.ssa.ssa as dom_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+
+
+public function place_phis_for_local(
+    phi_bits: mutable Vec_u64.Vec,
+    queued_bits: mutable Vec_u64.Vec,
+    worklist: mutable Vec_u32.Vec,
+    def_offsets: Vec_usize.Vec,
+    def_pool: Vec_u32.Vec,
+    dom: dom_mod.SsaDom,
+    cfg: cfg_mod.Cfg,
+    liv: live_mod.Liveness,
+    l: usize,
+    n_blocks: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_u32.clear(mutable worklist)
+    if l + 1 >= Vec_usize.len(def_offsets) { return }
+    let wpr = words_per_row(n_locals)
+    var i = Vec_usize.at(def_offsets, l)
+    let end = Vec_usize.at(def_offsets, l + 1)
+    loop decreases end - i {
+        if i >= end { break }
+        if i < Vec_u32.len(def_pool) {
+            let d = Vec_u32.at(def_pool, i)
+            if (d as usize) < n_blocks {
+                if !bit_at(queued_bits, (d as usize) * wpr, l) {
+                    bit_set_true(mutable queued_bits, (d as usize) * wpr, l)
+                    Vec_u32.push(mutable worklist, d, allocator)?
+                }
+            }
+        }
+        i += 1
+    }
+
+    var fuel: usize = n_blocks + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        let depth = Vec_u32.len(worklist)
+        if depth == 0 { break }
+        let d = Vec_u32.at(worklist, depth - 1)
+        let _ = Vec_u32.pop(mutable worklist)
+        expand_frontier(mutable phi_bits, mutable queued_bits, mutable worklist, dom, cfg, liv, d, l, wpr, n_blocks, allocator)?
+    }
+}
+
+
+function expand_frontier(
+    phi_bits: mutable Vec_u64.Vec,
+    queued_bits: mutable Vec_u64.Vec,
+    worklist: mutable Vec_u32.Vec,
+    dom: dom_mod.SsaDom,
+    cfg: cfg_mod.Cfg,
+    liv: live_mod.Liveness,
+    d: u32,
+    l: usize,
+    wpr: usize,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var j = dom_mod.df_start(dom, d as usize)
+    let dfe = dom_mod.df_end(dom, d as usize)
+    loop decreases dfe - j {
+        if j >= dfe { break }
+        let fb = dom_mod.df_at(dom, j) as usize
+        if try_place_phi(mutable phi_bits, cfg, liv, fb, l, wpr, n_blocks) {
+            if !bit_at(queued_bits, fb * wpr, l) {
+                bit_set_true(mutable queued_bits, fb * wpr, l)
+                Vec_u32.push(mutable worklist, fb as u32 wrapping, allocator)?
+            }
+        }
+        j += 1
+    }
+}
+
+
+function try_place_phi(
+    phi_bits: mutable Vec_u64.Vec,
+    cfg: cfg_mod.Cfg,
+    liv: live_mod.Liveness,
+    b: usize,
+    l: usize,
+    wpr: usize,
+    n_blocks: usize,
+) -> bool {
+    if b >= n_blocks { return false }
+    if !block_takes_params(cfg, b) { return false }
+    if !live_mod.is_live_in(liv, b, l) { return false }
+    if bit_at(phi_bits, b * wpr, l) { return false }
+    bit_set_true(mutable phi_bits, b * wpr, l)
+    return true
+}
+
+
+public function block_takes_params(cfg: cfg_mod.Cfg, b: usize) -> bool {
+    if b < 2 { return false }
+    if b >= Vec_u32.len(cfg.rpo_pos) { return false }
+    if Vec_u32.at(cfg.rpo_pos, b) == (0 as u32) { return false }
+    if b >= Vec_bool.len(cfg.any_incapable_pred) { return false }
+    return !Vec_bool.at(cfg.any_incapable_pred, b)
+}
+
+
+public function words_per_row(n_locals: usize) -> usize {
+    return (n_locals + 63) / 64
+}
+
+public function bit_at(bits: Vec_u64.Vec, base: usize, local: usize) -> bool {
+    let w = base + local / 64
+    if w >= Vec_u64.len(bits) { return false }
+    let word = Vec_u64.at(bits, w)
+    return ((word >> ((local % 64) as u64)) & (1 as u64)) == (1 as u64)
+}
+
+public function bit_set_true(bits: mutable Vec_u64.Vec, base: usize, local: usize) -> () {
+    let w = base + local / 64
+    if w >= Vec_u64.len(bits) { return }
+    let word = Vec_u64.at(bits, w)
+    Vec_u64.set_at(mutable bits, w, word | ((1 as u64) << ((local % 64) as u64)))
+}
+
+
+public function new_zeros(out: init Vec_u64.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u64.Vec
+    Vec_u64.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u64.push(mutable v, 0 as u64, allocator)?
+        i += 1
+    }
+    out = v
+}

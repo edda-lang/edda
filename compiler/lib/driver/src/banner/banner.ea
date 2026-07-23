@@ -1,0 +1,143 @@
+
+module driver.banner.banner
+
+import std.core.option
+import std.core.fmt as fmt_mod
+import std.io.stream as stream_mod
+import std.mem.alloc
+import std.os.fs
+import std.os.time as time_mod
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import manifest.manifest as manifest_mod
+import source.map as source_map_mod
+import compile.setup.env.load.load as load_mod
+
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+
+
+public function resolve_name(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    member: Option_String.Option,
+    map: mutable source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> String
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let dir = match member {
+        case .some(let m) => {
+            let head = string.concat(workspace_root, "/lib/", allocator)?
+            string.concat(head, m, allocator)?
+        }
+        case .none => workspace_root
+    }
+    let toml_path = string.concat(dir, "/package.toml", allocator)?
+    if !fs.path_exists(rfs, toml_path) {
+        return "program"
+    }
+    let m_opt = load_mod.manifest_load(rfs, mutable map, dir, mutable diags, allocator)?
+    return match m_opt {
+        case .some(let lm) => match manifest_mod.package_name_of(lm) {
+            case .some(let n) => n
+            case .none => "program"
+        }
+        case .none => "program"
+    }
+}
+
+
+public function print_start(
+    out: Stdout,
+    verb: String,
+    package_name: String,
+    allocator: Allocator,
+) -> ()
+    with {out, allocator, err: alloc.AllocError}
+{
+    let head = string.concat(verb, ": starting ", allocator)?
+    let line = string.concat(head, package_name, allocator)?
+    stream_mod.print_line(out, line)
+}
+
+
+public function begin(clock: MonotonicClock) -> time_mod.MonotonicInstant
+    with {clock}
+{
+    return time_mod.monotonic_now_untimed(clock)
+}
+
+
+public function print_summary(
+    out: Stdout,
+    verb: String,
+    modules: usize,
+    artifacts_cached: usize,
+    artifacts_generated: usize,
+    start: time_mod.MonotonicInstant,
+    clock: MonotonicClock,
+    allocator: Allocator,
+) -> ()
+    with {out, clock, allocator, err: alloc.AllocError}
+{
+    let now = time_mod.monotonic_now_untimed(clock)
+    let dur = if now.nanos_since_clock_start >= start.nanos_since_clock_start {
+        time_mod.duration_since(now, start)
+    } else {
+        time_mod.zero()
+    }
+    let m = fmt_mod.usize_to_string(modules, allocator)?
+    let head = string.concat(verb, ": ", allocator)?
+    let with_count = string.concat(head, m, allocator)?
+    let with_modules = string.concat(with_count, " modules", allocator)?
+    let with_artifacts = artifact_clause(with_modules, artifacts_cached, artifacts_generated, allocator)?
+    let with_comma = string.concat(with_artifacts, ", ", allocator)?
+    let secs = format_secs(dur, allocator)?
+    let line = string.concat(with_comma, secs, allocator)?
+    stream_mod.print_line(out, line)
+}
+
+
+function artifact_clause(
+    head: String,
+    artifacts_cached: usize,
+    artifacts_generated: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let total = artifacts_cached + artifacts_generated
+    if total == 0 as usize {
+        return head
+    }
+    let t = fmt_mod.usize_to_string(total, allocator)?
+    let c = fmt_mod.usize_to_string(artifacts_cached, allocator)?
+    let g = fmt_mod.usize_to_string(artifacts_generated, allocator)?
+    let a1 = string.concat(head, ", ", allocator)?
+    let a2 = string.concat(a1, t, allocator)?
+    let a3 = string.concat(a2, " artifacts (", allocator)?
+    let a4 = string.concat(a3, c, allocator)?
+    let a5 = string.concat(a4, " cached, ", allocator)?
+    let a6 = string.concat(a5, g, allocator)?
+    let a7 = string.concat(a6, " generated)", allocator)?
+    return a7
+}
+
+
+function format_secs(dur: time_mod.Duration, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let us = time_mod.as_micros(dur)
+    let hundredths = (us + 5000) / 10000
+    let secs = hundredths / 100
+    let frac = hundredths % 100
+    let whole = fmt_mod.i64_to_string(secs, allocator)?
+    let dot = string.concat(whole, ".", allocator)?
+    let f = fmt_mod.i64_to_string(frac, allocator)?
+    let padded = if frac < 10 { string.concat("0", f, allocator)? } else { f }
+    let with_frac = string.concat(dot, padded, allocator)?
+    return string.concat(with_frac, "s", allocator)?
+}

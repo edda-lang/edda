@@ -1,0 +1,319 @@
+
+module compile.phase.emit.library.libpath
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import std.core.option
+import std.os.env as env_mod
+import std.os.fs as fs
+
+import target.triple as triple_mod
+import object.lib as object_mod
+import link.emit.image.output as output_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(output_mod.LibSpec)
+spec std.core.option.Option(String)
+
+
+public function default_link_libs(
+    kind: output_mod.OutputKind,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Vec_LibSpec.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit libs: Vec_LibSpec.Vec
+    Vec_LibSpec.new(init libs, allocator)?
+    let is_dynamic = match kind {
+        case .dynamic_library => true
+        case _                => false
+    }
+    if !is_dynamic { return libs }
+    match object_mod.format_for_triple(target) {
+        case .coff => {
+            push_lib(mutable libs, "msvcrt", allocator)?
+            push_lib(mutable libs, "ucrt", allocator)?
+            push_lib(mutable libs, "vcruntime", allocator)?
+            push_lib(mutable libs, "kernel32", allocator)?
+            push_lib(mutable libs, "advapi32", allocator)?
+            push_lib(mutable libs, "ntdll", allocator)?
+            push_lib(mutable libs, "ws2_32", allocator)?
+            push_lib(mutable libs, "userenv", allocator)?
+            push_lib(mutable libs, "bcrypt", allocator)?
+        }
+        case _ => ()
+    }
+    return libs
+}
+
+
+function push_lib(libs: mutable Vec_LibSpec.Vec, name: take String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_LibSpec.push(
+        mutable libs,
+        output_mod.LibSpec { name: name, kind: output_mod.LibKind.dynamic_lib },
+        allocator,
+    )?
+}
+
+
+public function default_lib_search_paths(
+    kind: output_mod.OutputKind,
+    target: triple_mod.TargetTriple,
+    rfs: ReadOnlyFilesystem,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    uninit paths: Vec_String.Vec
+    Vec_String.new(init paths, allocator)?
+    let is_dynamic = match kind {
+        case .dynamic_library => true
+        case _                => false
+    }
+    if !is_dynamic { return paths }
+    match object_mod.format_for_triple(target) {
+        case .coff => {
+            collect_lib_env(mutable paths, allocator)?
+            if Vec_String.len(paths) == 0 as usize {
+                probe_msvc_paths(mutable paths, rfs, allocator)?
+            }
+        }
+        case _ => ()
+    }
+    return paths
+}
+
+
+function collect_lib_env(paths: mutable Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match env_mod.read_optional("LIB", allocator) {
+        case .some(let value) => {
+            let parts = string.split(value, ";", allocator)?
+            let n = parts.len()
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                let part = parts[i]
+                if !string.is_empty(part) {
+                    Vec_String.push(mutable paths, string.concat(part, "", allocator)?, allocator)?
+                }
+                i += 1
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+function probe_msvc_paths(paths: mutable Vec_String.Vec, rfs: ReadOnlyFilesystem, allocator: Allocator) -> ()
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let pf = env_or_default("ProgramFiles", "C:\\Program Files", allocator)?
+    let pf86 = env_or_default("ProgramFiles(x86)", "C:\\Program Files (x86)", allocator)?
+    match find_msvc_x64_lib(pf, rfs, allocator)? {
+        case .some(let lib) => Vec_String.push(mutable paths, lib, allocator)?
+        case .none => ()
+    }
+    probe_winsdk(mutable paths, pf86, rfs, allocator)?
+}
+
+
+function find_msvc_x64_lib(pf: String, rfs: ReadOnlyFilesystem, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let vs_root = path_join(pf, "Microsoft Visual Studio", allocator)?
+    uninit years: Vec_String.Vec
+    Vec_String.new(init years, allocator)?
+    Vec_String.push(mutable years, "2022", allocator)?
+    Vec_String.push(mutable years, "2019", allocator)?
+    Vec_String.push(mutable years, "2017", allocator)?
+    let n = Vec_String.len(years)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let year_dir = path_join(vs_root, Vec_String.at(years, i), allocator)?
+        if fs.path_exists(rfs, year_dir) {
+            match find_edition_lib(year_dir, rfs, allocator)? {
+                case .some(let lib) => return Option_String.some(value: lib)
+                case .none => ()
+            }
+        }
+        i += 1
+    }
+    return Option_String.none
+}
+
+
+function find_edition_lib(year_dir: String, rfs: ReadOnlyFilesystem, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    uninit eds: Vec_String.Vec
+    Vec_String.new(init eds, allocator)?
+    Vec_String.push(mutable eds, "Enterprise", allocator)?
+    Vec_String.push(mutable eds, "Professional", allocator)?
+    Vec_String.push(mutable eds, "Community", allocator)?
+    Vec_String.push(mutable eds, "BuildTools", allocator)?
+    let n = Vec_String.len(eds)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let msvc_root = msvc_tools_dir(year_dir, Vec_String.at(eds, i), allocator)?
+        match latest_subdir(rfs, msvc_root, allocator)? {
+            case .some(let ver) => {
+                let lib_dir = lib_x64_dir(msvc_root, ver, allocator)?
+                if fs.path_exists(rfs, lib_dir) { return Option_String.some(value: lib_dir) }
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+    return Option_String.none
+}
+
+
+function msvc_tools_dir(year_dir: String, ed: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = path_join(year_dir, ed, allocator)?
+    let b = path_join(a, "VC", allocator)?
+    let c = path_join(b, "Tools", allocator)?
+    return path_join(c, "MSVC", allocator)?
+}
+
+
+function lib_x64_dir(root: String, ver: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = path_join(root, ver, allocator)?
+    let b = path_join(a, "lib", allocator)?
+    return path_join(b, "x64", allocator)?
+}
+
+
+function probe_winsdk(paths: mutable Vec_String.Vec, pf86: String, rfs: ReadOnlyFilesystem, allocator: Allocator) -> ()
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let a = path_join(pf86, "Windows Kits", allocator)?
+    let b = path_join(a, "10", allocator)?
+    let winsdk_lib = path_join(b, "Lib", allocator)?
+    match latest_subdir(rfs, winsdk_lib, allocator)? {
+        case .some(let ver) => {
+            let base = path_join(winsdk_lib, ver, allocator)?
+            push_kit_dir(mutable paths, base, "ucrt", rfs, allocator)?
+            push_kit_dir(mutable paths, base, "um", rfs, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function push_kit_dir(
+    paths: mutable Vec_String.Vec,
+    base: String,
+    sub: String,
+    rfs: ReadOnlyFilesystem,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let a = path_join(base, sub, allocator)?
+    let dir = path_join(a, "x64", allocator)?
+    if fs.path_exists(rfs, dir) { Vec_String.push(mutable paths, dir, allocator)? }
+}
+
+
+function latest_subdir(rfs: ReadOnlyFilesystem, dir: String, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    return handle err: fs.FsError -> Option_String.none {
+        let entries = fs.read_dir(rfs, dir, allocator)?
+        pick_latest(entries, allocator)?
+    }
+}
+
+
+function pick_latest(entries: [String], allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    var best: Option_String.Option = Option_String.none
+    let n = entries.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = entries[i]
+        if starts_with_digit(e) {
+            best = better_subdir(best, e, allocator)?
+        }
+        i += 1
+    }
+    return best
+}
+
+
+function better_subdir(best: Option_String.Option, cand: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match best {
+        case .some(let cur) => if str_gt(cand, cur) {
+            Option_String.some(value: string.concat(cand, "", allocator)?)
+        } else {
+            Option_String.some(value: string.concat(cur, "", allocator)?)
+        }
+        case .none => Option_String.some(value: string.concat(cand, "", allocator)?)
+    }
+}
+
+
+function starts_with_digit(s: String) -> bool {
+    let bs = s.bytes()
+    if bs.len() == 0 as usize { return false }
+    let c = bs[0 as usize]
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+
+function str_gt(a: String, b: String) -> bool {
+    let ba = a.bytes()
+    let bb = b.bytes()
+    let na = ba.len()
+    let nb = bb.len()
+    let m = if na < nb { na } else { nb }
+    var i: usize = 0
+    loop decreases m - i {
+        if i >= m { break }
+        let ca = ba[i]
+        let cb = bb[i]
+        if ca > cb { return true }
+        if ca < cb { return false }
+        i += 1
+    }
+    return na > nb
+}
+
+
+function env_or_default(name: String, fallback: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match env_mod.read_optional(name, allocator) {
+        case .some(let v) => if string.is_empty(v) {
+            string.concat(fallback, "", allocator)?
+        } else {
+            string.concat(v, "", allocator)?
+        }
+        case .none => string.concat(fallback, "", allocator)?
+    }
+}
+
+
+function path_join(base: String, seg: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let with_sep = string.concat(base, "\\", allocator)?
+    return string.concat(with_sep, seg, allocator)?
+}

@@ -1,0 +1,121 @@
+
+module wasm.isel.wenc.wenc
+
+import std.mem.alloc
+import std.collections.vec
+import span.loc.pos.span as span_mod
+import mir.rvalue as mir_rvalue_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.tree.reg as reg_mod
+import ir.lir.id.vreg as vreg_mod
+import local.fmt.encode as enc_mod
+import local.model as model_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function local_index(v: vreg_mod.LirVRegId) -> u64 {
+    return (v.raw - (1 as u32)) as u64
+}
+
+
+public function get_local(code: mutable Vec_u8.Vec, v: vreg_mod.LirVRegId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x20, allocator)?
+    enc_mod.uleb(mutable code, local_index(v), allocator)?
+}
+
+
+public function set_local(code: mutable Vec_u8.Vec, v: vreg_mod.LirVRegId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x21, allocator)?
+    enc_mod.uleb(mutable code, local_index(v), allocator)?
+}
+
+
+public function emit_int_const(code: mutable Vec_u8.Vec, value: i64, want_i64: bool, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if want_i64 {
+        enc_mod.push_byte(mutable code, 0x42, allocator)?
+    } else {
+        enc_mod.push_byte(mutable code, 0x41, allocator)?
+    }
+    enc_mod.sleb(mutable code, value, allocator)?
+}
+
+
+public function emit_le_bytes(code: mutable Vec_u8.Vec, value: u64, n: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var v: u64 = value
+    var i: u32 = 0
+    loop decreases n - i {
+        if i >= n { break }
+        enc_mod.push_byte(mutable code, (v & (0xFF as u64)) as u8, allocator)?
+        v = v >> (8 as u64)
+        i += 1
+    }
+}
+
+
+public function emit_operand(
+    code: mutable Vec_u8.Vec,
+    o: reg_mod.Operand,
+    want_i64: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match o {
+        case .vreg(let id) => get_local(mutable code, id, allocator)?
+        case .imm(let value) => emit_int_const(mutable code, value, want_i64, allocator)?
+        case .preg(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: physical register operand reached the wasm backend (regalloc must not run for wasm)",
+        )
+    }
+}
+
+
+public function emit_float_const(code: mutable Vec_u8.Vec, bits: u64, width: mir_rvalue_mod.FloatWidth, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match width {
+        case .f32_ => {
+            enc_mod.push_byte(mutable code, 0x43, allocator)?
+            emit_le_bytes(mutable code, bits, 4 as u32, allocator)?
+        }
+        case .f64_ => {
+            enc_mod.push_byte(mutable code, 0x44, allocator)?
+            emit_le_bytes(mutable code, bits, 8 as u32, allocator)?
+        }
+    }
+}
+
+
+public function is_i64(vt: model_mod.ValType) -> bool {
+    return match vt {
+        case .i64_ => true
+        case _     => false
+    }
+}
+
+
+public function is_f32(vt: model_mod.ValType) -> bool {
+    return match vt {
+        case .f32_ => true
+        case _     => false
+    }
+}
+
+
+public function is_f64(vt: model_mod.ValType) -> bool {
+    return match vt {
+        case .f64_ => true
+        case _     => false
+    }
+}

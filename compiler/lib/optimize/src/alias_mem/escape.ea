@@ -1,0 +1,257 @@
+module optimize.alias_mem.escape
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.core.option.Option(mir_place_mod.Place)
+
+
+derive eq, hash, debug for EscapeInfo
+
+
+public type EscapeInfo {
+    escaped: Vec_bool.Vec
+    has_opaque_memory: bool
+}
+
+
+public function analyze(body: mir_body_mod.MirBody, allocator: Allocator) -> EscapeInfo
+    with {allocator, err: alloc.AllocError}
+{
+    let n_locals: usize = Vec_Local.len(body.locals)
+    uninit escaped: Vec_bool.Vec
+    Vec_bool.with_capacity(init escaped, n_locals, allocator)?
+    var li: usize = 0
+    loop decreases n_locals - li {
+        if li >= n_locals { break }
+        Vec_bool.push(mutable escaped, false, allocator)?
+        li += 1
+    }
+
+    var opaque: bool = false
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        opaque = opaque || scan_block(mutable escaped, block)
+        bi += 1
+    }
+
+    return EscapeInfo { escaped: escaped, has_opaque_memory: opaque }
+}
+
+
+function scan_block(
+    escaped: mutable Vec_bool.Vec,
+    block: mir_body_mod.BasicBlock,
+) -> bool {
+    var opaque: bool = false
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(block.statements, si)
+        opaque = opaque || scan_statement(mutable escaped, stmt)
+        si += 1
+    }
+    opaque = opaque || term_has_opaque(block.terminator)
+    return opaque
+}
+
+
+function scan_statement(
+    escaped: mutable Vec_bool.Vec,
+    stmt: mir_stmt_mod.Statement,
+) -> bool {
+    return match stmt.kind {
+        case .assign(let dest, let value) =>
+            place_has_deref(dest) || scan_rvalue(mutable escaped, value)
+        case .storage_live(_) => false
+        case .storage_dead(_) => false
+        case .nop_ => false
+    }
+}
+
+
+function scan_rvalue(
+    escaped: mutable Vec_bool.Vec,
+    rv: mir_rvalue_mod.Rvalue,
+) -> bool {
+    return match rv {
+        case .use_(let operand) => operand_has_deref(operand)
+        case .binary(_, let lhs, let rhs) => operand_has_deref(lhs) || operand_has_deref(rhs)
+        case .unary(_, let operand) => operand_has_deref(operand)
+        case .cast(let operand, _, _, _) => operand_has_deref(operand)
+        case .aggregate(_, let elems, _) => operands_have_deref(elems)
+        case .ref_(_, let place) => {
+            mark_escaped(mutable escaped, base_local(place))
+            place_has_deref(place)
+        }
+        case .len(let place) => place_has_deref(place)
+        case .discriminant(let place) => place_has_deref(place)
+        case .make_closure(_, let env) => operand_has_deref(env)
+    }
+}
+
+
+function term_has_opaque(term: mir_term_mod.Terminator) -> bool {
+    return match term.kind {
+        case .branch(let cond, _, _) => operand_has_deref(cond)
+        case .switch_(let discr, _) => operand_has_deref(discr)
+        case .raise_(let value, _) => operand_has_deref(value)
+        case .panic_(let message) => operand_has_deref(message)
+        case .call_(let callee, let args, let dest, _, _) =>
+            operand_has_deref(callee) || operands_have_deref(args) || place_has_deref(dest)
+        case .drop_(let place, _, _) => place_has_deref(place)
+        case .await_(let handle, let dest, _, _) =>
+            operand_has_deref(handle) || place_has_deref(dest)
+        case _ => false
+    }
+}
+
+
+function operands_have_deref(ops: Vec_Operand.Vec) -> bool {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        if operand_has_deref(op) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+
+function operand_has_deref(op: mir_rvalue_mod.Operand) -> bool {
+    return match op {
+        case .copy_(let place, _) => place_has_deref(place)
+        case .move_(let place, _) => place_has_deref(place)
+        case .constant(_) => false
+    }
+}
+
+
+function place_has_deref(p: mir_place_mod.Place) -> bool {
+    return has_deref(p)
+}
+
+
+function mark_escaped(escaped: mutable Vec_bool.Vec, l: mir_local_mod.LocalId) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_bool.len(escaped) {
+        Vec_bool.set_at(mutable escaped, idx, true)
+    }
+}
+
+
+public function escapes(info: EscapeInfo, l: mir_local_mod.LocalId) -> bool {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_bool.len(info.escaped) {
+        return Vec_bool.at(info.escaped, idx)
+    }
+    return true
+}
+
+
+public function is_opaque(info: EscapeInfo) -> bool {
+    return info.has_opaque_memory
+}
+
+
+public function local_count(info: EscapeInfo) -> usize {
+    return Vec_bool.len(info.escaped)
+}
+
+
+public function base_local(p: mir_place_mod.Place) -> mir_local_mod.LocalId {
+    return p.local
+}
+
+
+public function is_bare(p: mir_place_mod.Place) -> bool {
+    return mir_place_mod.proj_len(p) == 0
+}
+
+
+public function has_deref(p: mir_place_mod.Place) -> bool {
+    let n: usize = mir_place_mod.proj_len(p)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(p, i)
+        let is_deref: bool = match proj.kind {
+            case .deref_ => true
+            case _ => false
+        }
+        if is_deref {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+
+public function places_may_alias(
+    a: mir_place_mod.Place,
+    b: mir_place_mod.Place,
+    info: EscapeInfo,
+) -> bool {
+    if has_deref(a) {
+        return true
+    }
+    if has_deref(b) {
+        return true
+    }
+    let same_base: bool = mir_local_mod.index(base_local(a)) == mir_local_mod.index(base_local(b))
+    if same_base == false {
+        return false
+    }
+    return true
+}
+
+
+public function operand_place(op: mir_rvalue_mod.Operand) -> Option_Place.Option {
+    return match op {
+        case .copy_(let place, _) => Option_Place.some(value: place)
+        case .move_(let place, _) => Option_Place.some(value: place)
+        case .constant(_) => Option_Place.none
+    }
+}
+
+
+public function rvalue_is_trap_free(rv: mir_rvalue_mod.Rvalue) -> bool {
+    return match rv {
+        case .use_(_) => true
+        case .len(_) => true
+        case .discriminant(_) => true
+        case .ref_(_, _) => true
+        case .aggregate(_, _, _) => true
+        case .make_closure(_, _) => true
+        case _ => false
+    }
+}
+
+
+public function first_temp_index(body: mir_body_mod.MirBody) -> usize {
+    return 2 + (body.n_params as usize)
+}

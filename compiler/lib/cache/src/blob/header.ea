@@ -1,0 +1,174 @@
+
+module cache.blob.header
+
+import std.mem.alloc
+import std.text.string
+import local.addr.hash as hash_mod
+import local.blob.kind as kind_mod
+import local.error as error_mod
+
+derive eq, clone, debug for BlobHeader
+
+
+public type BlobHeader {
+    format_version: u8
+    hash: hash_mod.ArtifactHash
+    body_version: hash_mod.BodyVersion
+    kind: kind_mod.BlobKind
+    payload_len: u64
+}
+
+
+public stable function header_len() -> usize {
+    return 43
+}
+
+public stable function current_format_version() -> u8 {
+    return 1
+}
+
+
+public function write(h: BlobHeader, out: mutable [u8], offset: usize) -> ()
+    requires offset + 43 <= out.len()
+{
+    out[offset] = h.format_version
+    write_u64_be(h.hash.w0, mutable out, offset + 1)
+    write_u64_be(h.hash.w1, mutable out, offset + 9)
+    write_u64_be(h.hash.w2, mutable out, offset + 17)
+    write_u64_be(h.hash.w3, mutable out, offset + 25)
+    out[offset + 33] = h.body_version.value
+    out[offset + 34] = kind_mod.tag(h.kind)
+    write_u64_le(h.payload_len, mutable out, offset + 35)
+}
+
+public function to_bytes(h: BlobHeader, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    var buf: [u8] = allocator.alloc_array(u8, 43)?
+    write(h, mutable buf, 0)
+    return buf
+}
+
+
+public function parse(bytes: [u8], path: String, allocator: Allocator) -> BlobHeader
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires bytes.len() >= 43
+{
+    let format_version = bytes[0]
+    if format_version != current_format_version() {
+        raise error_mod.CacheError.header_parse(
+            path: path,
+            message: string.clone("unsupported blob header format version", allocator)?,
+        )
+    }
+
+    let w0 = read_u64_be(bytes, 1)
+    let w1 = read_u64_be(bytes, 9)
+    let w2 = read_u64_be(bytes, 17)
+    let w3 = read_u64_be(bytes, 25)
+    let body_version_value = bytes[33]
+
+    let kind = match kind_mod.from_tag(bytes[34]) {
+        case .some(let k) => k
+        case .none => raise error_mod.CacheError.header_parse(
+            path: path,
+            message: string.clone("unknown blob kind tag", allocator)?,
+        )
+    }
+
+    let payload_len = read_u64_le(bytes, 35)
+
+    return BlobHeader {
+        format_version: format_version,
+        hash: hash_mod.ArtifactHash { w0: w0, w1: w1, w2: w2, w3: w3 },
+        body_version: hash_mod.BodyVersion { value: body_version_value },
+        kind: kind,
+        payload_len: payload_len,
+    }
+}
+
+
+@property()
+public function round_trip_preserves_header(
+    w0: u64,
+    w1: u64,
+    w2: u64,
+    w3: u64,
+    body_version_value: u8,
+    kind_tag_in: u8 where kind_tag_in < 5,
+    payload_len: u64,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let kind = match kind_mod.from_tag(kind_tag_in) {
+        case .some(let k) => k
+        case .none => raise error_mod.CacheError.header_parse(
+            path: "property",
+            message: string.clone("kind_tag_in refinement violated", allocator)?,
+        )
+    }
+    let h = BlobHeader {
+        format_version: current_format_version(),
+        hash: hash_mod.ArtifactHash { w0: w0, w1: w1, w2: w2, w3: w3 },
+        body_version: hash_mod.BodyVersion { value: body_version_value },
+        kind: kind,
+        payload_len: payload_len,
+    }
+    let bytes = to_bytes(h, allocator)?
+    let parsed = parse(bytes, "property", allocator)?
+    return parsed == h
+}
+
+
+function write_u64_be(w: u64, out: mutable [u8], offset: usize) -> ()
+    requires offset + 8 <= out.len()
+{
+    out[offset]     = ((w >> 56) & 255) as u8
+    out[offset + 1] = ((w >> 48) & 255) as u8
+    out[offset + 2] = ((w >> 40) & 255) as u8
+    out[offset + 3] = ((w >> 32) & 255) as u8
+    out[offset + 4] = ((w >> 24) & 255) as u8
+    out[offset + 5] = ((w >> 16) & 255) as u8
+    out[offset + 6] = ((w >>  8) & 255) as u8
+    out[offset + 7] = ( w        & 255) as u8
+}
+
+function read_u64_be(bytes: [u8], offset: usize) -> u64
+    requires offset + 8 <= bytes.len()
+{
+    return  ((bytes[offset]     as u64) << 56)
+          | ((bytes[offset + 1] as u64) << 48)
+          | ((bytes[offset + 2] as u64) << 40)
+          | ((bytes[offset + 3] as u64) << 32)
+          | ((bytes[offset + 4] as u64) << 24)
+          | ((bytes[offset + 5] as u64) << 16)
+          | ((bytes[offset + 6] as u64) <<  8)
+          |  (bytes[offset + 7] as u64)
+}
+
+function write_u64_le(w: u64, out: mutable [u8], offset: usize) -> ()
+    requires offset + 8 <= out.len()
+{
+    out[offset]     = ( w        & 255) as u8
+    out[offset + 1] = ((w >>  8) & 255) as u8
+    out[offset + 2] = ((w >> 16) & 255) as u8
+    out[offset + 3] = ((w >> 24) & 255) as u8
+    out[offset + 4] = ((w >> 32) & 255) as u8
+    out[offset + 5] = ((w >> 40) & 255) as u8
+    out[offset + 6] = ((w >> 48) & 255) as u8
+    out[offset + 7] = ((w >> 56) & 255) as u8
+}
+
+function read_u64_le(bytes: [u8], offset: usize) -> u64
+    requires offset + 8 <= bytes.len()
+{
+    return   (bytes[offset]     as u64)
+          | ((bytes[offset + 1] as u64) <<  8)
+          | ((bytes[offset + 2] as u64) << 16)
+          | ((bytes[offset + 3] as u64) << 24)
+          | ((bytes[offset + 4] as u64) << 32)
+          | ((bytes[offset + 5] as u64) << 40)
+          | ((bytes[offset + 6] as u64) << 48)
+          | ((bytes[offset + 7] as u64) << 56)
+}

@@ -1,0 +1,191 @@
+module multipart.decode
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import local.scan as scan
+import local.params as params
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(Part)
+spec std.collections.vec.Vec(Part)
+
+
+public type Part {
+    name: String
+    filename: Option_String
+    content_type: Option_String
+    content: [u8]
+}
+
+type HeaderInfo {
+    name: Option_String
+    filename: Option_String
+    content_type: Option_String
+}
+
+function _b_cr() -> u8     { return 13 as u8 }
+function _b_colon() -> u8  { return 58 as u8 }
+
+function _cd_name() -> [u8]    { return "name".bytes() }
+function _cd_filename() -> [u8] { return "filename".bytes() }
+
+function _line_is_header(src: [u8], lo: usize, hi: usize, name: [u8]) -> bool {
+    let nn = name.len()
+    if lo + nn > hi { return false }
+    return params.name_eq_ci(src, lo, name)
+}
+
+function _empty_info() -> HeaderInfo {
+    return HeaderInfo {
+        name: Option_String.none,
+        filename: Option_String.none,
+        content_type: Option_String.none,
+    }
+}
+
+function _apply_header_line(
+    info: mutable HeaderInfo,
+    src: [u8],
+    lo: usize,
+    hi: usize where lo <= hi && hi <= src.len(),
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let colon = scan.index_of(src, lo, hi, _b_colon())
+    if colon >= hi { return }
+    let v_lo = scan.trim_ows_left(src, colon + (1 as usize), hi)
+    if _line_is_header(src, lo, colon, "content-disposition".bytes()) {
+        info.name = params.extract(src, v_lo, hi, _cd_name(), allocator)?
+        info.filename = params.extract(src, v_lo, hi, _cd_filename(), allocator)?
+        return
+    }
+    if _line_is_header(src, lo, colon, "content-type".bytes()) {
+        let v_hi = scan.trim_ows_right(src, v_lo, hi)
+        let copied = scan.slice_copy(src, v_lo, v_hi, allocator)?
+        info.content_type = Option_String.some(value: string.from_owned_utf8(take copied))
+    }
+}
+
+function _parse_headers(
+    src: [u8],
+    start: usize,
+    limit: usize where start <= limit && limit <= src.len(),
+    allocator: Allocator,
+) -> (HeaderInfo, usize)
+    with {allocator, err: alloc.AllocError}
+{
+    var info: HeaderInfo = _empty_info()
+    var p: usize = start
+    loop decreases limit + (1 as usize) - p {
+        if p >= limit {
+            return (info, limit)
+        }
+        let lf = scan.find_lf(src, p, limit)
+        var content_hi: usize = lf
+        if lf > p && src[lf - (1 as usize)] == _b_cr() {
+            content_hi = lf - (1 as usize)
+        }
+        if content_hi <= p {
+            let body_start = if lf < limit { lf + (1 as usize) } else { limit }
+            return (info, body_start)
+        }
+        _apply_header_line(mutable info, src, p, content_hi, allocator)?
+        if lf >= limit {
+            return (info, limit)
+        }
+        p = lf + (1 as usize)
+    }
+    return (info, limit)
+}
+
+function _make_part(
+    info: HeaderInfo,
+    content: take [u8],
+    allocator: Allocator,
+) -> Part
+    with {allocator, err: alloc.AllocError}
+{
+    let name = match info.name {
+        case .some(let v) => v
+        case .none        => string.from_owned_utf8(take scan.alloc_u8(allocator, 0 as usize)?)
+    }
+    return Part {
+        name: name,
+        filename: info.filename,
+        content_type: info.content_type,
+        content: content,
+    }
+}
+
+function _extract_part(
+    src: [u8],
+    seg_lo: usize,
+    seg_hi: usize where seg_lo <= seg_hi && seg_hi <= src.len(),
+    allocator: Allocator,
+) -> Option_Part
+    with {allocator, err: alloc.AllocError}
+{
+    let after_line = scan.find_lf(src, seg_lo, seg_hi)
+    if after_line >= seg_hi { return Option_Part.none }
+    let hdr_start = after_line + (1 as usize)
+    let parsed = _parse_headers(src, hdr_start, seg_hi, allocator)?
+    let body_start = match parsed { case (_, let bs) => bs }
+    let info = match parsed { case (let hi_info, _) => hi_info }
+    let body_hi = scan.strip_trailing_crlf(src, body_start, seg_hi)
+    let safe_lo = if body_start <= body_hi { body_start } else { body_hi }
+    let content = scan.slice_copy(src, safe_lo, body_hi, allocator)?
+    let part = _make_part(info, take content, allocator)?
+    return Option_Part.some(value: part)
+}
+
+public function parse(body: [u8], boundary: String, allocator: Allocator) -> [Part]
+    with {allocator, err: alloc.AllocError}
+{
+    let delim_str = string.concat("--", boundary, allocator)?
+    let delim = delim_str.bytes()
+    uninit parts: Vec_Part.Vec
+    Vec_Part.new(init parts, allocator)?
+    let n = body.len()
+    var d = scan.find_from(body, 0 as usize, delim)
+    loop decreases n + (1 as usize) - d {
+        if d >= n { break }
+        let after = d + delim.len()
+        if scan.is_double_dash_at(body, after) { break }
+        let next_d = scan.find_from(body, after, delim)
+        let seg_hi = if next_d <= n { next_d } else { n }
+        let maybe_part = _extract_part(body, after, seg_hi, allocator)?
+        match maybe_part {
+            case .some(let p) => Vec_Part.push(mutable parts, take p, allocator)?
+            case .none        => ()
+        }
+        if next_d >= n { break }
+        d = next_d
+    }
+    return Vec_Part.into_array(take parts, allocator)?
+}
+
+public function parse_with_header(
+    body: [u8],
+    content_type_header: String,
+    allocator: Allocator,
+) -> [Part]
+    with {allocator, err: alloc.AllocError}
+{
+    let hb = content_type_header.bytes()
+    let found = params.extract(hb, 0 as usize, hb.len(), "boundary".bytes(), allocator)?
+    return match found {
+        case .some(let b) => parse(body, b, allocator)?
+        case .none        => empty_parts(allocator)?
+    }
+}
+
+function empty_parts(allocator: Allocator) -> [Part]
+    with {allocator, err: alloc.AllocError}
+{
+    uninit parts: Vec_Part.Vec
+    Vec_Part.new(init parts, allocator)?
+    return Vec_Part.into_array(take parts, allocator)?
+}

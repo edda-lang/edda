@@ -1,0 +1,158 @@
+
+module compile.phase.eqwire.stringeq.stringeq
+
+import std.collections.vec
+import std.mem.alloc
+import hir.build.file as hir_file_mod
+import hir.def as def_mod
+import hir.item as hir_item_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import mir.lower.eqmap.targets as eqmap_mod
+import syntax.ast.ident as ast_ident_mod
+import types.pass.ty as ty_mod
+import types.pass.effect as effect_pass_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+
+
+spec std.mem.alloc.Box(hir_item_mod.HFnSignature)
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+public function add_string_eq_target(
+    m: mutable eqmap_mod.EqTargets,
+    files: Vec_HirFile.Vec,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let eq_def = find_string_eq_def(files, mutable interner, allocator)?
+    add_string_eq_target_def(mutable m, eq_def, mutable ty_interner, allocator)?
+}
+
+
+public function find_string_eq_def(
+    files: Vec_HirFile.Vec,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> def_mod.DefId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let equals_sym = interner_mod.intern(mutable interner, "equals", allocator)?
+    return find_string_equals_def(files, equals_sym, mutable interner, allocator)?
+}
+
+
+public function add_string_eq_target_def(
+    m: mutable eqmap_mod.EqTargets,
+    eq_def: def_mod.DefId,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if def_mod.is_error(eq_def) { return () }
+    let str_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.string_, allocator)?
+    let bool_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.primitive(ty_kind_mod.PrimKind.bool_), allocator)?
+    uninit params: Vec_TyId.Vec
+    Vec_TyId.new(init params, allocator)?
+    Vec_TyId.push(mutable params, str_ty, allocator)?
+    Vec_TyId.push(mutable params, str_ty, allocator)?
+    let fn_ty = ty_interner_mod.intern(
+        mutable ty_interner,
+        ty_kind_mod.CTy.fn_(params: params, ret: bool_ty, effects: effect_pass_mod.empty()),
+        allocator,
+    )?
+    eqmap_mod.insert_target(mutable m, str_ty, eq_def, fn_ty, allocator)?
+}
+
+
+function find_string_equals_def(
+    files: Vec_HirFile.Vec,
+    equals_sym: sym_mod.Symbol,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> def_mod.DefId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let seg_std = interner_mod.intern(mutable interner, "std", allocator)?
+    let seg_text = interner_mod.intern(mutable interner, "text", allocator)?
+    let seg_string = interner_mod.intern(mutable interner, "string", allocator)?
+    let n = Vec_HirFile.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_HirFile.at(files, i)
+        if file_is_module_path3(file, seg_std, seg_text, seg_string) {
+            let fn_def = file_equals_fn_def(file, equals_sym)
+            if !def_mod.is_error(fn_def) {
+                return fn_def
+            }
+        }
+        i = i + 1
+    }
+    return def_mod.error()
+}
+
+
+function file_is_module_path3(
+    file: hir_file_mod.HirFile,
+    s0: sym_mod.Symbol,
+    s1: sym_mod.Symbol,
+    s2: sym_mod.Symbol,
+) -> bool
+    with {divergence}
+{
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let sn = Vec_Ident.len(decl.path.segments)
+                        if sn != 3 { return false }
+                        if Vec_Ident.at(decl.path.segments, 0 as usize).name.raw != s0.raw { return false }
+                        if Vec_Ident.at(decl.path.segments, 1 as usize).name.raw != s1.raw { return false }
+                        return Vec_Ident.at(decl.path.segments, 2 as usize).name.raw == s2.raw
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function file_equals_fn_def(file: hir_file_mod.HirFile, equals_sym: sym_mod.Symbol) -> def_mod.DefId
+    with {divergence}
+{
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .function_(let sig_box, _) => {
+                if Box_HFnSignature.get(sig_box).name.raw == equals_sym.raw {
+                    return item.def_id
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return def_mod.error()
+}

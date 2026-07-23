@@ -1,0 +1,141 @@
+
+module cache.blob.mir.item.read.codec
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ty.read.codec as ty_codec_mod
+import local.blob.mir.expr.read.codec as expr_codec_mod
+import local.blob.mir.item.leaf.codec as item_leaf_mod
+import local.blob.mir.item.read.decl as decl_mod
+import local.blob.mir.item.read.tydecl as tydecl_mod
+
+
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.mem.alloc.Box(ast_item_mod.TypeDecl)
+spec std.mem.alloc.Box(ast_item_mod.Spec)
+spec std.mem.alloc.Box(ast_item_mod.SpecInvocation)
+spec std.mem.alloc.Box(ast_item_mod.LetDecl)
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+
+
+public function read_item(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.Item
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let attributes = item_leaf_mod.read_attribute_vec(bytes, mutable cur, mutable it, allocator)?
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    let kind = match tag {
+        case 0 => {
+            let decl = decl_mod.read_fn_decl(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.ItemKind.function_(decl: Box_FnDecl.new(take decl, allocator)?)
+        }
+        case 1 => {
+            let decl = tydecl_mod.read_type_decl(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.ItemKind.type_decl(decl: Box_TypeDecl.new(take decl, allocator)?)
+        }
+        case 2 => {
+            let decl = read_spec(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.ItemKind.spec_(decl: Box_Spec.new(take decl, allocator)?)
+        }
+        case 3 => {
+            let invocation = read_spec_invocation(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.ItemKind.spec_invocation(invocation: Box_SpecInvocation.new(take invocation, allocator)?)
+        }
+        case 4 => {
+            let decl = read_let_decl(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.ItemKind.let_(decl: Box_LetDecl.new(take decl, allocator)?)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown or unsupported ItemKind tag")
+    }
+    return ast_item_mod.Item { span: span, attributes: attributes, kind: kind }
+}
+
+public function read_item_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let item = read_item(bytes, mutable cur, mutable it, allocator)?
+        Vec_Item.push(mutable items, take item, allocator)?
+        i += 1
+    }
+    return items
+}
+
+public function read_spec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.Spec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let stability = item_leaf_mod.read_option_stability(bytes, mutable cur, mutable it, allocator)?
+    let visibility = item_leaf_mod.read_visibility(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let generics = decl_mod.read_generic_param_vec(bytes, mutable cur, mutable it, allocator)?
+    let where_clauses = decl_mod.read_refinement_clause_vec(bytes, mutable cur, mutable it, allocator)?
+    let body = read_item_vec(bytes, mutable cur, mutable it, allocator)?
+    return ast_item_mod.Spec {
+        span: span,
+        stability: stability,
+        visibility: visibility,
+        name: name,
+        generics: generics,
+        where_clauses: where_clauses,
+        body: body,
+    }
+}
+
+public function read_spec_invocation(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.SpecInvocation
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let path = ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?
+    let args = expr_codec_mod.read_expr_vec(bytes, mutable cur, mutable it, allocator)?
+    return ast_item_mod.SpecInvocation { span: span, path: path, args: args }
+}
+
+public function read_let_decl(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.LetDecl
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let visibility = item_leaf_mod.read_visibility(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let ty = ty_codec_mod.read_ty(bytes, mutable cur, mutable it, allocator, expr_codec_mod.read_expr)?
+    let init_ = expr_codec_mod.read_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_item_mod.LetDecl { span: span, visibility: visibility, name: name, ty: ty, init_: init_ }
+}

@@ -1,0 +1,156 @@
+module tinysql.parse.expr
+
+import std.mem.alloc
+import std.text.str
+import tinysql.model.error
+import tinysql.model.value
+import tinysql.model.ast
+import tinysql.parse.cursor
+
+function _alloc_string_slots(allocator: Allocator, n: usize) -> [String]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_value_slots(allocator: Allocator, n: usize) -> [value.Value]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_comparison_slots(allocator: Allocator, n: usize) -> [ast.Comparison]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_conjunction_slots(allocator: Allocator, n: usize) -> [ast.Conjunction]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function parse_value(p: mutable cursor.Parser, allocator: Allocator) -> value.Value
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let t = cursor.cur(p)
+    return match t {
+        case .number(let s, let e) => {
+            cursor.bump(mutable p)
+            let v = handle err: str.ParseIntError -> { raise error.SqlError.bad_number(at: s) } {
+                str.parse_i64(p.src[s..<e])?
+            }
+            value.Value.integer(v)
+        }
+        case .string_lit(let s, let e) => {
+            cursor.bump(mutable p)
+            value.Value.text(cursor.decode_string(p.src, s, e, allocator)?)
+        }
+        case .ident(let s, let e) => {
+            if cursor.kw_eq_at(p.src, s, e, "true") {
+                cursor.bump(mutable p)
+                value.Value.boolean(true)
+            } else if cursor.kw_eq_at(p.src, s, e, "false") {
+                cursor.bump(mutable p)
+                value.Value.boolean(false)
+            } else if cursor.kw_eq_at(p.src, s, e, "null") {
+                cursor.bump(mutable p)
+                value.Value.null_value
+            } else {
+                raise error.SqlError.unexpected_token(at: s)
+            }
+        }
+        case _ => raise error.SqlError.unexpected_token(at: cursor.offset(t))
+    }
+}
+
+function _parse_op(p: mutable cursor.Parser) -> ast.CompareOp
+    with {err: error.SqlError}
+{
+    let t = cursor.cur(p)
+    return match t {
+        case .eq(_) => { cursor.bump(mutable p); ast.CompareOp.op_eq }
+        case .ne(_) => { cursor.bump(mutable p); ast.CompareOp.op_ne }
+        case .lt(_) => { cursor.bump(mutable p); ast.CompareOp.op_lt }
+        case .le(_) => { cursor.bump(mutable p); ast.CompareOp.op_le }
+        case .gt(_) => { cursor.bump(mutable p); ast.CompareOp.op_gt }
+        case .ge(_) => { cursor.bump(mutable p); ast.CompareOp.op_ge }
+        case _      => raise error.SqlError.unexpected_token(at: cursor.offset(t))
+    }
+}
+
+function _parse_comparison(p: mutable cursor.Parser, allocator: Allocator) -> ast.Comparison
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let col = cursor.expect_ident(mutable p, allocator)?
+    let op = _parse_op(mutable p)?
+    let operand = parse_value(mutable p, allocator)?
+    return ast.Comparison { column: col, op: op, operand: operand }
+}
+
+function _parse_conjunction(p: mutable cursor.Parser, allocator: Allocator) -> ast.Conjunction
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let slots = _alloc_comparison_slots(allocator, p.n + 1 as usize)?
+    slots[0 as usize] = _parse_comparison(mutable p, allocator)?
+    var count: usize = 1
+    var guard: usize = p.n
+    loop decreases guard {
+        if guard == 0 as usize { break }
+        guard = guard - 1 as usize
+        if !cursor.is_kw(p, "and") { break }
+        cursor.bump(mutable p)
+        slots[count] = _parse_comparison(mutable p, allocator)?
+        count = count + 1 as usize
+    }
+    return ast.Conjunction { terms: slots[0 as usize..<count] }
+}
+
+public function parse_where(p: mutable cursor.Parser, allocator: Allocator) -> ast.WhereClause
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    if !cursor.is_kw(p, "where") { return ast.WhereClause.always }
+    cursor.bump(mutable p)
+    let slots = _alloc_conjunction_slots(allocator, p.n + 1 as usize)?
+    slots[0 as usize] = _parse_conjunction(mutable p, allocator)?
+    var count: usize = 1
+    var guard: usize = p.n
+    loop decreases guard {
+        if guard == 0 as usize { break }
+        guard = guard - 1 as usize
+        if !cursor.is_kw(p, "or") { break }
+        cursor.bump(mutable p)
+        slots[count] = _parse_conjunction(mutable p, allocator)?
+        count = count + 1 as usize
+    }
+    return ast.WhereClause.any_of(disjuncts: slots[0 as usize..<count])
+}
+
+public function parse_ident_list(p: mutable cursor.Parser, allocator: Allocator) -> [String]
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let slots = _alloc_string_slots(allocator, p.n + 1 as usize)?
+    slots[0 as usize] = cursor.expect_ident(mutable p, allocator)?
+    var count: usize = 1
+    var guard: usize = p.n
+    loop decreases guard {
+        if guard == 0 as usize { break }
+        guard = guard - 1 as usize
+        if !cursor.is_comma(p) { break }
+        cursor.bump(mutable p)
+        slots[count] = cursor.expect_ident(mutable p, allocator)?
+        count = count + 1 as usize
+    }
+    return slots[0 as usize..<count]
+}
+
+public function parse_value_list(p: mutable cursor.Parser, allocator: Allocator) -> [value.Value]
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let slots = _alloc_value_slots(allocator, p.n + 1 as usize)?
+    slots[0 as usize] = parse_value(mutable p, allocator)?
+    var count: usize = 1
+    var guard: usize = p.n
+    loop decreases guard {
+        if guard == 0 as usize { break }
+        guard = guard - 1 as usize
+        if !cursor.is_comma(p) { break }
+        cursor.bump(mutable p)
+        slots[count] = parse_value(mutable p, allocator)?
+        count = count + 1 as usize
+    }
+    return slots[0 as usize..<count]
+}

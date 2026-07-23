@@ -1,0 +1,373 @@
+
+module manifest.build.lockfile.parse.parse
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.emit.collection as collection_mod
+import span.file as file_mod
+import local.model.lockfile.lockfile as lf_mod
+import local.lex.toml.toml as toml_mod
+import local.lex.toml.val.values as values_mod
+import local.build.lockfile.tamper.tamper as tamper_mod
+import local.build.lockfile.meta.meta as meta_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(lf_mod.Rune)
+spec std.collections.vec.Vec(lf_mod.ContractBaseline)
+spec std.collections.vec.Vec(toml_mod.TomlToken)
+spec std.core.option.Option(lf_mod.LoadedLockfile)
+
+
+public function parse_lockfile(content: String, file: file_mod.FileId, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> Option_LoadedLockfile
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = content.bytes()
+
+    uninit tokens: Vec_TomlToken.Vec
+    Vec_TomlToken.new(init tokens, allocator)?
+    toml_mod.tokenize(bytes, file, mutable tokens, allocator)?
+
+    uninit fields: LfFields
+    new_lf_fields(init fields, allocator)?
+
+    parse_token_stream(tokens, bytes, mutable fields, mutable diags, allocator)?
+
+    if collection_mod.has_errors(diags) {
+        return Option_LoadedLockfile.none
+    }
+
+    let runes_vec: Vec_Rune.Vec = fields.runes
+    let hash = fields.lockfile_hash
+    let cb_vec: Vec_ContractBaseline.Vec = fields.contract_baselines
+    let lf = lf_mod.lockfile_of(take runes_vec, hash, take cb_vec)
+    tamper_mod.check_lockfile_tampered(lf, file, mutable diags, allocator)?
+    if collection_mod.has_errors(diags) {
+        return Option_LoadedLockfile.none
+    }
+    return Option_LoadedLockfile.some(value: lf)
+}
+
+
+function parse_token_stream(tokens: Vec_TomlToken.Vec, source: [u8], fields: mutable LfFields, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_TomlToken.len(tokens)
+    var pos: usize = 0
+    loop decreases (n - pos) {
+        if pos >= n { break }
+        pos = step(tokens, source, mutable fields, mutable diags, pos, allocator)?
+    }
+}
+
+function step(tokens: Vec_TomlToken.Vec, source: [u8], fields: mutable LfFields, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let tok = Vec_TomlToken.at(tokens, pos)
+    if toml_mod.is_eof(tok) { return n }
+    if toml_mod.is_newline(tok) { return pos + 1 }
+    if toml_mod.is_lex_error(tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "lockfile tokenizer rejected this input", allocator)?
+        return pos + 1
+    }
+    if toml_mod.is_lbracket(tok) {
+        return parse_header_and_block(tokens, source, mutable fields, mutable diags, pos, allocator)?
+    }
+    values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a `[lockfile_meta]` or `[[rune]]` header at top level", allocator)?
+    return values_mod.skip_to_newline(tokens, pos)
+}
+
+
+function parse_header_and_block(tokens: Vec_TomlToken.Vec, source: [u8], fields: mutable LfFields, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    if pos + 1 < n {
+        let nxt = Vec_TomlToken.at(tokens, pos + 1)
+        if toml_mod.is_lbracket(nxt) {
+            return parse_array_table(tokens, source, mutable fields, mutable diags, pos, allocator)?
+        }
+    }
+    return meta_mod.parse_single_table(tokens, source, mutable fields.lockfile_hash, mutable diags, pos, allocator)?
+}
+
+function parse_array_table(tokens: Vec_TomlToken.Vec, source: [u8], fields: mutable LfFields, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    if pos + 4 >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, pos)), "unterminated `[[...]]` header", allocator)?
+        return n
+    }
+    let name_tok = Vec_TomlToken.at(tokens, pos + 2)
+    if !toml_mod.is_bare_key(name_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(name_tok), "expected a bare-key name inside `[[...]]`", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let rbr1 = Vec_TomlToken.at(tokens, pos + 3)
+    let rbr2 = Vec_TomlToken.at(tokens, pos + 4)
+    if !toml_mod.is_rbracket(rbr1) || !toml_mod.is_rbracket(rbr2) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(rbr1), "expected `]]` to close the array-of-table header", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let key_sp = toml_mod.token_span(name_tok)
+    let block_name = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    let body_start = pos + 5
+    if string.equals(block_name, "rune") {
+        uninit sc: RuneScratch
+        new_rune_scratch(init sc, allocator)?
+        let endp = fill_rune_block(tokens, source, mutable sc, mutable diags, body_start, allocator)?
+        let r = lf_mod.rune_of(sc.name, sc.version, sc.source, sc.rune_hash, sc.surface_hash, sc.effect_hash, sc.publisher_key, sc.publisher_sig, take sc.deps)
+        Vec_Rune.push(mutable fields.runes, take r, allocator)?
+        return endp
+    }
+    if string.equals(block_name, "contract_baseline") {
+        uninit cbsc: ContractBaselineScratch
+        new_contract_baseline_scratch(init cbsc)
+        let endp = fill_contract_baseline_block(tokens, source, mutable cbsc, mutable diags, body_start, allocator)?
+        let cb = lf_mod.contract_baseline_of(cbsc.qualified_name, cbsc.contract_hash, cbsc.version_introduced)
+        Vec_ContractBaseline.push(mutable fields.contract_baselines, take cb, allocator)?
+        return endp
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown array-of-table — entries skipped", allocator)?
+    return values_mod.skip_block_body(tokens, body_start)
+}
+
+function fill_rune_block(tokens: Vec_TomlToken.Vec, source: [u8], sc: mutable RuneScratch, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos <= Vec_TomlToken.len(tokens)
+    ensures result > pos || result == Vec_TomlToken.len(tokens)
+{
+    let n = Vec_TomlToken.len(tokens)
+    var p = pos
+    loop decreases (n - p) {
+        if p >= n { return n }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_eof(tok) { return n }
+        if toml_mod.is_newline(tok) { p = p + 1; continue }
+        if toml_mod.is_lbracket(tok) { return p }
+        if toml_mod.is_lex_error(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "lockfile tokenizer rejected this input", allocator)?
+            return p + 1
+        }
+        if !toml_mod.is_bare_key(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a key=value pair inside `[[rune]]`", allocator)?
+            p = values_mod.skip_to_newline(tokens, p)
+            continue
+        }
+        p = handle_rune_key(tokens, source, mutable sc, mutable diags, p, allocator)?
+    }
+    return n
+}
+
+function handle_rune_key(tokens: Vec_TomlToken.Vec, source: [u8], sc: mutable RuneScratch, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let key_tok = Vec_TomlToken.at(tokens, pos)
+    let key_sp = toml_mod.token_span(key_tok)
+    let key = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    if pos + 1 >= n {
+        values_mod.emit_error_at(mutable diags, key_sp, "expected `=` after key", allocator)?
+        return n
+    }
+    let eq_tok = Vec_TomlToken.at(tokens, pos + 1)
+    if !toml_mod.is_equals(eq_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected `=` after key", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let value_pos = pos + 2
+    if value_pos >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected a value after `=`", allocator)?
+        return n
+    }
+    if string.equals(key, "deps") {
+        let after = values_mod.parse_string_array_into(tokens, source, value_pos, mutable sc.deps, mutable diags, allocator)?
+        return values_mod.after_value_newline(tokens, after)
+    }
+    if string.equals(key, "name") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.name = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "version") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.version = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "source") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.source = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "rune_hash") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.rune_hash = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "surface_hash") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.surface_hash = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "effect_hash") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.effect_hash = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "publisher_key") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.publisher_key = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "publisher_sig") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.publisher_sig = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[[rune]]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+
+function fill_contract_baseline_block(tokens: Vec_TomlToken.Vec, source: [u8], sc: mutable ContractBaselineScratch, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos <= Vec_TomlToken.len(tokens)
+    ensures result > pos || result == Vec_TomlToken.len(tokens)
+{
+    let n = Vec_TomlToken.len(tokens)
+    var p = pos
+    loop decreases (n - p) {
+        if p >= n { return n }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_eof(tok) { return n }
+        if toml_mod.is_newline(tok) { p = p + 1; continue }
+        if toml_mod.is_lbracket(tok) { return p }
+        if toml_mod.is_lex_error(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "lockfile tokenizer rejected this input", allocator)?
+            return p + 1
+        }
+        if !toml_mod.is_bare_key(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a key=value pair inside `[[contract_baseline]]`", allocator)?
+            p = values_mod.skip_to_newline(tokens, p)
+            continue
+        }
+        p = handle_contract_baseline_key(tokens, source, mutable sc, mutable diags, p, allocator)?
+    }
+    return n
+}
+
+function handle_contract_baseline_key(tokens: Vec_TomlToken.Vec, source: [u8], sc: mutable ContractBaselineScratch, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let key_tok = Vec_TomlToken.at(tokens, pos)
+    let key_sp = toml_mod.token_span(key_tok)
+    let key = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    if pos + 1 >= n {
+        values_mod.emit_error_at(mutable diags, key_sp, "expected `=` after key", allocator)?
+        return n
+    }
+    let eq_tok = Vec_TomlToken.at(tokens, pos + 1)
+    if !toml_mod.is_equals(eq_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected `=` after key", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let value_pos = pos + 2
+    if value_pos >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected a value after `=`", allocator)?
+        return n
+    }
+    if string.equals(key, "qualified_name") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.qualified_name = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "contract_hash") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.contract_hash = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "version_introduced") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        sc.version_introduced = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[[contract_baseline]]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+
+type LfFields {
+    runes: Vec_Rune.Vec
+    lockfile_hash: String
+    contract_baselines: Vec_ContractBaseline.Vec
+}
+
+function new_lf_fields(out: init LfFields, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit runes: Vec_Rune.Vec
+    Vec_Rune.new(init runes, allocator)?
+    uninit contract_baselines: Vec_ContractBaseline.Vec
+    Vec_ContractBaseline.new(init contract_baselines, allocator)?
+    out = LfFields { runes: runes, lockfile_hash: "", contract_baselines: contract_baselines }
+}
+
+
+type RuneScratch {
+    name: String
+    version: String
+    source: String
+    rune_hash: String
+    surface_hash: String
+    effect_hash: String
+    publisher_key: String
+    publisher_sig: String
+    deps: Vec_String.Vec
+}
+
+function new_rune_scratch(out: init RuneScratch, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit deps: Vec_String.Vec
+    Vec_String.new(init deps, allocator)?
+    out = RuneScratch {
+        name: "",
+        version: "",
+        source: "",
+        rune_hash: "",
+        surface_hash: "",
+        effect_hash: "",
+        publisher_key: "",
+        publisher_sig: "",
+        deps: deps,
+    }
+}
+
+
+type ContractBaselineScratch {
+    qualified_name: String
+    contract_hash: String
+    version_introduced: String
+}
+
+function new_contract_baseline_scratch(out: init ContractBaselineScratch) -> () {
+    out = ContractBaselineScratch {
+        qualified_name: "",
+        contract_hash: "",
+        version_introduced: "",
+    }
+}

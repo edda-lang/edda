@@ -1,0 +1,164 @@
+
+module manifest.lex.toml.val.values
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as collection_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import local.model.dependency.dependency as dep_mod
+import local.lex.toml.toml as toml_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(toml_mod.TomlToken)
+
+
+public type StringValue {
+    text: String
+    after: usize
+}
+
+public type DepDecoded {
+    version_req: String
+    source: dep_mod.DependencySource
+}
+
+
+public stable function bytes_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let n = hi - lo
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = bytes[lo + i]
+        i = i + 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+public function emit_error_at(diags: mutable collection_mod.Diagnostics, at: span_mod.Span, message: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(code_mod.manifest_error(), at, message)
+    collection_mod.emit(mutable diags, d, allocator)?
+}
+
+public function emit_warn_at(diags: mutable collection_mod.Diagnostics, at: span_mod.Span, message: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.warn_at(code_mod.manifest_error(), at, message)
+    collection_mod.emit(mutable diags, d, allocator)?
+}
+
+
+public function skip_to_newline(tokens: Vec_TomlToken.Vec, start: usize) -> usize
+    requires start < Vec_TomlToken.len(tokens)
+    ensures result > start
+{
+    let n = Vec_TomlToken.len(tokens)
+    var p = start + 1
+    loop decreases (n - p) {
+        if p >= n { return n }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_newline(tok) { return p + 1 }
+        if toml_mod.is_eof(tok) { return n }
+        p = p + 1
+    }
+    return n
+}
+
+public function skip_block_body(tokens: Vec_TomlToken.Vec, start: usize) -> usize
+    requires start <= Vec_TomlToken.len(tokens)
+    ensures result >= start
+{
+    let n = Vec_TomlToken.len(tokens)
+    var p = start
+    loop decreases (n - p) {
+        if p >= n { return n }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_lbracket(tok) { return p }
+        if toml_mod.is_eof(tok) { return n }
+        if toml_mod.is_lex_error(tok) { return p }
+        p = p + 1
+    }
+    return n
+}
+
+public function after_value_newline(tokens: Vec_TomlToken.Vec, after: usize) -> usize
+    requires after <= Vec_TomlToken.len(tokens)
+    ensures result >= after
+{
+    let n = Vec_TomlToken.len(tokens)
+    if after >= n { return n }
+    let tok = Vec_TomlToken.at(tokens, after)
+    if toml_mod.is_newline(tok) { return after + 1 }
+    return after
+}
+
+
+public function parse_string_value(tokens: Vec_TomlToken.Vec, source: [u8], value_pos: usize, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> StringValue
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+{
+    let tok = Vec_TomlToken.at(tokens, value_pos)
+    if !toml_mod.is_string_lit(tok) {
+        emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a double-quoted string value", allocator)?
+        return StringValue { text: "", after: value_pos + 1 }
+    }
+    let sp = toml_mod.token_span(tok)
+    let lo = if sp.start + 1 <= sp.end { sp.start + 1 } else { sp.start }
+    let hi = if sp.end >= sp.start + 1 { sp.end - 1 } else { sp.end }
+    let text = bytes_to_string(source, lo, hi, allocator)?
+    return StringValue { text: text, after: value_pos + 1 }
+}
+
+public function parse_string_array_into(tokens: Vec_TomlToken.Vec, source: [u8], value_pos: usize, out: mutable Vec_String.Vec, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let open_tok = Vec_TomlToken.at(tokens, value_pos)
+    if !toml_mod.is_lbracket(open_tok) {
+        emit_error_at(mutable diags, toml_mod.token_span(open_tok), "expected `[` to start an array value", allocator)?
+        return skip_to_newline(tokens, value_pos)
+    }
+    var p = value_pos + 1
+    loop decreases (n - p) {
+        if p >= n {
+            emit_error_at(mutable diags, toml_mod.token_span(open_tok), "unterminated `[` array — missing closing `]`", allocator)?
+            return n
+        }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_newline(tok) { p = p + 1; continue }
+        if toml_mod.is_rbracket(tok) { return p + 1 }
+        if toml_mod.is_string_lit(tok) {
+            let r = parse_string_value(tokens, source, p, mutable diags, allocator)?
+            Vec_String.push(mutable out, take r.text, allocator)?
+            p = r.after
+            if p < n {
+                let next = Vec_TomlToken.at(tokens, p)
+                if toml_mod.is_comma(next) { p = p + 1 }
+            }
+            continue
+        }
+        emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a string literal or `]` inside the array", allocator)?
+        return skip_to_newline(tokens, p)
+    }
+    return n
+}
+
+
+public function decode_dep_source(value: take String, allocator: Allocator) -> DepDecoded
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = allocator
+    return DepDecoded { version_req: value, source: dep_mod.DependencySource.registry }
+}

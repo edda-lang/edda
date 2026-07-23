@@ -1,0 +1,194 @@
+
+module refine.solver.lia.omega.eliminate
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.rational.wide as wide_mod
+import local.solver.theory.quant.linearize as lin_mod
+import local.solver.lia.omega.rows as rows_mod
+
+
+spec std.collections.vec.Vec(lin_mod.LinearTerm)
+spec std.collections.vec.Vec(rows_mod.OmegaRow)
+
+
+type PivotSel {
+    found: bool
+    row: usize
+    pivot: usize
+}
+
+
+public function eliminate(rows: mutable Vec_OmegaRow.Vec, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_OmegaRow.len(rows)
+    var round: usize = 0
+    loop
+        decreases (n - round)
+    {
+        if round >= n {
+            break
+        }
+        round = round + 1
+        let sel = find_equality_pivot(rows)
+        if !sel.found {
+            break
+        }
+        if !substitute_all(mutable rows, sel.row, sel.pivot, allocator)? {
+            return false
+        }
+    }
+    return true
+}
+
+
+function find_equality_pivot(rows: Vec_OmegaRow.Vec) -> PivotSel
+    with {divergence}
+{
+    let n = Vec_OmegaRow.len(rows)
+    if n < 2 {
+        return PivotSel { found: false, row: 0, pivot: 0 }
+    }
+    var i: usize = 0
+    loop
+        decreases (n - 1 - i)
+    {
+        if i >= n - 1 {
+            break
+        }
+        let a = Vec_OmegaRow.at(rows, i)
+        let b = Vec_OmegaRow.at(rows, i + 1)
+        if a.alive && b.alive && a.is_upper != b.is_upper && a.bound == b.bound && terms_equal(a.terms, b.terms) {
+            let p = unit_coeff_index(a.terms)
+            if p < Vec_LinearTerm.len(a.terms) {
+                return PivotSel { found: true, row: i, pivot: p }
+            }
+        }
+        i = i + 1
+    }
+    return PivotSel { found: false, row: 0, pivot: 0 }
+}
+
+
+function terms_equal(a: Vec_LinearTerm.Vec, b: Vec_LinearTerm.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_LinearTerm.len(a)
+    if n != Vec_LinearTerm.len(b) {
+        return false
+    }
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let ta = Vec_LinearTerm.at(a, i)
+        let tb = Vec_LinearTerm.at(b, i)
+        if !(ta.atom == tb.atom) || ta.coeff != tb.coeff {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+
+function unit_coeff_index(terms: Vec_LinearTerm.Vec) -> usize
+    with {divergence}
+{
+    let n = Vec_LinearTerm.len(terms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let c = Vec_LinearTerm.at(terms, i).coeff
+        if c == (1 as i128) || c == ((0 - 1) as i128) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+
+function substitute_all(rows: mutable Vec_OmegaRow.Vec, eq_i: usize, p_idx: usize, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if eq_i + 1 >= Vec_OmegaRow.len(rows) {
+        return false
+    }
+    let eq = Vec_OmegaRow.at(rows, eq_i)
+    if p_idx >= Vec_LinearTerm.len(eq.terms) {
+        return false
+    }
+    let pterm = Vec_LinearTerm.at(eq.terms, p_idx)
+    let s = pterm.coeff
+    rows_mod.kill_row(mutable rows, eq_i)
+    rows_mod.kill_row(mutable rows, eq_i + 1)
+    let n = Vec_OmegaRow.len(rows)
+    var j: usize = 0
+    loop
+        decreases (n - j)
+    {
+        if j >= n {
+            break
+        }
+        if j == eq_i || j == eq_i + 1 || !Vec_OmegaRow.at(rows, j).alive {
+            j = j + 1
+            continue
+        }
+        let k = rows_mod.coeff_of(Vec_OmegaRow.at(rows, j).terms, pterm.atom)
+        if k == (0 as i128) {
+            j = j + 1
+            continue
+        }
+        let fm = rows_mod.fold_mul(k, s)
+        if !fm.ok {
+            return false
+        }
+        if !apply_substitution(mutable rows, j, eq.terms, fm.value, eq.bound, allocator)? {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+
+function apply_substitution(
+    rows: mutable Vec_OmegaRow.Vec,
+    j: usize,
+    eq_terms: Vec_LinearTerm.Vec,
+    m: i128,
+    eq_bound: wide_mod.Wide,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var row = Vec_OmegaRow.at(rows, j)
+    let mb = wide_mod.wide_mul(wide_mod.wide_from_i128(m), eq_bound)
+    if !mb.ok {
+        return false
+    }
+    let nb = wide_mod.wide_sub(row.bound, mb.value)
+    if !nb.ok {
+        return false
+    }
+    let neg_m = rows_mod.fold_mul(m, (0 - 1) as i128)
+    if !neg_m.ok {
+        return false
+    }
+    if !rows_mod.add_scaled(mutable row.terms, eq_terms, neg_m.value, allocator)? {
+        return false
+    }
+    row.terms = rows_mod.drop_zero_terms(row.terms, allocator)?
+    row.bound = nb.value
+    Vec_OmegaRow.set_at(mutable rows, j, take row)
+    return true
+}

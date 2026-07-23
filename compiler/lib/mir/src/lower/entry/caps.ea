@@ -1,0 +1,194 @@
+
+module mir.lower.entry.caps
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.slice as slice
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import target.capability as cap_mod
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import hir.node as node_mod
+
+import local.file.store as file_mod
+import local.body.model as mir_body_mod
+import local.stmt as stmt_mod
+import local.rvalue as rvalue_mod
+import local.place as place_mod
+import local.id.local as local_mod
+
+
+spec std.collections.vec.Vec(file_mod.MirFile)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+
+
+public function materialize_entries(
+    mir_files: mutable Vec_MirFile.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let heap_ptr_ty = ty_interner_mod.intern(
+        mutable ty_interner,
+        ty_kind_mod.CTy.primitive(ty_kind_mod.PrimKind.heap_ptr),
+        allocator,
+    )?
+    let n = Vec_MirFile.len(mir_files)
+    var found = false
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        var file = Vec_MirFile.at(mir_files, i)
+        let file_found = materialize_file(mutable file, heap_ptr_ty, ty_interner, interner, allocator)?
+        if file_found {
+            found = true
+        }
+        Vec_MirFile.set_at(mutable mir_files, i, take file)
+        i += 1
+    }
+    return found
+}
+
+
+function materialize_file(
+    file: mutable file_mod.MirFile,
+    heap_ptr_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_MirBody.len(file.bodies)
+    var found = false
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        var body = Vec_MirBody.at(file.bodies, i)
+        if is_entry_name(body.name, interner) {
+            found = true
+            materialize_body(mutable body, heap_ptr_ty, ty_interner, allocator)?
+            Vec_MirBody.set_at(mutable file.bodies, i, take body)
+        }
+        i += 1
+    }
+    return found
+}
+
+
+function materialize_body(
+    body: mutable mir_body_mod.MirBody,
+    heap_ptr_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = body.n_params as usize
+    if n == 0 { return }
+    if Vec_BasicBlock.len(body.blocks) < (2 as usize) { return }
+    let n_locals = Vec_Local.len(body.locals)
+    let entry = Vec_BasicBlock.at(body.blocks, 1 as usize)
+
+    uninit prologue: Vec_Statement.Vec
+    Vec_Statement.new(init prologue, allocator)?
+
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let li = i + (2 as usize)
+        if li >= n_locals { return }
+        let ty = Vec_Local.at(body.locals, li).ty
+        if !is_capability_ty(ty_interner, ty) { return }
+        let stmt = seed_stmt(li, seed_fd_for_ty(ty_interner, ty), heap_ptr_ty, entry.node_id_origin)
+        Vec_Statement.push(mutable prologue, take stmt, allocator)?
+        i += 1
+    }
+
+    let n_old = Vec_Statement.len(entry.statements)
+    var k: usize = 0
+    loop decreases n_old - k {
+        if k >= n_old { break }
+        Vec_Statement.push(mutable prologue, take Vec_Statement.at(entry.statements, k), allocator)?
+        k += 1
+    }
+
+    let new_entry = mir_body_mod.BasicBlock {
+        node_id_origin: entry.node_id_origin,
+        statements: prologue,
+        terminator: entry.terminator,
+        coherence_region: entry.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, 1 as usize, take new_entry)
+    body.n_params = 0 as u32
+}
+
+
+function is_entry_name(name: symbol_mod.Symbol, interner: interner_mod.Interner) -> bool {
+    if symbol_mod.is_empty(name) {
+        return false
+    }
+    return slice.eq_u8(interner_mod.lookup(interner, name), "main".bytes())
+}
+
+
+function is_capability_ty(ty_interner: ty_interner_mod.Interner, ty: ty_mod.TyId) -> bool {
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .capability(_) => true
+        case _ => false
+    }
+}
+
+
+function seed_fd_for_ty(ty_interner: ty_interner_mod.Interner, ty: ty_mod.TyId) -> u128 {
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .capability(let cap) => seed_fd_for(cap)
+        case _ => 0 as u128
+    }
+}
+
+
+function seed_fd_for(cap: cap_mod.Capability) -> u128 {
+    return match cap {
+        case .stdout => 1 as u128
+        case .stderr => 2 as u128
+        case .filesystem | .read_only_filesystem | .sandboxed_filesystem => at_fdcwd()
+        case _ => 0 as u128
+    }
+}
+
+
+function at_fdcwd() -> u128 {
+    return ((0 as u64) -% (100 as u64)) as u128
+}
+
+
+function seed_stmt(
+    local_idx: usize,
+    fd: u128,
+    heap_ptr_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+) -> stmt_mod.Statement {
+    return stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: place_mod.bare(local_mod.LocalId { raw: local_idx as u32 }),
+            value: rvalue_mod.Rvalue.use_(
+                operand: rvalue_mod.Operand.constant(
+                    c: rvalue_mod.Constant {
+                        ty: heap_ptr_ty,
+                        kind: rvalue_mod.ConstantKind.int_(bits: fd),
+                    },
+                ),
+            ),
+        ),
+    }
+}

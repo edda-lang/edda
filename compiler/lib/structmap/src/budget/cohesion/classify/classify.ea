@@ -1,0 +1,241 @@
+module structmap.budget.cohesion.classify.classify
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string as string
+import local.data.model as model
+import local.budget.cohesion.graph.graph as cg
+import local.budget.cohesion.spoke.spoke as sp
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(cg.IdxComponent)
+spec std.collections.vec.Vec(sp.NameCluster)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(String)
+
+
+function contains_dot(s: String) -> bool {
+    let b = s.bytes()
+    let n: usize = b.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if b[i] == 0x2E { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function index_of_name(names: Vec_String.Vec, target: String) -> Option_usize.Option {
+    let n = Vec_String.len(names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_String.at(names, i), target) { return Option_usize.some(value: i) }
+        i = i + 1
+    }
+    return Option_usize.none()
+}
+
+function substring(s: String, lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+{
+    let b = s.bytes()
+    let bn: usize = b.len()
+    let end: usize = if hi <= bn { hi } else { bn }
+    let start: usize = if lo <= end { lo } else { end }
+    let len: usize = end - start
+    let out: [u8] = allocator.alloc_array(u8, len)?
+    var i: usize = 0
+    loop decreases (len - i) {
+        if i >= len { break }
+        out[i] = b[start + i]
+        i = i + 1
+    }
+    return string.from_owned_utf8(take out)
+}
+
+function module_of(name: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let b = name.bytes()
+    let n: usize = b.len()
+    var last: usize = 0
+    var found: bool = false
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if b[i] == 0x2E { last = i; found = true }
+        i = i + 1
+    }
+    if !found { return string.clone("", allocator)? }
+    return substring(name, 0 as usize, last, allocator)?
+}
+
+function qualify(mod_name: String, callee: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let dotted = string.concat(mod_name, ".", allocator)?
+    return string.concat(dotted, callee, allocator)?
+}
+
+function resolve_callee(callee: String, caller_module: String, names: Vec_String.Vec, allocator: Allocator) -> Option_usize.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let cb = callee.bytes()
+    if cb.len() > 0 as usize && cb[0] == 0x2E { return Option_usize.none() }
+    match index_of_name(names, callee) {
+        case .some(let idx) => return Option_usize.some(value: idx)
+        case .none => ()
+    }
+    if contains_dot(callee) { return Option_usize.none() }
+    if caller_module.bytes().len() == 0 as usize { return Option_usize.none() }
+    let q = qualify(caller_module, callee, allocator)?
+    return index_of_name(names, q)
+}
+
+function build_graph(functions: Vec_FunctionEntry.Vec, fn_idxs: Vec_usize.Vec, allocator: Allocator) -> cg.Graph
+    with {allocator, err: alloc.AllocError}
+{
+    var g = cg.new_graph(allocator)?
+    let n = Vec_usize.len(fn_idxs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let gi = Vec_usize.at(fn_idxs, i)
+        let fe = Vec_FunctionEntry.at(functions, gi)
+        Vec_String.push(mutable g.names, string.clone(fe.qualified_name, allocator)?, allocator)?
+        i = i + 1
+    }
+    var local: usize = 0
+    loop decreases (n - local) {
+        if local >= n { break }
+        let gi = Vec_usize.at(fn_idxs, local)
+        let fe = Vec_FunctionEntry.at(functions, gi)
+        let mod_name = module_of(fe.qualified_name, allocator)?
+        let ncalls = Vec_String.len(fe.calls)
+        var k: usize = 0
+        loop decreases (ncalls - k) {
+            if k >= ncalls { break }
+            let callee = Vec_String.at(fe.calls, k)
+            match resolve_callee(callee, mod_name, g.names, allocator)? {
+                case .some(let other) => cg.add_edge(mutable g, local, other, allocator)?
+                case .none => ()
+            }
+            k = k + 1
+        }
+        local = local + 1
+    }
+    return g
+}
+
+public function classify_call_graph(functions: Vec_FunctionEntry.Vec, fn_idxs: Vec_usize.Vec, allocator: Allocator) -> sp.Seam
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let g = build_graph(functions, fn_idxs, allocator)?
+    let n = Vec_String.len(g.names)
+
+    let wccs = cg.components_undirected(g, n, cg.min_component_size(), allocator)?
+    let coverage = sp.total_members(wccs)
+    if Vec_IdxComponent.len(wccs) >= cg.min_component_count() && coverage >= cg.min_total_cluster_coverage() {
+        let comps = sp.names_for_components(g.names, wccs, allocator)?
+        return sp.Seam { has_seam: true, components: comps, dispatcher: Option_String.none() }
+    }
+
+    if n < cg.min_function_count() { return sp.empty_seam(allocator)? }
+    let largest = cg.largest_scc_size(g, n, allocator)?
+    if largest >= cg.scc_absolute_floor() || largest * cg.scc_dominance_den() >= n * cg.scc_dominance_num() {
+        return sp.empty_seam(allocator)?
+    }
+
+    let pick = sp.find_dispatcher(g, n, allocator)?
+    if pick.found {
+        let comps = sp.names_for_components(g.names, pick.clusters, allocator)?
+        return sp.Seam {
+            has_seam: true,
+            components: comps,
+            dispatcher: Option_String.some(value: string.clone(Vec_String.at(g.names, pick.node), allocator)?)
+        }
+    }
+    return sp.empty_seam(allocator)?
+}
+
+function file_index_of(files: Vec_String.Vec, target: String) -> Option_usize.Option {
+    let n = Vec_String.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_String.at(files, i), target) { return Option_usize.some(value: i) }
+        i = i + 1
+    }
+    return Option_usize.none()
+}
+
+public function dir_file_components(functions: Vec_FunctionEntry.Vec, fn_idxs: Vec_usize.Vec, allocator: Allocator) -> Vec_NameCluster.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nf = Vec_usize.len(fn_idxs)
+    uninit files: Vec_String.Vec
+    Vec_String.new(init files, allocator)?
+    uninit fn_names: Vec_String.Vec
+    Vec_String.new(init fn_names, allocator)?
+    uninit fn_files: Vec_usize.Vec
+    Vec_usize.new(init fn_files, allocator)?
+    var i: usize = 0
+    loop decreases (nf - i) {
+        if i >= nf { break }
+        let gi = Vec_usize.at(fn_idxs, i)
+        let fe = Vec_FunctionEntry.at(functions, gi)
+        Vec_String.push(mutable fn_names, string.clone(fe.qualified_name, allocator)?, allocator)?
+        let fidx = match file_index_of(files, fe.file) {
+            case .some(let idx) => idx
+            case .none => {
+                let at = Vec_String.len(files)
+                Vec_String.push(mutable files, string.clone(fe.file, allocator)?, allocator)?
+                at
+            }
+        }
+        Vec_usize.push(mutable fn_files, fidx, allocator)?
+        i = i + 1
+    }
+
+    var fg = cg.new_graph(allocator)?
+    let files_n = Vec_String.len(files)
+    var f: usize = 0
+    loop decreases (files_n - f) {
+        if f >= files_n { break }
+        Vec_String.push(mutable fg.names, string.clone(Vec_String.at(files, f), allocator)?, allocator)?
+        f = f + 1
+    }
+    var local: usize = 0
+    loop decreases (nf - local) {
+        if local >= nf { break }
+        let src = Vec_usize.at(fn_files, local)
+        let mod_name = module_of(Vec_String.at(fn_names, local), allocator)?
+        let gi = Vec_usize.at(fn_idxs, local)
+        let fe = Vec_FunctionEntry.at(functions, gi)
+        let ncalls = Vec_String.len(fe.calls)
+        var k: usize = 0
+        loop decreases (ncalls - k) {
+            if k >= ncalls { break }
+            let callee = Vec_String.at(fe.calls, k)
+            match resolve_callee(callee, mod_name, fn_names, allocator)? {
+                case .some(let other) => {
+                    let dst = Vec_usize.at(fn_files, other)
+                    if dst != src { cg.add_edge(mutable fg, src, dst, allocator)? }
+                }
+                case .none => ()
+            }
+            k = k + 1
+        }
+        local = local + 1
+    }
+
+    let comps = cg.components_undirected(fg, files_n, 1 as usize, allocator)?
+    return sp.names_for_components(fg.names, comps, allocator)?
+}

@@ -1,0 +1,488 @@
+
+module cache.manifest.parse
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import std.time.calendar
+import local.error as error_mod
+import local.addr.hash as hash_mod
+import local.manifest.store.value as manifest_value
+import local.tier.tier as tier_mod
+import local.toon.lex as lex_mod
+import local.manifest.parsers.num.walk as walk_mod
+import local.manifest.parsers.field.iso8601 as iso8601_mod
+import local.manifest.parsers.bodyversion as bodyversion_mod
+import local.manifest.parsers.field.reachable as reachable_mod
+import local.manifest.parsers.num.u32parse as u32parse_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(manifest_value.ArtifactEntry)
+spec std.collections.vec.Vec(manifest_value.ArgumentEntry)
+spec std.core.option.Option(String)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(calendar.DateTime)
+
+
+public function parse(
+    input: String,
+    source_path: String,
+    allocator: Allocator,
+) -> manifest_value.Manifest
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, err: lex_mod.LexError}
+{
+    let lexed = lex_mod.lex(input, false, allocator)?
+    return build_manifest(lexed, source_path, allocator)?
+}
+
+
+function build_manifest(
+    lx: lex_mod.Lexed,
+    source_path: String,
+    allocator: Allocator,
+) -> manifest_value.Manifest
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let n = lex_mod.len(lx)
+    let schema_str = require_top_scalar(lx, n, "schema_version", source_path, allocator)?
+    let schema_v = u32parse_mod.parse_u32(schema_str, source_path)?
+    if schema_v != manifest_value.schema_version() {
+        raise error_mod.CacheError.schema_version_mismatch(
+            path: source_path,
+            found: schema_v,
+            supported: manifest_value.schema_version(),
+        )
+    }
+    let project = require_top_scalar(lx, n, "project", source_path, allocator)?
+    let generated_at_str = require_top_scalar(lx, n, "generated_at", source_path, allocator)?
+    let generated_at = iso8601_mod.parse_iso8601_utc(generated_at_str, source_path, allocator)?
+    let last_gc_run_opt = optional_top_scalar(lx, n, "last_gc_run", allocator)?
+    let last_gc_run: Option_DateTime = match last_gc_run_opt {
+        case .none        => Option_DateTime.none
+        case .some(let s) => Option_DateTime.some(value: iso8601_mod.parse_iso8601_utc(s, source_path, allocator)?)
+    }
+    let artifacts = collect_artifacts(lx, 0, n, source_path, allocator)?
+    return manifest_value.Manifest {
+        schema_version: schema_v,
+        project: project,
+        generated_at: generated_at,
+        last_gc_run: last_gc_run,
+        artifacts: artifacts,
+    }
+}
+
+
+function require_top_scalar(
+    lx: lex_mod.Lexed,
+    n: usize,
+    key: String,
+    source_path: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let found = walk_mod.walk_top_scalar(lx, 0, n, key, allocator)?
+    return match found {
+        case .some(let s) => s
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: missing_field_message(key, allocator)?,
+        )
+    }
+}
+
+function optional_top_scalar(
+    lx: lex_mod.Lexed,
+    n: usize,
+    key: String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+{
+    return walk_mod.walk_top_scalar(lx, 0, n, key, allocator)?
+}
+
+
+function collect_artifacts(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    source_path: String,
+    allocator: Allocator,
+) -> Vec_ArtifactEntry.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n {
+        uninit empty: Vec_ArtifactEntry.Vec
+        Vec_ArtifactEntry.new(init empty, allocator)?
+        return empty
+    }
+    if lex_mod.indent_at(lx, i) != 0 {
+        return collect_artifacts(lx, i + 1, n, source_path, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !walk_mod.line_key_equals(line, "artifacts") {
+        return collect_artifacts(lx, i + 1, n, source_path, allocator)?
+    }
+    uninit entries: Vec_ArtifactEntry.Vec
+    Vec_ArtifactEntry.new(init entries, allocator)?
+    walk_artifact_items(lx, i + 1, n, mutable entries, source_path, allocator)?
+    return entries
+}
+
+function walk_artifact_items(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    entries: mutable Vec_ArtifactEntry.Vec,
+    source_path: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth < 1 { return () }
+    if depth != 1 {
+        return walk_artifact_items(lx, i + 1, n, mutable entries, source_path, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !walk_mod.is_list_item_line(line) {
+        return walk_artifact_items(lx, i + 1, n, mutable entries, source_path, allocator)?
+    }
+    let after_dash = walk_mod.strip_list_marker(line, allocator)?
+    let entry = parse_artifact_entry(lx, i + 1, n, after_dash, source_path, allocator)?
+    Vec_ArtifactEntry.push(mutable entries, take entry, allocator)?
+    return walk_artifact_items(lx, i + 1, n, mutable entries, source_path, allocator)?
+}
+
+
+function parse_artifact_entry(
+    lx: lex_mod.Lexed,
+    body_start: usize,
+    n: usize,
+    first_line_after_dash: String,
+    source_path: String,
+    allocator: Allocator,
+) -> manifest_value.ArtifactEntry
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires body_start <= n
+{
+    let path_kv = require_kv(first_line_after_dash, "path", source_path, allocator)?
+    let hash_str = require_entry_scalar(lx, body_start, n, "hash", source_path, allocator)?
+    let hash_v: hash_mod.ArtifactHash = match hash_mod.parse_hex(hash_str) {
+        case .some(let h) => h
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: string.clone("invalid hash", allocator)?,
+        )
+    }
+    let short_name = require_entry_scalar(lx, body_start, n, "short_name", source_path, allocator)?
+    let tier_str = require_entry_scalar(lx, body_start, n, "tier", source_path, allocator)?
+    let tier: tier_mod.Tier = match tier_mod.from_name(tier_str) {
+        case .some(let t) => t
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: string.clone("unknown tier", allocator)?,
+        )
+    }
+    let inputs = parse_inputs(lx, body_start, n, source_path, allocator)?
+    let reachable_from = reachable_mod.parse_reachable_from(lx, body_start, n, source_path, allocator)?
+    let generated_at_str = require_entry_scalar(lx, body_start, n, "generated_at", source_path, allocator)?
+    let generated_at = iso8601_mod.parse_iso8601_utc(generated_at_str, source_path, allocator)?
+    return manifest_value.ArtifactEntry {
+        path: path_kv,
+        hash: hash_v,
+        short_name: short_name,
+        tier: tier,
+        inputs: inputs,
+        reachable_from: reachable_from,
+        generated_at: generated_at,
+    }
+}
+
+function require_entry_scalar(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    key: String,
+    source_path: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+{
+    let found = walk_entry_scalar(lx, i, n, key, allocator)?
+    return match found {
+        case .some(let s) => s
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: missing_field_message(key, allocator)?,
+        )
+    }
+}
+
+function walk_entry_scalar(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    key: String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return Option_String.none }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth < 2 { return Option_String.none }
+    if depth != 2 {
+        return walk_entry_scalar(lx, i + 1, n, key, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    return match walk_mod.split_kv(line, allocator)? {
+        case .none => walk_entry_scalar(lx, i + 1, n, key, allocator)?
+        case .some(let kv) => {
+            if string.equals(kv.key, key) && kv.value.bytes().len() > 0 {
+                Option_String.some(value: kv.value)
+            } else {
+                walk_entry_scalar(lx, i + 1, n, key, allocator)?
+            }
+        }
+    }
+}
+
+
+function parse_inputs(
+    lx: lex_mod.Lexed,
+    body_start: usize,
+    n: usize,
+    source_path: String,
+    allocator: Allocator,
+) -> manifest_value.ArtifactInputs
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires body_start <= n
+{
+    let body_version_str = require_field_in_block(
+        lx, body_start, n, 2, "inputs", 3, "body_version", source_path, allocator,
+    )?
+    let body_byte = bodyversion_mod.parse_body_version_byte(body_version_str, source_path)?
+    let body_version = hash_mod.BodyVersion { value: body_byte }
+    let spec_name = require_field_in_block(
+        lx, body_start, n, 2, "inputs", 3, "spec_qualified_name", source_path, allocator,
+    )?
+    let argument_tuple = collect_argument_tuple(lx, body_start, n, source_path, allocator)?
+    let nested_deps = collect_string_list_in_inputs(lx, body_start, n, "nested_deps", allocator)?
+    return manifest_value.ArtifactInputs {
+        body_version: body_version,
+        spec_qualified_name: spec_name,
+        argument_tuple: argument_tuple,
+        nested_deps: nested_deps,
+    }
+}
+
+function require_field_in_block(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    outer_indent: usize,
+    outer_key: String,
+    inner_indent: usize,
+    inner_key: String,
+    source_path: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    requires outer_indent < inner_indent
+{
+    let opener = walk_mod.find_block_opener(lx, i, n, outer_indent, outer_key, allocator)?
+    return match opener {
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: missing_field_message(inner_key, allocator)?,
+        )
+
+        case .some(let body_idx) => {
+            let value_opt = walk_mod.walk_indented_scalar(lx, body_idx, n, inner_indent, outer_indent, inner_key, allocator)?
+            match value_opt {
+                case .none => raise error_mod.CacheError.manifest_parse(
+                    path: source_path,
+                    line: 0,
+                    message: missing_field_message(inner_key, allocator)?,
+                )
+                case .some(let s) => s
+            }
+        }
+    }
+}
+
+
+function collect_argument_tuple(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    source_path: String,
+    allocator: Allocator,
+) -> Vec_ArgumentEntry.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+{
+    uninit args: Vec_ArgumentEntry.Vec
+    Vec_ArgumentEntry.new(init args, allocator)?
+    let inputs_opener = walk_mod.find_block_opener(lx, i, n, 2, "inputs", allocator)?
+    match inputs_opener {
+        case .none => return args
+        case .some(let body_idx) => {
+            let arg_tuple_state = walk_mod.classify_inputs_field(lx, body_idx, n, "argument_tuple", allocator)?
+            match arg_tuple_state {
+                case .none        => ()
+                case .empty       => ()
+                case .block(let block_start) => {
+                    walk_argument_items(lx, block_start, n, mutable args, source_path, allocator)?
+                }
+            }
+        }
+    }
+    return args
+}
+
+function walk_argument_items(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    args: mutable Vec_ArgumentEntry.Vec,
+    source_path: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth < 4 { return () }
+    if depth != 4 {
+        return walk_argument_items(lx, i + 1, n, mutable args, source_path, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !walk_mod.is_list_item_line(line) {
+        return walk_argument_items(lx, i + 1, n, mutable args, source_path, allocator)?
+    }
+    let after_dash = walk_mod.strip_list_marker(line, allocator)?
+    let kind_value = require_kv(after_dash, "kind", source_path, allocator)?
+    let kind: manifest_value.ArgumentKind = match manifest_value.argument_kind_from_name(kind_value) {
+        case .some(let k) => k
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: string.clone("unknown argument kind", allocator)?,
+        )
+    }
+    let value_str = walk_argument_value(lx, i + 1, n, source_path, allocator)?
+    let entry = manifest_value.ArgumentEntry { kind: kind, value: value_str }
+    Vec_ArgumentEntry.push(mutable args, take entry, allocator)?
+    return walk_argument_items(lx, i + 1, n, mutable args, source_path, allocator)?
+}
+
+function walk_argument_value(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    source_path: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+{
+    let found = walk_mod.walk_indented_scalar(lx, i, n, 5, 4, "value", allocator)?
+    return match found {
+        case .some(let s) => s
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: missing_field_message("value", allocator)?,
+        )
+    }
+}
+
+function collect_string_list_in_inputs(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    key: String,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let inputs_opener = walk_mod.find_block_opener(lx, i, n, 2, "inputs", allocator)?
+    match inputs_opener {
+        case .none => return out
+        case .some(let body_idx) => {
+            let state = walk_mod.classify_inputs_field(lx, body_idx, n, key, allocator)?
+            match state {
+                case .none  => ()
+                case .empty => ()
+                case .block(let block_start) => {
+                    walk_mod.walk_string_list_items(lx, block_start, n, 4, 3, mutable out, allocator)?
+                }
+            }
+        }
+    }
+    return out
+}
+
+
+function require_kv(line: String, key: String, source_path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    return match walk_mod.split_kv(line, allocator)? {
+        case .none => raise error_mod.CacheError.manifest_parse(
+            path: source_path,
+            line: 0,
+            message: missing_field_message(key, allocator)?,
+        )
+        case .some(let kv) => {
+            if !string.equals(kv.key, key) {
+                raise error_mod.CacheError.manifest_parse(
+                    path: source_path,
+                    line: 0,
+                    message: missing_field_message(key, allocator)?,
+                )
+            }
+            kv.value
+        }
+    }
+}
+
+
+function missing_field_message(key: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let pre = string.concat("missing field: ", key, allocator)?
+    return pre
+}

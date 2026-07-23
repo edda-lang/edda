@@ -1,0 +1,202 @@
+
+module link.coff.archive
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import object.coff as coff_mod
+import local.coff.cursor as cursor_mod
+import local.coff.read as read_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(ShortImport)
+
+
+public type ShortImport {
+    symbol: String
+    dll: String
+}
+
+
+public type ArchiveContents {
+    objects: Vec_CoffFile.Vec
+    shorts: Vec_ShortImport.Vec
+}
+
+
+public function parse_archive(bytes: Vec_u8.Vec, allocator: Allocator) -> ArchiveContents
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    var cur: cursor_mod.Cursor = cursor_mod.at_start()
+    verify_magic(bytes, mutable cur)?
+    uninit out: Vec_CoffFile.Vec
+    Vec_CoffFile.new(init out, allocator)?
+    uninit shorts: Vec_ShortImport.Vec
+    Vec_ShortImport.new(init shorts, allocator)?
+    let total = Vec_u8.len(bytes)
+    loop
+        decreases (total - cur.pos)
+    {
+        if cur.pos + (60 as usize) > total {
+            break
+        }
+        let special = read_name_is_special(bytes, mutable cur)?
+        cursor_mod.seek(mutable cur, cur.pos + (32 as usize))
+        let size = read_decimal(bytes, mutable cur)?
+        cursor_mod.seek(mutable cur, cur.pos + (2 as usize))
+        let data_start = cur.pos
+        if !special {
+            let member = slice_copy(bytes, data_start, size, allocator)?
+            if is_short_import(member) {
+                let si = parse_short_import(member, allocator)?
+                Vec_ShortImport.push(mutable shorts, take si, allocator)?
+            } else {
+                let cf = read_mod.parse_file(member, allocator)?
+                Vec_CoffFile.push(mutable out, take cf, allocator)?
+            }
+        }
+        let pad = size % (2 as usize)
+        let next = data_start + size + pad
+        cursor_mod.seek(mutable cur, if next > total { total } else { next })
+    }
+    return ArchiveContents { objects: out, shorts: shorts }
+}
+
+
+function is_short_import(member: Vec_u8.Vec) -> bool {
+    if Vec_u8.len(member) < (24 as usize) {
+        return false
+    }
+    return Vec_u8.at(member, 0 as usize) == (0x00 as u8)
+        && Vec_u8.at(member, 1 as usize) == (0x00 as u8)
+        && Vec_u8.at(member, 2 as usize) == (0xFF as u8)
+        && Vec_u8.at(member, 3 as usize) == (0xFF as u8)
+}
+
+
+function read_cstr(member: Vec_u8.Vec, start: usize, allocator: Allocator) -> String
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let total = Vec_u8.len(member)
+    var end: usize = start
+    loop decreases (total - end) {
+        if end >= total {
+            raise cursor_mod.ReadError.truncated
+        }
+        if Vec_u8.at(member, end) == (0 as u8) {
+            break
+        }
+        end = end + (1 as usize)
+    }
+    let n = end - start
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = Vec_u8.at(member, start + i)
+        i = i + (1 as usize)
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function parse_short_import(member: Vec_u8.Vec, allocator: Allocator) -> ShortImport
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let sym = read_cstr(member, 20 as usize, allocator)?
+    let sym_len = sym.len()
+    let dll = read_cstr(member, (21 as usize) + sym_len, allocator)?
+    return ShortImport { symbol: sym, dll: dll }
+}
+
+
+function verify_magic(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> ()
+    with {err: cursor_mod.ReadError}
+{
+    let m0 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m1 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m2 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m3 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m4 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m5 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m6 = cursor_mod.read_u8(bytes, mutable cur)?
+    let m7 = cursor_mod.read_u8(bytes, mutable cur)?
+    let ok = m0 == (0x21 as u8)
+        && m1 == (0x3C as u8)
+        && m2 == (0x61 as u8)
+        && m3 == (0x72 as u8)
+        && m4 == (0x63 as u8)
+        && m5 == (0x68 as u8)
+        && m6 == (0x3E as u8)
+        && m7 == (0x0A as u8)
+    if !ok {
+        raise cursor_mod.ReadError.bad_archive_magic
+    }
+}
+
+
+function read_name_is_special(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> bool
+    with {err: cursor_mod.ReadError}
+{
+    let b0 = cursor_mod.read_u8(bytes, mutable cur)?
+    let b1 = cursor_mod.read_u8(bytes, mutable cur)?
+    let b2 = cursor_mod.read_u8(bytes, mutable cur)?
+    cursor_mod.seek(mutable cur, cur.pos + (13 as usize))
+    if b0 != (0x2F as u8) {
+        return false
+    }
+    if b1 == (0x20 as u8) {
+        return true
+    }
+    if b1 == (0x2F as u8) && b2 == (0x20 as u8) {
+        return true
+    }
+    return false
+}
+
+
+function read_decimal(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> usize
+    with {err: cursor_mod.ReadError}
+{
+    var value: usize = 0
+    var i: usize = 0
+    loop
+        decreases ((10 as usize) - i)
+    {
+        if i >= (10 as usize) {
+            break
+        }
+        let b = cursor_mod.read_u8(bytes, mutable cur)?
+        if b >= (0x30 as u8) && b <= (0x39 as u8) {
+            value = value * (10 as usize) + ((b - (0x30 as u8)) as usize)
+        }
+        i = i + (1 as usize)
+    }
+    return value
+}
+
+
+function slice_copy(bytes: Vec_u8.Vec, start: usize, size: usize, allocator: Allocator) -> Vec_u8.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let total = Vec_u8.len(bytes)
+    if start + size > total {
+        raise cursor_mod.ReadError.truncated
+    }
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    var i: usize = 0
+    loop
+        decreases (size - i)
+    {
+        if i >= size {
+            break
+        }
+        let b = Vec_u8.at(bytes, start + i)
+        Vec_u8.push(mutable out, take b, allocator)?
+        i = i + (1 as usize)
+    }
+    return out
+}

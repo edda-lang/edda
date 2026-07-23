@@ -1,0 +1,219 @@
+
+module regalloc.interval.positions
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.term as lir_term_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import local.live.live as live_mod
+import local.scan.step.walk as walk_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+
+
+spec std.core.option.Option(u32)
+
+
+public function scan(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    body: lir_body_mod.LirBody,
+    live: live_mod.Liveness,
+    n_blocks: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    var pos: usize = 0
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        let block = Vec_LirBlock.at(body.blocks, b)
+        let block_start = pos
+        extend_params(mutable present, mutable starts, mutable ends, block.params, block_start, n_vregs)
+        let after = scan_ops(mutable present, mutable starts, mutable ends, body, block, pos, n_vregs, allocator)?
+        pos = after
+        pos += 1
+        let block_end = pos
+        extend_term(mutable present, mutable starts, mutable ends, block.terminator, block_end, n_vregs, allocator)?
+        extend_liveness(mutable present, mutable starts, mutable ends, live, b, block_start, block_end, n_vregs)
+        b += 1
+    }
+    return pos
+}
+
+
+function scan_ops(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    body: lir_body_mod.LirBody,
+    block: lir_body_mod.LirBlock,
+    start_pos: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    var pos = start_pos
+    let ops = block.ops
+    let n = Vec_LirOpId.len(ops)
+    uninit scratch: Vec_u32.Vec
+    Vec_u32.new(init scratch, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        pos += 1
+        let op_id = Vec_LirOpId.at(ops, i)
+        let oidx = op_id.raw as usize
+        if oidx != 0 {
+            if oidx < Vec_LirOp.len(body.ops) {
+                let op = Vec_LirOp.at(body.ops, oidx)
+                Vec_u32.clear(mutable scratch)
+                walk_mod.collect_op_uses(op, mutable scratch, allocator)?
+                extend_list(mutable present, mutable starts, mutable ends, scratch, pos, n_vregs)
+                extend_def(mutable present, mutable starts, mutable ends, op, pos, n_vregs)
+            }
+        }
+        i += 1
+    }
+    return pos
+}
+
+
+function extend_params(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    params: Vec_LirVRegId.Vec,
+    p: usize,
+    n_vregs: usize,
+) -> ()
+{
+    let n = Vec_LirVRegId.len(params)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let id = Vec_LirVRegId.at(params, i)
+        extend(mutable present, mutable starts, mutable ends, id.raw as usize, p, n_vregs)
+        i += 1
+    }
+}
+
+
+function extend_list(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    list: Vec_u32.Vec,
+    p: usize,
+    n_vregs: usize,
+) -> ()
+{
+    let n = Vec_u32.len(list)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        extend(mutable present, mutable starts, mutable ends, Vec_u32.at(list, i) as usize, p, n_vregs)
+        i += 1
+    }
+}
+
+
+function extend_def(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    op: lir_op_mod.LirOp,
+    p: usize,
+    n_vregs: usize,
+) -> ()
+{
+    match walk_mod.op_def(op) {
+        case .some(let raw) => extend(mutable present, mutable starts, mutable ends, raw as usize, p, n_vregs)
+        case .none          => ()
+    }
+}
+
+
+function extend_term(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    term: lir_term_mod.LirTerminator,
+    p: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit scratch: Vec_u32.Vec
+    Vec_u32.new(init scratch, allocator)?
+    walk_mod.collect_term_uses(term, mutable scratch, allocator)?
+    extend_list(mutable present, mutable starts, mutable ends, scratch, p, n_vregs)
+}
+
+
+function extend_liveness(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    live: live_mod.Liveness,
+    b: usize,
+    block_start: usize,
+    block_end: usize,
+    n_vregs: usize,
+) -> ()
+{
+    var v: usize = 0
+    loop decreases n_vregs - v {
+        if v >= n_vregs { break }
+        if live_mod.live_in_at(live, b, v) {
+            extend(mutable present, mutable starts, mutable ends, v, block_start, n_vregs)
+        }
+        if live_mod.live_out_at(live, b, v) {
+            extend(mutable present, mutable starts, mutable ends, v, block_end, n_vregs)
+        }
+        v += 1
+    }
+}
+
+
+function extend(
+    present: mutable Vec_bool.Vec,
+    starts: mutable Vec_usize.Vec,
+    ends: mutable Vec_usize.Vec,
+    v: usize,
+    p: usize,
+    n_vregs: usize,
+) -> ()
+{
+    if v == 0 { return }
+    if v >= n_vregs { return }
+    if !Vec_bool.at(present, v) {
+        Vec_bool.set_at(mutable present, v, true)
+        Vec_usize.set_at(mutable starts, v, p)
+        Vec_usize.set_at(mutable ends, v, p)
+        return
+    }
+    if p < Vec_usize.at(starts, v) {
+        Vec_usize.set_at(mutable starts, v, p)
+    }
+    if p > Vec_usize.at(ends, v) {
+        Vec_usize.set_at(mutable ends, v, p)
+    }
+}

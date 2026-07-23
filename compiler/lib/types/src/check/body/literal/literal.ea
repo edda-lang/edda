@@ -1,0 +1,420 @@
+module types.check.body.literal.literal
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import syntax.ast.ops as ast_ops
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.body.numeric.numeric as num_mod
+import local.check.body.retype.retype as retype_mod
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.core.option.Option(Box_HExpr)
+
+
+public function adopt_value(
+    e: hir_tree.HExpr,
+    self_ty: ty_mod.TyId,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    if !can_adopt_value(e, peer_ty, builtins, ty_interner, node_types) {
+        return adopt_expr(e, self_ty, peer_ty, builtins, mutable node_types)
+    }
+    retype_mod.retype_value(e, peer_ty, ty_interner, mutable node_types)
+    return peer_ty
+}
+
+public function adopt_block_tail(
+    block: hir_tree.HBlock,
+    self_ty: ty_mod.TyId,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    return match block.trailing {
+        case .some(let b) => adopt_value(Box_HExpr.get(b), self_ty, peer_ty, builtins, ty_interner, mutable node_types)
+        case .none => self_ty
+    }
+}
+
+public function adopt_arms_prefix(
+    arms: Vec_HArm.Vec,
+    upto: usize,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    var i: usize = 0
+    loop decreases (upto - i) {
+        if i >= upto { break }
+        let arm = Vec_HArm.at(arms, i)
+        if !can_adopt_value(arm.body, peer_ty, builtins, ty_interner, node_types) {
+            return false
+        }
+        i = i + 1
+    }
+    var j: usize = 0
+    loop decreases (upto - j) {
+        if j >= upto { break }
+        let arm = Vec_HArm.at(arms, j)
+        retype_mod.retype_value(arm.body, peer_ty, ty_interner, mutable node_types)
+        j = j + 1
+    }
+    return true
+}
+
+
+public function payload_arg_ok(
+    e: hir_tree.HExpr,
+    arg_ty: ty_mod.TyId,
+    decl_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(arg_ty) {
+        return true
+    }
+    if ty_mod.is_error(decl_ty) {
+        return true
+    }
+    if arg_ty.raw == decl_ty.raw {
+        return true
+    }
+    if fn_ty_matches(arg_ty, decl_ty, ty_interner, 16 as usize) {
+        return true
+    }
+    if can_adopt_value(e, decl_ty, builtins, ty_interner, node_types) {
+        return true
+    }
+    return is_float_literal(e) && is_float_ty(decl_ty, builtins)
+}
+
+public function fn_ty_matches(
+    a: ty_mod.TyId,
+    d: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: usize,
+) -> bool
+    with {divergence}
+    decreases fuel
+{
+    if a.raw == d.raw {
+        return true
+    }
+    if fuel == 0 {
+        return false
+    }
+    if ty_mod.is_error(a) || ty_mod.is_error(d) {
+        return false
+    }
+    if ty_mod.index(a) >= ty_interner_mod.slot_count(ty_interner) {
+        return false
+    }
+    if ty_mod.index(d) >= ty_interner_mod.slot_count(ty_interner) {
+        return false
+    }
+    let ca = ty_interner_mod.lookup(ty_interner, a)
+    let cd = ty_interner_mod.lookup(ty_interner, d)
+    return match ca {
+        case .fn_(let a_params, let a_ret, _) => match cd {
+            case .fn_(let d_params, let d_ret, _) => {
+                let n = Vec_TyId.len(a_params)
+                if n != Vec_TyId.len(d_params) {
+                    return false
+                }
+                var i: usize = 0
+                loop decreases (n - i) {
+                    if i >= n { break }
+                    if !fn_ty_matches(Vec_TyId.at(a_params, i), Vec_TyId.at(d_params, i), ty_interner, fuel - 1) {
+                        return false
+                    }
+                    i = i + 1
+                }
+                fn_ty_matches(a_ret, d_ret, ty_interner, fuel - 1)
+            }
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+public function adopt_payload_arg(
+    e: hir_tree.HExpr,
+    arg_ty: ty_mod.TyId,
+    decl_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(arg_ty) {
+        return true
+    }
+    if ty_mod.is_error(decl_ty) {
+        return true
+    }
+    if arg_ty.raw == decl_ty.raw {
+        return true
+    }
+    if fn_ty_matches(arg_ty, decl_ty, ty_interner, 16 as usize) {
+        return true
+    }
+    if can_adopt_value(e, decl_ty, builtins, ty_interner, node_types) {
+        retype_mod.retype_value(e, decl_ty, ty_interner, mutable node_types)
+        return true
+    }
+    return is_float_literal(e) && is_float_ty(decl_ty, builtins)
+}
+
+function is_float_literal(e: hir_tree.HExpr) -> bool {
+    return match e.kind {
+        case .literal(let lit) => match lit {
+            case .float(_, _) => true
+            case _ => false
+        }
+        case .unary(let op, let inner) => match op {
+            case .neg => inner_float_literal(inner)
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function inner_float_literal(inner: Box_HExpr) -> bool {
+    let ie = Box_HExpr.get(inner)
+    return match ie.kind {
+        case .literal(let lit) => match lit {
+            case .float(_, _) => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function is_float_ty(t: ty_mod.TyId, builtins: builtins_mod.Builtins) -> bool {
+    return t.raw == builtins.f32_.raw || t.raw == builtins.f64_.raw
+}
+
+function can_adopt_value(
+    e: hir_tree.HExpr,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    return match e.kind {
+        case .block_(let body) => can_adopt_block(body, peer_ty, builtins, ty_interner, node_types)
+        case .if_(_, let then_b, let else_opt) => match else_opt {
+            case .some(let else_b) => can_adopt_block(then_b, peer_ty, builtins, ty_interner, node_types) && can_adopt_block(else_b, peer_ty, builtins, ty_interner, node_types)
+            case .none => false
+        }
+        case .match_(_, let arms) => can_adopt_all_arms(arms, peer_ty, builtins, ty_interner, node_types)
+        case .tuple(let elements) => can_adopt_tuple(elements, peer_ty, builtins, ty_interner, node_types)
+        case _ => can_adopt(e, peer_ty, builtins, node_types)
+    }
+}
+
+function can_adopt_block(
+    block: hir_tree.HBlock,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    return match block.trailing {
+        case .some(let b) => can_adopt_value(Box_HExpr.get(b), peer_ty, builtins, ty_interner, node_types)
+        case .none => false
+    }
+}
+
+function can_adopt_all_arms(
+    arms: Vec_HArm.Vec,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    if n == 0 {
+        return false
+    }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        if !can_adopt_value(arm.body, peer_ty, builtins, ty_interner, node_types) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+function can_adopt_tuple(
+    elements: Vec_HExpr.Vec,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    if (peer_ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return false
+    }
+    let elem_tys = match ty_interner_mod.lookup(ty_interner, peer_ty) {
+        case .tuple_(let tys) => tys
+        case _ => return false
+    }
+    let n = Vec_HExpr.len(elements)
+    if n != Vec_TyId.len(elem_tys) {
+        return false
+    }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if !tuple_elem_ok(Vec_HExpr.at(elements, i), Vec_TyId.at(elem_tys, i), builtins, ty_interner, node_types) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+function tuple_elem_ok(
+    elem: hir_tree.HExpr,
+    elem_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(elem_ty) {
+        return true
+    }
+    let cur = retype_mod.node_ty_at(node_types, elem.node_id)
+    if ty_mod.is_error(cur) {
+        return true
+    }
+    if cur.raw == elem_ty.raw {
+        return true
+    }
+    return can_adopt_value(elem, elem_ty, builtins, ty_interner, node_types)
+}
+
+function can_adopt(
+    e: hir_tree.HExpr,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    node_types: Vec_TyId.Vec,
+) -> bool
+{
+    let cur = retype_mod.node_ty_at(node_types, e.node_id)
+    if cur.raw == builtins.f64_.raw {
+        if peer_ty.raw != builtins.f32_.raw {
+            return false
+        }
+        return is_float_literal(e)
+    }
+    if cur.raw != builtins.i64_.raw {
+        return false
+    }
+    if !num_mod.adoptable_peer(peer_ty, builtins) {
+        return false
+    }
+    let (found, negative, magnitude) = num_mod.int_literal_of(e)
+    if !found {
+        return false
+    }
+    return num_mod.fits(magnitude, negative, peer_ty, builtins)
+}
+
+public function adopt_expr(
+    e: hir_tree.HExpr,
+    self_ty: ty_mod.TyId,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    node_types: mutable Vec_TyId.Vec,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    if self_ty.raw != builtins.i64_.raw && self_ty.raw != builtins.f64_.raw {
+        return self_ty
+    }
+    if !can_adopt_arith(e, peer_ty, builtins, node_types) {
+        return self_ty
+    }
+    retype_mod.retype_arith(e, peer_ty, mutable node_types)
+    return peer_ty
+}
+
+function is_adopt_arith_op(op: ast_ops.BinOp) -> bool {
+    return match op {
+        case .add => true
+        case .sub => true
+        case .mul => true
+        case .div => true
+        case .mod => true
+        case .wrap_add => true
+        case .wrap_sub => true
+        case .wrap_mul => true
+        case .sat_add => true
+        case .sat_sub => true
+        case .sat_mul => true
+        case .check_add => true
+        case .check_sub => true
+        case .check_mul => true
+        case .check_mod => true
+        case .bit_and => true
+        case .bit_or => true
+        case .bit_xor => true
+        case _ => false
+    }
+}
+
+function can_adopt_arith(
+    e: hir_tree.HExpr,
+    peer_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    node_types: Vec_TyId.Vec,
+) -> bool
+    with {divergence}
+{
+    if retype_mod.node_ty_at(node_types, e.node_id).raw == peer_ty.raw {
+        return true
+    }
+    return match e.kind {
+        case .binary(let op, let l, let r) => is_adopt_arith_op(op)
+            && can_adopt_arith(Box_HExpr.get(l), peer_ty, builtins, node_types)
+            && can_adopt_arith(Box_HExpr.get(r), peer_ty, builtins, node_types)
+        case _ => can_adopt(e, peer_ty, builtins, node_types)
+    }
+}

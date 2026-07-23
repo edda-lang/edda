@@ -1,0 +1,109 @@
+module debug.codeview.cursor.cursor
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+
+import debug.model as model_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public type Cursor {
+    pos: usize
+}
+
+
+public function at_start() -> Cursor {
+    return Cursor { pos: 0 }
+}
+
+
+public function seek(cur: mutable Cursor, pos: usize) -> () {
+    cur.pos = pos
+}
+
+
+public function remaining(bytes: Vec_u8.Vec, cur: Cursor) -> usize {
+    let len = Vec_u8.len(bytes)
+    if cur.pos >= len { return 0 as usize }
+    return len - cur.pos
+}
+
+
+public function align_to_4(cur: mutable Cursor) -> () {
+    let rem = cur.pos % (4 as usize)
+    if rem != (0 as usize) {
+        cur.pos = cur.pos + ((4 as usize) - rem)
+    }
+}
+
+
+public function read_u8(bytes: Vec_u8.Vec, cur: mutable Cursor) -> u8
+    with {err: model_mod.DebugError}
+{
+    let len = Vec_u8.len(bytes)
+    if cur.pos >= len { raise model_mod.DebugError.truncated }
+    let b = Vec_u8.at(bytes, cur.pos)
+    cur.pos = cur.pos + (1 as usize)
+    return b
+}
+
+
+public function read_u16_le(bytes: Vec_u8.Vec, cur: mutable Cursor) -> u16
+    with {err: model_mod.DebugError}
+{
+    let len = Vec_u8.len(bytes)
+    if (len < (2 as usize)) || (cur.pos > len - (2 as usize)) { raise model_mod.DebugError.truncated }
+    let b0 = Vec_u8.at(bytes, cur.pos) as u16
+    let b1 = Vec_u8.at(bytes, cur.pos + (1 as usize)) as u16
+    cur.pos = cur.pos + (2 as usize)
+    return b0 | (b1 << 8)
+}
+
+
+public function read_u32_le(bytes: Vec_u8.Vec, cur: mutable Cursor) -> u32
+    with {err: model_mod.DebugError}
+{
+    let len = Vec_u8.len(bytes)
+    if (len < (4 as usize)) || (cur.pos > len - (4 as usize)) { raise model_mod.DebugError.truncated }
+    let b0 = Vec_u8.at(bytes, cur.pos) as u32
+    let b1 = Vec_u8.at(bytes, cur.pos + (1 as usize)) as u32
+    let b2 = Vec_u8.at(bytes, cur.pos + (2 as usize)) as u32
+    let b3 = Vec_u8.at(bytes, cur.pos + (3 as usize)) as u32
+    cur.pos = cur.pos + (4 as usize)
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+
+public function read_i32_le(bytes: Vec_u8.Vec, cur: mutable Cursor) -> i32
+    with {err: model_mod.DebugError}
+{
+    let raw = read_u32_le(bytes, mutable cur)?
+    return raw as i32 wrapping
+}
+
+
+public function read_cstr(bytes: Vec_u8.Vec, cur: mutable Cursor, allocator: Allocator) -> String
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    let len = Vec_u8.len(bytes)
+    let start = cur.pos
+    var end = start
+    loop decreases len - end {
+        if end >= len { raise model_mod.DebugError.truncated }
+        if Vec_u8.at(bytes, end) == (0 as u8) { break }
+        end += 1
+    }
+    let n = end - start
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = Vec_u8.at(bytes, start + i)
+        i += 1
+    }
+    cur.pos = end + (1 as usize)
+    return string.from_owned_utf8(take buf)
+}

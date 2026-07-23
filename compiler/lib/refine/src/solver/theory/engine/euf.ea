@@ -1,0 +1,681 @@
+
+module refine.solver.theory.engine.euf
+
+import std.collections.vec
+import std.collections.hashmap
+import std.mem.alloc
+import std.core.hash as hash_mod
+import local.solver.lit.lit as lit_mod
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(EufApp)
+spec std.collections.vec.Vec(DisEq)
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(EufClass)
+spec std.collections.hashmap.IntMap(usize)
+
+
+public type EufApp {
+    op: term_mod.SmtOp
+    args: Vec_usize.Vec
+    node: usize
+}
+
+
+public type DisEq {
+    a: usize
+    b: usize
+    lit: lit_mod.Lit
+}
+
+
+public type EufSolver {
+    terms: Vec_SmtTerm.Vec
+    parent: Vec_usize.Vec
+    rank: Vec_usize.Vec
+    apps: Vec_EufApp.Vec
+    eq_lits: Vec_Lit.Vec
+    diseqs: Vec_DisEq.Vec
+    bucket_head: IntMap_usize.IntMap
+    chain: Vec_usize.Vec
+}
+
+
+public type EufResult {
+    case consistent
+    case conflict(explanation: Vec_Lit.Vec)
+}
+
+
+public type EufClass {
+    members: Vec_SmtTerm.Vec
+}
+
+
+public type EufModel {
+    classes: Vec_EufClass.Vec
+}
+
+
+public function new(out: init EufSolver, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit terms: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init terms, allocator)?
+    uninit parent: Vec_usize.Vec
+    Vec_usize.new(init parent, allocator)?
+    uninit rank: Vec_usize.Vec
+    Vec_usize.new(init rank, allocator)?
+    uninit apps: Vec_EufApp.Vec
+    Vec_EufApp.new(init apps, allocator)?
+    uninit eq_lits: Vec_Lit.Vec
+    Vec_Lit.new(init eq_lits, allocator)?
+    uninit diseqs: Vec_DisEq.Vec
+    Vec_DisEq.new(init diseqs, allocator)?
+    uninit chain: Vec_usize.Vec
+    Vec_usize.new(init chain, allocator)?
+    let bucket_head = IntMap_usize.new(allocator)?
+    out = EufSolver {
+        terms: terms,
+        parent: parent,
+        rank: rank,
+        apps: apps,
+        eq_lits: eq_lits,
+        diseqs: diseqs,
+        bucket_head: bucket_head,
+        chain: chain,
+    }
+}
+
+
+public function intern(euf: mutable EufSolver, term: term_mod.SmtTerm, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let h: i64 = term_mod.term_hash(term) as i64 wrapping
+    var cur = match IntMap_usize.get(euf.bucket_head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    var fuel = Vec_SmtTerm.len(euf.terms)
+    loop
+        decreases fuel
+    {
+        if cur == 0 {
+            break
+        }
+        if fuel == 0 {
+            break
+        }
+        fuel = fuel - 1
+        let cand = cur -% 1
+        if cand >= Vec_SmtTerm.len(euf.terms) {
+            break
+        }
+        let existing = Vec_SmtTerm.at(euf.terms, cand)
+        if existing == term {
+            return cand
+        }
+        if cand >= Vec_usize.len(euf.chain) {
+            break
+        }
+        cur = Vec_usize.at(euf.chain, cand)
+    }
+    let id = Vec_SmtTerm.len(euf.terms)
+    let stored = term
+    Vec_SmtTerm.push(mutable euf.terms, take stored, allocator)?
+    let self_parent = id
+    Vec_usize.push(mutable euf.parent, take self_parent, allocator)?
+    let zero_rank: usize = 0
+    Vec_usize.push(mutable euf.rank, take zero_rank, allocator)?
+    let prev_head = match IntMap_usize.get(euf.bucket_head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable euf.chain, take prev_head, allocator)?
+    let new_head = id +% 1
+    let _ = IntMap_usize.insert(mutable euf.bucket_head, h, take new_head, allocator)?
+    match term {
+        case .app(let op, let args) => build_app(mutable euf, op, args, id, allocator)?
+        case _ => {}
+    }
+    return id
+}
+
+
+function build_app(
+    euf: mutable EufSolver,
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    node: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit arg_ids: Vec_usize.Vec
+    Vec_usize.new(init arg_ids, allocator)?
+    let m = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        let aid = intern(mutable euf, arg, allocator)?
+        Vec_usize.push(mutable arg_ids, take aid, allocator)?
+        i = i + 1
+    }
+    let app = EufApp {
+        op: op,
+        args: arg_ids,
+        node: node,
+    }
+    Vec_EufApp.push(mutable euf.apps, take app, allocator)?
+}
+
+
+function find(euf: EufSolver, x: usize) -> usize {
+    let cap = Vec_usize.len(euf.parent)
+    var current = x
+    var steps: usize = 0
+    loop
+        decreases (cap - steps)
+    {
+        if steps >= cap {
+            break
+        }
+        if current >= cap {
+            break
+        }
+        let p = Vec_usize.at(euf.parent, current)
+        if p == current {
+            break
+        }
+        current = p
+        steps = steps + 1
+    }
+    return current
+}
+
+
+function union(euf: mutable EufSolver, a: usize, b: usize) -> () {
+    let ra = find(euf, a)
+    let rb = find(euf, b)
+    if ra == rb {
+        return
+    }
+    let cap = Vec_usize.len(euf.parent)
+    if ra >= cap {
+        return
+    }
+    if rb >= cap {
+        return
+    }
+    let rank_a = Vec_usize.at(euf.rank, ra)
+    let rank_b = Vec_usize.at(euf.rank, rb)
+    if rank_a < rank_b {
+        let store_b = rb
+        Vec_usize.set_at(mutable euf.parent, ra, take store_b)
+        return
+    }
+    if rank_a > rank_b {
+        let store_a = ra
+        Vec_usize.set_at(mutable euf.parent, rb, take store_a)
+        return
+    }
+    let store_root = ra
+    Vec_usize.set_at(mutable euf.parent, rb, take store_root)
+    let bumped = rank_a + 1
+    Vec_usize.set_at(mutable euf.rank, ra, take bumped)
+}
+
+
+public function merge_input(
+    euf: mutable EufSolver,
+    a: usize,
+    b: usize,
+    lit: lit_mod.Lit,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_Lit.push(mutable euf.eq_lits, take lit, allocator)?
+    union(mutable euf, a, b)
+}
+
+
+public function reset_merges(euf: mutable EufSolver) -> () {
+    let n = Vec_usize.len(euf.parent)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let self_p = i
+        Vec_usize.set_at(mutable euf.parent, i, take self_p)
+        if i < Vec_usize.len(euf.rank) {
+            let zr: usize = 0
+            Vec_usize.set_at(mutable euf.rank, i, take zr)
+        }
+        i = i + 1
+    }
+    Vec_Lit.clear(mutable euf.eq_lits)
+    Vec_DisEq.clear(mutable euf.diseqs)
+}
+
+
+public function assert_distinct(
+    euf: mutable EufSolver,
+    a: usize,
+    b: usize,
+    lit: lit_mod.Lit,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let de = DisEq {
+        a: a,
+        b: b,
+        lit: lit,
+    }
+    Vec_DisEq.push(mutable euf.diseqs, take de, allocator)?
+}
+
+
+function congruent(euf: EufSolver, x: EufApp, y: EufApp) -> bool {
+    if !(x.op == y.op) {
+        return false
+    }
+    let nx = Vec_usize.len(x.args)
+    let ny = Vec_usize.len(y.args)
+    if nx != ny {
+        return false
+    }
+    var k: usize = 0
+    loop
+        decreases (nx - k)
+    {
+        if k >= nx {
+            break
+        }
+        let ax = Vec_usize.at(x.args, k)
+        let ay = Vec_usize.at(y.args, k)
+        if find(euf, ax) != find(euf, ay) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+
+function cc_sig_hash(euf: EufSolver, app: EufApp) -> i64 {
+    let m = Vec_usize.len(app.args)
+    var acc: u64 = hash_mod.hash_usize(m)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let r = find(euf, Vec_usize.at(app.args, i))
+        acc = hash_mod.hash_u64(acc ^ hash_mod.hash_usize(r))
+        i = i + 1
+    }
+    return acc as i64 wrapping
+}
+
+
+type CloseCtx {
+    sig_heads: IntMap_usize.IntMap
+    sig_apps: Vec_usize.Vec
+    sig_next: Vec_usize.Vec
+    use_heads: IntMap_usize.IntMap
+    use_apps: Vec_usize.Vec
+    use_next: Vec_usize.Vec
+    worklist: Vec_usize.Vec
+}
+
+
+function chain_push(
+    heads: mutable IntMap_usize.IntMap,
+    entry_apps: mutable Vec_usize.Vec,
+    entry_next: mutable Vec_usize.Vec,
+    key: i64,
+    app: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let prev_head = match IntMap_usize.get(heads, key) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    let entry = Vec_usize.len(entry_apps)
+    let store_app = app
+    Vec_usize.push(mutable entry_apps, take store_app, allocator)?
+    let store_next = prev_head
+    Vec_usize.push(mutable entry_next, take store_next, allocator)?
+    let new_head = entry +% 1
+    let _ = IntMap_usize.insert(mutable heads, key, take new_head, allocator)?
+}
+
+
+function merge_nodes(
+    euf: mutable EufSolver,
+    ctx: mutable CloseCtx,
+    a: usize,
+    b: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let ra = find(euf, a)
+    let rb = find(euf, b)
+    if ra == rb {
+        return
+    }
+    union(mutable euf, a, b)
+    let survivor = find(euf, ra)
+    let absorbed = if survivor == ra { rb } else { ra }
+    var cur = match IntMap_usize.get(ctx.use_heads, absorbed as i64) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    if cur == 0 {
+        return
+    }
+    let absorbed_head = cur
+    var tail = cur
+    var fuel = Vec_usize.len(ctx.use_apps)
+    loop
+        decreases fuel
+    {
+        if fuel == 0 {
+            break
+        }
+        fuel = fuel - 1
+        let entry = cur -% 1
+        if entry >= Vec_usize.len(ctx.use_apps) {
+            break
+        }
+        let queued = Vec_usize.at(ctx.use_apps, entry)
+        Vec_usize.push(mutable ctx.worklist, take queued, allocator)?
+        let nxt = Vec_usize.at(ctx.use_next, entry)
+        if nxt == 0 {
+            tail = cur
+            break
+        }
+        cur = nxt
+    }
+    let surv_head = match IntMap_usize.get(ctx.use_heads, survivor as i64) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    let tail_entry = tail -% 1
+    if tail_entry < Vec_usize.len(ctx.use_next) {
+        let store_next = surv_head
+        Vec_usize.set_at(mutable ctx.use_next, tail_entry, take store_next)
+        let store_head = absorbed_head
+        let _ = IntMap_usize.insert(mutable ctx.use_heads, survivor as i64, take store_head, allocator)?
+        let cleared: usize = 0
+        let _ = IntMap_usize.insert(mutable ctx.use_heads, absorbed as i64, take cleared, allocator)?
+    }
+}
+
+
+function process_app(euf: mutable EufSolver, ctx: mutable CloseCtx, i: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let ai = Vec_EufApp.at(euf.apps, i)
+    let key = cc_sig_hash(euf, ai)
+    var cur = match IntMap_usize.get(ctx.sig_heads, key) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    var found: bool = false
+    var fuel = Vec_usize.len(ctx.sig_apps)
+    loop
+        decreases fuel
+    {
+        if cur == 0 {
+            break
+        }
+        if fuel == 0 {
+            break
+        }
+        fuel = fuel - 1
+        let entry = cur -% 1
+        if entry >= Vec_usize.len(ctx.sig_apps) {
+            break
+        }
+        let cand = Vec_usize.at(ctx.sig_apps, entry)
+        if cand != i {
+            if cand < Vec_EufApp.len(euf.apps) {
+                let aj = Vec_EufApp.at(euf.apps, cand)
+                if congruent(euf, ai, aj) {
+                    found = true
+                    merge_nodes(mutable euf, mutable ctx, ai.node, aj.node, allocator)?
+                    break
+                }
+            }
+        }
+        cur = Vec_usize.at(ctx.sig_next, entry)
+    }
+    if !found {
+        chain_push(mutable ctx.sig_heads, mutable ctx.sig_apps, mutable ctx.sig_next, key, i, allocator)?
+    }
+}
+
+
+function close(euf: mutable EufSolver, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_EufApp.len(euf.apps)
+    if n == 0 {
+        return
+    }
+    let sig_heads = IntMap_usize.new(allocator)?
+    uninit sig_apps: Vec_usize.Vec
+    Vec_usize.new(init sig_apps, allocator)?
+    uninit sig_next: Vec_usize.Vec
+    Vec_usize.new(init sig_next, allocator)?
+    let use_heads = IntMap_usize.new(allocator)?
+    uninit use_apps: Vec_usize.Vec
+    Vec_usize.new(init use_apps, allocator)?
+    uninit use_next: Vec_usize.Vec
+    Vec_usize.new(init use_next, allocator)?
+    uninit worklist: Vec_usize.Vec
+    Vec_usize.new(init worklist, allocator)?
+    uninit ctx: CloseCtx
+    ctx = CloseCtx {
+        sig_heads: take sig_heads,
+        sig_apps: take sig_apps,
+        sig_next: take sig_next,
+        use_heads: take use_heads,
+        use_apps: take use_apps,
+        use_next: take use_next,
+        worklist: take worklist,
+    }
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let ai = Vec_EufApp.at(euf.apps, i)
+        let m = Vec_usize.len(ai.args)
+        var k: usize = 0
+        loop
+            decreases (m - k)
+        {
+            if k >= m {
+                break
+            }
+            let r = find(euf, Vec_usize.at(ai.args, k))
+            chain_push(mutable ctx.use_heads, mutable ctx.use_apps, mutable ctx.use_next, r as i64, i, allocator)?
+            k = k + 1
+        }
+        let queued = i
+        Vec_usize.push(mutable ctx.worklist, take queued, allocator)?
+        i = i + 1
+    }
+    var head: usize = 0
+    loop {
+        if head >= Vec_usize.len(ctx.worklist) {
+            break
+        }
+        let pending = Vec_usize.at(ctx.worklist, head)
+        head = head + 1
+        if pending < n {
+            process_app(mutable euf, mutable ctx, pending, allocator)?
+        }
+    }
+}
+
+
+function build_explanation(euf: EufSolver, neg_lit: lit_mod.Lit, allocator: Allocator) -> Vec_Lit.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit expl: Vec_Lit.Vec
+    Vec_Lit.new(init expl, allocator)?
+    let n = Vec_Lit.len(euf.eq_lits)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let l = Vec_Lit.at(euf.eq_lits, i)
+        Vec_Lit.push(mutable expl, take l, allocator)?
+        i = i + 1
+    }
+    Vec_Lit.push(mutable expl, take neg_lit, allocator)?
+    return expl
+}
+
+
+public function check(euf: mutable EufSolver, allocator: Allocator) -> EufResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    close(mutable euf, allocator)?
+    let d = Vec_DisEq.len(euf.diseqs)
+    var i: usize = 0
+    loop
+        decreases (d - i)
+    {
+        if i >= d {
+            break
+        }
+        let de = Vec_DisEq.at(euf.diseqs, i)
+        if find(euf, de.a) == find(euf, de.b) {
+            let expl = build_explanation(euf, de.lit, allocator)?
+            return EufResult.conflict(explanation: expl)
+        }
+        i = i + 1
+    }
+    return EufResult.consistent
+}
+
+
+public function extract_model(euf: mutable EufSolver, allocator: Allocator) -> EufModel
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    close(mutable euf, allocator)?
+    let n = Vec_SmtTerm.len(euf.terms)
+    uninit roots: Vec_usize.Vec
+    Vec_usize.new(init roots, allocator)?
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let r = find(euf, i)
+        if !contains_usize(roots, r) {
+            let store = r
+            Vec_usize.push(mutable roots, take store, allocator)?
+        }
+        i = i + 1
+    }
+    uninit classes: Vec_EufClass.Vec
+    Vec_EufClass.new(init classes, allocator)?
+    let nr = Vec_usize.len(roots)
+    var k: usize = 0
+    loop
+        decreases (nr - k)
+    {
+        if k >= nr {
+            break
+        }
+        let root = Vec_usize.at(roots, k)
+        let cls = collect_class(euf, root, n, allocator)?
+        if Vec_SmtTerm.len(cls.members) >= 2 {
+            Vec_EufClass.push(mutable classes, take cls, allocator)?
+        }
+        k = k + 1
+    }
+    return EufModel { classes: classes }
+}
+
+
+function collect_class(euf: EufSolver, root: usize, n: usize, allocator: Allocator) -> EufClass
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit members: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init members, allocator)?
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if find(euf, i) == root {
+            let t = Vec_SmtTerm.at(euf.terms, i)
+            if is_meaningful(t) {
+                Vec_SmtTerm.push(mutable members, take t, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return EufClass { members: members }
+}
+
+
+function is_meaningful(t: term_mod.SmtTerm) -> bool {
+    return match t {
+        case .numeral(_) => false
+        case .true_ => false
+        case .false_ => false
+        case _ => true
+    }
+}
+
+
+function contains_usize(v: Vec_usize.Vec, x: usize) -> bool {
+    let n = Vec_usize.len(v)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if Vec_usize.at(v, i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

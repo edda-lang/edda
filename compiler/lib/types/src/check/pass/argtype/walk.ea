@@ -1,0 +1,622 @@
+
+module types.check.pass.argtype.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import intern.symbol
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import intern.interner as interner_mod
+import types.check.env.builtins as builtins_mod
+import resolve.build.builtins as resolve_builtins_mod
+import types.check.env.fields as fields_mod
+import types.check.env.sig as sig_mod
+import types.check.body.literal.literal as literal_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+spec std.collections.vec.Vec(fields_mod.FieldNameMatrix)
+
+
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public function check_arg_types(
+    file: hir_file.HirFile,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_items(file, file.items, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+}
+
+
+function walk_items(
+    file: hir_file.HirFile,
+    items: Vec_HItem.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        walk_item(file, item, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+function walk_item(
+    file: hir_file.HirFile,
+    item: hir_item.HItem,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(_, let body) => {
+            walk_block(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .spec_decl(_, let inner_items) => {
+            walk_items(file, inner_items, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+function walk_block(
+    file: hir_file.HirFile,
+    block: hir_tree.HBlock,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let s = Vec_HStmt.at(block.stmts, i)
+        walk_stmt(file, s, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+    match block.trailing {
+        case .some(let box_e) => {
+            let inner = Box_HExpr.get(box_e)
+            walk_expr(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+function walk_stmt(
+    file: hir_file.HirFile,
+    stmt: hir_tree.HStmt,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match stmt.kind {
+        case .let_(_, _, _, _, let init_) => {
+            walk_expr(file, init_, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .uninit_(_, _, _) => ()
+        case .assign(let target, _, let rhs) => {
+            walk_expr(file, target, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_expr(file, rhs, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+    }
+}
+
+function walk_expr(
+    file: hir_file.HirFile,
+    expr: hir_tree.HExpr,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match expr.kind {
+        case .binary(_, let lhs, let rhs) => {
+            walk_boxed(file, lhs, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_boxed(file, rhs, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .unary(_, let inner) => {
+            walk_boxed(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .call(let callee, let args) => {
+            let actual_callee = if hir_file.is_method_call(file, expr.node_id) {
+                method_callee_at(node_call_method, expr.node_id)
+            } else {
+                callee
+            }
+            check_call_args(file, expr.node_id, actual_callee, args, fn_signatures, node_types, ty_interner, interner, builtins, mutable diags, allocator)?
+            walk_args(file, args, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .variant_ctor(_, _, let args) => {
+            walk_args(file, args, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .dyn_call(let callee, let args) => {
+            walk_boxed(file, callee, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_args(file, args, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .field(let recv, _) => {
+            walk_boxed(file, recv, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .index(let recv, let idx) => {
+            walk_boxed(file, recv, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_boxed(file, idx, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .if_(let cond, let then_b, let else_opt) => {
+            walk_boxed(file, cond, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_block(file, then_b, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_opt_block(file, else_opt, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .match_(let scrut, let arms) => {
+            walk_boxed(file, scrut, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_arms(file, arms, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .block_(let body) => {
+            walk_block(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .loop_(let body, _, let dec_opt) => {
+            walk_block(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_opt_boxed(file, dec_opt, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .cast(let inner, _, _) => {
+            walk_boxed(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .tuple(let elements) => {
+            walk_exprs(file, elements, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .struct_lit(let def, let fields) => {
+            check_struct_lit_fields(file, def, fields, field_tys, field_names, node_types, ty_interner, builtins, mutable diags, allocator)?
+            walk_args(file, fields, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .raise_(let inner) => {
+            walk_boxed(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .panic_(let inner) => {
+            walk_boxed(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .return_(let opt) => {
+            walk_opt_boxed(file, opt, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .break_(_, let opt) => {
+            walk_opt_boxed(file, opt, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .comptime_(let inner) => {
+            walk_boxed(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .comptime_block(let body) => {
+            walk_block(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .scope_(_, _, let body) => {
+            walk_block(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .handle_(_, _, let recovery, let body) => {
+            walk_boxed(file, recovery, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_block(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .forall_(_, let iter, let body) => {
+            walk_boxed(file, iter, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_boxed(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case .exists_(_, let iter, let body) => {
+            walk_boxed(file, iter, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            walk_boxed(file, body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function method_callee_at(node_call_method: Vec_DefId.Vec, n: node_mod.NodeId) -> def_mod.DefId {
+    let i = node_mod.index(n)
+    if i >= Vec_DefId.len(node_call_method) {
+        return def_mod.error()
+    }
+    return Vec_DefId.at(node_call_method, i)
+}
+
+function check_call_args(
+    file: hir_file.HirFile,
+    call_node: node_mod.NodeId,
+    callee: def_mod.DefId,
+    args: Vec_HArg.Vec,
+    fn_signatures: Vec_FnSig.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(callee) {
+        return
+    }
+    if resolve_builtins_mod.is_inline_intrinsic_def(callee) {
+        return
+    }
+    let ci = def_mod.index(callee)
+    if ci >= Vec_FnSig.len(fn_signatures) {
+        return
+    }
+    let sig = Vec_FnSig.at(fn_signatures, ci)
+    let np = Vec_TyId.len(sig.params)
+    let na_total = Vec_HArg.len(args)
+    let skip = if na_total >= sig.leading_comptime_params { sig.leading_comptime_params } else { 0 as usize }
+    let na = na_total - skip
+    if !ty_mod.is_error(sig.ret) && na != np {
+        let name_bytes = interner_mod.lookup(interner, sig.name)
+        let name_str = string.from_owned_utf8(take name_bytes)
+        let msg = f"function `{name_str}` takes {np} argument(s) but {na} were supplied"
+        emit_type_error(file, call_node, msg, mutable diags, allocator)?
+        return
+    }
+    var i: usize = 0 as usize
+    loop decreases (np - i) {
+        if i >= np { break }
+        if i >= na { break }
+        let a = Vec_HArg.at(args, i + skip)
+        let arg_ty = base_ty(node_type_at(node_types, a.expr.node_id), ty_interner)
+        let decl_ty = base_ty(Vec_TyId.at(sig.params, i), ty_interner)
+        let opaque_either = ty_interner_mod.is_opaque(ty_interner, arg_ty) || ty_interner_mod.is_opaque(ty_interner, decl_ty)
+        if !opaque_either && !literal_mod.payload_arg_ok(a.expr, arg_ty, decl_ty, builtins, ty_interner, node_types) {
+            emit_type_error(file, a.expr.node_id, "call argument has the wrong type", mutable diags, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+function check_struct_lit_fields(
+    file: hir_file.HirFile,
+    def: def_mod.DefId,
+    fields: Vec_HArg.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let di = def_mod.index(def)
+    if di >= Vec_FieldTyList.len(field_tys) {
+        return
+    }
+    if di >= Vec_FieldNameMatrix.len(field_names) {
+        return
+    }
+    let flist = Vec_FieldTyList.at(field_tys, di)
+    let matrix = Vec_FieldNameMatrix.at(field_names, di)
+    if Vec_VariantNameList.len(matrix.rows) == 0 as usize {
+        return
+    }
+    let row = Vec_VariantNameList.at(matrix.rows, 0 as usize)
+    let nf = Vec_HArg.len(fields)
+    var i: usize = 0 as usize
+    loop decreases (nf - i) {
+        if i >= nf { break }
+        let f = Vec_HArg.at(fields, i)
+        check_one_field(file, f, row, flist, node_types, ty_interner, builtins, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+function check_one_field(
+    file: hir_file.HirFile,
+    f: hir_tree.HArg,
+    row: fields_mod.VariantNameList,
+    flist: fields_mod.FieldTyList,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nm = match f.name {
+        case .some(let s) => s
+        case .none => return
+    }
+    let nn = Vec_Symbol.len(row.names)
+    var k: usize = 0 as usize
+    var fidx: usize = nn
+    loop decreases (nn - k) {
+        if k >= nn { break }
+        if Vec_Symbol.at(row.names, k).raw == nm.raw {
+            fidx = k
+            break
+        }
+        k = k + 1 as usize
+    }
+    if fidx >= nn {
+        return
+    }
+    if fidx >= Vec_TyId.len(flist.tys) {
+        return
+    }
+    let decl_ty = base_ty(Vec_TyId.at(flist.tys, fidx), ty_interner)
+    let arg_ty = base_ty(node_type_at(node_types, f.expr.node_id), ty_interner)
+    let opaque_either = ty_interner_mod.is_opaque(ty_interner, arg_ty) || ty_interner_mod.is_opaque(ty_interner, decl_ty)
+    if !opaque_either && !literal_mod.payload_arg_ok(f.expr, arg_ty, decl_ty, builtins, ty_interner, node_types) {
+        emit_type_error(file, f.expr.node_id, "struct literal field has the wrong type", mutable diags, allocator)?
+    }
+}
+
+function base_ty(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> ty_mod.TyId
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return t
+    }
+    if (t.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return t
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .refined(let base, _) => base_ty(base, ty_interner)
+        case _ => t
+    }
+}
+
+function node_type_at(node_types: Vec_TyId.Vec, n: node_mod.NodeId) -> ty_mod.TyId {
+    let i = node_mod.index(n)
+    if i >= Vec_TyId.len(node_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(node_types, i)
+}
+
+function emit_type_error(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    msg: String,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match hir_file.span_of_opt(file, node_id) {
+        case .some(let span) => {
+            let d = diag_mod.error_at(code_mod.typecheck_error(), span, msg)
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+function walk_boxed(
+    file: hir_file.HirFile,
+    boxed: Box_HExpr,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_HExpr.get(boxed)
+    walk_expr(file, inner, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+}
+
+function walk_opt_boxed(
+    file: hir_file.HirFile,
+    opt: Option_Box_HExpr.Option,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match opt {
+        case .some(let b) => walk_boxed(file, b, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+function walk_opt_block(
+    file: hir_file.HirFile,
+    opt: Option_HBlock.Option,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match opt {
+        case .some(let b) => walk_block(file, b, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+function walk_exprs(
+    file: hir_file.HirFile,
+    exprs: Vec_HExpr.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_HExpr.at(exprs, i)
+        walk_expr(file, e, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+function walk_args(
+    file: hir_file.HirFile,
+    args: Vec_HArg.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        walk_expr(file, a.expr, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+function walk_arms(
+    file: hir_file.HirFile,
+    arms: Vec_HArm.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        match arm.guard {
+            case .some(let g) => {
+                walk_expr(file, g, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+            }
+            case .none => ()
+        }
+        walk_expr(file, arm.body, node_types, ty_interner, interner, fn_signatures, node_call_method, field_tys, field_names, builtins, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}

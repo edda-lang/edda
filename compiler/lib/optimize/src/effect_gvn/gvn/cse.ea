@@ -1,0 +1,184 @@
+
+module optimize.effect_gvn.gvn.cse
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.op as op_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.analysis.purity as purity_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+
+
+spec std.collections.vec.Vec(Replacement)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(op_mod.OpId)
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+
+
+public type Replacement {
+    redundant: value_mod.ValueId
+    canonical: value_mod.ValueId
+}
+
+
+public type GvnPlan {
+    replacements: Vec_Replacement.Vec
+}
+
+
+public function analyze(
+    body: hlir_body_mod.HlirBody,
+    built: mutable mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> GvnPlan
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit replacements: Vec_Replacement.Vec
+    Vec_Replacement.new(init replacements, allocator)?
+    let n = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop
+        decreases n - b
+    {
+        if b >= n { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        analyze_block(mutable replacements, mutable built, body, block, allocator)?
+        b = b + 1
+    }
+    return GvnPlan { replacements: replacements }
+}
+
+
+function analyze_block(
+    replacements: mutable Vec_Replacement.Vec,
+    built: mutable mapping_mod.BuildResult,
+    body: hlir_body_mod.HlirBody,
+    block: hlir_body_mod.HlirBlock,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var local_reps = IntMap_u32.new(allocator)?
+    let m = Vec_OpId.len(block.ops)
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        let op_id = Vec_OpId.at(block.ops, i)
+        process_op(mutable replacements, mutable local_reps, mutable built, body, op_id, allocator)?
+        i = i + 1
+    }
+}
+
+
+function process_op(
+    replacements: mutable Vec_Replacement.Vec,
+    local_reps: mutable IntMap_u32.IntMap,
+    built: mutable mapping_mod.BuildResult,
+    body: hlir_body_mod.HlirBody,
+    op_id: op_mod.OpId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if op_id.raw == 0 { return () }
+    if (op_id.raw as usize) >= Vec_HlirOp.len(body.ops) { return () }
+    let op = Vec_HlirOp.at(body.ops, op_id.raw as usize)
+    let result_v = op.result_
+    if result_v.raw == 0 { return () }
+    let purity = mapping_mod.purity_of_value(built, result_v)
+    if !purity_mod.is_cse_eligible(purity) { return () }
+    record_or_replace(mutable replacements, mutable local_reps, mutable built, result_v, allocator)?
+}
+
+
+function record_or_replace(
+    replacements: mutable Vec_Replacement.Vec,
+    local_reps: mutable IntMap_u32.IntMap,
+    built: mutable mapping_mod.BuildResult,
+    result_v: value_mod.ValueId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let canon = mapping_mod.canonical_class_of_value(mutable built, result_v)
+    if canon.raw == 0 { return () }
+    let key = canon.raw as i64
+    let existing = IntMap_u32.get(local_reps, key)
+    match existing {
+        case .some(let rep_raw) =>
+            if replacement_is_sound(built, rep_raw, result_v) {
+                emit_replacement(mutable replacements, rep_raw, result_v, allocator)?
+            }
+        case .none => seed_representative(mutable local_reps, key, result_v, allocator)?
+    }
+}
+
+
+function replacement_is_sound(
+    built: mapping_mod.BuildResult,
+    canonical_raw: u32,
+    redundant_v: value_mod.ValueId,
+) -> bool {
+    let canonical_v = value_mod.ValueId { raw: canonical_raw }
+    let canonical_purity = mapping_mod.purity_of_value(built, canonical_v)
+    let redundant_purity = mapping_mod.purity_of_value(built, redundant_v)
+    return is_pure_total(canonical_purity) && is_pure_total(redundant_purity)
+}
+
+
+function is_pure_total(p: purity_mod.Purity) -> bool {
+    return match p {
+        case .pure_total => true
+        case .pure_trapping => false
+        case .effectful => false
+    }
+}
+
+
+function seed_representative(
+    local_reps: mutable IntMap_u32.IntMap,
+    key: i64,
+    result_v: value_mod.ValueId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let _ = IntMap_u32.insert(mutable local_reps, key, result_v.raw, allocator)?
+}
+
+
+function emit_replacement(
+    replacements: mutable Vec_Replacement.Vec,
+    canonical_raw: u32,
+    redundant_v: value_mod.ValueId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if canonical_raw == redundant_v.raw { return () }
+    let edit = Replacement {
+        redundant: redundant_v,
+        canonical: value_mod.ValueId { raw: canonical_raw },
+    }
+    Vec_Replacement.push(mutable replacements, take edit, allocator)?
+}
+
+
+public function plan_len(plan: GvnPlan) -> usize {
+    return Vec_Replacement.len(plan.replacements)
+}
+
+
+public function plan_at(plan: GvnPlan, i: usize) -> Replacement
+    requires i < Vec_Replacement.len(plan.replacements)
+{
+    return Vec_Replacement.at(plan.replacements, i)
+}

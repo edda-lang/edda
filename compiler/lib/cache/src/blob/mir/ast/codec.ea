@@ -1,0 +1,100 @@
+
+module cache.blob.mir.ast.codec
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import span.loc.pos.span as span_mod
+import span.file as file_mod
+import syntax.ast.ident as ident_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ident_mod.Ident)
+
+
+public function write_span(s: span_mod.Span, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prim_mod.push_u32_le(mutable out, s.file.raw, allocator)?
+    prim_mod.push_u32_le(mutable out, s.start as u32 wrapping, allocator)?
+    prim_mod.push_u32_le(mutable out, s.end as u32 wrapping, allocator)?
+}
+
+public function read_span(bytes: [u8], cur: mutable prim_mod.Reader) -> span_mod.Span
+    with {err: error_mod.CacheError}
+{
+    let file = file_mod.FileId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let start = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    let end = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    return span_mod.Span { file: file, start: start, end: end }
+}
+
+public function write_ident(
+    it: interner_mod.Interner,
+    ident: ident_mod.Ident,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    symbol_codec_mod.write_symbol(it, ident.name, mutable out, allocator)?
+    write_span(ident.span, mutable out, allocator)?
+}
+
+public function read_ident(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ident_mod.Ident
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let name = symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?
+    let span = read_span(bytes, mutable cur)?
+    return ident_mod.Ident { name: name, span: span }
+}
+
+public function write_path(
+    it: interner_mod.Interner,
+    path: ident_mod.Path,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Ident.len(path.segments)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_ident(it, Vec_Ident.at(path.segments, i), mutable out, allocator)?
+        i += 1
+    }
+    write_span(path.span, mutable out, allocator)?
+}
+
+public function read_path(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ident_mod.Path
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let seg = read_ident(bytes, mutable cur, mutable it, allocator)?
+        Vec_Ident.push(mutable segments, take seg, allocator)?
+        i += 1
+    }
+    let span = read_span(bytes, mutable cur)?
+    return ident_mod.Path { segments: segments, span: span }
+}

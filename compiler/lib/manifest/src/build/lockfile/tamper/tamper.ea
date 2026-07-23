@@ -1,0 +1,156 @@
+
+module manifest.build.lockfile.tamper.tamper
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import diagnostics.code
+import diagnostics.emit.collection as collection_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import cache.addr.hash as hash_mod
+import local.model.lockfile.lockfile as lf_mod
+
+spec std.collections.vec.Vec(lf_mod.Rune)
+spec std.collections.vec.Vec(lf_mod.ContractBaseline)
+
+
+public function check_lockfile_tampered(
+    lf: lf_mod.LoadedLockfile,
+    file: file_mod.FileId,
+    diags: mutable collection_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let canonical = canonical_lockfile_encoding(lf, allocator)?
+    let digest = hash_mod.hash_bytes(canonical.bytes(), allocator)?
+    let hex = hash_mod.to_hex_string(digest, allocator)?
+    let computed = string.concat("blake3:", hex, allocator)?
+    if !string.equals(computed, lf_mod.lockfile_hash(lf)) {
+        emit_tampered(file, mutable diags, allocator)?
+    }
+}
+
+
+function emit_tampered(
+    file: file_mod.FileId,
+    diags: mutable collection_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(code.lockfile_tampered(), span_mod.dummy(), "lockfile_hash does not match the canonical encoding of the [[rune]] entries — the lockfile was hand-edited or corrupted; regenerate it with an edda verb instead of editing package.lock.toml directly")
+    collection_mod.emit(mutable diags, take d, allocator)?
+}
+
+
+function canonical_lockfile_encoding(lf: lf_mod.LoadedLockfile, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = lf_mod.rune_count(lf)
+    var acc: String = ""
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = encode_rune_canonical(lf_mod.rune_at(lf, i), allocator)?
+        acc = string.concat(acc, entry, allocator)?
+        i = i + 1 as usize
+    }
+    let cn = lf_mod.contract_baseline_count(lf)
+    var j: usize = 0 as usize
+    loop decreases (cn - j) {
+        if j >= cn { break }
+        let cb_entry = encode_contract_baseline_canonical(lf_mod.contract_baseline_at(lf, j), allocator)?
+        acc = string.concat(acc, cb_entry, allocator)?
+        j = j + 1 as usize
+    }
+    return acc
+}
+
+
+function encode_rune_canonical(r: lf_mod.Rune, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a0 = encode_deps(r, allocator)?
+    let a1 = append_kv(a0, "effect_hash", lf_mod.effect_hash(r), allocator)?
+    let a2 = append_kv(a1, "name", lf_mod.name(r), allocator)?
+    let a3 = append_kv(a2, "publisher_key", lf_mod.publisher_key(r), allocator)?
+    let a4 = append_kv(a3, "publisher_sig", lf_mod.publisher_sig(r), allocator)?
+    let a5 = append_kv(a4, "rune_hash", lf_mod.rune_hash(r), allocator)?
+    let a6 = append_kv(a5, "source", lf_mod.source(r), allocator)?
+    let a7 = append_kv(a6, "surface_hash", lf_mod.surface_hash(r), allocator)?
+    let a8 = append_kv(a7, "version", lf_mod.version(r), allocator)?
+    return string.concat(a8, "\n", allocator)?
+}
+
+
+function append_kv(acc: String, key: String, value: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a1 = string.concat(acc, key, allocator)?
+    let a2 = string.concat(a1, " = \"", allocator)?
+    let a3 = string.concat(a2, value, allocator)?
+    return string.concat(a3, "\"\n", allocator)?
+}
+
+
+function encode_contract_baseline_canonical(cb: lf_mod.ContractBaseline, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a0 = append_kv("", "contract_hash", lf_mod.contract_hash(cb), allocator)?
+    let a1 = append_kv(a0, "qualified_name", lf_mod.qualified_name(cb), allocator)?
+    let a2 = append_kv(a1, "version_introduced", lf_mod.version_introduced(cb), allocator)?
+    return string.concat(a2, "\n", allocator)?
+}
+
+
+function encode_deps(r: lf_mod.Rune, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = lf_mod.dep_count(r)
+    var acc: String = "deps = ["
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i > 0 as usize {
+            acc = string.concat(acc, ", ", allocator)?
+        }
+        let a1 = string.concat(acc, "\"", allocator)?
+        let a2 = string.concat(a1, lf_mod.dep_at(r, i), allocator)?
+        acc = string.concat(a2, "\"", allocator)?
+        i = i + 1 as usize
+    }
+    return string.concat(acc, "]\n", allocator)?
+}
+
+
+public function compute_lockfile_hash_from_parts(
+    runes: Vec_Rune.Vec,
+    contract_baselines: Vec_ContractBaseline.Vec,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Rune.len(runes)
+    var acc: String = ""
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = encode_rune_canonical(Vec_Rune.at(runes, i), allocator)?
+        acc = string.concat(acc, entry, allocator)?
+        i = i + 1 as usize
+    }
+    let cn = Vec_ContractBaseline.len(contract_baselines)
+    var j: usize = 0 as usize
+    loop decreases (cn - j) {
+        if j >= cn { break }
+        let cb_entry = encode_contract_baseline_canonical(Vec_ContractBaseline.at(contract_baselines, j), allocator)?
+        acc = string.concat(acc, cb_entry, allocator)?
+        j = j + 1 as usize
+    }
+    let digest = hash_mod.hash_bytes(acc.bytes(), allocator)?
+    let hex = hash_mod.to_hex_string(digest, allocator)?
+    return string.concat("blake3:", hex, allocator)?
+}

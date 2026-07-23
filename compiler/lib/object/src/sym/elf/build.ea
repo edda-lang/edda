@@ -1,0 +1,176 @@
+
+module object.sym.elf.build
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import intern.interner as interner_mod
+
+import local.fmt.elf as elf_mod
+import local.elf.wrap as elf_wrap_mod
+import local.sym.coff.multisym as multisym_mod
+import local.sym.elf.collect as collect_mod
+import local.sym.elf.rodata as rodata_mod
+import ir.emitted as emit_types_mod
+import ir.runtime as runtime_mod
+
+
+spec std.collections.vec.Vec(emit_types_mod.EmittedBody)
+spec std.collections.vec.Vec(elf_mod.ElfRela)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(bool)
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.IntMap(String)
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(String)
+
+
+public function build_elf_object(
+    out: init elf_mod.ElfFile,
+    emitted: Vec_EmittedBody.Vec,
+    global_syms: IntMap_String.IntMap,
+    machine: elf_mod.ElfMachine,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    uninit file: elf_mod.ElfFile
+    elf_wrap_mod.new_object(init file, machine, allocator)?
+
+    let n = Vec_EmittedBody.len(emitted)
+
+    var data_index_map = IntMap_u32.new(allocator)?
+    var f32_index_map = IntMap_u32.new(allocator)?
+    var f64_index_map = IntMap_u32.new(allocator)?
+    uninit data_offsets: Vec_u32.Vec
+    Vec_u32.new(init data_offsets, allocator)?
+    uninit data_is_string: Vec_bool.Vec
+    Vec_bool.new(init data_is_string, allocator)?
+    uninit rdata: Vec_u8.Vec
+    Vec_u8.new(init rdata, allocator)?
+
+    var next_index: u32 = 1 as u32
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        next_index = collect_mod.collect_data_locals(body.relocations, mutable data_index_map, mutable f32_index_map, mutable f64_index_map, mutable data_offsets, mutable data_is_string, mutable rdata, next_index, interner, allocator)?
+        i += 1
+    }
+    let first_global = next_index
+
+    var func_index_map = IntMap_u32.new(allocator)?
+    i = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        let slot = first_global + (i as u32)
+        let _ = IntMap_u32.insert(mutable func_index_map, body.def_id.raw as i64, take slot, allocator)?
+        i += 1
+    }
+
+    uninit ext_defs: Vec_u32.Vec
+    Vec_u32.new(init ext_defs, allocator)?
+    var ext_next = first_global + (n as u32)
+    i = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        ext_next = collect_mod.collect_externals_elf(body.relocations, mutable func_index_map, mutable ext_defs, ext_next, allocator)?
+        i += 1
+    }
+
+    var rt_index_map = IntMap_u32.new(allocator)?
+    uninit rt_defs: Vec_u32.Vec
+    Vec_u32.new(init rt_defs, allocator)?
+    i = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        ext_next = collect_mod.collect_runtime_elf(body.relocations, mutable rt_index_map, mutable rt_defs, ext_next, allocator)?
+        i += 1
+    }
+
+    add_text_sections(mutable file, emitted, func_index_map, rt_index_map, data_index_map, f32_index_map, f64_index_map, allocator)?
+
+    if Vec_u32.len(data_offsets) > 0 {
+        rodata_mod.add_rodata_section(mutable file, take rdata, data_offsets, data_is_string, allocator)?
+    }
+
+    add_symbols(mutable file, emitted, global_syms, ext_defs, rt_defs, allocator)?
+
+    out = file
+}
+
+
+function add_text_sections(
+    file: mutable elf_mod.ElfFile,
+    emitted: Vec_EmittedBody.Vec,
+    func_index_map: IntMap_u32.IntMap,
+    rt_index_map: IntMap_u32.IntMap,
+    data_index_map: IntMap_u32.IntMap,
+    f32_index_map: IntMap_u32.IntMap,
+    f64_index_map: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    let n = Vec_EmittedBody.len(emitted)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        let relocs = collect_mod.translate_relocs_elf(body.relocations, func_index_map, rt_index_map, data_index_map, f32_index_map, f64_index_map, allocator)?
+        elf_wrap_mod.add_section(mutable file, ".text", elf_mod.ElfSectionType.progbits, elf_wrap_mod.text_flags(), 16 as u64, take body.code, take relocs, allocator)?
+        i += 1
+    }
+}
+
+
+function add_symbols(
+    file: mutable elf_mod.ElfFile,
+    emitted: Vec_EmittedBody.Vec,
+    global_syms: IntMap_String.IntMap,
+    ext_defs: Vec_u32.Vec,
+    rt_defs: Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    let n = Vec_EmittedBody.len(emitted)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        let name = collect_mod.lookup_symbol(global_syms, body.def_id.raw)?
+        let section_index = (i + 1) as u16
+        elf_wrap_mod.add_symbol(mutable file, name, elf_mod.ElfSymbolBinding.global_, elf_mod.ElfSymbolType.func, section_index, 0 as u64, 0 as u64, allocator)?
+        i += 1
+    }
+
+    let ne = Vec_u32.len(ext_defs)
+    var k: usize = 0
+    loop decreases ne - k {
+        if k >= ne { break }
+        let def_raw = Vec_u32.at(ext_defs, k)
+        let name = collect_mod.lookup_symbol(global_syms, def_raw)?
+        elf_wrap_mod.add_symbol(mutable file, name, elf_mod.ElfSymbolBinding.global_, elf_mod.ElfSymbolType.notype, 0 as u16, 0 as u64, 0 as u64, allocator)?
+        k += 1
+    }
+
+    let nr = Vec_u32.len(rt_defs)
+    var r: usize = 0
+    loop decreases nr - r {
+        if r >= nr { break }
+        let ord = Vec_u32.at(rt_defs, r)
+        let rt_name = runtime_mod.runtime_fn_symbol(runtime_mod.runtime_fn_from_ordinal(ord))
+        elf_wrap_mod.add_symbol(mutable file, rt_name, elf_mod.ElfSymbolBinding.global_, elf_mod.ElfSymbolType.notype, 0 as u16, 0 as u64, 0 as u64, allocator)?
+        r += 1
+    }
+}

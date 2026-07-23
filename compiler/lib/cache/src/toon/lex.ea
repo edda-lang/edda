@@ -1,0 +1,242 @@
+
+module cache.toon.lex
+
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import std.mem.alloc
+import std.text.string
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(u32)
+spec std.core.option.Option(usize)
+
+derive eq, hash, ord, clone, debug for LexError
+
+
+public stable function indent_step() -> usize {
+    return 2
+}
+
+
+public type LexError {
+    case tab_in_line(line_no: u32)
+    case bad_indent(line_no: u32, indent: usize)
+    case missing_comment_prefix(line_no: u32)
+}
+
+public type Lexed {
+    contents: Vec_String
+    indents: Vec_usize
+    line_nos: Vec_u32
+}
+
+
+public function lex(
+    input: String,
+    strip_comment_prefix: bool,
+    allocator: Allocator,
+) -> Lexed
+    with {allocator, err: alloc.AllocError, err: LexError}
+{
+    uninit contents: Vec_String.Vec
+    Vec_String.new(init contents, allocator)?
+    uninit indents: Vec_usize.Vec
+    Vec_usize.new(init indents, allocator)?
+    uninit line_nos: Vec_u32.Vec
+    Vec_u32.new(init line_nos, allocator)?
+
+    let bytes = input.bytes()
+    lex_acc(bytes, strip_comment_prefix, 0, 0, 1, mutable contents, mutable indents, mutable line_nos, allocator)?
+    return Lexed { contents: contents, indents: indents, line_nos: line_nos }
+}
+
+
+public stable function len(lx: Lexed) -> usize
+    ensures result == Vec_String.len(lx.contents)
+{
+    return Vec_String.len(lx.contents)
+}
+
+public stable function content_at(lx: Lexed, i: usize where i < len(lx)) -> String
+    requires i < Vec_String.len(lx.contents)
+{
+    return Vec_String.at(lx.contents, i)
+}
+
+public stable function indent_at(lx: Lexed, i: usize where i < len(lx)) -> usize
+    requires i < Vec_usize.len(lx.indents)
+{
+    return Vec_usize.at(lx.indents, i)
+}
+
+public stable function line_no_at(lx: Lexed, i: usize where i < len(lx)) -> u32
+    requires i < Vec_u32.len(lx.line_nos)
+{
+    return Vec_u32.at(lx.line_nos, i)
+}
+
+
+function lex_acc(
+    bytes: [u8],
+    strip_comment_prefix: bool,
+    start: usize,
+    pos: usize,
+    line_no: u32,
+    contents: mutable Vec_String.Vec,
+    indents: mutable Vec_usize.Vec,
+    line_nos: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: LexError}
+    requires start <= pos
+    requires pos <= bytes.len()
+    decreases bytes.len() - pos
+{
+    if pos >= bytes.len() {
+        if start < pos {
+            process_line(
+                bytes,
+                strip_comment_prefix,
+                start,
+                pos,
+                line_no,
+                mutable contents,
+                mutable indents,
+                mutable line_nos,
+                allocator,
+            )?
+        }
+        return ()
+    }
+    if bytes[pos] == 10 {
+        let line_end: usize = if pos > 0 && bytes[pos - 1] == 13 { pos - 1 } else { pos }
+        process_line(
+            bytes,
+            strip_comment_prefix,
+            start,
+            line_end,
+            line_no,
+            mutable contents,
+            mutable indents,
+            mutable line_nos,
+            allocator,
+        )?
+        return lex_acc(
+            bytes,
+            strip_comment_prefix,
+            pos + 1,
+            pos + 1,
+            line_no + 1,
+            mutable contents,
+            mutable indents,
+            mutable line_nos,
+            allocator,
+        )?
+    }
+    return lex_acc(
+        bytes,
+        strip_comment_prefix,
+        start,
+        pos + 1,
+        line_no,
+        mutable contents,
+        mutable indents,
+        mutable line_nos,
+        allocator,
+    )?
+}
+
+function process_line(
+    bytes: [u8],
+    strip_comment_prefix: bool,
+    start: usize,
+    end: usize,
+    line_no: u32,
+    contents: mutable Vec_String.Vec,
+    indents: mutable Vec_usize.Vec,
+    line_nos: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: LexError}
+    requires start <= end
+    requires end <= bytes.len()
+{
+    let payload_lo: usize = if strip_comment_prefix {
+        match find_comment_prefix(bytes, start, end) {
+            case .none           => return ()
+            case .some(let body) => body
+        }
+    } else {
+        start
+    }
+    if has_tab(bytes, payload_lo, end) {
+        raise LexError.tab_in_line(line_no: line_no)
+    }
+    let indent: usize = count_leading_spaces(bytes, payload_lo, end)
+    let body_lo: usize = payload_lo + indent
+    if body_lo >= end {
+        return ()
+    }
+    if bytes[body_lo] == 92 && !strip_comment_prefix {
+        return ()
+    }
+    if indent % indent_step() != 0 {
+        raise LexError.bad_indent(line_no: line_no, indent: indent)
+    }
+    let body: String = byte_range_to_string(bytes, body_lo, end, allocator)?
+    Vec_String.push(mutable contents, take body, allocator)?
+    Vec_usize.push(mutable indents, indent / indent_step(), allocator)?
+    Vec_u32.push(mutable line_nos, line_no, allocator)?
+    return ()
+}
+
+
+function find_comment_prefix(bytes: [u8], start: usize, end: usize) -> Option_usize
+    requires start <= end
+    requires end <= bytes.len()
+{
+    let lead: usize = count_leading_spaces(bytes, start, end)
+    let pos: usize = start + lead
+    if pos + 2 > end { return Option_usize.none }
+    if bytes[pos] != 47 || bytes[pos + 1] != 47 { return Option_usize.none }
+    if pos + 2 == end { return Option_usize.some(value: end) }
+    if bytes[pos + 2] == 32 {
+        return Option_usize.some(value: pos + 3)
+    }
+    return Option_usize.none
+}
+
+function count_leading_spaces(bytes: [u8], i: usize, end: usize) -> usize
+    requires i <= end
+    requires end <= bytes.len()
+    ensures result <= end - i
+    decreases end - i
+{
+    if i >= end { return 0 }
+    if bytes[i] != 32 { return 0 }
+    return 1 + count_leading_spaces(bytes, i + 1, end)
+}
+
+function has_tab(bytes: [u8], lo: usize, hi: usize) -> bool
+    requires lo <= hi
+    requires hi <= bytes.len()
+    decreases hi - lo
+{
+    if lo >= hi { return false }
+    if bytes[lo] == 9 { return true }
+    return has_tab(bytes, lo + 1, hi)
+}
+
+
+function byte_range_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let len: usize = hi - lo
+    var buf: [u8] = allocator.alloc_array(u8, len)?
+    slice.copy_u8(mutable buf, bytes[lo..<hi])
+    return string.from_owned_utf8(take buf)
+}

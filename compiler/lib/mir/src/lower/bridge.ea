@@ -1,0 +1,398 @@
+
+module mir.lower.bridge
+
+import std.mem.alloc
+import std.collections.slice as slice
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import hir.build.file as hir_file_mod
+import hir.item as hir_item
+import hir.def as def_mod
+import intern.interner as interner_mod
+import local.rvalue as rvalue_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import target.triple as triple_mod
+import cteval.builtin.target.layout.compute.engine as engine_mod
+
+
+spec std.core.option.Option(BridgeKind)
+spec std.core.option.Option(rvalue_mod.Operand)
+spec std.core.option.Option(ty_mod.TyId)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(check_mod.TypeOutput)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public type BridgeKind {
+    case alloc_
+    case box_read
+    case box_unbox
+    case free_
+    case alloc_array
+    case realloc_array
+    case copy_array
+}
+
+public type LayoutField {
+    case size_
+    case align_
+}
+
+
+public function classify_extern(name: [u8]) -> Option_BridgeKind.Option {
+    if slice.eq_u8(name, "__edda_alloc".bytes()) {
+        return Option_BridgeKind.some(value: BridgeKind.alloc_)
+    }
+    if slice.eq_u8(name, "__edda_box_read".bytes()) {
+        return Option_BridgeKind.some(value: BridgeKind.box_read)
+    }
+    if slice.eq_u8(name, "__edda_box_unbox".bytes()) {
+        return Option_BridgeKind.some(value: BridgeKind.box_unbox)
+    }
+    if slice.eq_u8(name, "__edda_free".bytes()) {
+        return Option_BridgeKind.some(value: BridgeKind.free_)
+    }
+    if slice.eq_u8(name, "__edda_alloc_array".bytes()) {
+        return Option_BridgeKind.some(value: BridgeKind.alloc_array)
+    }
+    if slice.eq_u8(name, "__edda_realloc_array".bytes()) {
+        return Option_BridgeKind.some(value: BridgeKind.realloc_array)
+    }
+    if slice.eq_u8(name, "__edda_copy_array".bytes()) { return Option_BridgeKind.some(value: BridgeKind.copy_array) }
+    return Option_BridgeKind.none
+}
+
+
+public function ordinal(kind: BridgeKind) -> u32 {
+    return match kind {
+        case .alloc_ => 0
+        case .box_read => 1
+        case .box_unbox => 2
+        case .free_ => 3
+        case .alloc_array => 4
+        case .realloc_array => 5
+        case .copy_array => 6
+    }
+}
+
+
+public function from_ordinal(o: u32) -> Option_BridgeKind.Option {
+    return match o {
+        case 0 => Option_BridgeKind.some(value: BridgeKind.alloc_)
+        case 1 => Option_BridgeKind.some(value: BridgeKind.box_read)
+        case 2 => Option_BridgeKind.some(value: BridgeKind.box_unbox)
+        case 3 => Option_BridgeKind.some(value: BridgeKind.free_)
+        case 4 => Option_BridgeKind.some(value: BridgeKind.alloc_array)
+        case 5 => Option_BridgeKind.some(value: BridgeKind.realloc_array)
+        case 6 => Option_BridgeKind.some(value: BridgeKind.copy_array)
+        case _ => Option_BridgeKind.none
+    }
+}
+
+
+public function emit_layout_constant(
+    field: LayoutField,
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> Option_Operand.Option
+    with {divergence}
+{
+    return match engine_mod.compute_layout(t, ty_interner, types_out, triple) {
+        case .ok(let layout) => {
+            let v: usize = match field {
+                case .size_ => layout.size
+                case .align_ => layout.align
+            }
+            Option_Operand.some(
+                value: rvalue_mod.Operand.constant(
+                    c: rvalue_mod.Constant {
+                        ty: types_out.builtins.usize_,
+                        kind: rvalue_mod.ConstantKind.int_(bits: v as u128),
+                    },
+                ),
+            )
+        }
+        case .unsupported(_) => Option_Operand.none
+    }
+}
+
+
+public function build_bridge_map(
+    hir_files: Vec_HirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError}
+{
+    var map = IntMap_u32.new(allocator)?
+    extend_bridge_map(mutable map, hir_files, interner, allocator)?
+    return map
+}
+
+
+public function extend_bridge_map(
+    map: mutable IntMap_u32.IntMap,
+    hir_files: Vec_HirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nf: usize = Vec_HirFile.len(hir_files)
+    var fi: usize = 0
+    loop
+        decreases (nf - fi)
+    {
+        if fi >= nf {
+            break
+        }
+        let file = Vec_HirFile.at(hir_files, fi)
+        insert_bridge_map_entries(mutable map, file.items, interner, allocator)?
+        fi = fi + 1
+    }
+}
+
+
+function insert_bridge_map_entries(
+    map: mutable IntMap_u32.IntMap,
+    items: Vec_HItem.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_HItem.len(items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .function_extern(_, let extern_name, _, _) => {
+                let name_bytes = interner_mod.lookup(interner, extern_name)
+                match classify_extern(name_bytes) {
+                    case .some(let kind) => {
+                        let ord: u32 = ordinal(kind)
+                        let _ = IntMap_u32.insert(mutable map, item.def_id.raw as i64, take ord, allocator)?
+                    }
+                    case .none => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+public function build_extern_defs_map(
+    hir_files: Vec_HirFile.Vec,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError}
+{
+    var map = IntMap_u32.new(allocator)?
+    extend_extern_defs_map(mutable map, hir_files, allocator)?
+    return map
+}
+
+
+public function extend_extern_defs_map(
+    map: mutable IntMap_u32.IntMap,
+    hir_files: Vec_HirFile.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nf: usize = Vec_HirFile.len(hir_files)
+    var fi: usize = 0
+    loop
+        decreases (nf - fi)
+    {
+        if fi >= nf {
+            break
+        }
+        let file = Vec_HirFile.at(hir_files, fi)
+        insert_extern_defs_map_entries(mutable map, file.items, allocator)?
+        fi = fi + 1
+    }
+}
+
+
+function insert_extern_defs_map_entries(
+    map: mutable IntMap_u32.IntMap,
+    items: Vec_HItem.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_HItem.len(items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .function_extern(_, _, _, _) => {
+                let marker: u32 = 1 as u32
+                let _ = IntMap_u32.insert(mutable map, item.def_id.raw as i64, take marker, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function recover_box_elem_ty(
+    kind: BridgeKind,
+    def_id: def_mod.DefId,
+    types_out: check_mod.TypeOutput,
+) -> Option_TyId.Option {
+    return match check_mod.signature_of(types_out, def_id) {
+        case .some(let sig) => match kind {
+            case .box_read => Option_TyId.some(value: sig.ret)
+            case .box_unbox => Option_TyId.some(value: sig.ret)
+            case .alloc_ => if Vec_TyId.len(sig.params) > 0 {
+                Option_TyId.some(value: Vec_TyId.at(sig.params, 0))
+            } else {
+                Option_TyId.none
+            }
+            case _ => Option_TyId.none
+        }
+        case .none => Option_TyId.none
+    }
+}
+
+
+function box_elem_ty_of_file(
+    items: Vec_HItem.Vec,
+    types_out: check_mod.TypeOutput,
+    interner: interner_mod.Interner,
+) -> Option_TyId.Option
+    with {divergence}
+{
+    let n: usize = Vec_HItem.len(items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .function_extern(_, let extern_name, _, _) => {
+                let name_bytes = interner_mod.lookup(interner, extern_name)
+                match classify_extern(name_bytes) {
+                    case .some(let kind) => {
+                        match recover_box_elem_ty(kind, item.def_id, types_out) {
+                            case .some(let t) => return Option_TyId.some(value: t)
+                            case .none => ()
+                        }
+                    }
+                    case .none => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return Option_TyId.none
+}
+
+
+public function build_box_elem_ty_map(
+    hir_files: Vec_HirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var map = IntMap_u32.new(allocator)?
+    extend_box_elem_ty_map(mutable map, hir_files, type_outputs, interner, allocator)?
+    return map
+}
+
+
+public function extend_box_elem_ty_map(
+    map: mutable IntMap_u32.IntMap,
+    hir_files: Vec_HirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nf: usize = Vec_HirFile.len(hir_files)
+    var fi: usize = 0
+    loop
+        decreases (nf - fi)
+    {
+        if fi >= nf {
+            break
+        }
+        let file = Vec_HirFile.at(hir_files, fi)
+        let types_out = Vec_TypeOutput.at(type_outputs, fi)
+        insert_box_elem_ty_map_entries(mutable map, file.items, types_out, interner, allocator)?
+        fi = fi + 1
+    }
+}
+
+
+function insert_box_elem_ty_map_entries(
+    map: mutable IntMap_u32.IntMap,
+    items: Vec_HItem.Vec,
+    types_out: check_mod.TypeOutput,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match box_elem_ty_of_file(items, types_out, interner) {
+        case .some(let t) => {
+            let n: usize = Vec_HItem.len(items)
+            var i: usize = 0
+            loop
+                decreases (n - i)
+            {
+                if i >= n {
+                    break
+                }
+                let item = Vec_HItem.at(items, i)
+                match item.kind {
+                    case .function_extern(_, let extern_name, _, _) => {
+                        let name_bytes = interner_mod.lookup(interner, extern_name)
+                        match classify_extern(name_bytes) {
+                            case .some(let kind) => match kind {
+                                case .alloc_ | .box_read | .box_unbox | .free_ => {
+                                    let elem_raw: u32 = t.raw
+                                    let _ = IntMap_u32.insert(mutable map, item.def_id.raw as i64, take elem_raw, allocator)?
+                                }
+                                case _ => ()
+                            }
+                            case .none => ()
+                        }
+                    }
+                    case _ => ()
+                }
+                i = i + 1
+            }
+        }
+        case .none => ()
+    }
+}

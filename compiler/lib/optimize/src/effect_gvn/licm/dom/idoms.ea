@@ -1,0 +1,345 @@
+
+module optimize.effect_gvn.licm.dom.idoms
+
+import std.mem.alloc
+import std.collections.vec
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.licm.rel.preds.preds as preds_mod
+import local.effect_gvn.licm.rel.succ.succ as succ_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(preds_mod.BlockPreds)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+
+
+public function compute_idom(
+    body: hlir_body_mod.HlirBody,
+    preds_by_block: Vec_BlockPreds.Vec,
+    n: usize,
+    allocator: Allocator,
+) -> Vec_u32.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit idom: Vec_u32.Vec
+    new_filled(init idom, n, 0 as u32, allocator)?
+    if n <= 1 { return idom }
+    Vec_u32.set_at(mutable idom, 1, 1 as u32)
+
+    uninit pool: Vec_u32.Vec
+    uninit pool_start: Vec_u32.Vec
+    build_succ_pool(init pool, init pool_start, body, n, allocator)?
+
+    uninit rpo_of: Vec_u32.Vec
+    new_filled(init rpo_of, n, 0 as u32, allocator)?
+    uninit order: Vec_u32.Vec
+    build_rpo_order(init order, mutable rpo_of, pool, pool_start, n, allocator)?
+
+    let budget = n + 2
+    var rounds: usize = 0
+    var changed: bool = true
+    loop
+        decreases budget - rounds
+    {
+        if rounds >= budget { break }
+        if !changed { break }
+        changed = idom_round(mutable idom, preds_by_block, rpo_of, order, n)
+        rounds = rounds + 1
+    }
+    return idom
+}
+
+
+function new_filled(
+    out: init Vec_u32.Vec,
+    n: usize,
+    value: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u32.Vec
+    Vec_u32.new(init v, allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_u32.push(mutable v, value, allocator)?
+        i = i + 1
+    }
+    out = v
+}
+
+
+function build_succ_pool(
+    pool: init Vec_u32.Vec,
+    pool_start: init Vec_u32.Vec,
+    body: hlir_body_mod.HlirBody,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit p: Vec_u32.Vec
+    Vec_u32.new(init p, allocator)?
+    uninit starts: Vec_u32.Vec
+    Vec_u32.new(init starts, allocator)?
+    uninit scratch: Vec_u32.Vec
+    Vec_u32.new(init scratch, allocator)?
+    var b: usize = 0
+    loop
+        decreases n - b
+    {
+        if b >= n { break }
+        Vec_u32.push(mutable starts, Vec_u32.len(p) as u32, allocator)?
+        if b >= 1 {
+            let block = Vec_HlirBlock.at(body.blocks, b)
+            Vec_u32.clear(mutable scratch)
+            succ_mod.collect_successors(mutable scratch, block.terminator, n, allocator)?
+            let m = Vec_u32.len(scratch)
+            var i: usize = 0
+            loop
+                decreases m - i
+            {
+                if i >= m { break }
+                Vec_u32.push(mutable p, Vec_u32.at(scratch, i), allocator)?
+                i = i + 1
+            }
+        }
+        b = b + 1
+    }
+    Vec_u32.push(mutable starts, Vec_u32.len(p) as u32, allocator)?
+    pool = p
+    pool_start = starts
+}
+
+
+function build_rpo_order(
+    order_out: init Vec_u32.Vec,
+    rpo_of: mutable Vec_u32.Vec,
+    pool: Vec_u32.Vec,
+    pool_start: Vec_u32.Vec,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit po: Vec_u32.Vec
+    Vec_u32.new(init po, allocator)?
+    uninit visited: Vec_u32.Vec
+    new_filled(init visited, n, 0 as u32, allocator)?
+    uninit stack: Vec_u32.Vec
+    Vec_u32.new(init stack, allocator)?
+    let phase_bit = 2147483648 as u32
+    let id_mask = 2147483647 as u32
+    Vec_u32.push(mutable stack, 1 as u32, allocator)?
+    let budget = n + n + Vec_u32.len(pool) + 4
+    var iter: usize = 0
+    loop
+        decreases budget - iter
+    {
+        if iter >= budget { break }
+        match Vec_u32.pop(mutable stack) {
+            case .none => break
+            case .some(let raw) => {
+                if (raw & phase_bit) != (0 as u32) {
+                    Vec_u32.push(mutable po, raw & id_mask, allocator)?
+                } else {
+                    if (raw as usize) < n {
+                        if Vec_u32.at(visited, raw as usize) == (0 as u32) {
+                            Vec_u32.set_at(mutable visited, raw as usize, 1 as u32)
+                            Vec_u32.push(mutable stack, raw | phase_bit, allocator)?
+                            push_unvisited_succs(mutable stack, visited, pool, pool_start, raw, n, allocator)?
+                        }
+                    }
+                }
+            }
+        }
+        iter = iter + 1
+    }
+
+    let m = Vec_u32.len(po)
+    uninit order: Vec_u32.Vec
+    Vec_u32.new(init order, allocator)?
+    var k: usize = 0
+    loop
+        decreases m - k
+    {
+        if k >= m { break }
+        let b = Vec_u32.at(po, m - 1 - k)
+        Vec_u32.push(mutable order, b, allocator)?
+        if (b as usize) < n {
+            Vec_u32.set_at(mutable rpo_of, b as usize, (k + 1) as u32)
+        }
+        k = k + 1
+    }
+    order_out = order
+}
+
+
+function push_unvisited_succs(
+    stack: mutable Vec_u32.Vec,
+    visited: Vec_u32.Vec,
+    pool: Vec_u32.Vec,
+    pool_start: Vec_u32.Vec,
+    b: u32,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let e0 = Vec_u32.at(pool_start, b as usize) as usize
+    let e1 = Vec_u32.at(pool_start, (b as usize) + 1) as usize
+    if e1 < e0 { return () }
+    var e = e0
+    loop
+        decreases e1 - e
+    {
+        if e >= e1 { break }
+        let s = Vec_u32.at(pool, e)
+        if s != (0 as u32) {
+            if (s as usize) < n {
+                if Vec_u32.at(visited, s as usize) == (0 as u32) {
+                    Vec_u32.push(mutable stack, s, allocator)?
+                }
+            }
+        }
+        e = e + 1
+    }
+}
+
+
+function idom_round(
+    idom: mutable Vec_u32.Vec,
+    preds_by_block: Vec_BlockPreds.Vec,
+    rpo_of: Vec_u32.Vec,
+    order: Vec_u32.Vec,
+    n: usize,
+) -> bool
+    with {panic}
+{
+    var changed: bool = false
+    let m = Vec_u32.len(order)
+    var k: usize = 0
+    loop
+        decreases m - k
+    {
+        if k >= m { break }
+        let b = Vec_u32.at(order, k)
+        if b != (1 as u32) {
+            if (b as usize) < n {
+                let new_idom = recompute_idom(idom, preds_by_block, rpo_of, b)
+                if new_idom != (0 as u32) {
+                    let prev = Vec_u32.at(idom, b as usize)
+                    if prev != new_idom {
+                        Vec_u32.set_at(mutable idom, b as usize, new_idom)
+                        changed = true
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    return changed
+}
+
+
+function recompute_idom(
+    idom: Vec_u32.Vec,
+    preds_by_block: Vec_BlockPreds.Vec,
+    rpo_of: Vec_u32.Vec,
+    b: u32,
+) -> u32
+    with {panic}
+{
+    let entry = Vec_BlockPreds.at(preds_by_block, b as usize)
+    let m = Vec_u32.len(entry.preds)
+    var new_idom: u32 = 0
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        let p = Vec_u32.at(entry.preds, i)
+        if Vec_u32.at(idom, p as usize) != 0 || p == 1 {
+            if new_idom == 0 {
+                new_idom = p
+            } else {
+                new_idom = intersect_rpo(idom, rpo_of, new_idom, p)
+            }
+        }
+        i = i + 1
+    }
+    return new_idom
+}
+
+
+function intersect_rpo(
+    idom: Vec_u32.Vec,
+    rpo_of: Vec_u32.Vec,
+    a: u32,
+    b: u32,
+) -> u32
+    with {panic}
+{
+    if a == 0 { return b }
+    if b == 0 { return a }
+    let budget = Vec_u32.len(idom) + Vec_u32.len(idom) + 4
+    var x = a
+    var y = b
+    var steps: usize = 0
+    loop
+        decreases budget - steps
+    {
+        if steps >= budget { break }
+        if x == y { return x }
+        if (x as usize) >= Vec_u32.len(rpo_of) { break }
+        if (y as usize) >= Vec_u32.len(rpo_of) { break }
+        let rx = Vec_u32.at(rpo_of, x as usize)
+        let ry = Vec_u32.at(rpo_of, y as usize)
+        if rx == 0 { break }
+        if ry == 0 { break }
+        if rx > ry {
+            let px = Vec_u32.at(idom, x as usize)
+            if px == 0 { break }
+            if px == x { break }
+            x = px
+        } else {
+            let py = Vec_u32.at(idom, y as usize)
+            if py == 0 { break }
+            if py == y { break }
+            y = py
+        }
+        steps = steps + 1
+    }
+    return 1 as u32
+}
+
+
+public function idom_dominates(idom: Vec_u32.Vec, n_blocks: usize, a: u32, b: u32, b_reachable: bool) -> bool
+    with {panic}
+{
+    if a == 0 { return false }
+    if b == 0 { return false }
+    if (a as usize) >= n_blocks { return false }
+    if (b as usize) >= n_blocks { return false }
+    if a == b { return true }
+    if !b_reachable { return false }
+    if a == 1 { return true }
+    var cur = b
+    let budget = n_blocks + 1
+    var steps: usize = 0
+    loop
+        decreases budget - steps
+    {
+        if steps >= budget { break }
+        let parent = Vec_u32.at(idom, cur as usize)
+        if parent == 0 { return false }
+        if parent == a { return true }
+        if parent == cur { return false }
+        cur = parent
+        steps = steps + 1
+    }
+    return false
+}

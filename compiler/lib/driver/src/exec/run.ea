@@ -1,0 +1,322 @@
+
+module driver.exec.run
+
+import std.collections.vec
+import std.core.fmt as fmt_mod
+import std.core.option
+import std.io.stream
+import std.mem.alloc
+import std.os.fs
+import std.os.process.child as child
+import std.os.process.spawn as spawn
+import std.os.process.spawn.error as spawn_error
+import std.os.process.wait as wait
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import source.map as source_map_mod
+import intern.interner as interner_mod
+import manifest.manifest as manifest_mod
+import manifest.model.workspace.workspace as ws_mod
+import compile.check.check as check_mod
+import compile.output.path as build_path_mod
+import compile.member.detect as detect_mod
+import compile.member.build as member_build_mod
+import compile.setup.env.closure as closure_mod
+import compile.setup.env.membership as membership_mod
+import compile.setup.env.load.load as load_mod
+import local.banner.banner as banner_mod
+import local.cli as cli_mod
+import local.exit as exit_mod
+
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ws_mod.Workspace)
+spec std.collections.vec.Vec(String)
+
+
+public function build_and_run(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    out: Stdout,
+    verb: String,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, subprocess, out, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return 0
+    }
+    let primary_member = membership_mod.primary_member_of(rfs, workspace_root, manifest, allocator)?
+    let name = banner_mod.resolve_name(rfs, workspace_root, primary_member, mutable map, mutable diags, allocator)?
+    banner_mod.print_start(out, verb, name, allocator)?
+    let started = banner_mod.begin(clock)
+    let summary = check_mod.build_workspace_with_target(rfs, wfs, subprocess, workspace_root, parsed.target, parsed.stdlib_path, parsed.dump, clock, errout, parsed.trace, mutable map, mutable interner, mutable diags, allocator)?
+    banner_mod.print_summary(out, verb, summary.modules, summary.artifacts_cached, summary.artifacts_generated, started, clock, allocator)?
+    if exit_mod.exit_code_of(diags) != 0 {
+        return 0
+    }
+    let program_name = closure_mod.program_name_of(primary_member, manifest)
+    let exe_opt = build_path_mod.build_output_exe_path(rfs, workspace_root, parsed.target, program_name, mutable map, mutable diags, allocator)?
+    let exe = match exe_opt {
+        case .some(let p) => p
+        case .none => {
+            emit_run_diag(mutable diags, "could not resolve build output executable", allocator)?
+            return 0
+        }
+    }
+    return handle err: spawn_error.SpawnError as se -> spawn_failed_code(mutable diags, se, allocator)? {
+        handle err: wait.WaitError as we -> wait_failed_code(mutable diags, we, allocator)? {
+            run_to_exit(subprocess, take exe, allocator)?
+        }
+    }
+}
+
+
+public function run_tests(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    out: Stdout,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, subprocess, out, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return 0
+    }
+    return match load_mod.workspace_of(manifest) {
+        case .some(let ws) => run_test_members(parsed, rfs, wfs, subprocess, out, clock, errout, workspace_root, ws, mutable map, mutable interner, mutable diags, allocator)?
+        case .none => build_and_run(parsed, rfs, wfs, subprocess, out, "test", clock, errout, workspace_root, mutable map, mutable interner, mutable diags, allocator)?
+    }
+}
+
+
+function run_test_members(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    out: Stdout,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    ws: ws_mod.Workspace,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, subprocess, out, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let files = detect_mod.parse_workspace_files(rfs, workspace_root, mutable map, mutable interner, mutable diags, allocator)?
+    let root_segment = ws_mod.discover_root_of(ws)
+    let n = ws_mod.member_count(ws)
+    var worst: i32 = 0
+    var passed: usize = 0
+    var failed: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member = ws_mod.member_at(ws, i)
+        let prefix = member_src_prefix_of(workspace_root, root_segment, member, allocator)?
+        if detect_mod.any_i32_main_under_prefix(files, prefix, map, interner) {
+            let code = run_one_test_member(parsed, rfs, wfs, subprocess, out, clock, errout, workspace_root, member, prefix, mutable map, mutable interner, mutable diags, allocator)?
+            if code == 0 {
+                passed += 1
+            } else {
+                failed += 1
+                if worst == 0 { worst = code }
+            }
+        }
+        i += 1
+    }
+    print_test_summary(out, passed, failed, allocator)?
+    return worst
+}
+
+
+function run_one_test_member(
+    parsed: cli_mod.ParsedArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    subprocess: Subprocess,
+    out: Stdout,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    member: String,
+    prefix: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {rfs, wfs, subprocess, out, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let pre_errors = diags_mod.error_count(diags)
+    let name = banner_mod.resolve_name(rfs, workspace_root, Option_String.some(value: member), mutable map, mutable diags, allocator)?
+    banner_mod.print_start(out, "test", name, allocator)?
+    let started = banner_mod.begin(clock)
+    let summary = member_build_mod.build_member_with_target(rfs, wfs, subprocess, workspace_root, prefix, member, member, parsed.target, parsed.stdlib_path, parsed.dump, clock, errout, parsed.trace, mutable map, mutable interner, mutable diags, allocator)?
+    banner_mod.print_summary(out, "test", summary.modules, summary.artifacts_cached, summary.artifacts_generated, started, clock, allocator)?
+    if diags_mod.error_count(diags) != pre_errors {
+        print_member_result(out, member, "build failed", allocator)?
+        return 1
+    }
+    let exe_opt = build_path_mod.build_output_exe_path(rfs, workspace_root, parsed.target, member, mutable map, mutable diags, allocator)?
+    let exe = match exe_opt {
+        case .some(let p) => p
+        case .none => {
+            print_member_result(out, member, "no executable produced", allocator)?
+            return 1
+        }
+    }
+    let code = handle err: spawn_error.SpawnError as se -> spawn_failed_code(mutable diags, se, allocator)? {
+        handle err: wait.WaitError as we -> wait_failed_code(mutable diags, we, allocator)? {
+            run_to_exit(subprocess, take exe, allocator)?
+        }
+    }
+    print_member_run_result(out, member, code, allocator)?
+    return code
+}
+
+
+function run_to_exit(
+    subprocess: Subprocess,
+    exe: take String,
+    allocator: Allocator,
+) -> i32
+    with {subprocess, allocator, err: spawn_error.SpawnError, err: wait.WaitError, err: alloc.AllocError}
+{
+    uninit argv: Vec_String.Vec
+    Vec_String.new(init argv, allocator)?
+    let args = Vec_String.into_array(take argv, allocator)?
+    let child_spec = child.of(take exe, take args)
+    let h = spawn.spawn(subprocess, take child_spec, allocator)?
+    let outcome = wait.wait(take h)?
+    return match outcome {
+        case .exited(let code) => code
+        case .signaled(let _sig) => 1
+        case .wait_failed(let _e) => 1
+    }
+}
+
+
+function spawn_failed_code(
+    diags: mutable diags_mod.Diagnostics,
+    e: spawn_error.SpawnError,
+    allocator: Allocator,
+) -> i32
+    with {allocator, err: alloc.AllocError}
+{
+    let detail = match e {
+        case .executable_not_found(let _p) => "executable not found"
+        case .not_in_allowlist(let _x) => "executable not in allowlist"
+        case .cwd_outside_scope(let _c) => "working directory outside scope"
+        case .spawn_failed(let _r) => "spawn failed"
+    }
+    let msg = string.concat("could not run target: ", detail, allocator)?
+    emit_run_diag(mutable diags, msg, allocator)?
+    return 1
+}
+
+
+function wait_failed_code(
+    diags: mutable diags_mod.Diagnostics,
+    e: wait.WaitError,
+    allocator: Allocator,
+) -> i32
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = e
+    emit_run_diag(mutable diags, "could not wait on target process", allocator)?
+    return 1
+}
+
+
+function emit_run_diag(
+    diags: mutable diags_mod.Diagnostics,
+    message: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.cli_error(), span_mod.dummy(), message)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function member_src_prefix_of(workspace_root: String, root_segment: String, member: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let part0 = string.concat(workspace_root, "/", allocator)?
+    let part1 = string.concat(part0, root_segment, allocator)?
+    let part1b = string.concat(part1, "/", allocator)?
+    let part2 = string.concat(part1b, member, allocator)?
+    return string.concat(part2, "/src", allocator)?
+}
+
+
+function print_member_run_result(out: Stdout, member: String, code: i32, allocator: Allocator) -> ()
+    with {out, allocator, err: alloc.AllocError}
+{
+    if code == 0 {
+        print_member_result(out, member, "ok", allocator)?
+    } else {
+        let cs = fmt_mod.i64_to_string(code as i64, allocator)?
+        let opened = string.concat("FAILED (exit ", cs, allocator)?
+        let closed = string.concat(opened, ")", allocator)?
+        print_member_result(out, member, closed, allocator)?
+    }
+}
+
+
+function print_member_result(out: Stdout, member: String, status: String, allocator: Allocator) -> ()
+    with {out, allocator, err: alloc.AllocError}
+{
+    let part1 = string.concat("test member ", member, allocator)?
+    let part2 = string.concat(part1, " ... ", allocator)?
+    let line = string.concat(part2, status, allocator)?
+    stream.print_line(out, line)
+}
+
+
+function print_test_summary(out: Stdout, passed: usize, failed: usize, allocator: Allocator) -> ()
+    with {out, allocator, err: alloc.AllocError}
+{
+    let total = passed + failed
+    if total == 0 as usize {
+        stream.print_line(out, "no test targets found")
+    } else {
+        let ps = fmt_mod.usize_to_string(passed, allocator)?
+        let fcount = fmt_mod.usize_to_string(failed, allocator)?
+        let part1 = string.concat("test summary: ", ps, allocator)?
+        let part2 = string.concat(part1, " passed, ", allocator)?
+        let part3 = string.concat(part2, fcount, allocator)?
+        let line = string.concat(part3, " failed", allocator)?
+        stream.print_line(out, line)
+    }
+}

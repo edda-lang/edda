@@ -1,0 +1,156 @@
+
+module types.effect.row
+
+import std.mem.alloc
+import std.collections.vec
+import types.pass.ty as ty_mod
+
+
+spec std.collections.vec.Vec(CEntry)
+
+
+derive eq, hash, clone, debug for CRow
+derive eq, hash, clone, debug for CEntry
+derive eq, hash, clone, debug for EffectFacts
+
+
+public type CRow {
+    entries: Vec_CEntry.Vec
+}
+
+
+public type EffectFacts {
+    pure_: bool
+    no_alloc: bool
+    no_io: bool
+    nounwind: bool
+    has_alloc_bound: bool
+    alloc_bytes_max: u128
+    raises: bool
+    err_ty: ty_mod.TyId
+}
+
+
+public type CEntry {
+    case capability(local: u32)
+    case err_(ty_mod.TyId)
+    case panic_
+    case yield_(ty_mod.TyId)
+    case cancellation_
+    case divergence_
+    case nondet_
+    case alloc_(bytes_max: u128)
+    case io_(calls_max: u128)
+    case time_(ops_max: u128)
+}
+
+
+public function empty_row(allocator: Allocator) -> CRow
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_CEntry.Vec
+    Vec_CEntry.new(init entries, allocator)?
+    return CRow { entries: entries }
+}
+
+
+public function pure_facts() -> EffectFacts {
+    return EffectFacts {
+        pure_: true,
+        no_alloc: true,
+        no_io: true,
+        nounwind: true,
+        has_alloc_bound: false,
+        alloc_bytes_max: 0 as u128,
+        raises: false,
+        err_ty: ty_mod.error(),
+    }
+}
+
+
+public function mark_impure(facts: EffectFacts) -> EffectFacts {
+    return EffectFacts {
+        pure_: false,
+        no_alloc: facts.no_alloc,
+        no_io: facts.no_io,
+        nounwind: facts.nounwind,
+        has_alloc_bound: facts.has_alloc_bound,
+        alloc_bytes_max: facts.alloc_bytes_max,
+        raises: facts.raises,
+        err_ty: facts.err_ty,
+    }
+}
+
+
+public function summarize(row: CRow) -> EffectFacts {
+    var no_alloc: bool = true
+    var no_io: bool = true
+    var nounwind: bool = true
+    var impure: bool = false
+    var raises: bool = false
+    var err_ty: ty_mod.TyId = ty_mod.error()
+    var has_bound: bool = false
+    var bound: u128 = 0 as u128
+    let n = Vec_CEntry.len(row.entries)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = Vec_CEntry.at(row.entries, i)
+        match e {
+            case .capability(_) => {
+                no_io = false
+                impure = true
+            }
+            case .err_(let t) => {
+                nounwind = false
+                impure = true
+                if !raises {
+                    err_ty = t
+                }
+                raises = true
+            }
+            case .panic_ => {
+                nounwind = false
+                impure = true
+            }
+            case .yield_(_) => {
+                impure = true
+            }
+            case .cancellation_ => {
+                nounwind = false
+                impure = true
+            }
+            case .divergence_ => {
+                nounwind = false
+                impure = true
+            }
+            case .nondet_ => {
+                impure = true
+            }
+            case .alloc_(let bytes_max) => {
+                no_alloc = false
+                impure = true
+                has_bound = true
+                bound = bytes_max
+            }
+            case .io_(_) => {
+                no_io = false
+                impure = true
+            }
+            case .time_(_) => {
+                impure = true
+            }
+        }
+        i = i + 1
+    }
+    return EffectFacts {
+        pure_: !impure,
+        no_alloc: no_alloc,
+        no_io: no_io,
+        nounwind: nounwind,
+        has_alloc_bound: has_bound,
+        alloc_bytes_max: bound,
+        raises: raises,
+        err_ty: err_ty,
+    }
+}

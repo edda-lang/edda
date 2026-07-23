@@ -1,0 +1,241 @@
+
+module optimize.effect_gvn.pass.promote
+
+import std.mem.alloc
+import std.collections.vec
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.op as op_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import types.pass.ty as ty_mod
+import hir.node as node_mod
+import local.effect_gvn.stack.promote.promote as alloc_mod
+
+
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(op_mod.OpId)
+spec std.collections.vec.Vec(alloc_mod.AllocPromotion)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+
+
+public function apply_promotions(
+    body: mutable hlir_body_mod.HlirBody,
+    plan: alloc_mod.AllocPromotePlan,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_AllocPromotion.len(plan.promotions)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let promo = Vec_AllocPromotion.at(plan.promotions, i)
+        promote_op(mutable body, promo.op, promo.bytes, allocator)?
+        i = i + 1
+    }
+}
+
+
+function promote_op(
+    body: mutable hlir_body_mod.HlirBody,
+    op_id: op_mod.OpId,
+    bytes: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if op_id.raw == 0 { return () }
+    let idx = op_id.raw as usize
+    if idx >= Vec_HlirOp.len(body.ops) { return () }
+    let op = Vec_HlirOp.at(body.ops, idx)
+    match op.kind {
+        case .call_(let callee, let args) =>
+            materialize_promotion(
+                mutable body, op_id, idx, op.origin, op.flags, op.result_,
+                callee, args, bytes, allocator,
+            )?
+        case _ => return ()
+    }
+}
+
+
+function materialize_promotion(
+    body: mutable hlir_body_mod.HlirBody,
+    op_id: op_mod.OpId,
+    idx: usize,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    result_v: value_mod.ValueId,
+    callee: value_mod.ValueId,
+    args: Vec_ValueId.Vec,
+    bytes: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if Vec_ValueId.len(args) < 2 { return () }
+    if value_mod.is_error(result_v) { return () }
+    if Vec_HlirOp.len(body.ops) >= 4294967295 { return () }
+    if Vec_HlirValue.len(body.values) >= 4294967295 { return () }
+    let count = Vec_ValueId.at(args, 1)
+    let new_op_id = op_mod.OpId { raw: Vec_HlirOp.len(body.ops) as u32 }
+    let addr_id = value_mod.ValueId { raw: Vec_HlirValue.len(body.values) as u32 }
+    let addr_ty = value_ty_of(count, body)
+    let salloc = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: hlir_op_mod.HlirOpKind.stack_alloc(bytes: bytes),
+        result_: addr_id,
+        flags: bare_flags(),
+    }
+    let _ = hlir_body_mod.push_op(mutable body, take salloc, allocator)?
+    let addr_value = hlir_body_mod.HlirValue {
+        ty: addr_ty,
+        def: hlir_body_mod.HlirValueDef.op_result(op: new_op_id),
+    }
+    let _ = hlir_body_mod.push_value(mutable body, take addr_value, allocator)?
+    let new_kind = slice_from_raw_call(callee, addr_id, count, allocator)?
+    let rewritten = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: new_kind,
+        result_: result_v,
+        flags: slice_from_raw_flags(flags),
+    }
+    Vec_HlirOp.set_at(mutable body.ops, idx, take rewritten)
+    insert_op_before(mutable body, op_id, new_op_id, allocator)?
+}
+
+
+function slice_from_raw_call(
+    callee: value_mod.ValueId,
+    addr: value_mod.ValueId,
+    count: value_mod.ValueId,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit args: Vec_ValueId.Vec
+    Vec_ValueId.new(init args, allocator)?
+    Vec_ValueId.push(mutable args, take addr, allocator)?
+    Vec_ValueId.push(mutable args, take count, allocator)?
+    return hlir_op_mod.HlirOpKind.call_(callee: callee, args: args)
+}
+
+
+function value_ty_of(
+    v: value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+) -> ty_mod.TyId
+    with {panic}
+{
+    if v.raw == 0 { return ty_mod.error() }
+    if (v.raw as usize) >= Vec_HlirValue.len(body.values) { return ty_mod.error() }
+    return Vec_HlirValue.at(body.values, v.raw as usize).ty
+}
+
+
+function bare_flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+
+function slice_from_raw_flags(base: hlir_op_mod.OpFlags) -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: base.overflow_safe,
+        in_bounds: base.in_bounds,
+        nonzero_divisor: base.nonzero_divisor,
+        range_safe: base.range_safe,
+        intrinsic: hlir_op_mod.Intrinsic.slice_from_raw,
+        div_overflow: base.div_overflow,
+        div_overflow_safe: base.div_overflow_safe,
+        extern_call: base.extern_call,
+        extern_ret_size: base.extern_ret_size,
+    }
+}
+
+
+function insert_op_before(
+    body: mutable hlir_body_mod.HlirBody,
+    target: op_mod.OpId,
+    new_op: op_mod.OpId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let nb = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 0
+    loop
+        decreases nb - b
+    {
+        if b >= nb { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        if block_contains_op(block.ops, target) {
+            let new_ops = splice_before(block.ops, target, new_op, allocator)?
+            let new_block = hlir_body_mod.HlirBlock {
+                node_id_origin: block.node_id_origin,
+                params: block.params,
+                ops: new_ops,
+                terminator: block.terminator,
+                coherence_region: block.coherence_region,
+            }
+            Vec_HlirBlock.set_at(mutable body.blocks, b, take new_block)
+            return ()
+        }
+        b = b + 1
+    }
+}
+
+
+function block_contains_op(ops: Vec_OpId.Vec, target: op_mod.OpId) -> bool {
+    let n = Vec_OpId.len(ops)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if Vec_OpId.at(ops, i).raw == target.raw { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function splice_before(
+    ops: Vec_OpId.Vec,
+    target: op_mod.OpId,
+    new_op: op_mod.OpId,
+    allocator: Allocator,
+) -> Vec_OpId.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit out: Vec_OpId.Vec
+    Vec_OpId.new(init out, allocator)?
+    let n = Vec_OpId.len(ops)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let cur = Vec_OpId.at(ops, i)
+        if cur.raw == target.raw {
+            let inserted = new_op
+            Vec_OpId.push(mutable out, take inserted, allocator)?
+        }
+        Vec_OpId.push(mutable out, take cur, allocator)?
+        i = i + 1
+    }
+    return out
+}

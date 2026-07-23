@@ -1,0 +1,223 @@
+
+module resolve.lints.dead
+
+import std.collections.vec
+import std.collections.hashmap
+import std.collections.slice
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import hir.def as def_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.attr as attr_mod
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import manifest.lex.toml.val.values as values_mod
+import local.ctx as ctx_mod
+import local.paths.modules as mt_mod
+import local.bind.lookup.lookup as lookup_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+spec std.collections.hashmap.IntMap(bool)
+spec std.core.option.Option(Vec_DefId)
+spec std.mem.alloc.Box(ast_item.FnDecl)
+
+
+public function check_dead_private_functions(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var reachable = IntMap_bool.new(allocator)?
+    uninit worklist: Vec_DefId.Vec
+    Vec_DefId.new(init worklist, allocator)?
+    seed_roots(ctx, files, interner, mutable reachable, mutable worklist, allocator)?
+    propagate(ctx, mutable reachable, mutable worklist, allocator)?
+    flag_unreachable(mutable ctx, files, interner, reachable, allocator)?
+}
+
+
+function seed_roots(ctx: ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, reachable: mutable IntMap_bool.IntMap, worklist: mutable Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_File.at(files, i)
+        let mp = lookup_mod.module_path_of(file.items, allocator)?
+        let mod_id = ctx_mod.module_id_of(ctx, mp)
+        if mod_id.raw != 0 {
+            seed_public_in_file(ctx, mod_id, file, interner, mutable reachable, mutable worklist, allocator)?
+        }
+        i = i + 1
+    }
+    let roots = ctx_mod.extra_roots_of(ctx)
+    let rn = Vec_DefId.len(roots)
+    var j: usize = 0
+    loop decreases (rn - j) {
+        if j >= rn { break }
+        enqueue(Vec_DefId.at(roots, j), mutable reachable, mutable worklist, allocator)?
+        j = j + 1
+    }
+}
+
+
+function seed_public_in_file(ctx: ctx_mod.ResolveCtx, mod_id: mt_mod.ModuleId, file: ast_file.File, interner: interner_mod.Interner, reachable: mutable IntMap_bool.IntMap, worklist: mutable Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .function_(let decl_box) => {
+                let decl = Box_FnDecl.get(decl_box)
+                if is_root_function(decl, item.attributes, interner) {
+                    enqueue(ctx_mod.lookup_in_module(ctx, mod_id, decl.name.name), mutable reachable, mutable worklist, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function is_root_function(decl: ast_item.FnDecl, attrs: Vec_Attribute.Vec, interner: interner_mod.Interner) -> bool {
+    let is_public = match decl.visibility {
+        case .public_ => true
+        case .module_ => false
+    }
+    return is_public || is_property(attrs, interner)
+}
+
+
+function is_property(attrs: Vec_Attribute.Vec, interner: interner_mod.Interner) -> bool {
+    let n = Vec_Attribute.len(attrs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        let a = Vec_Attribute.at(attrs, i)
+        if slice.eq_u8(interner_mod.lookup(interner, a.name.name), "property".bytes()) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function propagate(ctx: ctx_mod.ResolveCtx, reachable: mutable IntMap_bool.IntMap, worklist: mutable Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var head: usize = 0
+    var fuel: usize = ctx_mod.def_id_bound(ctx) + 1
+    loop decreases fuel {
+        if fuel == 0 as usize { break }
+        if head >= Vec_DefId.len(worklist) { break }
+        fuel = fuel - 1
+        let def = Vec_DefId.at(worklist, head)
+        head = head + 1
+        match ctx_mod.callees_of(ctx, def) {
+            case .some(let callees) => enqueue_all(callees, mutable reachable, mutable worklist, allocator)?
+            case .none => ()
+        }
+    }
+}
+
+
+function enqueue_all(callees: Vec_DefId.Vec, reachable: mutable IntMap_bool.IntMap, worklist: mutable Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_DefId.len(callees)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        enqueue(Vec_DefId.at(callees, i), mutable reachable, mutable worklist, allocator)?
+        i = i + 1
+    }
+}
+
+
+function enqueue(def: def_mod.DefId, reachable: mutable IntMap_bool.IntMap, worklist: mutable Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if def.raw == 0 {
+        return
+    }
+    if is_reachable(reachable, def) {
+        return
+    }
+    let _ = IntMap_bool.insert(mutable reachable, def.raw as i64, true, allocator)?
+    Vec_DefId.push(mutable worklist, def, allocator)?
+}
+
+
+function is_reachable(reachable: IntMap_bool.IntMap, def: def_mod.DefId) -> bool {
+    return match IntMap_bool.get(reachable, def.raw as i64) {
+        case .some(let v) => v
+        case .none => false
+    }
+}
+
+
+function flag_unreachable(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, reachable: IntMap_bool.IntMap, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        flag_file(mutable ctx, interner, Vec_File.at(files, i), reachable, allocator)?
+        i = i + 1
+    }
+}
+
+
+function flag_file(ctx: mutable ctx_mod.ResolveCtx, interner: interner_mod.Interner, file: ast_file.File, reachable: IntMap_bool.IntMap, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let mp = lookup_mod.module_path_of(file.items, allocator)?
+    let mod_id = ctx_mod.module_id_of(ctx, mp)
+    if mod_id.raw == 0 {
+        return
+    }
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .function_(let decl_box) => flag_function(mutable ctx, interner, mod_id, Box_FnDecl.get(decl_box), reachable, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function flag_function(ctx: mutable ctx_mod.ResolveCtx, interner: interner_mod.Interner, mod_id: mt_mod.ModuleId, decl: ast_item.FnDecl, reachable: IntMap_bool.IntMap, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match decl.visibility {
+        case .module_ => ()
+        case .public_ => return
+    }
+    let def = ctx_mod.lookup_in_module(ctx, mod_id, decl.name.name)
+    if def.raw == 0 {
+        return
+    }
+    if !is_reachable(reachable, def) {
+        let bytes = interner_mod.lookup(interner, decl.name.name)
+        let name_str = values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+        let msg = f"function `{name_str}` is never used"
+        let d = diag_mod.warn_at(diag_code_mod.dead_private_function(), decl.name.span, msg)
+        ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+    }
+}

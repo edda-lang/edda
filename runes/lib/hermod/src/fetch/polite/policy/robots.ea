@@ -1,0 +1,331 @@
+
+module hermod.fetch.polite.policy.robots
+
+import std.mem.alloc
+import std.os.time
+import local.fetch.polite.num as num_mod
+
+public type RobotsRules {
+    disallows: [[u8]]
+    allows: [[u8]]
+    crawl_delay: time.Duration
+    has_crawl_delay: bool
+}
+
+type LineSpan {
+    lo: usize
+    hi: usize
+    next: usize
+}
+
+type Field {
+    kind: u8
+    value: [u8]
+}
+
+type RangeSel {
+    found: bool
+    lo: usize
+    hi: usize
+}
+
+type Counts {
+    n_disallow: usize
+    n_allow: usize
+}
+
+function _alloc_bytes_slots(allocator: Allocator, n: usize) -> [[u8]]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 {
+        return b + 32 as u8
+    }
+    return b
+}
+
+function _is_space(b: u8) -> bool {
+    return b == 32 as u8 || b == 9 as u8
+}
+
+function _ci_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    var i: usize = 0 as usize
+    loop decreases a.len() - i {
+        if i >= a.len() { return true }
+        if _lower(a[i]) != _lower(b[i]) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _ci_contains(hay: [u8], needle: [u8]) -> bool {
+    if needle.len() == 0 as usize { return false }
+    if hay.len() < needle.len() { return false }
+    let last = hay.len() - needle.len()
+    var s: usize = 0 as usize
+    loop decreases last - s + 1 as usize {
+        if s > last { break }
+        var k: usize = 0 as usize
+        var ok: bool = true
+        loop decreases needle.len() - k {
+            if k >= needle.len() { break }
+            if _lower(hay[s + k]) != _lower(needle[k]) { ok = false; break }
+            k = k + 1 as usize
+        }
+        if ok { return true }
+        s = s + 1 as usize
+    }
+    return false
+}
+
+function _starts_with(path: [u8], pref: [u8]) -> bool {
+    if pref.len() == 0 as usize { return false }
+    if path.len() < pref.len() { return false }
+    var i: usize = 0 as usize
+    loop decreases pref.len() - i {
+        if i >= pref.len() { return true }
+        if path[i] != pref[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _next_line(data: [u8], from: usize) -> LineSpan {
+    var i: usize = from
+    loop decreases data.len() - i {
+        if i >= data.len() { break }
+        if data[i] == 10 as u8 { break }
+        i = i + 1 as usize
+    }
+    let eol = i
+    let next = if eol < data.len() { eol + 1 as usize } else { eol }
+    var hi = eol
+    if hi > from && data[hi - 1 as usize] == 13 as u8 {
+        hi = hi - 1 as usize
+    }
+    var j = from
+    loop decreases hi - j + 1 as usize {
+        if j >= hi { break }
+        if data[j] == 35 as u8 { hi = j; break }
+        j = j + 1 as usize
+    }
+    return LineSpan { lo: from, hi: hi, next: next }
+}
+
+function _trim(line: [u8]) -> [u8] {
+    var lo: usize = 0 as usize
+    loop decreases line.len() - lo {
+        if lo >= line.len() { break }
+        if !_is_space(line[lo]) { break }
+        lo = lo + 1 as usize
+    }
+    var hi = line.len()
+    loop decreases hi - lo + 1 as usize {
+        if hi <= lo { break }
+        if !_is_space(line[hi - 1 as usize]) { break }
+        hi = hi - 1 as usize
+    }
+    if lo > hi { return _empty_slice() }
+    return line[lo..<hi]
+}
+
+function _empty_slice() -> [u8] {
+    return "".bytes()
+}
+
+function _parse_field(line: [u8]) -> Field {
+    var c: usize = 0 as usize
+    loop decreases line.len() - c {
+        if c >= line.len() { break }
+        if line[c] == 58 as u8 { break }
+        c = c + 1 as usize
+    }
+    if c >= line.len() {
+        return Field { kind: 0 as u8, value: _empty_slice() }
+    }
+    let name = _trim(line[0 as usize..<c])
+    let v_start = c + 1 as usize
+    let value = _trim(line[v_start..<line.len()])
+    var kind: u8 = 0 as u8
+    if _ci_eq(name, "user-agent".bytes()) {
+        kind = 1 as u8
+    } else if _ci_eq(name, "disallow".bytes()) {
+        kind = 2 as u8
+    } else if _ci_eq(name, "allow".bytes()) {
+        kind = 3 as u8
+    } else if _ci_eq(name, "crawl-delay".bytes()) {
+        kind = 4 as u8
+    }
+    return Field { kind: kind, value: value }
+}
+
+function _ua_category(ua: [u8], value: [u8]) -> u8 {
+    if value.len() == 0 as usize { return 0 as u8 }
+    if value.len() == 1 as usize && value[0] == 42 as u8 {
+        return 1 as u8
+    }
+    if _ci_contains(ua, value) { return 2 as u8 }
+    return 0 as u8
+}
+
+function _line_slice(data: [u8], ls: LineSpan) -> [u8] {
+    if ls.lo > ls.hi || ls.hi > data.len() { return _empty_slice() }
+    return data[ls.lo..<ls.hi]
+}
+
+function _sel(found: bool, lo: usize, hi: usize) -> RangeSel {
+    return RangeSel { found: found, lo: lo, hi: hi }
+}
+
+function _select_range(data: [u8], ua: [u8]) -> RangeSel {
+    var specific = _sel(false, 0 as usize, 0 as usize)
+    var star = _sel(false, 0 as usize, 0 as usize)
+    var in_rules: bool = false
+    var grp_cat: u8 = 0 as u8
+    var grp_lo: usize = 0 as usize
+    var off: usize = 0 as usize
+    loop decreases data.len() - off + 1 as usize {
+        if off >= data.len() {
+            if in_rules && grp_cat == 2 as u8 && !specific.found {
+                specific = _sel(true, grp_lo, data.len())
+            } else if in_rules && grp_cat == 1 as u8 && !star.found {
+                star = _sel(true, grp_lo, data.len())
+            }
+            break
+        }
+        let ls = _next_line(data, off)
+        let f = _parse_field(_line_slice(data, ls))
+        if f.kind == 1 as u8 {
+            if in_rules {
+                if grp_cat == 2 as u8 && !specific.found {
+                    specific = _sel(true, grp_lo, ls.lo)
+                } else if grp_cat == 1 as u8 && !star.found {
+                    star = _sel(true, grp_lo, ls.lo)
+                }
+                in_rules = false
+                grp_cat = 0 as u8
+            }
+            let cat = _ua_category(ua, f.value)
+            if cat > grp_cat { grp_cat = cat }
+        } else if f.kind >= 2 as u8 && f.kind <= 4 as u8 {
+            if !in_rules {
+                in_rules = true
+                grp_lo = ls.lo
+            }
+        }
+        off = if ls.next > off && ls.next <= data.len() { ls.next } else { off + 1 as usize }
+    }
+    if specific.found { return specific }
+    return star
+}
+
+function _count_in_range(data: [u8], sel: RangeSel) -> Counts {
+    var nd: usize = 0 as usize
+    var na: usize = 0 as usize
+    if !sel.found { return Counts { n_disallow: nd, n_allow: na } }
+    let hi_b = if sel.hi <= data.len() { sel.hi } else { data.len() }
+    var off = if sel.lo <= hi_b { sel.lo } else { hi_b }
+    loop decreases data.len() - off + 1 as usize {
+        if off >= hi_b { break }
+        let ls = _next_line(data, off)
+        let f = _parse_field(_line_slice(data, ls))
+        if f.kind == 2 as u8 && f.value.len() > 0 as usize {
+            nd = nd + 1 as usize
+        } else if f.kind == 3 as u8 && f.value.len() > 0 as usize {
+            na = na + 1 as usize
+        }
+        off = if ls.next > off && ls.next <= data.len() { ls.next } else { off + 1 as usize }
+    }
+    return Counts { n_disallow: nd, n_allow: na }
+}
+
+public function robots_empty_alloc(allocator: mutable Allocator) -> RobotsRules
+    with {allocator, err: alloc.AllocError}
+{
+    let dis = _alloc_bytes_slots(allocator, 0 as usize)?
+    let allow = _alloc_bytes_slots(allocator, 0 as usize)?
+    return RobotsRules {
+        disallows: dis, allows: allow, crawl_delay: time.zero(), has_crawl_delay: false,
+    }
+}
+
+public function parse_robots(
+    data: [u8],
+    ua: [u8],
+    allocator: mutable Allocator,
+) -> RobotsRules
+    with {allocator, err: alloc.AllocError}
+{
+    let sel = _select_range(data, ua)
+    let counts = _count_in_range(data, sel)
+    var dis = _alloc_bytes_slots(allocator, counts.n_disallow)?
+    var allow = _alloc_bytes_slots(allocator, counts.n_allow)?
+    var di: usize = 0 as usize
+    var ai: usize = 0 as usize
+    var cd = time.zero()
+    var has_cd: bool = false
+    var off = sel.lo
+    loop decreases data.len() - off + 1 as usize {
+        if !sel.found { break }
+        if off >= sel.hi { break }
+        let ls = _next_line(data, off)
+        let f = _parse_field(_line_slice(data, ls))
+        if f.kind == 2 as u8 && f.value.len() > 0 as usize && di < dis.len() {
+            dis[di] = f.value
+            di = di + 1 as usize
+        } else if f.kind == 3 as u8 && f.value.len() > 0 as usize && ai < allow.len() {
+            allow[ai] = f.value
+            ai = ai + 1 as usize
+        } else if f.kind == 4 as u8 && f.value.len() > 0 as usize {
+            let sc = num_mod.parse_seconds(f.value)
+            if sc.present {
+                cd = time.from_secs(sc.secs)
+                has_cd = true
+            }
+        }
+        off = if ls.next > off && ls.next <= data.len() { ls.next } else { off + 1 as usize }
+    }
+    return RobotsRules {
+        disallows: dis, allows: allow, crawl_delay: cd, has_crawl_delay: has_cd,
+    }
+}
+
+public function robots_allows(rules: RobotsRules, path: [u8]) -> bool {
+    var best_dis: usize = 0 as usize
+    var has_dis: bool = false
+    var k: usize = 0 as usize
+    loop decreases rules.disallows.len() - k {
+        if k >= rules.disallows.len() { break }
+        let d = rules.disallows[k]
+        if _starts_with(path, d) && (!has_dis || d.len() > best_dis) {
+            best_dis = d.len()
+            has_dis = true
+        }
+        k = k + 1 as usize
+    }
+    if !has_dis { return true }
+    var best_allow: usize = 0 as usize
+    var has_allow: bool = false
+    var j: usize = 0 as usize
+    loop decreases rules.allows.len() - j {
+        if j >= rules.allows.len() { break }
+        let a = rules.allows[j]
+        if _starts_with(path, a) && (!has_allow || a.len() > best_allow) {
+            best_allow = a.len()
+            has_allow = true
+        }
+        j = j + 1 as usize
+    }
+    if has_allow && best_allow >= best_dis { return true }
+    return false
+}
+
+public function robots_crawl_delay(rules: RobotsRules) -> time.Duration {
+    return rules.crawl_delay
+}
+
+public function robots_has_crawl_delay(rules: RobotsRules) -> bool {
+    return rules.has_crawl_delay
+}

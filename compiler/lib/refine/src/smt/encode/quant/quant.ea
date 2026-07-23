@@ -1,0 +1,180 @@
+
+module refine.smt.encode.quant.quant
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import syntax.ast.ident as ident_mod
+import syntax.ast.ops as ops_mod
+import syntax.ast.tree as ast_tree
+import intern.symbol as symbol_mod
+import types.check.env.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.term as term_mod
+import local.smt.encode.encres as result_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.mem.alloc.Box(term_mod.SmtTerm)
+
+
+public type RangeBounds {
+    lo: ast_tree.Expr
+    hi: ast_tree.Expr
+    kind: ops_mod.RangeKind
+}
+
+derive eq, debug for RangeBounds
+
+spec std.core.option.Option(RangeBounds)
+
+
+function clone_with_binding(
+    src: Vec_VariableBinding.Vec,
+    binding: ctx_mod.VariableBinding,
+    allocator: Allocator,
+) -> Vec_VariableBinding.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit dst: Vec_VariableBinding.Vec
+    Vec_VariableBinding.new(init dst, allocator)?
+    let n = Vec_VariableBinding.len(src)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let entry = Vec_VariableBinding.at(src, i)
+        Vec_VariableBinding.push(mutable dst, take entry, allocator)?
+        i = i + 1
+    }
+    Vec_VariableBinding.push(mutable dst, take binding, allocator)?
+    return dst
+}
+
+public function encode_quantifier(
+    is_forall: bool,
+    bound: ident_mod.Ident,
+    iter_box: Box_Expr,
+    body_box: Box_Expr,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let iter_expr = Box_Expr.get(iter_box)
+    let bounds_lookup = extract_range_bounds(iter_expr)
+    return match bounds_lookup {
+        case .none => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "quantifier iter must be a range with both bounds present",
+            ),
+        )
+        case .some(let r) => {
+            let lo_result = encode_fn(r.lo, vars, ty_interner, builtins, allocator)?
+            match lo_result {
+                case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+                case .encoded(let lo_term) => {
+                    let hi_result = encode_fn(r.hi, vars, ty_interner, builtins, allocator)?
+                    match hi_result {
+                        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+                        case .encoded(let hi_term) => {
+                            let binder_binding = ctx_mod.VariableBinding {
+                                name: bound.name,
+                                ty: builtins.i64_,
+                            }
+                            let body_scope = clone_with_binding(vars, binder_binding, allocator)?
+                            let body_expr = Box_Expr.get(body_box)
+                            let body_result = encode_fn(body_expr, body_scope, ty_interner, builtins, allocator)?
+                            match body_result {
+                                case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+                                case .encoded(let body_term) =>
+                                    build_quantifier_term(is_forall, bound.name, r.kind, take lo_term, take hi_term, take body_term, allocator)?
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+function extract_range_bounds(e: ast_tree.Expr) -> Option_RangeBounds.Option {
+    return match e.kind {
+        case .range(let lo_opt, let hi_opt, let kind) => match lo_opt {
+            case .none => Option_RangeBounds.none
+            case .some(let lo_box) => match hi_opt {
+                case .none => Option_RangeBounds.none
+                case .some(let hi_box) => Option_RangeBounds.some(
+                    value: RangeBounds {
+                        lo: Box_Expr.get(lo_box),
+                        hi: Box_Expr.get(hi_box),
+                        kind: kind,
+                    },
+                )
+            }
+        }
+        case _ => Option_RangeBounds.none
+    }
+}
+
+function build_quantifier_term(
+    is_forall: bool,
+    binder: symbol_mod.Symbol,
+    kind: ops_mod.RangeKind,
+    lo_term: take term_mod.SmtTerm,
+    hi_term: take term_mod.SmtTerm,
+    body_term: take term_mod.SmtTerm,
+    allocator: Allocator,
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let binder_var = term_mod.SmtTerm.var_(name: binder, sort: term_mod.SmtSort.int_)
+
+    uninit lo_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init lo_args, allocator)?
+    Vec_SmtTerm.push(mutable lo_args, take lo_term, allocator)?
+    Vec_SmtTerm.push(mutable lo_args, take binder_var, allocator)?
+    let lo_bound = term_mod.SmtTerm.app(op: term_mod.SmtOp.le, args: lo_args)
+
+    let hi_op = match kind {
+        case .half_open => term_mod.SmtOp.lt
+        case .closed => term_mod.SmtOp.le
+    }
+    let binder_var_again = term_mod.SmtTerm.var_(name: binder, sort: term_mod.SmtSort.int_)
+    uninit hi_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init hi_args, allocator)?
+    Vec_SmtTerm.push(mutable hi_args, take binder_var_again, allocator)?
+    Vec_SmtTerm.push(mutable hi_args, take hi_term, allocator)?
+    let hi_bound = term_mod.SmtTerm.app(op: hi_op, args: hi_args)
+
+    uninit bound_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init bound_args, allocator)?
+    Vec_SmtTerm.push(mutable bound_args, take lo_bound, allocator)?
+    Vec_SmtTerm.push(mutable bound_args, take hi_bound, allocator)?
+    let bound_term = term_mod.SmtTerm.app(op: term_mod.SmtOp.and_, args: bound_args)
+
+    let wrap_op = if is_forall { term_mod.SmtOp.implies_ } else { term_mod.SmtOp.and_ }
+    uninit wrap_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init wrap_args, allocator)?
+    Vec_SmtTerm.push(mutable wrap_args, take bound_term, allocator)?
+    Vec_SmtTerm.push(mutable wrap_args, take body_term, allocator)?
+    let inner = term_mod.SmtTerm.app(op: wrap_op, args: wrap_args)
+
+    let inner_box = Box_SmtTerm.new(take inner, allocator)?
+    let quant = if is_forall {
+        term_mod.SmtTerm.forall_(binder: binder, binder_sort: term_mod.SmtSort.int_, body: inner_box)
+    } else {
+        term_mod.SmtTerm.exists_(binder: binder, binder_sort: term_mod.SmtSort.int_, body: inner_box)
+    }
+    return result_mod.EncodeResult.encoded(term: quant)
+}

@@ -1,0 +1,159 @@
+
+module structmap.walk.emit.fn
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import source.map as source_map_mod
+import span.file as file_mod
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree
+import hir.def as def_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import local.data.model as model
+import local.cone.leaf as coneleaf
+import local.render.toon as toon
+import local.render.sig.signature as signature
+import local.render.expr.refine as refine
+import local.walk.calls.calls as calls_mod
+import local.walk.calls.callsort as callsort_mod
+import local.walk.core.util as util
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(model.InvariantEntry)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.core.option.Option(ast_tree.EffectRow)
+
+
+public function push_fn(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    start_line: u32,
+    end_line: u32,
+    fd: ast_item_mod.FnDecl,
+    file_rel: String,
+    module_path: String,
+    file_id: file_mod.FileId,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    file_idx: usize,
+    def_id: def_mod.DefId,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let qualified = util.qualify(module_path, fd.name.name, interner, allocator)?
+    let sig_text = signature.render_signature(fd, interner, allocator)?
+    push_fn_invariants(
+        mutable tree, dir_idx, qualified, file_rel, file_id, fd.refinements,
+        interner, source_map, allocator,
+    )?
+    uninit declared: Vec_String.Vec
+    Vec_String.new(init declared, allocator)?
+    match fd.effects {
+        case .some(let row) => collect_effect_members(mutable declared, row, interner, allocator)?
+        case .none => ()
+    }
+    uninit cone_leaf: Vec_String.Vec
+    Vec_String.new(init cone_leaf, allocator)?
+    coneleaf.build_cone_leaf(
+        mutable cone_leaf, fd, type_outputs, file_idx, def_id,
+        effect_interner, interner, allocator,
+    )?
+    uninit raw_calls: Vec_String.Vec
+    Vec_String.new(init raw_calls, allocator)?
+    match fd.body {
+        case .block_(let body) =>
+            calls_mod.collect_calls_block(body, interner, mutable raw_calls, allocator)?
+        case .extern_(_, _, _, _) => ()
+    }
+    let calls = callsort_mod.sort_and_dedup(take raw_calls, allocator)?
+    uninit cone: Vec_String.Vec
+    Vec_String.new(init cone, allocator)?
+    Vec_FunctionEntry.push(
+        mutable tree.functions,
+        model.FunctionEntry {
+            dir_idx: dir_idx,
+            qualified_name: qualified,
+            file: util.clone_str(file_rel, allocator)?,
+            line: start_line,
+            end: end_line,
+            visibility: util.vis_to_map(fd.visibility),
+            stability: util.fn_stability_to_map(fd),
+            signature: sig_text,
+            calls: calls,
+            effect_cone: cone,
+            declared_effects: declared,
+            cone_leaf_keys: cone_leaf,
+        },
+        allocator,
+    )?
+}
+
+function push_fn_invariants(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    qualified: String,
+    file_rel: String,
+    file_id: file_mod.FileId,
+    cs: Vec_RefinementClause.Vec,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_RefinementClause.len(cs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let c = Vec_RefinementClause.at(cs, i)
+        let rule = refine.refinement_rule_text(c, interner, allocator)?
+        Vec_InvariantEntry.push(
+            mutable tree.invariants,
+            model.InvariantEntry {
+                dir_idx: dir_idx,
+                target: util.clone_str(qualified, allocator)?,
+                file: util.clone_str(file_rel, allocator)?,
+                line: util.line_of(source_map, file_id, c.span),
+                rule: rule,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+}
+
+function collect_effect_members(
+    out: mutable Vec_String.Vec,
+    row: ast_tree.EffectRow,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_EffectMember.len(row.members)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        uninit buf: Vec_u8.Vec
+        Vec_u8.new(init buf, allocator)?
+        signature.effect_member_to(mutable buf, Vec_EffectMember.at(row.members, i), interner, allocator)?
+        let txt = toon.finish_string(take buf, allocator)?
+        Vec_String.push(mutable out, txt, allocator)?
+        i += 1
+    }
+}

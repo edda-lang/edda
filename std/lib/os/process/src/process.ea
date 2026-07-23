@@ -1,0 +1,245 @@
+
+module std.os.process
+import std.text.string
+
+import std.os.raw
+import std.mem.alloc
+
+public linear type ChildHandle {
+    raw: u64
+    out_fd: u64
+    err_fd: u64
+}
+
+public function no_capture_fd() -> u64 {
+    return 0xFFFFFFFFFFFFFFFF
+}
+
+function exit_process(code: u64) -> i64
+    extern "ExitProcess" from "kernel32.dll"
+
+function get_command_line_w() -> u64
+    extern "GetCommandLineW" from "kernel32.dll"
+
+function command_line_to_argv_w(cmd_line: u64, num_args: u64) -> u64
+    extern "CommandLineToArgvW" from "shell32.dll"
+
+function wide_char_to_multi_byte(
+    code_page: u64,
+    flags: u64,
+    wide_str: u64,
+    wide_len_: i32,
+    multi_str: u64,
+    multi_len: i32,
+    default_char: u64,
+    used_default: u64,
+) -> i32
+    extern "WideCharToMultiByte" from "kernel32.dll"
+
+function local_free(mem: u64) -> u64
+    extern "LocalFree" from "kernel32.dll"
+
+function get_current_process_id() -> u32
+    extern "GetCurrentProcessId" from "kernel32.dll"
+
+function get_process_id(handle: u64) -> u32
+    extern "GetProcessId" from "kernel32.dll"
+
+public function exit(code: i32) -> never
+    with {divergence}
+{
+    comptime if target_has("windows") {
+        let _ = exit_process((code & 0xFF) as u64)
+    } else {
+        let _ = raw.syscall6(231, (code & 0xFF) as u64, 0, 0, 0, 0, 0)
+    }
+    loop {}
+}
+
+public function self_pid() -> u64 {
+    comptime if target_has("windows") {
+        return get_current_process_id() as u64
+    } else {
+        let pid: i64 = raw.syscall6(39, 0, 0, 0, 0, 0, 0)
+        if pid < 0 { return 0 }
+        return pid as u64
+    }
+}
+
+public function pid_of(h: ChildHandle) -> u64 {
+    comptime if target_has("windows") {
+        return get_process_id(h.raw) as u64
+    } else {
+        return h.raw
+    }
+}
+
+public function args(allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    comptime if target_has("windows") {
+        return skip_program_name(args_windows(allocator)?)
+    } else {
+        return skip_program_name(args_linux(allocator)?)
+    }
+}
+
+function skip_program_name(full: [String]) -> [String] {
+    if full.len() == 0 { return full }
+    return full[1..]
+}
+
+function args_linux(allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    comptime if target_has("windows") {
+        return allocator.alloc_array(String, 0)?
+    } else {
+        let p: [u8] = "/proc/self/cmdline".bytes()
+        let path: [u8] = allocator.alloc_array(u8, p.len() + 1)?
+        var k: usize = 0
+        loop
+            decreases p.len() - k
+        {
+            if k >= p.len() { break }
+            path[k] = p[k]
+            k = k + 1
+        }
+        path[p.len()] = 0
+        let fd: i64 = raw.syscall6(257, 0xFFFFFFFFFFFFFF9C, raw.slice_addr(path), 0, 0, 0, 0)
+        if fd < 0 { return allocator.alloc_array(String, 0)? }
+        let cap: usize = 2097152
+        let buf: [u8] = allocator.alloc_array(u8, cap)?
+        let base: u64 = raw.slice_addr(buf)
+        var used: usize = 0
+        var fuel: u64 = 2097153
+        loop
+            decreases fuel
+        {
+            if fuel == 0 { break }
+            fuel = fuel - 1
+            if used >= cap { break }
+            let r: i64 = raw.syscall6(0, fd as u64, base +% (used as u64), (cap - used) as u64, 0, 0, 0)
+            if r <= 0 { break }
+            let room: usize = cap - used
+            let got: usize = r as usize
+            let take_n: usize = if got > room { room } else { got }
+            used = used + take_n
+        }
+        let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+        let n: usize = count_cstrings(base, used)
+        var out: [String] = allocator.alloc_array(String, n)?
+        fill_cstrings(base, used, mutable out, allocator)?
+        return out
+    }
+}
+
+function args_windows(allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    comptime if target_has("windows") {
+        let cmdline: u64 = get_command_line_w()
+        let argc_buf: [u8] = allocator.alloc_array(u8, 4)?
+        let argc_addr: u64 = raw.slice_addr(argc_buf)
+        let argv: u64 = command_line_to_argv_w(cmdline, argc_addr)
+        if argv == 0 { return allocator.alloc_array(String, 0)? }
+        let argc: usize = raw.load_u32(argc_addr) as usize
+        var out: [String] = allocator.alloc_array(String, argc)?
+        var i: usize = 0
+        loop
+            decreases argc - i
+        {
+            if i >= argc { break }
+            let wptr: u64 = raw.load_u64(argv +% ((i as u64) *% 8))
+            let wlen: usize = wide_len(wptr)
+            if wlen == 0 {
+                out[i] = ""
+            } else {
+                let mblen: i32 = wide_char_to_multi_byte(65001, 0, wptr, wlen as i32 wrapping, 0, 0, 0, 0)
+                if mblen <= 0 {
+                    out[i] = ""
+                } else {
+                    let sbuf: [u8] = allocator.alloc_array(u8, mblen as usize)?
+                    let _ = wide_char_to_multi_byte(65001, 0, wptr, wlen as i32 wrapping, raw.slice_addr(sbuf), mblen, 0, 0)
+                    out[i] = string.from_owned_utf8(take sbuf)
+                }
+            }
+            i = i + 1
+        }
+        let _ = local_free(argv)
+        return out
+    } else {
+        return allocator.alloc_array(String, 0)?
+    }
+}
+
+function wide_len(wptr: u64) -> usize {
+    var n: usize = 0
+    var fuel: u64 = 65536
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if raw.load_u16(wptr +% ((n as u64) *% 2)) == 0 { break }
+        n = n + 1
+    }
+    return n
+}
+
+function count_cstrings(addr: u64, used: usize) -> usize {
+    var count: usize = 0
+    var i: usize = 0
+    loop
+        decreases used - i
+    {
+        if i >= used { break }
+        if raw.load_u8(addr +% (i as u64)) == 0 { count = count + 1 }
+        i = i + 1
+    }
+    if used > 0 {
+        if raw.load_u8(addr +% ((used - 1) as u64)) != 0 { count = count + 1 }
+    }
+    return count
+}
+
+function fill_cstrings(addr: u64, used: usize, out: mutable [String], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var idx: usize = 0
+    var start: usize = 0
+    var i: usize = 0
+    loop
+        decreases used - i
+    {
+        if i >= used { break }
+        if raw.load_u8(addr +% (i as u64)) == 0 {
+            if idx < out.len() {
+                out[idx] = cstr_slice_to_string(addr, start, i, allocator)?
+                idx = idx + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < used && idx < out.len() {
+        out[idx] = cstr_slice_to_string(addr, start, used, allocator)?
+    }
+}
+
+function cstr_slice_to_string(addr: u64, lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if hi <= lo { return "" }
+    let n: usize = hi - lo
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var k: usize = 0
+    loop
+        decreases n - k
+    {
+        if k >= n { break }
+        buf[k] = raw.load_u8(addr +% ((lo + k) as u64))
+        k = k + 1
+    }
+    return string.from_owned_utf8(take buf)
+}

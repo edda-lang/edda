@@ -1,0 +1,239 @@
+
+module wasm.isel.body.body
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import ir.lir.tree.body as body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.tree.reg as reg_mod
+import ir.lir.id.vreg as vreg_mod
+import ir.lir.id.op as op_id_mod
+import local.model as model_mod
+import local.fmt.encode as enc_mod
+import local.isel.ctx.ctx as ctx_mod
+import local.isel.valtype.valtype as vt_mod
+import local.isel.inst.op.emit as inst_mod
+import local.isel.inst.term.emit as inst_term_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(model_mod.ValType)
+spec std.collections.vec.Vec(body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(reg_mod.LirVReg)
+spec std.collections.vec.Vec(op_id_mod.LirOpId)
+spec std.collections.vec.Vec(vreg_mod.LirVRegId)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public function lower_body(
+    out: init model_mod.Func,
+    wmod: mutable model_mod.WasmModule,
+    mctx: ctx_mod.ModuleCtx,
+    body: body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let bctx = build_body_ctx(body, allocator)?
+    let ft = compute_functype(body, allocator)?
+    let type_idx = model_mod.add_type(mutable wmod, take ft, allocator)?
+    let locals = compute_locals(body, allocator)?
+    uninit bytes: Vec_u8.Vec
+    Vec_u8.new(init bytes, allocator)?
+    emit_body_code(mutable bytes, mctx, bctx, body, allocator)?
+    out = model_mod.Func { type_idx: type_idx, locals: locals, body: bytes }
+}
+
+
+function build_body_ctx(body: body_mod.LirBody, allocator: Allocator) -> ctx_mod.BodyCtx
+    with {allocator, err: alloc.AllocError}
+{
+    var vreg_def = IntMap_u32.new(allocator)?
+    var stack_off = IntMap_u32.new(allocator)?
+    var running: u32 = 0
+    let n_ops: usize = Vec_LirOp.len(body.ops)
+    var i: usize = 0
+    loop decreases n_ops - i {
+        if i >= n_ops { break }
+        let op = Vec_LirOp.at(body.ops, i)
+        match op.kind {
+            case .constant_(let c, let dst) => {
+                match c {
+                    case .fn_ref(let def) => { let _ = IntMap_u32.insert(mutable vreg_def, dst.raw as i64, def.raw, allocator)? }
+                    case _ => ()
+                }
+            }
+            case .stack_addr(let bytes_n, _) => {
+                let _ = IntMap_u32.insert(mutable stack_off, i as i64, running, allocator)?
+                running = running +% bytes_n
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    let frame = align16(running)
+    let state_local = (Vec_LirVReg.len(body.vregs) - (1 as usize)) as u32
+    return ctx_mod.BodyCtx {
+        vreg_def: vreg_def,
+        stack_off_by_op: stack_off,
+        frame_size: frame,
+        state_local: state_local,
+    }
+}
+
+
+function align16(n: u32) -> u32 {
+    return (n +% (15 as u32)) & (~(15 as u32))
+}
+
+
+function compute_functype(body: body_mod.LirBody, allocator: Allocator) -> model_mod.FuncType
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValType.Vec
+    Vec_ValType.new(init params, allocator)?
+    let np: u32 = body.n_params
+    var i: u32 = 1
+    loop decreases (np + (1 as u32)) - i {
+        if i > np { break }
+        Vec_ValType.push(mutable params, vt_mod.valtype_of_vreg(body, vreg_mod.LirVRegId { raw: i }), allocator)?
+        i += 1
+    }
+    uninit results: Vec_ValType.Vec
+    Vec_ValType.new(init results, allocator)?
+    collect_results(mutable results, body, allocator)?
+    return model_mod.FuncType { params: params, results: results }
+}
+
+
+function collect_results(results: mutable Vec_ValType.Vec, body: body_mod.LirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb: usize = Vec_LirBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases nb - b {
+        if b >= nb { break }
+        let blk = Vec_LirBlock.at(body.blocks, b)
+        match blk.terminator.kind {
+            case .return_(let values) => {
+                let nv: usize = Vec_LirVRegId.len(values)
+                var k: usize = 0
+                loop decreases nv - k {
+                    if k >= nv { break }
+                    Vec_ValType.push(mutable results, vt_mod.valtype_of_vreg(body, Vec_LirVRegId.at(values, k)), allocator)?
+                    k += 1
+                }
+                return
+            }
+            case _ => ()
+        }
+        b += 1
+    }
+}
+
+
+function compute_locals(body: body_mod.LirBody, allocator: Allocator) -> Vec_ValType.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit locals: Vec_ValType.Vec
+    Vec_ValType.new(init locals, allocator)?
+    let nv: usize = Vec_LirVReg.len(body.vregs)
+    var i: usize = (body.n_params as usize) + (1 as usize)
+    loop decreases nv - i {
+        if i >= nv { break }
+        Vec_ValType.push(mutable locals, vt_mod.valtype_of_vreg(body, vreg_mod.LirVRegId { raw: i as u32 }), allocator)?
+        i += 1
+    }
+    Vec_ValType.push(mutable locals, model_mod.ValType.i32_, allocator)?
+    return locals
+}
+
+
+function emit_body_code(
+    bytes: mutable Vec_u8.Vec,
+    mctx: ctx_mod.ModuleCtx,
+    bctx: ctx_mod.BodyCtx,
+    body: body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if bctx.frame_size != 0 {
+        enc_mod.push_byte(mutable bytes, 0x23, allocator)?
+        enc_mod.uleb(mutable bytes, 0 as u64, allocator)?
+        enc_mod.push_byte(mutable bytes, 0x41, allocator)?
+        enc_mod.sleb(mutable bytes, bctx.frame_size as i64, allocator)?
+        enc_mod.push_byte(mutable bytes, 0x6B, allocator)?
+        enc_mod.push_byte(mutable bytes, 0x24, allocator)?
+        enc_mod.uleb(mutable bytes, 0 as u64, allocator)?
+    }
+    enc_mod.push_byte(mutable bytes, 0x41, allocator)?
+    enc_mod.sleb(mutable bytes, 1 as i64, allocator)?
+    enc_mod.push_byte(mutable bytes, 0x21, allocator)?
+    enc_mod.uleb(mutable bytes, bctx.state_local as u64, allocator)?
+
+    enc_mod.push_byte(mutable bytes, 0x03, allocator)?
+    enc_mod.push_byte(mutable bytes, 0x40, allocator)?
+
+    let nb: usize = Vec_LirBlock.len(body.blocks)
+    var j: usize = 0
+    loop decreases nb - j {
+        if j >= nb { break }
+        enc_mod.push_byte(mutable bytes, 0x02, allocator)?
+        enc_mod.push_byte(mutable bytes, 0x40, allocator)?
+        j += 1
+    }
+
+    enc_mod.push_byte(mutable bytes, 0x20, allocator)?
+    enc_mod.uleb(mutable bytes, bctx.state_local as u64, allocator)?
+    enc_mod.push_byte(mutable bytes, 0x0E, allocator)?
+    enc_mod.uleb(mutable bytes, nb as u64, allocator)?
+    var k: usize = 0
+    loop decreases nb - k {
+        if k >= nb { break }
+        enc_mod.uleb(mutable bytes, ((nb - (1 as usize)) - k) as u64, allocator)?
+        k += 1
+    }
+    enc_mod.uleb(mutable bytes, 0 as u64, allocator)?
+
+    var idx: usize = nb
+    loop decreases idx {
+        if idx == 0 as usize { break }
+        idx -= 1
+        enc_mod.push_byte(mutable bytes, 0x0B, allocator)?
+        emit_block_code(mutable bytes, mctx, bctx, body, idx, allocator)?
+    }
+    enc_mod.push_byte(mutable bytes, 0x0B, allocator)?
+    enc_mod.push_byte(mutable bytes, 0x00, allocator)?
+}
+
+
+function emit_block_code(
+    bytes: mutable Vec_u8.Vec,
+    mctx: ctx_mod.ModuleCtx,
+    bctx: ctx_mod.BodyCtx,
+    body: body_mod.LirBody,
+    idx: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if idx == 0 as usize {
+        enc_mod.push_byte(mutable bytes, 0x00, allocator)?
+        return
+    }
+    let blk = Vec_LirBlock.at(body.blocks, idx)
+    let n_ops: usize = Vec_LirOpId.len(blk.ops)
+    var i: usize = 0
+    loop decreases n_ops - i {
+        if i >= n_ops { break }
+        let op_id = Vec_LirOpId.at(blk.ops, i)
+        let op = Vec_LirOp.at(body.ops, op_id.raw as usize)
+        inst_mod.emit_op(mutable bytes, mctx, bctx, body, op_id, op, allocator)?
+        i += 1
+    }
+    inst_term_mod.emit_terminator(mutable bytes, bctx, body, idx as u32, blk.terminator, allocator)?
+}

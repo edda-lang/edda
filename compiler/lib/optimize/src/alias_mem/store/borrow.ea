@@ -1,0 +1,102 @@
+module optimize.alias_mem.store.borrow
+
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.term as mir_term_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+
+public function body_has_borrow_surface(body: mir_body_mod.MirBody) -> bool {
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        let n_stmts: usize = Vec_Statement.len(block.statements)
+        var si: usize = 0
+        loop decreases n_stmts - si {
+            if si >= n_stmts { break }
+            let stmt = Vec_Statement.at(block.statements, si)
+            if stmt_has_borrow_surface(stmt) {
+                return true
+            }
+            si += 1
+        }
+        if term_has_borrow_surface(block.terminator) {
+            return true
+        }
+        bi += 1
+    }
+    return false
+}
+
+
+function stmt_has_borrow_surface(stmt: mir_stmt_mod.Statement) -> bool {
+    return match stmt.kind {
+        case .assign(_, let value) => rvalue_has_borrow_surface(value)
+        case .storage_live(_) => false
+        case .storage_dead(_) => false
+        case .nop_ => false
+    }
+}
+
+
+function rvalue_has_borrow_surface(rv: mir_rvalue_mod.Rvalue) -> bool {
+    return match rv {
+        case .use_(let operand) => operand_is_move(operand)
+        case .binary(_, let lhs, let rhs) => operand_is_move(lhs) || operand_is_move(rhs)
+        case .unary(_, let operand) => operand_is_move(operand)
+        case .cast(let operand, _, _, _) => operand_is_move(operand)
+        case .aggregate(_, let elems, _) => operands_have_move(elems)
+        case .ref_(_, _) => true
+        case .len(_) => false
+        case .discriminant(_) => false
+        case .make_closure(_, let env) => operand_is_move(env)
+    }
+}
+
+
+function operands_have_move(ops: Vec_Operand.Vec) -> bool {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        if operand_is_move(op) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+
+function operand_is_move(op: mir_rvalue_mod.Operand) -> bool {
+    return match op {
+        case .move_(_, _) => true
+        case .copy_(_, _) => false
+        case .constant(_) => false
+    }
+}
+
+
+function term_has_borrow_surface(term: mir_term_mod.Terminator) -> bool {
+    return match term.kind {
+        case .branch(let cond, _, _) => operand_is_move(cond)
+        case .switch_(let discr, _) => operand_is_move(discr)
+        case .raise_(let value, _) => operand_is_move(value)
+        case .panic_(let message) => operand_is_move(message)
+        case .call_(let callee, let args, _, _, _) =>
+            operand_is_move(callee) || operands_have_move(args)
+        case .spawn_(_, let args, _, _, _, _) => operands_have_move(args)
+        case .await_(let handle, _, _, _) => operand_is_move(handle)
+        case _ => false
+    }
+}

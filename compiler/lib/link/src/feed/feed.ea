@@ -1,0 +1,92 @@
+
+module link.feed.feed
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import object.coff as coff_mod
+import local.coff.archive as archive_mod
+import local.coff.cursor as cursor_mod
+import local.emit.image.fix.res.resolve as resolve_mod
+import local.pe.imports as imports_mod
+import local.feed.select.select as select_mod
+import local.feed.classify.classify as classify_mod
+import local.feed.thunks.thunks as thunks_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(imports_mod.ImportDll)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(String)
+
+
+public type RuntimeFeed {
+    objects: Vec_CoffFile.Vec
+    provided: StringMap_bool.StringMap
+    dlls: Vec_ImportDll.Vec
+}
+
+
+public function prepare_runtime(
+    roots: Vec_CoffFile.Vec,
+    rt_bytes: Vec_u8.Vec,
+    declared_externs: StringMap_bool.StringMap,
+    declared_extern_dlls: StringMap_String.StringMap,
+    allocator: Allocator,
+) -> RuntimeFeed
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let contents = archive_mod.parse_archive(rt_bytes, allocator)?
+    let pulled = select_mod.select_members(roots, contents.objects, allocator)?
+
+    uninit objects: Vec_CoffFile.Vec
+    Vec_CoffFile.new(init objects, allocator)?
+    let nroots = Vec_CoffFile.len(roots)
+    var r: usize = 0
+    loop decreases (nroots - r) {
+        if r >= nroots { break }
+        let f = Vec_CoffFile.at(roots, r)
+        Vec_CoffFile.push(mutable objects, take f, allocator)?
+        r = r + (1 as usize)
+    }
+    let nmem = Vec_CoffFile.len(contents.objects)
+    var m: usize = 0
+    loop decreases (nmem - m) {
+        if m >= nmem { break }
+        if Vec_bool.at(pulled, m) {
+            let f = Vec_CoffFile.at(contents.objects, m)
+            Vec_CoffFile.push(mutable objects, take f, allocator)?
+        }
+        m = m + (1 as usize)
+    }
+
+    let rt_referenced = select_mod.pulled_undefined(contents.objects, pulled, allocator)?
+    let empty = StringMap_bool.new(allocator)?
+    let probe = resolve_mod.resolve(objects, empty, allocator)?
+    let plan = classify_mod.classify(probe.unresolved, contents.shorts, rt_referenced, declared_externs, declared_extern_dlls, allocator)?
+
+    let any_synth = plan.synth.fltused
+        || plan.synth.chkstk
+        || plan.synth.type_info_vtable
+        || plan.synth.tls_index
+        || plan.synth.tls_used
+        || plan.synth.security_cookie
+        || plan.synth.security_check_cookie
+        || plan.synth.gs_handler_check
+        || plan.synth.tls_guard
+        || plan.synth.isa_available
+        || plan.synth.dyn_tls_init
+        || plan.synth.report_rangecheck
+        || plan.synth.atexit_stub
+        || plan.synth.get_new_handler_stub
+    if Vec_String.len(plan.thunks) > (0 as usize) || any_synth {
+        uninit thunk_obj: coff_mod.CoffFile
+        thunks_mod.build_thunk_object(init thunk_obj, plan.thunks, plan.synth, allocator)?
+        Vec_CoffFile.push(mutable objects, take thunk_obj, allocator)?
+    }
+
+    return RuntimeFeed { objects: objects, provided: plan.provided, dlls: plan.dlls }
+}

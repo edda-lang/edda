@@ -1,0 +1,224 @@
+
+module egraph.sat.parents.parents
+
+import std.mem.alloc
+import std.collections.vec
+import local.eclass as eclass_mod
+import local.graph.enode as enode_mod
+import local.graph.graph as graph_mod
+import local.key as key_mod
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(eclass_mod.EClassId)
+spec std.collections.vec.Vec(graph_mod.EClass)
+spec std.collections.vec.Vec(enode_mod.ENode)
+
+
+public type ParentMap {
+    off: Vec_usize.Vec
+    ids: Vec_usize.Vec
+}
+
+
+public function build_parent_map(
+    graph: mutable graph_mod.EGraph,
+    total: usize,
+    allocator: Allocator,
+) -> ParentMap
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit counts: Vec_usize.Vec
+    Vec_usize.new(init counts, allocator)?
+    var z: usize = 0
+    loop
+        decreases total - z
+    {
+        if z >= total { break }
+        Vec_usize.push(mutable counts, 0 as usize, allocator)?
+        z = z + 1
+    }
+    uninit buf: Vec_usize.Vec
+    Vec_usize.new(init buf, allocator)?
+    var k: usize = 0
+    loop
+        decreases total - k
+    {
+        if k >= total { break }
+        class_child_roots(mutable graph, mutable buf, k, total, allocator)?
+        let bn = Vec_usize.len(buf)
+        var b: usize = 0
+        loop
+            decreases bn - b
+        {
+            if b >= bn { break }
+            let idx = Vec_usize.at(buf, b)
+            if idx < Vec_usize.len(counts) {
+                Vec_usize.set_at(mutable counts, idx, Vec_usize.at(counts, idx) + 1)
+            }
+            b = b + 1
+        }
+        k = k + 1
+    }
+    uninit off: Vec_usize.Vec
+    Vec_usize.new(init off, allocator)?
+    Vec_usize.push(mutable off, 0 as usize, allocator)?
+    var acc: usize = 0
+    var i: usize = 0
+    loop
+        decreases total - i
+    {
+        if i >= total { break }
+        acc = acc + Vec_usize.at(counts, i)
+        Vec_usize.push(mutable off, acc, allocator)?
+        i = i + 1
+    }
+    uninit ids: Vec_usize.Vec
+    Vec_usize.new(init ids, allocator)?
+    var m: usize = 0
+    loop
+        decreases acc - m
+    {
+        if m >= acc { break }
+        Vec_usize.push(mutable ids, 0 as usize, allocator)?
+        m = m + 1
+    }
+    uninit cursor: Vec_usize.Vec
+    Vec_usize.new(init cursor, allocator)?
+    i = 0
+    loop
+        decreases total - i
+    {
+        if i >= total { break }
+        Vec_usize.push(mutable cursor, Vec_usize.at(off, i), allocator)?
+        i = i + 1
+    }
+    k = 0
+    loop
+        decreases total - k
+    {
+        if k >= total { break }
+        class_child_roots(mutable graph, mutable buf, k, total, allocator)?
+        let bn = Vec_usize.len(buf)
+        var b: usize = 0
+        loop
+            decreases bn - b
+        {
+            if b >= bn { break }
+            let idx = Vec_usize.at(buf, b)
+            if idx < Vec_usize.len(cursor) {
+                let pos = Vec_usize.at(cursor, idx)
+                if pos < Vec_usize.len(ids) {
+                    Vec_usize.set_at(mutable ids, pos, k)
+                    Vec_usize.set_at(mutable cursor, idx, pos + 1)
+                }
+            }
+            b = b + 1
+        }
+        k = k + 1
+    }
+    return ParentMap { off: off, ids: ids }
+}
+
+
+function class_child_roots(
+    graph: mutable graph_mod.EGraph,
+    out: mutable Vec_usize.Vec,
+    k: usize,
+    total: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    Vec_usize.clear(mutable out)
+    if k >= Vec_EClass.len(graph.classes) { return }
+    let cls = Vec_EClass.at(graph.classes, k)
+    let n = Vec_ENode.len(cls.nodes)
+    var j: usize = 0
+    loop
+        decreases n - j
+    {
+        if j >= n { break }
+        append_node_roots(mutable graph, mutable out, Vec_ENode.at(cls.nodes, j), total, allocator)?
+        j = j + 1
+    }
+}
+
+
+function append_node_roots(
+    graph: mutable graph_mod.EGraph,
+    out: mutable Vec_usize.Vec,
+    node: enode_mod.ENode,
+    total: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match node.kind {
+        case .literal(_) => {}
+        case .binary(_, let lhs, let rhs) => {
+            push_root(mutable graph, mutable out, lhs, total, allocator)?
+            push_root(mutable graph, mutable out, rhs, total, allocator)?
+        }
+        case .unary(_, let operand) =>
+            push_root(mutable graph, mutable out, operand, total, allocator)?
+        case .cast(let value, _, _, _) =>
+            push_root(mutable graph, mutable out, value, total, allocator)?
+        case .call_(let callee, let args) => {
+            push_root(mutable graph, mutable out, callee, total, allocator)?
+            append_ids(mutable graph, mutable out, args, total, allocator)?
+        }
+        case .field(let operand, _) =>
+            push_root(mutable graph, mutable out, operand, total, allocator)?
+        case .index(let operand, let index_v) => {
+            push_root(mutable graph, mutable out, operand, total, allocator)?
+            push_root(mutable graph, mutable out, index_v, total, allocator)?
+        }
+        case .len(let operand) =>
+            push_root(mutable graph, mutable out, operand, total, allocator)?
+        case .discriminant(let operand) =>
+            push_root(mutable graph, mutable out, operand, total, allocator)?
+        case .aggregate(_, let elems) =>
+            append_ids(mutable graph, mutable out, elems, total, allocator)?
+        case .ref_(_, let operand) =>
+            push_root(mutable graph, mutable out, operand, total, allocator)?
+    }
+}
+
+
+function append_ids(
+    graph: mutable graph_mod.EGraph,
+    out: mutable Vec_usize.Vec,
+    kids: Vec_EClassId.Vec,
+    total: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_EClassId.len(kids)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        push_root(mutable graph, mutable out, Vec_EClassId.at(kids, i), total, allocator)?
+        i = i + 1
+    }
+}
+
+
+function push_root(
+    graph: mutable graph_mod.EGraph,
+    out: mutable Vec_usize.Vec,
+    c: eclass_mod.EClassId,
+    total: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let root = key_mod.canon_child(mutable graph.uf, c)
+    let idx = root.raw as usize
+    if idx < total {
+        Vec_usize.push(mutable out, idx, allocator)?
+    }
+}

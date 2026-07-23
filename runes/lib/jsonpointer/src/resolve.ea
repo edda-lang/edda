@@ -1,0 +1,106 @@
+module jsonpointer.resolve
+
+import std.core.option
+import std.mem.alloc
+import json.value.core as jvcore
+import local.escape as escape_mod
+
+spec std.core.option.Option(jvcore.JsonValue)
+spec std.core.option.Option(usize)
+
+
+function _byte_slash() -> u8 {
+    return 47 as u8
+}
+
+function _byte_zero() -> u8 {
+    return 48 as u8
+}
+
+function _byte_nine() -> u8 {
+    return 57 as u8
+}
+
+function _parse_index(bytes: [u8]) -> Option_usize {
+    let n = bytes.len()
+    if n == 0 as usize {
+        return Option_usize.none
+    }
+    if bytes[0 as usize] == _byte_zero() && n > 1 as usize {
+        return Option_usize.none
+    }
+    var acc: usize = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = bytes[i]
+        if c < _byte_zero() || c > _byte_nine() {
+            return Option_usize.none
+        }
+        let digit = (c -| _byte_zero()) as usize
+        acc = acc *| 10 as usize +| digit
+        i += 1
+    }
+    return Option_usize.some(value: acc)
+}
+
+function _step(current: jvcore.JsonValue, token: String) -> Option_JsonValue {
+    if jvcore.is_obj(current) {
+        return jvcore.obj_get(current, token)
+    }
+    if jvcore.is_arr(current) {
+        return match _parse_index(token.bytes()) {
+            case .some(let idx) => jvcore.arr_at(current, idx)
+            case .none          => Option_JsonValue.none
+        }
+    }
+    return Option_JsonValue.none
+}
+
+public function resolve(
+    root: jvcore.JsonValue,
+    pointer: String,
+    allocator: Allocator,
+) -> Option_JsonValue
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let pb = pointer.bytes()
+    let n = pb.len()
+    if n == 0 as usize {
+        return Option_JsonValue.some(value: root)
+    }
+    if pb[0 as usize] != _byte_slash() {
+        return Option_JsonValue.none
+    }
+    var current: jvcore.JsonValue = root
+    var i: usize = 1 as usize
+    var tok_start: usize = 1 as usize
+    loop decreases n -| i +| 1 as usize {
+        if i > n { break }
+        let at_sep = i < n && pb[i] == _byte_slash()
+        if i == n || at_sep {
+            let token = escape_mod.unescape_bytes(pb[tok_start..<i], allocator)?
+            let next = _step(current, token)
+            current = match next {
+                case .some(let inner) => inner
+                case .none            => return Option_JsonValue.none
+            }
+            tok_start = i +| 1 as usize
+        }
+        i = i +| 1 as usize
+    }
+    return Option_JsonValue.some(value: current)
+}
+
+public function has(
+    root: jvcore.JsonValue,
+    pointer: String,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match resolve(root, pointer, allocator)? {
+        case .some(_) => true
+        case .none    => false
+    }
+}

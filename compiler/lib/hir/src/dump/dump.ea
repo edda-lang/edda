@@ -1,0 +1,402 @@
+module hir.dump.dump
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import std.core.fmt as fmt_mod
+import intern.symbol
+import intern.interner as interner_mod
+import local.tree as hir_tree
+import local.item as hir_item
+import local.node as node_mod
+import local.build.file as hir_file_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+
+
+public function dump_hir_files(
+    files: Vec_HirFile.Vec,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_HirFile.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let chunk = dump_file(Vec_HirFile.at(files, i), it, allocator)?
+        out = string.concat(out, chunk, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function dump_file(
+    file: hir_file_mod.HirFile,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let chunk = dump_item(Vec_HItem.at(file.items, i), it, allocator)?
+        out = string.concat(out, chunk, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function dump_item(
+    item: hir_item.HItem,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match item.kind {
+        case .function_(let sig, let body) => {
+            let name = sym_text(it, Box_HFnSignature.get(sig).name, allocator)?
+            let head = string.concat("fn ", name, allocator)?
+            let header = string.concat(head, "\n", allocator)?
+            let kids = dump_block(body, 1 as usize, it, allocator)?
+            string.concat(header, kids, allocator)?
+        }
+        case _ => ""
+    }
+}
+
+
+function dump_block(
+    block: hir_tree.HBlock,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let chunk = dump_stmt(Vec_HStmt.at(block.stmts, i), depth, it, allocator)?
+        out = string.concat(out, chunk, allocator)?
+        i = i + 1
+    }
+    let trailing = dump_opt_box(block.trailing, depth, it, allocator)?
+    return string.concat(out, trailing, allocator)?
+}
+
+
+function dump_stmt(
+    stmt: hir_tree.HStmt,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let ind = indent(depth, allocator)?
+    return match stmt.kind {
+        case .let_(_, _, _, _, let init_) => {
+            let head = string.concat(ind, "let\n", allocator)?
+            string.concat(head, dump_expr(init_, depth + 1, it, allocator)?, allocator)?
+        }
+        case .uninit_(_, _, _) => string.concat(ind, "uninit\n", allocator)?
+        case .assign(let target, _, let rhs) => {
+            let head = string.concat(ind, "assign\n", allocator)?
+            let t = dump_expr(target, depth + 1, it, allocator)?
+            let r = dump_expr(rhs, depth + 1, it, allocator)?
+            string.concat(head, string.concat(t, r, allocator)?, allocator)?
+        }
+    }
+}
+
+
+function dump_expr(
+    e: hir_tree.HExpr,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let head = dump_head(e, depth, it, allocator)?
+    let kids = dump_kids(e.kind, depth + 1, it, allocator)?
+    return string.concat(head, kids, allocator)?
+}
+
+
+function dump_head(
+    e: hir_tree.HExpr,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let ind = indent(depth, allocator)?
+    let label = label_of(e.kind, it, allocator)?
+    let idstr = fmt_mod.usize_to_string(node_mod.index(e.node_id), allocator)?
+    let a = string.concat(ind, label, allocator)?
+    let b = string.concat(a, "@", allocator)?
+    let c = string.concat(b, idstr, allocator)?
+    return string.concat(c, "\n", allocator)?
+}
+
+
+function label_of(
+    kind: hir_tree.HExprKind,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match kind {
+        case .literal(_) => "literal"
+        case .use_(_) => "use"
+        case .ident_literal(_) => "ident_literal"
+        case .binary(_, _, _) => "binary"
+        case .unary(_, _) => "unary"
+        case .call(_, _) => "call"
+        case .variant_ctor(_, _, _) => "variant_ctor"
+        case .dyn_call(_, _) => "dyn_call"
+        case .field(_, _) => "field"
+        case .positional(_, _) => "positional"
+        case .index(_, _) => "index"
+        case .subrange(_, _, _, _) => "subrange"
+        case .range(_, _, _) => "range"
+        case .if_(_, _, _) => "if"
+        case .match_(_, _) => "match"
+        case .block_(_) => "block"
+        case .loop_(_, _, _) => "loop"
+        case .cast(_, _, _) => "cast"
+        case .tuple(_) => "tuple"
+        case .struct_lit(_, _) => "struct_lit"
+        case .raise_(_) => "raise"
+        case .panic_(_) => "panic"
+        case .return_(_) => "return"
+        case .break_(_, _) => "break"
+        case .continue_(_) => "continue"
+        case .comptime_(_) => "comptime"
+        case .comptime_block(_) => "comptime_block"
+        case .comptime_for(_, _, _, _, _) => "comptime_for"
+        case .scope_(_, _, _) => "scope"
+        case .handle_(_, _, _, _) => "handle"
+        case .closure(_) => "closure"
+        case .spawn_(_) => "spawn"
+        case .forall_(_, _, _) => "forall"
+        case .exists_(_, _, _) => "exists"
+        case .method_call(let name, _) => string.concat("method_call .", sym_text(it, name, allocator)?, allocator)?
+        case .error => "error"
+    }
+}
+
+
+function dump_kids(
+    kind: hir_tree.HExprKind,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match kind {
+        case .binary(_, let lhs, let rhs) => string.concat(dump_boxed(lhs, depth, it, allocator)?, dump_boxed(rhs, depth, it, allocator)?, allocator)?
+        case .unary(_, let inner) => dump_boxed(inner, depth, it, allocator)?
+        case .call(_, let args) => dump_args(args, depth, it, allocator)?
+        case .variant_ctor(_, _, let args) => dump_args(args, depth, it, allocator)?
+        case .dyn_call(let callee, let args) => string.concat(dump_boxed(callee, depth, it, allocator)?, dump_args(args, depth, it, allocator)?, allocator)?
+        case .field(let recv, _) => dump_boxed(recv, depth, it, allocator)?
+        case .positional(let recv, let idx) => string.concat(dump_boxed(recv, depth, it, allocator)?, dump_boxed(idx, depth, it, allocator)?, allocator)?
+        case .index(let recv, let idx) => string.concat(dump_boxed(recv, depth, it, allocator)?, dump_boxed(idx, depth, it, allocator)?, allocator)?
+        case .range(let lo, let hi, _) => string.concat(dump_boxed(lo, depth, it, allocator)?, dump_boxed(hi, depth, it, allocator)?, allocator)?
+        case .if_(let cond, let then_block, let else_block) => string.concat(dump_boxed(cond, depth, it, allocator)?, string.concat(dump_block(then_block, depth, it, allocator)?, dump_opt_block(else_block, depth, it, allocator)?, allocator)?, allocator)?
+        case .match_(let scrut, let arms) => string.concat(dump_boxed(scrut, depth, it, allocator)?, dump_arms(arms, depth, it, allocator)?, allocator)?
+        case .block_(let body) => dump_block(body, depth, it, allocator)?
+        case .loop_(let body, _, let dec) => string.concat(dump_block(body, depth, it, allocator)?, dump_opt_box(dec, depth, it, allocator)?, allocator)?
+        case .cast(let inner, _, _) => dump_boxed(inner, depth, it, allocator)?
+        case .tuple(let elements) => dump_exprs(elements, depth, it, allocator)?
+        case .struct_lit(_, let fields) => dump_args(fields, depth, it, allocator)?
+        case .raise_(let inner) => dump_boxed(inner, depth, it, allocator)?
+        case .panic_(let inner) => dump_boxed(inner, depth, it, allocator)?
+        case .return_(let value) => dump_opt_box(value, depth, it, allocator)?
+        case .break_(_, let value) => dump_opt_box(value, depth, it, allocator)?
+        case .comptime_(let inner) => dump_boxed(inner, depth, it, allocator)?
+        case .comptime_block(let body) => dump_block(body, depth, it, allocator)?
+        case .comptime_for(_, let lo, let hi, _, let body) => string.concat(dump_boxed(lo, depth, it, allocator)?, string.concat(dump_boxed(hi, depth, it, allocator)?, dump_block(body, depth, it, allocator)?, allocator)?, allocator)?
+        case .scope_(_, _, let body) => dump_block(body, depth, it, allocator)?
+        case .handle_(_, _, let recovery, let body) => string.concat(dump_boxed(recovery, depth, it, allocator)?, dump_block(body, depth, it, allocator)?, allocator)?
+        case .forall_(_, let iter, let body) => string.concat(dump_boxed(iter, depth, it, allocator)?, dump_boxed(body, depth, it, allocator)?, allocator)?
+        case .exists_(_, let iter, let body) => string.concat(dump_boxed(iter, depth, it, allocator)?, dump_boxed(body, depth, it, allocator)?, allocator)?
+        case .method_call(_, let args) => dump_args(args, depth, it, allocator)?
+        case _ => ""
+    }
+}
+
+
+function dump_boxed(
+    box: Box_HExpr,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return dump_expr(Box_HExpr.get(box), depth, it, allocator)?
+}
+
+
+function dump_opt_box(
+    opt: Option_Box_HExpr.Option,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let box) => dump_boxed(box, depth, it, allocator)?
+        case .none => ""
+    }
+}
+
+
+function dump_opt_block(
+    opt: Option_HBlock.Option,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let block) => dump_block(block, depth, it, allocator)?
+        case .none => ""
+    }
+}
+
+
+function dump_exprs(
+    exprs: Vec_HExpr.Vec,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let chunk = dump_expr(Vec_HExpr.at(exprs, i), depth, it, allocator)?
+        out = string.concat(out, chunk, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function dump_args(
+    args: Vec_HArg.Vec,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let chunk = dump_expr(Vec_HArg.at(args, i).expr, depth, it, allocator)?
+        out = string.concat(out, chunk, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function dump_arms(
+    arms: Vec_HArm.Vec,
+    depth: usize,
+    it: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        let guard = match arm.guard {
+            case .some(let g) => dump_expr(g, depth, it, allocator)?
+            case .none => ""
+        }
+        let body = dump_expr(arm.body, depth, it, allocator)?
+        out = string.concat(out, string.concat(guard, body, allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function indent(depth: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: String = ""
+    var i: usize = 0
+    loop decreases (depth - i) {
+        if i >= depth { break }
+        out = string.concat(out, "  ", allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function sym_text(
+    it: interner_mod.Interner,
+    sym: symbol.Symbol,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(it) { return "?" }
+    let bytes = interner_mod.lookup(it, sym)
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i = i + 1
+    }
+    return string.from_owned_utf8(take buf)
+}

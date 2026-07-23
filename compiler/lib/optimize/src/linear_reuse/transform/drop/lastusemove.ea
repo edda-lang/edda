@@ -1,0 +1,194 @@
+module optimize.linear_reuse.transform.drop.lastusemove
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+import mir.id.block as mir_block_mod
+
+import local.linear_reuse.analysis as analysis_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+
+public function optimize_body(out: init mir_body_mod.MirBody, body: take mir_body_mod.MirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit a: analysis_mod.Analysis
+    analysis_mod.analyze(init a, body, allocator)?
+
+    uninit new_blocks: Vec_BasicBlock.Vec
+    Vec_BasicBlock.new(init new_blocks, allocator)?
+
+    let n_blocks = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let src_block = Vec_BasicBlock.at(body.blocks, bi)
+        let block_id = mir_block_mod.BlockId { raw: bi as u32 }
+        let new_block = rewrite_block(a, body, src_block, block_id, allocator)?
+        Vec_BasicBlock.push(mutable new_blocks, take new_block, allocator)?
+        bi += 1
+    }
+
+    out = mir_body_mod.MirBody {
+        def_id: body.def_id,
+        name: body.name,
+        origin_file: body.origin_file,
+        locals: body.locals,
+        n_params: body.n_params,
+        blocks: new_blocks,
+        obligations: body.obligations,
+        function_trust: body.function_trust,
+        effect_facts: body.effect_facts,
+        agg_layouts: body.agg_layouts,
+        requires_assumptions: body.requires_assumptions,
+        err_bymem: body.err_bymem
+    }
+}
+
+function rewrite_block(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, src_block: mir_body_mod.BasicBlock, b: mir_block_mod.BlockId, allocator: Allocator) -> mir_body_mod.BasicBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit new_stmts: Vec_Statement.Vec
+    Vec_Statement.new(init new_stmts, allocator)?
+
+    let n_stmts = Vec_Statement.len(src_block.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let src_stmt = Vec_Statement.at(src_block.statements, si)
+        let new_stmt = rewrite_statement(a, body, src_stmt, b, si, allocator)?
+        Vec_Statement.push(mutable new_stmts, take new_stmt, allocator)?
+        si += 1
+    }
+
+    return mir_body_mod.BasicBlock {
+        node_id_origin: src_block.node_id_origin,
+        statements: new_stmts,
+        terminator: src_block.terminator,
+        coherence_region: src_block.coherence_region
+    }
+}
+
+function rewrite_statement(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, src_stmt: mir_stmt_mod.Statement, b: mir_block_mod.BlockId, index: usize, allocator: Allocator) -> mir_stmt_mod.Statement
+    with {allocator, err: alloc.AllocError}
+{
+    return match src_stmt.kind {
+        case .assign(let dest, let value) => mir_stmt_mod.Statement {
+            origin: src_stmt.origin,
+            kind: mir_stmt_mod.MStmtKind.assign(dest: dest, value: rewrite_rvalue(a, body, value, b, index, allocator)?)
+        }
+        case .storage_live(_) => src_stmt
+        case .storage_dead(_) => src_stmt
+        case .nop_ => src_stmt
+    }
+}
+
+function rewrite_rvalue(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, value: mir_rvalue_mod.Rvalue, b: mir_block_mod.BlockId, index: usize, allocator: Allocator) -> mir_rvalue_mod.Rvalue
+    with {allocator, err: alloc.AllocError}
+{
+    return match value {
+        case .use_(let operand) => mir_rvalue_mod.Rvalue.use_(operand: rewrite_operand(a, body, operand, b, index))
+        case .binary(let op, let lhs, let rhs) => rewrite_binary(a, body, op, lhs, rhs, b, index)
+        case .unary(let op, let operand) => mir_rvalue_mod.Rvalue.unary(op: op, operand: rewrite_operand(a, body, operand, b, index))
+        case .cast(let operand, let from, let to, let kind) => mir_rvalue_mod.Rvalue.cast(operand: rewrite_operand(a, body, operand, b, index), from: from, to: to, kind: kind)
+        case .aggregate(let kind, let elems, let result_ty) => mir_rvalue_mod.Rvalue.aggregate(kind: kind, elems: rewrite_elems(a, body, elems, b, index, allocator)?, result_ty: result_ty)
+        case .ref_(_, _) => value
+        case .len(_) => value
+        case .discriminant(_) => value
+        case .make_closure(let code, let env) => mir_rvalue_mod.Rvalue.make_closure(code: code, env: rewrite_operand(a, body, env, b, index))
+    }
+}
+
+function rewrite_binary(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, op: mir_rvalue_mod.MBinOp, lhs: mir_rvalue_mod.Operand, rhs: mir_rvalue_mod.Operand, b: mir_block_mod.BlockId, index: usize) -> mir_rvalue_mod.Rvalue {
+    let rhs_local = bare_local_of_operand(rhs)
+    let lhs_local = bare_local_of_operand(lhs)
+    let same = locals_eq(rhs_local, lhs_local)
+    if same { return mir_rvalue_mod.Rvalue.binary(op: op, lhs: lhs, rhs: rhs) }
+    let new_rhs = rewrite_operand(a, body, rhs, b, index)
+    let rhs_changed = operand_is_move(new_rhs) && !operand_is_move(rhs)
+    let new_lhs = if rhs_changed { lhs } else { rewrite_operand(a, body, lhs, b, index) }
+    return mir_rvalue_mod.Rvalue.binary(op: op, lhs: new_lhs, rhs: new_rhs)
+}
+
+function rewrite_elems(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, elems: Vec_Operand.Vec, b: mir_block_mod.BlockId, index: usize, allocator: Allocator) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit new_elems: Vec_Operand.Vec
+    Vec_Operand.new(init new_elems, allocator)?
+    let n = Vec_Operand.len(elems)
+    var i: usize = 0
+    var consumed_one: bool = false
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(elems, i)
+        let unique = operand_local_unique(op, elems)
+        let candidate = if consumed_one { op } else { if unique { rewrite_operand(a, body, op, b, index) } else { op } }
+        let did_change = operand_is_move(candidate) && !operand_is_move(op)
+        consumed_one = if consumed_one { consumed_one } else { did_change }
+        Vec_Operand.push(mutable new_elems, take candidate, allocator)?
+        i += 1
+    }
+    return new_elems
+}
+
+function operand_local_unique(op: mir_rvalue_mod.Operand, elems: Vec_Operand.Vec) -> bool {
+    let target = bare_local_of_operand(op)
+    if !target_present(target) { return false }
+    let n = Vec_Operand.len(elems)
+    var i: usize = 0
+    var count: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let other = bare_local_of_operand(Vec_Operand.at(elems, i))
+        if locals_eq(target, other) { count += 1 }
+        i += 1
+    }
+    return count == 1
+}
+
+function rewrite_operand(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, op: mir_rvalue_mod.Operand, b: mir_block_mod.BlockId, index: usize) -> mir_rvalue_mod.Operand {
+    return match op {
+        case .copy_(let place, let ty) => if analysis_mod.operand_move_eligible(a, body, place, b, index) {
+            mir_rvalue_mod.Operand.move_(place: place, ty: ty)
+        } else {
+            op
+        }
+        case .move_(_, _) => op
+        case .constant(_) => op
+    }
+}
+
+function operand_is_move(op: mir_rvalue_mod.Operand) -> bool {
+    return match op {
+        case .copy_(_, _) => false
+        case .move_(_, _) => true
+        case .constant(_) => false
+    }
+}
+
+function bare_local_of_operand(op: mir_rvalue_mod.Operand) -> mir_local_mod.LocalId {
+    return match op {
+        case .copy_(let place, _) => if analysis_mod.bare_local_of(place) { place.local } else { mir_local_mod.error() }
+        case .move_(let place, _) => if analysis_mod.bare_local_of(place) { place.local } else { mir_local_mod.error() }
+        case .constant(_) => mir_local_mod.error()
+    }
+}
+
+function target_present(id: mir_local_mod.LocalId) -> bool {
+    return !mir_local_mod.is_error(id)
+}
+
+function locals_eq(x: mir_local_mod.LocalId, y: mir_local_mod.LocalId) -> bool {
+    if mir_local_mod.is_error(x) { return false }
+    if mir_local_mod.is_error(y) { return false }
+    return mir_local_mod.index(x) == mir_local_mod.index(y)
+}

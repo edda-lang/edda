@@ -1,0 +1,234 @@
+
+module hermod.codec.wire.encode.encode
+
+import std.mem.alloc
+import local.error
+import local.proto.method as method_mod
+import local.proto.status as status_mod
+import local.proto.headers as headers_mod
+import local.message.body as body_mod
+import local.uri.types as uri_mod
+import local.message.request as request_mod
+import local.message.response as response_mod
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _b_sp() -> u8     { return 32 as u8 }
+function _b_cr() -> u8     { return 13 as u8 }
+function _b_lf() -> u8     { return 10 as u8 }
+function _b_colon() -> u8  { return 58 as u8 }
+function _b_zero() -> u8   { return 48 as u8 }
+
+function _write_byte(buf: mutable [u8], pos: usize, b: u8) -> usize
+    with {err: error.CodecError}
+{
+    if pos >= buf.len() { raise error.CodecError.buffer_overflow }
+    buf[pos] = b
+    return pos + 1 as usize
+}
+
+function _write_bytes(buf: mutable [u8], pos: usize, src: [u8]) -> usize
+    with {err: error.CodecError}
+{
+    let n = src.len()
+    var i: usize = 0
+    var p: usize = pos
+    loop decreases n - i {
+        if i >= n { break }
+        p = _write_byte(mutable buf, p, src[i])?
+        i += 1
+    }
+    return p
+}
+
+function _write_crlf(buf: mutable [u8], pos: usize) -> usize
+    with {err: error.CodecError}
+{
+    let p1 = _write_byte(mutable buf, pos, _b_cr())?
+    return _write_byte(mutable buf, p1, _b_lf())?
+}
+
+function _write_decimal_usize(
+    buf: mutable [u8],
+    pos: usize,
+    n: usize,
+) -> usize
+    with {err: error.CodecError}
+{
+    if n == 0 as usize {
+        return _write_byte(mutable buf, pos, _b_zero())?
+    }
+    var work: usize = n
+    var k: usize = 0
+    loop decreases work + (1 as usize) {
+        if work == 0 as usize { break }
+        work = work / (10 as usize)
+        k += 1
+    }
+    var divisor: usize = 1 as usize
+    var i: usize = 1 as usize
+    loop decreases k - i + (1 as usize) {
+        if i >= k { break }
+        divisor = divisor * (10 as usize)
+        i += 1
+    }
+    var p: usize = pos
+    var remaining: usize = n
+    loop decreases divisor + (1 as usize) {
+        if divisor == 0 as usize { break }
+        let digit = (remaining / divisor) as u8
+        p = _write_byte(mutable buf, p, _b_zero() + digit)?
+        remaining = remaining % divisor
+        if divisor == 1 as usize { break }
+        divisor = divisor / (10 as usize)
+    }
+    return p
+}
+
+function _serialise_headers(
+    h: headers_mod.Headers,
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.CodecError}
+{
+    let used = headers_mod.headers_len(h)
+    var i: usize = 0
+    var p: usize = pos
+    loop decreases used - i {
+        if i >= used { break }
+        let e = headers_mod.headers_at(h, i)
+        p = _write_bytes(mutable buf, p, headers_mod.header_name(e))?
+        p = _write_byte(mutable buf, p, _b_colon())?
+        p = _write_byte(mutable buf, p, _b_sp())?
+        p = _write_bytes(mutable buf, p, headers_mod.header_value(e))?
+        p = _write_crlf(mutable buf, p)?
+        i += 1
+    }
+    return p
+}
+
+function _serialise_request(
+    r: request_mod.Request,
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.CodecError}
+{
+    let m = request_mod.request_method(r)
+    let u = request_mod.request_uri(r)
+    let h = request_mod.request_headers(r)
+    let b = request_mod.request_body(r)
+    var p: usize = pos
+    p = _write_bytes(mutable buf, p, method_mod.method_token(m))?
+    p = _write_byte(mutable buf, p, _b_sp())?
+    p = _write_bytes(mutable buf, p, uri_mod.uri_target(u))?
+    p = _write_byte(mutable buf, p, _b_sp())?
+    p = _write_bytes(mutable buf, p, "HTTP/1.1".bytes())?
+    p = _write_crlf(mutable buf, p)?
+    p = _serialise_headers(h, mutable buf, p)?
+    p = _write_crlf(mutable buf, p)?
+    p = _write_bytes(mutable buf, p, body_mod.body_bytes(b))?
+    return p
+}
+
+function _serialise_response(
+    r: response_mod.Response,
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.CodecError}
+{
+    let s = response_mod.response_status(r)
+    let h = response_mod.response_headers(r)
+    let b = response_mod.response_body(r)
+    var p: usize = pos
+    p = _write_bytes(mutable buf, p, "HTTP/1.1".bytes())?
+    p = _write_byte(mutable buf, p, _b_sp())?
+    p = _write_decimal_usize(mutable buf, p, status_mod.status_code(s) as usize)?
+    p = _write_byte(mutable buf, p, _b_sp())?
+    p = _write_bytes(mutable buf, p, status_mod.status_reason(s))?
+    p = _write_crlf(mutable buf, p)?
+    p = _serialise_headers(h, mutable buf, p)?
+    p = _write_crlf(mutable buf, p)?
+    p = _write_bytes(mutable buf, p, body_mod.body_bytes(b))?
+    return p
+}
+
+function _decimal_len(n: usize) -> usize {
+    if n == 0 as usize { return 1 as usize }
+    var work: usize = n
+    var k: usize = 0
+    loop decreases work + (1 as usize) {
+        if work == 0 as usize { break }
+        work = work / (10 as usize)
+        k += 1
+    }
+    return k
+}
+
+function _headers_serialised_len(h: headers_mod.Headers) -> usize {
+    let used = headers_mod.headers_len(h)
+    var n: usize = 0
+    var i: usize = 0
+    loop decreases used - i {
+        if i >= used { break }
+        let e = headers_mod.headers_at(h, i)
+        n = n + headers_mod.header_name(e).len() + (2 as usize) + headers_mod.header_value(e).len() + (2 as usize)
+        i += 1
+    }
+    return n
+}
+
+function _request_serialised_len(r: request_mod.Request) -> usize {
+    let m = request_mod.request_method(r)
+    let u = request_mod.request_uri(r)
+    let h = request_mod.request_headers(r)
+    let b = request_mod.request_body(r)
+    var n: usize = method_mod.method_token(m).len() + (1 as usize)
+    n = n + uri_mod.uri_target(u).len() + (1 as usize)
+    n = n + (8 as usize) + (2 as usize)
+    n = n + _headers_serialised_len(h) + (2 as usize)
+    n = n + body_mod.body_bytes(b).len()
+    return n
+}
+
+function _response_serialised_len(r: response_mod.Response) -> usize {
+    let s = response_mod.response_status(r)
+    let h = response_mod.response_headers(r)
+    let b = response_mod.response_body(r)
+    var n: usize = (8 as usize) + (1 as usize)
+    n = n + _decimal_len(status_mod.status_code(s) as usize) + (1 as usize)
+    n = n + status_mod.status_reason(s).len() + (2 as usize)
+    n = n + _headers_serialised_len(h) + (2 as usize)
+    n = n + body_mod.body_bytes(b).len()
+    return n
+}
+
+public function encode_request(
+    r: request_mod.Request,
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        var buf = _alloc_u8_slots(allocator, _request_serialised_len(r))?
+        let n = _serialise_request(r, mutable buf, 0 as usize)?
+        buf[0 as usize..<n]
+    }
+}
+
+public function encode_response(
+    r: response_mod.Response,
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        var buf = _alloc_u8_slots(allocator, _response_serialised_len(r))?
+        let n = _serialise_response(r, mutable buf, 0 as usize)?
+        buf[0 as usize..<n]
+    }
+}

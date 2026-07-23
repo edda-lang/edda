@@ -1,0 +1,261 @@
+
+module hermod.transport.client.client
+
+import std.mem.alloc
+import std.net.socket
+import std.text.string
+import std.crypto.x509.chain as x509_chain
+import tls.client as tls_client
+import tls.conn as tls_conn
+import tls.config as tls_config
+import tls.error as tls_error
+import local.error
+import local.message.request as request_mod
+import local.message.response as response_mod
+import local.codec.wire.encode.encode as codec_encode
+import local.codec.wire.decode.decode as codec_decode
+import local.uri.types as uri_mod
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public type Client {
+    origin_host: [u8]
+    origin_port: u16
+    ready: bool
+}
+
+public function client_for(host: [u8], port: u16) -> Client {
+    return Client {
+        origin_host: host,
+        origin_port: port,
+        ready: true,
+    }
+}
+
+public function client_host(c: Client) -> [u8] { return c.origin_host }
+
+public function client_port(c: Client) -> u16 { return c.origin_port }
+
+public function client_is_ready(c: Client) -> bool { return c.ready }
+
+function _max_response_bytes() -> usize { return 262144 as usize }
+
+function _read_timeout_millis() -> u32 { return 30000 as u32 }
+
+function _sock_err(e: socket.SocketError) -> error.TransportError {
+    return match e {
+        case .connection_refused    => error.TransportError.connection_refused
+        case .connection_reset      => error.TransportError.connection_reset
+        case .connection_aborted    => error.TransportError.connection_reset
+        case .host_unreachable      => error.TransportError.dial_failed
+        case .network_unreachable   => error.TransportError.dial_failed
+        case .timeout               => error.TransportError.timed_out
+        case .address_in_use        => error.TransportError.dial_failed
+        case .address_not_available => error.TransportError.dial_failed
+        case .dns_lookup_failed(_)  => error.TransportError.dial_failed
+        case .broken_pipe           => error.TransportError.write_failed
+        case .would_block           => error.TransportError.timed_out
+        case .not_connected         => error.TransportError.connection_reset
+        case .unexpected_eof        => error.TransportError.read_failed
+        case .out_of_memory         => error.TransportError.read_failed
+        case .os_error(_)           => error.TransportError.read_failed
+    }
+}
+
+function _dial(net: Network, fs: ReadOnlyFilesystem, host: String, port: u16) -> socket.Connection
+    with {net, fs, err: error.TransportError}
+{
+    return handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+        socket.dial(net, fs, host, port)?
+    }
+}
+
+function _config(conn: mutable socket.Connection) -> ()
+    with {err: error.TransportError}
+{
+    handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+        socket.set_read_timeout(mutable conn, _read_timeout_millis())?
+    }
+}
+
+function _write_all(conn: mutable socket.Connection, data: [u8]) -> ()
+    with {err: error.TransportError}
+{
+    var remaining: [u8] = data
+    loop decreases remaining.len() {
+        if remaining.len() == 0 as usize { break }
+        let wrote = handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+            socket.write(mutable conn, remaining)?
+        }
+        if wrote == 0 as usize { raise error.TransportError.write_failed }
+        let adv = if wrote > remaining.len() { remaining.len() } else { wrote }
+        remaining = remaining[adv..]
+    }
+}
+
+function _read_response(conn: mutable socket.Connection, allocator: Allocator) -> [u8]
+    with {allocator, err: error.TransportError, err: alloc.AllocError}
+{
+    let cap = _max_response_bytes()
+    let buf: [u8] = _alloc_u8_slots(allocator, cap)?
+    var filled: usize = 0 as usize
+    loop decreases cap - filled {
+        if filled >= cap { break }
+        let got = handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+            socket.read(mutable conn, mutable buf[filled..<cap])?
+        }
+        if got == 0 as usize { break }
+        let adv = if got > cap - filled { cap - filled } else { got }
+        filled = filled + adv
+    }
+    return buf[0..<filled]
+}
+
+function _transact(
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    host: String,
+    port: u16,
+    wire: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {net, fs, allocator, err: error.TransportError, err: alloc.AllocError}
+{
+    var conn = _dial(net, fs, host, port)?
+    _config(mutable conn)?
+    _write_all(mutable conn, wire)?
+    let out = _read_response(mutable conn, allocator)?
+    socket.close(take conn)
+    return out
+}
+
+public function client_send(
+    c: Client,
+    req: request_mod.Request,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {net, fs, allocator, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    let wire = codec_encode.encode_request(req, mutable allocator)?
+    let host = string.bytes_slice_to_string(c.origin_host, 0, c.origin_host.len(), allocator)?
+    let resp_bytes = _transact(net, fs, host, c.origin_port, wire, allocator)?
+    return codec_decode.decode_response(resp_bytes, mutable allocator)?
+}
+
+public function client_get(
+    c: Client,
+    target: [u8],
+    header_cap: usize,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {net, fs, allocator, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    let u = uri_mod.uri_http(c.origin_host, c.origin_port, target)
+    let req = request_mod.request_get(u, header_cap, mutable allocator)?
+    return client_send(c, req, net, fs, mutable allocator)?
+}
+
+function _tls_err(e: tls_error.TlsError) -> error.TransportError {
+    return match e {
+        case .socket_failed            => error.TransportError.dial_failed
+        case .peer_closed_unexpectedly => error.TransportError.read_failed
+        case _                         => error.TransportError.tls_failed
+    }
+}
+
+function _read_response_tls(conn: mutable tls_conn.Connection, allocator: mutable Allocator) -> [u8]
+    with {allocator, err: error.TransportError}
+{
+    let cap = _max_response_bytes()
+    let buf: [u8] = handle err: alloc.AllocError -> (raise error.TransportError.read_failed) {
+        _alloc_u8_slots(allocator, cap)?
+    }
+    var filled: usize = 0 as usize
+    loop decreases cap - filled {
+        if filled >= cap { break }
+        let got = handle err: tls_error.TlsError as e -> (raise _tls_err(e)) {
+            tls_conn.recv(mutable conn, mutable buf[filled..<cap], mutable allocator)?
+        }
+        if got == 0 as usize { break }
+        let adv = if got > cap - filled { cap - filled } else { got }
+        filled = filled + adv
+    }
+    return buf[0..<filled]
+}
+
+function _tls_send_recv(conn: mutable tls_conn.Connection, wire: [u8], allocator: mutable Allocator) -> [u8]
+    with {allocator, err: error.TransportError}
+{
+    handle err: tls_error.TlsError as e -> (raise _tls_err(e)) {
+        tls_conn.send(mutable conn, wire, mutable allocator)?
+    }
+    return _read_response_tls(mutable conn, mutable allocator)?
+}
+
+type TlsResult {
+    case ok([u8])
+    case fail(error.TransportError)
+}
+
+function _transact_tls(
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    random: Random,
+    host: String,
+    port: u16,
+    wire: [u8],
+    trust_store: x509_chain.TrustStore,
+    now_unix_seconds: i64,
+    allocator: mutable Allocator,
+) -> [u8]
+    with {net, fs, random, allocator, err: error.TransportError}
+{
+    let config = tls_config.client_config_new(host, trust_store, now_unix_seconds)
+    var conn = handle err: tls_error.TlsError as e -> (raise _tls_err(e)) {
+        handle err: alloc.AllocError -> (raise error.TransportError.dial_failed) {
+            tls_client.open(net, fs, random, host, port, config, mutable allocator)?
+        }
+    }
+    let outcome = handle err: error.TransportError as e -> TlsResult.fail(e) {
+        TlsResult.ok(_tls_send_recv(mutable conn, wire, mutable allocator)?)
+    }
+    tls_conn.close(take conn, mutable allocator)
+    return match outcome {
+        case .ok(let bytes) => bytes
+        case .fail(let e)   => raise e
+    }
+}
+
+public function client_send_tls(
+    c: Client,
+    req: request_mod.Request,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    random: Random,
+    trust_store: x509_chain.TrustStore,
+    now_unix_seconds: i64,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {net, fs, random, allocator, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    let wire = codec_encode.encode_request(req, mutable allocator)?
+    let host = string.bytes_slice_to_string(c.origin_host, 0, c.origin_host.len(), allocator)?
+    let resp_bytes = _transact_tls(net, fs, random, host, c.origin_port, wire, trust_store, now_unix_seconds, mutable allocator)?
+    return codec_decode.decode_response(resp_bytes, mutable allocator)?
+}
+
+public function client_local_roundtrip(
+    req: request_mod.Request,
+    allocator: mutable Allocator,
+) -> request_mod.Request
+    with {allocator, err: error.CodecError}
+{
+    let wire = codec_encode.encode_request(req, mutable allocator)?
+    return codec_decode.decode_request(wire, mutable allocator)?
+}

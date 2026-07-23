@@ -1,0 +1,150 @@
+
+module cteval.eval.arithmetic.signed
+
+import std.core.overflow
+import span.loc.pos.span as span_mod
+import syntax.ast.ops as ast_ops
+import local.state.value as value_mod
+import cteval.eval.arithmetic.outcome as outcome_mod
+
+
+public function apply(
+    op: ast_ops.BinOp,
+    av: i64,
+    bv: i64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    return match op {
+        case .add => signed_trap_addish(outcome_mod.AddishKind.add, av, bv, width, at)
+        case .check_add => signed_trap_addish(outcome_mod.AddishKind.add, av, bv, width, at)
+        case .sub => signed_trap_addish(outcome_mod.AddishKind.sub, av, bv, width, at)
+        case .check_sub => signed_trap_addish(outcome_mod.AddishKind.sub, av, bv, width, at)
+        case .mul => signed_trap_addish(outcome_mod.AddishKind.mul, av, bv, width, at)
+        case .check_mul => signed_trap_addish(outcome_mod.AddishKind.mul, av, bv, width, at)
+        case .wrap_add => signed_wrap_addish(outcome_mod.AddishKind.add, av, bv, width)
+        case .wrap_sub => signed_wrap_addish(outcome_mod.AddishKind.sub, av, bv, width)
+        case .wrap_mul => signed_wrap_addish(outcome_mod.AddishKind.mul, av, bv, width)
+        case .div => signed_div(av, bv, width, at)
+        case .mod => signed_mod(av, bv, width, at)
+        case .check_mod => signed_mod(av, bv, width, at)
+        case _ => outcome_mod.failed_arith_unsupported(at)
+    }
+}
+
+
+function signed_trap_addish(
+    kind: outcome_mod.AddishKind,
+    av: i64,
+    bv: i64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    return handle err: overflow.Overflow -> outcome_mod.overflow_outcome(at, signed_label(kind)) {
+        let raw = match kind {
+            case .add => av +? bv
+            case .sub => av -? bv
+            case .mul => av *? bv
+        }
+        let narrowed = check_signed_in_width(raw, width)?
+        outcome_mod.ArithOutcome.ok(
+            value: value_mod.ComptimeValue.int_signed(value: narrowed, width: width),
+        )
+    }
+}
+
+
+function signed_wrap_addish(
+    kind: outcome_mod.AddishKind,
+    av: i64,
+    bv: i64,
+    width: value_mod.IntWidth,
+) -> outcome_mod.ArithOutcome {
+    let raw = match kind {
+        case .add => av +% bv
+        case .sub => av -% bv
+        case .mul => av *% bv
+    }
+    let wrapped = wrap_signed_to_width(raw, width)
+    return outcome_mod.ArithOutcome.ok(
+        value: value_mod.ComptimeValue.int_signed(value: wrapped, width: width),
+    )
+}
+
+
+function signed_div(
+    av: i64,
+    bv: i64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    if bv == 0 {
+        return outcome_mod.overflow_outcome(at, "signed div by zero")
+    }
+    let i64_min = -9223372036854775807 - 1
+    if av == i64_min && bv == -1 {
+        return outcome_mod.overflow_outcome(at, "signed div (i64::MIN / -1)")
+    }
+    let raw = av / bv
+    return handle err: overflow.Overflow -> outcome_mod.overflow_outcome(at, "signed div (width)") {
+        let narrowed = check_signed_in_width(raw, width)?
+        outcome_mod.ArithOutcome.ok(
+            value: value_mod.ComptimeValue.int_signed(value: narrowed, width: width),
+        )
+    }
+}
+
+function signed_mod(
+    av: i64,
+    bv: i64,
+    width: value_mod.IntWidth,
+    at: span_mod.Span,
+) -> outcome_mod.ArithOutcome {
+    return handle err: overflow.Overflow -> outcome_mod.overflow_outcome(at, "signed mod") {
+        let raw = av %? bv
+        let narrowed = check_signed_in_width(raw, width)?
+        outcome_mod.ArithOutcome.ok(
+            value: value_mod.ComptimeValue.int_signed(value: narrowed, width: width),
+        )
+    }
+}
+
+
+function check_signed_in_width(v: i64, width: value_mod.IntWidth) -> i64
+    with {err: overflow.Overflow}
+{
+    return match width {
+        case .w8 => signed_range(v, -128, 127)?
+        case .w16 => signed_range(v, -32768, 32767)?
+        case .w32 => signed_range(v, -2147483648, 2147483647)?
+        case .w64 => v
+        case .wsize => v
+    }
+}
+
+function signed_range(v: i64, lo: i64, hi: i64) -> i64 with {err: overflow.Overflow} {
+    if v < lo || v > hi {
+        raise overflow.Overflow.overflow
+    }
+    return v
+}
+
+
+function wrap_signed_to_width(v: i64, width: value_mod.IntWidth) -> i64 {
+    return match width {
+        case .w8 => (v as i8 wrapping) as i64
+        case .w16 => (v as i16 wrapping) as i64
+        case .w32 => (v as i32 wrapping) as i64
+        case .w64 => v
+        case .wsize => v
+    }
+}
+
+
+function signed_label(kind: outcome_mod.AddishKind) -> String {
+    return match kind {
+        case .add => "signed add"
+        case .sub => "signed sub"
+        case .mul => "signed mul"
+    }
+}

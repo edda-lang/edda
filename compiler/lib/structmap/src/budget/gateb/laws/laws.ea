@@ -1,0 +1,209 @@
+module structmap.budget.gateb.laws.laws
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string as string
+import local.data.model as model
+import local.budget.model as bmodel
+import local.budget.cohesion.spoke.spoke as sp
+import local.budget.cohesion.classify.classify as cc
+import local.budget.gate.select.select as sel
+import local.budget.gate.measure.measure as mz
+import local.budget.gateb.tree.tree as tree_mod
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(sp.NameCluster)
+spec std.collections.vec.Vec(bmodel.FileGroup)
+spec std.collections.vec.Vec(bmodel.WorklistEntry)
+spec std.core.option.Option(bmodel.Directive)
+
+
+function clone_strings(src: Vec_String.Vec, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n = Vec_String.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_String.push(mutable out, string.clone(Vec_String.at(src, i), allocator)?, allocator)?
+        i += 1
+    }
+    return out
+}
+
+function to_file_groups(comps: Vec_NameCluster.Vec, allocator: Allocator) -> Vec_FileGroup.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_FileGroup.Vec
+    Vec_FileGroup.new(init out, allocator)?
+    let n = Vec_NameCluster.len(comps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let files = clone_strings(Vec_NameCluster.at(comps, i).names, allocator)?
+        Vec_FileGroup.push(mutable out, bmodel.FileGroup { files: files }, allocator)?
+        i += 1
+    }
+    return out
+}
+
+function component_equals(b: [u8], start: usize, word: String) -> bool {
+    let w = word.bytes()
+    let wn: usize = w.len()
+    let bn: usize = b.len()
+    if start +| wn > bn { return false }
+    var k: usize = 0
+    loop decreases (wn - k) {
+        if k >= wn { break }
+        if b[start + k] != w[k] { return false }
+        k += 1
+    }
+    let after: usize = start +| wn
+    if after == bn { return true }
+    return b[after] == 0x2F || b[after] == 0x5C
+}
+
+function is_generated_dir(dir: String, root: String) -> bool {
+    if !string.starts_with(dir, root) { return false }
+    let db = dir.bytes()
+    let rb = root.bytes()
+    var i: usize = rb.len()
+    if i < db.len() && (db[i] == 0x2F || db[i] == 0x5C) { i = i + 1 }
+    return component_equals(db, i, "codegen") || component_equals(db, i, "target")
+}
+
+function within_member_src(dir: String, root: String) -> bool {
+    if !string.starts_with(dir, root) { return true }
+    let db = dir.bytes()
+    let rb = root.bytes()
+    let n: usize = db.len()
+    var i: usize = rb.len()
+    if i < n && (db[i] == 0x2F || db[i] == 0x5C) { i = i + 1 }
+    loop decreases (n - i) {
+        if i >= n { break }
+        if component_equals(db, i, "src") { return true }
+        var j: usize = i
+        loop decreases (n - j) {
+            if j >= n { break }
+            if db[j] == 0x2F || db[j] == 0x5C { break }
+            j += 1
+        }
+        if j >= n { break }
+        i = j + 1
+    }
+    return false
+}
+
+function exempt_combined_cost(tree: model.Tree, dir_idx: usize, exempt: Vec_String.Vec, cfg: bmodel.BudgetConfig, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(exempt)
+    var sum: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        sum = sum +| mz.file_interface_cost(tree, dir_idx, Vec_String.at(exempt, i), cfg, allocator)?
+        i += 1
+    }
+    return sum
+}
+
+function compute_own_costs(tree: model.Tree, cfg: bmodel.BudgetConfig, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.new(init out, allocator)?
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_usize.push(mutable out, tree_mod.own_interface(tree, i, cfg, allocator)?, allocator)?
+        i += 1
+    }
+    return out
+}
+
+public function gate_b_structure(tree: model.Tree, cfg: bmodel.BudgetConfig, root: String, out: mutable Vec_WorklistEntry.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let read_cap = cfg.node_amber_max
+    let own_costs = compute_own_costs(tree, cfg, allocator)?
+    let ndirs: usize = Vec_String.len(tree.paths)
+    var dir_idx: usize = 0
+    loop decreases (ndirs - dir_idx) {
+        if dir_idx >= ndirs { break }
+        let dir = Vec_String.at(tree.paths, dir_idx)
+        if is_generated_dir(dir, root) { dir_idx = dir_idx + 1; continue }
+        if !within_member_src(dir, root) { dir_idx = dir_idx + 1; continue }
+
+        let exempt = sel.exempt_files(tree, dir_idx, allocator)?
+        if Vec_String.len(exempt) >= 2 as usize {
+            let combined = exempt_combined_cost(tree, dir_idx, exempt, cfg, allocator)?
+            let ex_idxs = sel.subset_fn_idxs(tree, dir_idx, exempt, allocator)?
+            let groups_nc = cc.dir_file_components(tree.functions, ex_idxs, allocator)?
+            if combined > read_cap && Vec_NameCluster.len(groups_nc) >= 2 as usize {
+                let hoard = bmodel.AtomicHoard {
+                    files: clone_strings(exempt, allocator)?,
+                    tokens: combined,
+                    groups: to_file_groups(groups_nc, allocator)?
+                }
+                Vec_WorklistEntry.push(mutable out, bmodel.WorklistEntry {
+                    gate: bmodel.Gate.spine,
+                    node: string.clone(dir, allocator)?,
+                    token_cost: combined,
+                    ceiling: read_cap,
+                    overage: combined -| read_cap,
+                    directive: Option_Directive.some(value: bmodel.Directive.atomic_hoard(hoard)),
+                    band: bmodel.Band.red
+                }, allocator)?
+            }
+        }
+
+        let kids = tree_mod.immediate_child_idxs(tree, dir_idx, allocator)?
+        if Vec_usize.len(kids) == 0 as usize { dir_idx = dir_idx + 1; continue }
+        let own_d = Vec_usize.at(own_costs, dir_idx)
+
+        if Vec_usize.len(kids) == 1 as usize && tree_mod.own_file_count(tree, dir_idx) == 0 as usize && !string.equals(dir, root) {
+            let child_own = Vec_usize.at(own_costs, Vec_usize.at(kids, 0 as usize))
+            Vec_WorklistEntry.push(mutable out, bmodel.WorklistEntry {
+                gate: bmodel.Gate.spine,
+                node: string.clone(dir, allocator)?,
+                token_cost: child_own,
+                ceiling: 0 as usize,
+                overage: child_own,
+                directive: Option_Directive.some(value: bmodel.Directive.flatten),
+                band: bmodel.Band.red
+            }, allocator)?
+            dir_idx = dir_idx + 1
+            continue
+        }
+
+        let sub = tree_mod.subtree_interface(tree, dir_idx, own_costs)
+        if sub <= read_cap { dir_idx = dir_idx + 1; continue }
+        let band = tree_mod.hub_band(own_d, sub)
+        if mz.is_green(band) { dir_idx = dir_idx + 1; continue }
+
+        let denom: usize = if sub == 0 as usize { 1 as usize } else { sub }
+        let percent = own_d *| (100 as usize) / denom
+        let green_share = sub *| bmodel.hub_lean_green_num() / bmodel.hub_lean_green_den()
+        let all_idxs = sel.dir_fn_idxs(tree, dir_idx, allocator)?
+        let groups_nc = cc.dir_file_components(tree.functions, all_idxs, allocator)?
+        let hub = bmodel.HoardingHub { percent: percent, groups: to_file_groups(groups_nc, allocator)? }
+        Vec_WorklistEntry.push(mutable out, bmodel.WorklistEntry {
+            gate: bmodel.Gate.spine,
+            node: string.clone(dir, allocator)?,
+            token_cost: own_d,
+            ceiling: green_share,
+            overage: own_d -| green_share,
+            directive: Option_Directive.some(value: bmodel.Directive.hoarding_hub(hub)),
+            band: band
+        }, allocator)?
+        dir_idx = dir_idx + 1
+    }
+}

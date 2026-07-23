@@ -1,0 +1,129 @@
+
+module query.memo.memo
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import cache.addr.hash as hash_mod
+import local.graph.idx.key as key_mod
+import local.persist.wire as wire_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(MemoEntry)
+spec std.core.option.Option(usize)
+
+
+public type MemoEntry {
+    key: hash_mod.ArtifactHash
+    blob: Vec_u8.Vec
+}
+
+public type MemoStore {
+    entries: Vec_MemoEntry.Vec
+}
+
+
+public function new_store(allocator: Allocator) -> MemoStore
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_MemoEntry.Vec
+    Vec_MemoEntry.new(init entries, allocator)?
+    return MemoStore { entries: entries }
+}
+
+public function len(store: MemoStore) -> usize {
+    return Vec_MemoEntry.len(store.entries)
+}
+
+
+public function derive_key(kind: u32, inputs: [hash_mod.ArtifactHash], allocator: Allocator) -> hash_mod.ArtifactHash
+    with {allocator, divergence, err: alloc.AllocError}
+    requires inputs.len() < 4294967296
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    wire_mod.push_u32_be(mutable buf, kind, allocator)?
+    wire_mod.push_u32_be(mutable buf, inputs.len() as u32, allocator)?
+    let n = inputs.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        wire_mod.push_hash_be(mutable buf, inputs[i], allocator)?
+        i += 1
+    }
+    let bytes = Vec_u8.into_array(take buf, allocator)?
+    return hash_mod.hash_bytes(bytes, allocator)?
+}
+
+
+public function get(store: MemoStore, key: hash_mod.ArtifactHash) -> Option_usize {
+    let n = Vec_MemoEntry.len(store.entries)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = Vec_MemoEntry.at(store.entries, i)
+        if key_mod.hash_equals(e.key, key) {
+            return Option_usize.some(value: i)
+        }
+        i += 1
+    }
+    return Option_usize.none
+}
+
+public function contains(store: MemoStore, key: hash_mod.ArtifactHash) -> bool {
+    return match get(store, key) {
+        case .some(let _i) => true
+        case .none         => false
+    }
+}
+
+public function insert(store: mutable MemoStore, key: hash_mod.ArtifactHash, blob: take Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match get(store, key) {
+        case .some(let _i) => return ()
+        case .none         => ()
+    }
+    let entry = MemoEntry { key: key, blob: blob }
+    Vec_MemoEntry.push(mutable store.entries, take entry, allocator)?
+}
+
+public function blob_at(store: MemoStore, i: usize where i < len(store)) -> Vec_u8.Vec {
+    let e = Vec_MemoEntry.at(store.entries, i)
+    return e.blob
+}
+
+public function key_at(store: MemoStore, i: usize where i < len(store)) -> hash_mod.ArtifactHash {
+    let e = Vec_MemoEntry.at(store.entries, i)
+    return e.key
+}
+
+
+public function gc_retain(store: MemoStore, live: [hash_mod.ArtifactHash], allocator: Allocator) -> MemoStore
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    var kept = new_store(allocator)?
+    let n = Vec_MemoEntry.len(store.entries)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = Vec_MemoEntry.at(store.entries, i)
+        if contains_hash(live, e.key) {
+            insert(mutable kept, e.key, take e.blob, allocator)?
+        }
+        i += 1
+    }
+    return kept
+}
+
+
+function contains_hash(live: [hash_mod.ArtifactHash], key: hash_mod.ArtifactHash) -> bool {
+    let n = live.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if key_mod.hash_equals(live[i], key) { return true }
+        i += 1
+    }
+    return false
+}

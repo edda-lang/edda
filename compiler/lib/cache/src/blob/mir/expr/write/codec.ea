@@ -1,0 +1,549 @@
+
+module cache.blob.mir.expr.write.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.literal as ast_literal_mod
+import local.blob.mir.ast.ops as ast_ops_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.pat.codec as pat_codec_mod
+import local.blob.mir.ty.write.codec as ty_codec_mod
+import local.blob.mir.expr.leaf.codec as leaf_mod
+
+
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.mem.alloc.Box(ast_tree_mod.Closure)
+spec std.mem.alloc.Box(ast_tree_mod.SpawnExpr)
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_tree_mod.Stmt)
+spec std.collections.vec.Vec(ast_tree_mod.MatchArm)
+spec std.collections.vec.Vec(ast_tree_mod.StructLitField)
+spec std.collections.vec.Vec(ast_tree_mod.CallArg)
+spec std.collections.vec.Vec(ast_tree_mod.SpawnArg)
+spec std.collections.vec.Vec(ast_tree_mod.FStringSeg)
+
+
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(ast_tree_mod.Expr)
+
+
+public function write_expr(
+    it: interner_mod.Interner,
+    expr: ast_tree_mod.Expr,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(expr.span, mutable out, allocator)?
+    match expr.kind {
+        case .literal(let value) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            ast_literal_mod.write_literal(it, value, mutable out, allocator)?
+        }
+        case .fstring(let segments) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            write_fstring_seg_vec(segments, it, mutable out, allocator)?
+        }
+        case .path(let path) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            ast_codec_mod.write_path(it, path, mutable out, allocator)?
+        }
+        case .binary(let op, let lhs, let rhs) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            ast_ops_mod.write_bin_op(op, mutable out, allocator)?
+            write_box_expr(it, lhs, mutable out, allocator)?
+            write_box_expr(it, rhs, mutable out, allocator)?
+        }
+        case .unary(let op, let operand) => {
+            prim_mod.push_u8(mutable out, 4, allocator)?
+            ast_ops_mod.write_un_op(op, mutable out, allocator)?
+            write_box_expr(it, operand, mutable out, allocator)?
+        }
+        case .call(let callee, let args) => {
+            prim_mod.push_u8(mutable out, 5, allocator)?
+            write_box_expr(it, callee, mutable out, allocator)?
+            write_call_arg_vec(args, it, mutable out, allocator)?
+        }
+        case .method_call(let receiver, let name, let args) => {
+            prim_mod.push_u8(mutable out, 6, allocator)?
+            write_box_expr(it, receiver, mutable out, allocator)?
+            ast_codec_mod.write_ident(it, name, mutable out, allocator)?
+            write_call_arg_vec(args, it, mutable out, allocator)?
+        }
+        case .field(let receiver, let name) => {
+            prim_mod.push_u8(mutable out, 7, allocator)?
+            write_box_expr(it, receiver, mutable out, allocator)?
+            ast_codec_mod.write_ident(it, name, mutable out, allocator)?
+        }
+        case .tuple_index(let receiver, let index) => {
+            prim_mod.push_u8(mutable out, 8, allocator)?
+            write_box_expr(it, receiver, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, index, allocator)?
+        }
+        case .positional(let receiver, let index) => {
+            prim_mod.push_u8(mutable out, 9, allocator)?
+            write_box_expr(it, receiver, mutable out, allocator)?
+            write_box_expr(it, index, mutable out, allocator)?
+        }
+        case .index(let receiver, let index) => {
+            prim_mod.push_u8(mutable out, 10, allocator)?
+            write_box_expr(it, receiver, mutable out, allocator)?
+            write_box_expr(it, index, mutable out, allocator)?
+        }
+        case .if_(let cond, let then_block, let else_branch) => {
+            prim_mod.push_u8(mutable out, 11, allocator)?
+            write_box_expr(it, cond, mutable out, allocator)?
+            write_block(it, then_block, mutable out, allocator)?
+            write_option_box_expr(else_branch, it, mutable out, allocator)?
+        }
+        case .match_(let scrutinee, let arms) => {
+            prim_mod.push_u8(mutable out, 12, allocator)?
+            write_box_expr(it, scrutinee, mutable out, allocator)?
+            write_match_arm_vec(arms, it, mutable out, allocator)?
+        }
+        case .block(let body) => {
+            prim_mod.push_u8(mutable out, 13, allocator)?
+            write_block(it, body, mutable out, allocator)?
+        }
+        case .cast(let inner, let ty, let mode) => {
+            prim_mod.push_u8(mutable out, 14, allocator)?
+            write_box_expr(it, inner, mutable out, allocator)?
+            leaf_mod.write_box_ty(it, ty, mutable out, allocator, write_expr)?
+            ast_ops_mod.write_cast_mode(mode, mutable out, allocator)?
+        }
+        case .range(let lo, let hi, let kind) => {
+            prim_mod.push_u8(mutable out, 15, allocator)?
+            write_option_box_expr(lo, it, mutable out, allocator)?
+            write_option_box_expr(hi, it, mutable out, allocator)?
+            ast_ops_mod.write_range_kind(kind, mutable out, allocator)?
+        }
+        case .tuple(let elements) => {
+            prim_mod.push_u8(mutable out, 16, allocator)?
+            write_expr_vec(elements, it, mutable out, allocator)?
+        }
+        case .struct_lit(let path, let fields) => {
+            prim_mod.push_u8(mutable out, 17, allocator)?
+            ast_codec_mod.write_path(it, path, mutable out, allocator)?
+            write_struct_lit_field_vec(fields, it, mutable out, allocator)?
+        }
+        case .loop_(let body, let label, let decreases_) => {
+            prim_mod.push_u8(mutable out, 18, allocator)?
+            write_block(it, body, mutable out, allocator)?
+            leaf_mod.write_option_ident(label, it, mutable out, allocator)?
+            write_option_box_expr(decreases_, it, mutable out, allocator)?
+        }
+        case .for_(let pat, let iter, let body, let label) => {
+            prim_mod.push_u8(mutable out, 19, allocator)?
+            leaf_mod.write_box_pat(it, pat, mutable out, allocator, write_expr)?
+            write_box_expr(it, iter, mutable out, allocator)?
+            write_block(it, body, mutable out, allocator)?
+            leaf_mod.write_option_ident(label, it, mutable out, allocator)?
+        }
+        case .try_(let inner) => {
+            prim_mod.push_u8(mutable out, 20, allocator)?
+            write_box_expr(it, inner, mutable out, allocator)?
+        }
+        case .await_(let inner) => {
+            prim_mod.push_u8(mutable out, 21, allocator)?
+            write_box_expr(it, inner, mutable out, allocator)?
+        }
+        case .raise_(let inner) => {
+            prim_mod.push_u8(mutable out, 22, allocator)?
+            write_box_expr(it, inner, mutable out, allocator)?
+        }
+        case .panic_(let inner) => {
+            prim_mod.push_u8(mutable out, 23, allocator)?
+            write_box_expr(it, inner, mutable out, allocator)?
+        }
+        case .return_(let value) => {
+            prim_mod.push_u8(mutable out, 24, allocator)?
+            write_option_box_expr(value, it, mutable out, allocator)?
+        }
+        case .break_(let label, let value) => {
+            prim_mod.push_u8(mutable out, 25, allocator)?
+            leaf_mod.write_option_ident(label, it, mutable out, allocator)?
+            write_option_box_expr(value, it, mutable out, allocator)?
+        }
+        case .continue_(let label) => {
+            prim_mod.push_u8(mutable out, 26, allocator)?
+            leaf_mod.write_option_ident(label, it, mutable out, allocator)?
+        }
+        case .comptime_(let inner) => {
+            prim_mod.push_u8(mutable out, 27, allocator)?
+            write_box_expr(it, inner, mutable out, allocator)?
+        }
+        case .comptime_block(let body) => {
+            prim_mod.push_u8(mutable out, 28, allocator)?
+            write_block(it, body, mutable out, allocator)?
+        }
+        case .scope_(let kind, let name, let body) => {
+            prim_mod.push_u8(mutable out, 29, allocator)?
+            ast_ops_mod.write_scope_kind(kind, mutable out, allocator)?
+            leaf_mod.write_option_ident(name, it, mutable out, allocator)?
+            write_block(it, body, mutable out, allocator)?
+        }
+        case .effect_row(let row) => {
+            prim_mod.push_u8(mutable out, 30, allocator)?
+            ty_codec_mod.write_effect_row(it, row, mutable out, allocator, write_expr)?
+        }
+        case .handle_(let effect, let ty, let binder, let recovery, let body) => {
+            prim_mod.push_u8(mutable out, 31, allocator)?
+            ast_codec_mod.write_ident(it, effect, mutable out, allocator)?
+            leaf_mod.write_box_ty(it, ty, mutable out, allocator, write_expr)?
+            ast_codec_mod.write_ident(it, binder, mutable out, allocator)?
+            write_box_expr(it, recovery, mutable out, allocator)?
+            write_block(it, body, mutable out, allocator)?
+        }
+        case .closure(let payload) => {
+            prim_mod.push_u8(mutable out, 32, allocator)?
+            write_closure(it, Box_Closure.get(payload), mutable out, allocator)?
+        }
+        case .spawn(let payload) => {
+            prim_mod.push_u8(mutable out, 33, allocator)?
+            write_spawn_expr(it, Box_SpawnExpr.get(payload), mutable out, allocator)?
+        }
+        case .forall_(let bound, let iter, let body) => {
+            prim_mod.push_u8(mutable out, 34, allocator)?
+            ast_codec_mod.write_ident(it, bound, mutable out, allocator)?
+            write_box_expr(it, iter, mutable out, allocator)?
+            write_box_expr(it, body, mutable out, allocator)?
+        }
+        case .exists_(let bound, let iter, let body) => {
+            prim_mod.push_u8(mutable out, 35, allocator)?
+            ast_codec_mod.write_ident(it, bound, mutable out, allocator)?
+            write_box_expr(it, iter, mutable out, allocator)?
+            write_box_expr(it, body, mutable out, allocator)?
+        }
+        case .error => prim_mod.push_u8(mutable out, 36, allocator)?
+    }
+}
+
+public function write_box_expr(
+    it: interner_mod.Interner,
+    b: Box_Expr,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    write_expr(it, Box_Expr.get(b), mutable out, allocator)?
+}
+
+public function write_option_box_expr(
+    opt: Option_Box_Expr,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match opt {
+        case .some(let b) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            write_box_expr(it, b, mutable out, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function write_option_expr(
+    opt: Option_Expr,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match opt {
+        case .some(let e) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            write_expr(it, e, mutable out, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function write_expr_vec(
+    elements: Vec_Expr.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_Expr.len(elements)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_expr(it, Vec_Expr.at(elements, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_stmt(
+    it: interner_mod.Interner,
+    stmt: ast_tree_mod.Stmt,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(stmt.span, mutable out, allocator)?
+    match stmt.kind {
+        case .let_(let binding, let pat, let ty, let init_) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            ast_ops_mod.write_binding_mode(binding, mutable out, allocator)?
+            pat_codec_mod.write_pat(it, pat, mutable out, allocator, write_expr)?
+            leaf_mod.write_option_ty(ty, it, mutable out, allocator, write_expr)?
+            write_option_expr(init_, it, mutable out, allocator)?
+        }
+        case .assign(let target, let op, let rhs) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            write_expr(it, target, mutable out, allocator)?
+            ast_ops_mod.write_assign_op(op, mutable out, allocator)?
+            write_expr(it, rhs, mutable out, allocator)?
+        }
+        case .expr(let value) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            write_expr(it, value, mutable out, allocator)?
+        }
+    }
+}
+
+public function write_stmt_vec(
+    stmts: Vec_Stmt.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_Stmt.len(stmts)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_stmt(it, Vec_Stmt.at(stmts, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_block(
+    it: interner_mod.Interner,
+    block: ast_tree_mod.Block,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(block.span, mutable out, allocator)?
+    write_stmt_vec(block.stmts, it, mutable out, allocator)?
+    write_option_box_expr(block.trailing, it, mutable out, allocator)?
+}
+
+public function write_match_arm(
+    it: interner_mod.Interner,
+    arm: ast_tree_mod.MatchArm,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(arm.span, mutable out, allocator)?
+    pat_codec_mod.write_pat(it, arm.pat, mutable out, allocator, write_expr)?
+    write_option_expr(arm.guard, it, mutable out, allocator)?
+    write_expr(it, arm.body, mutable out, allocator)?
+}
+
+public function write_match_arm_vec(
+    arms: Vec_MatchArm.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_MatchArm.len(arms)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_match_arm(it, Vec_MatchArm.at(arms, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_struct_lit_field(
+    it: interner_mod.Interner,
+    field: ast_tree_mod.StructLitField,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(field.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, field.name, mutable out, allocator)?
+    leaf_mod.write_option_call_mode(field.mode, mutable out, allocator)?
+    write_expr(it, field.value, mutable out, allocator)?
+}
+
+public function write_struct_lit_field_vec(
+    fields: Vec_StructLitField.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_StructLitField.len(fields)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_struct_lit_field(it, Vec_StructLitField.at(fields, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_call_arg(
+    it: interner_mod.Interner,
+    arg: ast_tree_mod.CallArg,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(arg.span, mutable out, allocator)?
+    leaf_mod.write_option_call_mode(arg.mode, mutable out, allocator)?
+    leaf_mod.write_option_ident(arg.name, it, mutable out, allocator)?
+    write_expr(it, arg.expr, mutable out, allocator)?
+}
+
+public function write_call_arg_vec(
+    args: Vec_CallArg.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_CallArg.len(args)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_call_arg(it, Vec_CallArg.at(args, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_closure(
+    it: interner_mod.Interner,
+    closure: ast_tree_mod.Closure,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(closure.span, mutable out, allocator)?
+    leaf_mod.write_param_vec(closure.params, it, mutable out, allocator, write_expr)?
+    ty_codec_mod.write_ty(it, closure.ret, mutable out, allocator, write_expr)?
+    ty_codec_mod.write_option_effect_row(closure.effects, it, mutable out, allocator, write_expr)?
+    leaf_mod.write_option_vec_capture(closure.captures_, it, mutable out, allocator)?
+    write_block(it, closure.body, mutable out, allocator)?
+}
+
+public function write_spawn_expr(
+    it: interner_mod.Interner,
+    spawn: ast_tree_mod.SpawnExpr,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(spawn.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, spawn.scope_name, mutable out, allocator)?
+    write_spawn_arg_vec(spawn.args, it, mutable out, allocator)?
+    write_block(it, spawn.body, mutable out, allocator)?
+}
+
+public function write_spawn_arg(
+    it: interner_mod.Interner,
+    arg: ast_tree_mod.SpawnArg,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(arg.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, arg.name, mutable out, allocator)?
+    leaf_mod.write_option_ty(arg.ty, it, mutable out, allocator, write_expr)?
+    write_expr(it, arg.init_, mutable out, allocator)?
+}
+
+public function write_spawn_arg_vec(
+    args: Vec_SpawnArg.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_SpawnArg.len(args)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_spawn_arg(it, Vec_SpawnArg.at(args, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_fstring_seg(
+    it: interner_mod.Interner,
+    seg: ast_tree_mod.FStringSeg,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match seg {
+        case .text(let sym) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            symbol_codec_mod.write_symbol(it, sym, mutable out, allocator)?
+        }
+        case .interp(let expr) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            write_box_expr(it, expr, mutable out, allocator)?
+        }
+    }
+}
+
+public function write_fstring_seg_vec(
+    segments: Vec_FStringSeg.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_FStringSeg.len(segments)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_fstring_seg(it, Vec_FStringSeg.at(segments, i), mutable out, allocator)?
+        i += 1
+    }
+}

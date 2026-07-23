@@ -1,0 +1,131 @@
+module structmap.budget.gateb.tree.tree
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string as string
+import local.data.model as model
+import local.budget.model as bmodel
+import local.budget.gate.select.select as sel
+import local.budget.gate.measure.measure as mz
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.ModuleEntry)
+
+
+public function own_file_count(tree: model.Tree, dir_idx: usize) -> usize {
+    let n: usize = Vec_ModuleEntry.len(tree.modules)
+    var c: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_ModuleEntry.at(tree.modules, i).dir_idx == dir_idx { c += 1 }
+        i += 1
+    }
+    return c
+}
+
+public function own_interface(tree: model.Tree, dir_idx: usize, cfg: bmodel.BudgetConfig, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let files = sel.distinct_files(tree, dir_idx, allocator)?
+    let exempt = sel.exempt_files(tree, dir_idx, allocator)?
+    let n: usize = Vec_String.len(files)
+    var sum: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_String.at(files, i)
+        if !sel.contains_file(exempt, file) {
+            sum = sum +| mz.file_interface_cost(tree, dir_idx, file, cfg, allocator)?
+        }
+        i += 1
+    }
+    return sum
+}
+
+function last_sep(b: [u8]) -> usize {
+    let n: usize = b.len()
+    var last: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if b[i] == 0x2F || b[i] == 0x5C { last = i }
+        i += 1
+    }
+    return last
+}
+
+public function parent_path(path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let b = path.bytes()
+    let n: usize = b.len()
+    let cut: usize = last_sep(b)
+    if cut == 0 as usize { return string.clone("", allocator)? }
+    let out: [u8] = allocator.alloc_array(u8, cut)?
+    var i: usize = 0
+    loop decreases (cut - i) {
+        if i >= cut { break }
+        out[i] = b[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take out)
+}
+
+public function is_descendant(e: String, d: String) -> bool {
+    if string.equals(e, d) { return true }
+    if !string.starts_with(e, d) { return false }
+    let eb = e.bytes()
+    let db = d.bytes()
+    let dn: usize = db.len()
+    if dn >= eb.len() { return false }
+    return eb[dn] == 0x2F || eb[dn] == 0x5C
+}
+
+public function immediate_child_idxs(tree: model.Tree, dir_idx: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let this_path = Vec_String.at(tree.paths, dir_idx)
+    uninit out: Vec_usize.Vec
+    Vec_usize.new(init out, allocator)?
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i != dir_idx {
+            let pp = parent_path(Vec_String.at(tree.paths, i), allocator)?
+            if string.equals(pp, this_path) {
+                Vec_usize.push(mutable out, i, allocator)?
+            }
+        }
+        i += 1
+    }
+    return out
+}
+
+public function subtree_interface(tree: model.Tree, dir_idx: usize, own_costs: Vec_usize.Vec) -> usize {
+    let this_path = Vec_String.at(tree.paths, dir_idx)
+    let n: usize = Vec_String.len(tree.paths)
+    var sum: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if is_descendant(Vec_String.at(tree.paths, i), this_path) {
+            sum = sum +| Vec_usize.at(own_costs, i)
+        }
+        i += 1
+    }
+    return sum
+}
+
+public function hub_band(own: usize, subtree: usize) -> bmodel.Band {
+    if own *| bmodel.hub_lean_red_den() > subtree *| bmodel.hub_lean_red_num() {
+        return bmodel.Band.red
+    }
+    if own *| bmodel.hub_lean_green_den() > subtree *| bmodel.hub_lean_green_num() {
+        return bmodel.Band.amber
+    }
+    return bmodel.Band.green
+}

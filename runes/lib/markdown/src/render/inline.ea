@@ -1,0 +1,118 @@
+module markdown.render.inline
+
+import std.mem.alloc
+import markdown.escape.sink as sink
+
+public function render(s: mutable sink.Sink, data: [u8], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    render_span(mutable s, data, 0 as usize, data.len(), data.len(), allocator)?
+}
+
+function render_span(
+    s: mutable sink.Sink,
+    data: [u8],
+    lo: usize,
+    hi: usize,
+    fuel: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires hi <= data.len()
+    requires lo <= hi
+    requires hi - lo <= fuel
+    decreases fuel
+{
+    if lo >= hi { return }
+    let byte = data[lo]
+    if byte == 96 {
+        let close = find_byte(data, lo + 1, hi, 96 as u8)
+        if close < hi {
+            sink.push_raw(mutable s, "<code>", allocator)?
+            sink.push_escaped_bytes(mutable s, data[lo + 1..<close], allocator)?
+            sink.push_raw(mutable s, "</code>", allocator)?
+            render_span(mutable s, data, close + 1, hi, fuel - 1, allocator)?
+            return
+        }
+    } else if byte == 42 && lo + 1 < hi && data[lo + 1] == 42 {
+        let close = find_pair(data, lo + 2, hi, 42 as u8)
+        if close + 1 < hi {
+            sink.push_raw(mutable s, "<strong>", allocator)?
+            render_span(mutable s, data, lo + 2, close, fuel - 1, allocator)?
+            sink.push_raw(mutable s, "</strong>", allocator)?
+            render_span(mutable s, data, close + 2, hi, fuel - 1, allocator)?
+            return
+        }
+    } else if byte == 42 || byte == 95 {
+        let close = find_byte(data, lo + 1, hi, byte)
+        if close < hi {
+            sink.push_raw(mutable s, "<em>", allocator)?
+            render_span(mutable s, data, lo + 1, close, fuel - 1, allocator)?
+            sink.push_raw(mutable s, "</em>", allocator)?
+            render_span(mutable s, data, close + 1, hi, fuel - 1, allocator)?
+            return
+        }
+    } else if byte == 91 {
+        let rb = find_byte(data, lo + 1, hi, 93 as u8)
+        if rb + 1 < hi && data[rb + 1] == 40 {
+            let rp = find_byte(data, rb + 2, hi, 41 as u8)
+            if rp < hi {
+                sink.push_raw(mutable s, "<a href=\"", allocator)?
+                sink.push_escaped_bytes(mutable s, data[rb + 2..<rp], allocator)?
+                sink.push_raw(mutable s, "\">", allocator)?
+                render_span(mutable s, data, lo + 1, rb, fuel - 1, allocator)?
+                sink.push_raw(mutable s, "</a>", allocator)?
+                render_span(mutable s, data, rp + 1, hi, fuel - 1, allocator)?
+                return
+            }
+        }
+    }
+    sink.push_byte(mutable s, take byte, allocator)?
+    render_span(mutable s, data, lo + 1, hi, fuel - 1, allocator)?
+}
+
+function find_byte(
+    data: [u8],
+    from: usize where from <= data.len(),
+    to: usize where from <= to && to <= data.len(),
+    target: u8,
+) -> usize
+    ensures result >= from
+    ensures result <= to
+{
+    var i: usize = from
+    loop
+        decreases to - i
+    {
+        if i >= to { break }
+        if data[i] == target {
+            return i
+        }
+        i += 1
+    }
+    return to
+}
+
+function find_pair(
+    data: [u8],
+    from: usize where from <= data.len(),
+    to: usize where from <= to && to <= data.len(),
+    marker: u8,
+) -> usize
+    ensures result >= from
+    ensures result <= to
+{
+    if to == 0 { return to }
+    let last = to - 1
+    var i: usize = from
+    loop
+        decreases to - i
+    {
+        if i >= last { break }
+        if data[i] == marker && data[i + 1] == marker {
+            return i
+        }
+        i += 1
+    }
+    return to
+}

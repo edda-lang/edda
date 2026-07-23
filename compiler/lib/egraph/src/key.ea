@@ -1,0 +1,300 @@
+
+module egraph.key
+
+import std.collections.vec
+import local.eclass as eclass_mod
+import local.graph.unionfind as uf_mod
+import local.graph.enode as enode_mod
+import ir.hlir.op as hlir_op_mod
+import mir.rvalue as mir_rvalue_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(eclass_mod.EClassId)
+
+
+public function mix(acc: u64, value: u64) -> u64 {
+    let stepped = acc ^ value
+    return stepped *% (1099511628211 as u64)
+}
+
+
+public function canon_child(uf: mutable uf_mod.UnionFind, c: eclass_mod.EClassId) -> eclass_mod.EClassId
+    with {panic}
+{
+    if (c.raw as usize) >= Vec_u32.len(uf.parent) {
+        return c
+    }
+    return uf_mod.find(mutable uf, c)
+}
+
+
+public function node_hash(uf: mutable uf_mod.UnionFind, node: enode_mod.ENode) -> u64
+    with {panic}
+{
+    return match node.kind {
+        case .literal(let c) => mix(11 as u64, constant_hash(c))
+        case .binary(let op, let lhs, let rhs) =>
+            mix(mix(mix(22 as u64, binop_tag(op)), canon_raw(mutable uf, lhs)), canon_raw(mutable uf, rhs))
+        case .unary(let op, let operand) =>
+            mix(mix(33 as u64, unop_tag(op)), canon_raw(mutable uf, operand))
+        case .cast(let value, let from, let to, let kind) =>
+            mix(mix(mix(mix(44 as u64, canon_raw(mutable uf, value)), from.raw as u64), to.raw as u64), cast_tag(kind))
+        case .call_(let callee, let args) =>
+            children_hash(mutable uf, mix(55 as u64, canon_raw(mutable uf, callee)), args)
+        case .field(let operand, let index) =>
+            mix(mix(66 as u64, canon_raw(mutable uf, operand)), index as u64)
+        case .index(let operand, let index_v) =>
+            mix(mix(77 as u64, canon_raw(mutable uf, operand)), canon_raw(mutable uf, index_v))
+        case .len(let operand) => mix(88 as u64, canon_raw(mutable uf, operand))
+        case .discriminant(let operand) => mix(99 as u64, canon_raw(mutable uf, operand))
+        case .aggregate(let kind, let elems) =>
+            children_hash(mutable uf, mix(111 as u64, aggregate_tag(kind)), elems)
+        case .ref_(let kind, let operand) =>
+            mix(mix(122 as u64, borrow_tag(kind)), canon_raw(mutable uf, operand))
+    }
+}
+
+
+function canon_raw(uf: mutable uf_mod.UnionFind, c: eclass_mod.EClassId) -> u64
+    with {panic}
+{
+    return canon_child(mutable uf, c).raw as u64
+}
+
+
+function children_hash(uf: mutable uf_mod.UnionFind, seed: u64, kids: Vec_EClassId.Vec) -> u64
+    with {panic}
+{
+    let n = Vec_EClassId.len(kids)
+    var acc: u64 = mix(seed, n as u64)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        acc = mix(acc, canon_raw(mutable uf, Vec_EClassId.at(kids, i)))
+        i = i + 1
+    }
+    return acc
+}
+
+
+function width_tag(width: mir_rvalue_mod.FloatWidth) -> u64 {
+    return match width {
+        case .f32_ => 1 as u64
+        case .f64_ => 2 as u64
+    }
+}
+
+
+function constant_hash(c: hlir_op_mod.HConstant) -> u64 {
+    return match c {
+        case .int_(let value, let ty) =>
+            mix(mix(201 as u64, (value as i64 wrapping) as u64), ty.raw as u64)
+        case .float_(let bits, let width) =>
+            mix(mix(202 as u64, bits), width_tag(width))
+        case .bool_(let value) => mix(203 as u64, if value { 1 as u64 } else { 0 as u64 })
+        case .unit_ => 204
+        case .string_(let symbol) => mix(205 as u64, symbol.raw as u64)
+        case .fn_ref(let def) => mix(206 as u64, def.raw as u64)
+    }
+}
+
+
+public function node_equal(
+    uf: mutable uf_mod.UnionFind,
+    a: enode_mod.ENode,
+    b: enode_mod.ENode,
+) -> bool
+    with {panic}
+{
+    return match a.kind {
+        case .literal(let ca) => match b.kind {
+            case .literal(let cb) => constant_equal(ca, cb)
+            case _ => false
+        }
+        case .binary(let opa, let la, let ra) => match b.kind {
+            case .binary(let opb, let lb, let rb) =>
+                binop_tag(opa) == binop_tag(opb)
+                    && child_eq(mutable uf, la, lb)
+                    && child_eq(mutable uf, ra, rb)
+            case _ => false
+        }
+        case .unary(let opa, let oa) => match b.kind {
+            case .unary(let opb, let ob) =>
+                unop_tag(opa) == unop_tag(opb) && child_eq(mutable uf, oa, ob)
+            case _ => false
+        }
+        case .cast(let va, let fa, let ta, let ka) => match b.kind {
+            case .cast(let vb, let fb, let tb, let kb) =>
+                child_eq(mutable uf, va, vb)
+                    && fa.raw == fb.raw
+                    && ta.raw == tb.raw
+                    && cast_tag(ka) == cast_tag(kb)
+            case _ => false
+        }
+        case .call_(let ca, let aa) => match b.kind {
+            case .call_(let cb, let ab) =>
+                child_eq(mutable uf, ca, cb) && children_equal(mutable uf, aa, ab)
+            case _ => false
+        }
+        case .field(let oa, let ia) => match b.kind {
+            case .field(let ob, let ib) => child_eq(mutable uf, oa, ob) && ia == ib
+            case _ => false
+        }
+        case .index(let oa, let iva) => match b.kind {
+            case .index(let ob, let ivb) =>
+                child_eq(mutable uf, oa, ob) && child_eq(mutable uf, iva, ivb)
+            case _ => false
+        }
+        case .len(let oa) => match b.kind {
+            case .len(let ob) => child_eq(mutable uf, oa, ob)
+            case _ => false
+        }
+        case .discriminant(let oa) => match b.kind {
+            case .discriminant(let ob) => child_eq(mutable uf, oa, ob)
+            case _ => false
+        }
+        case .aggregate(let ka, let ea) => match b.kind {
+            case .aggregate(let kb, let eb) =>
+                aggregate_tag(ka) == aggregate_tag(kb) && children_equal(mutable uf, ea, eb)
+            case _ => false
+        }
+        case .ref_(let ka, let oa) => match b.kind {
+            case .ref_(let kb, let ob) =>
+                borrow_tag(ka) == borrow_tag(kb) && child_eq(mutable uf, oa, ob)
+            case _ => false
+        }
+    }
+}
+
+
+function child_eq(uf: mutable uf_mod.UnionFind, a: eclass_mod.EClassId, b: eclass_mod.EClassId) -> bool
+    with {panic}
+{
+    return canon_child(mutable uf, a).raw == canon_child(mutable uf, b).raw
+}
+
+
+function children_equal(
+    uf: mutable uf_mod.UnionFind,
+    a: Vec_EClassId.Vec,
+    b: Vec_EClassId.Vec,
+) -> bool
+    with {panic}
+{
+    let na = Vec_EClassId.len(a)
+    let nb = Vec_EClassId.len(b)
+    if na != nb { return false }
+    var i: usize = 0
+    loop
+        decreases na - i
+    {
+        if i >= na { break }
+        if !child_eq(mutable uf, Vec_EClassId.at(a, i), Vec_EClassId.at(b, i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+
+function constant_equal(a: hlir_op_mod.HConstant, b: hlir_op_mod.HConstant) -> bool {
+    return match a {
+        case .int_(let va, let ta) => match b {
+            case .int_(let vb, let tb) => va == vb && ta.raw == tb.raw
+            case _ => false
+        }
+        case .float_(let bits_a, let wa) => match b {
+            case .float_(let bits_b, let wb) => bits_a == bits_b && width_tag(wa) == width_tag(wb)
+            case _ => false
+        }
+        case .bool_(let va) => match b {
+            case .bool_(let vb) => va == vb
+            case _ => false
+        }
+        case .unit_ => match b {
+            case .unit_ => true
+            case _ => false
+        }
+        case .string_(let sa) => match b {
+            case .string_(let sb) => sa.raw == sb.raw
+            case _ => false
+        }
+        case .fn_ref(let da) => match b {
+            case .fn_ref(let db) => da.raw == db.raw
+            case _ => false
+        }
+    }
+}
+
+
+function binop_tag(op: hlir_op_mod.HBinOp) -> u64 {
+    return match op {
+        case .add => 1
+        case .sub => 2
+        case .mul => 3
+        case .div => 4
+        case .rem => 5
+        case .add_wrap => 6
+        case .sub_wrap => 7
+        case .mul_wrap => 8
+        case .add_sat => 9
+        case .sub_sat => 10
+        case .mul_sat => 11
+        case .bit_and => 12
+        case .bit_or => 13
+        case .bit_xor => 14
+        case .shl => 15
+        case .shr => 16
+        case .eq => 17
+        case .ne => 18
+        case .lt => 19
+        case .le => 20
+        case .gt => 21
+        case .ge => 22
+        case .logical_and => 23
+        case .logical_or => 24
+    }
+}
+
+
+function unop_tag(op: hlir_op_mod.HUnOp) -> u64 {
+    return match op {
+        case .neg => 1
+        case .bit_not => 2
+        case .logical_not => 3
+    }
+}
+
+
+function cast_tag(kind: hlir_op_mod.HCastKind) -> u64 {
+    return match kind {
+        case .integer => 1
+        case .integer_wrapping => 2
+        case .integer_saturating => 3
+        case .integer_checked => 4
+        case .float => 5
+        case .float_to_integer => 6
+        case .integer_to_float => 7
+    }
+}
+
+
+function aggregate_tag(kind: hlir_op_mod.HAggregateKind) -> u64 {
+    return match kind {
+        case .tuple_ => 1
+        case .record_ => 2
+        case .sum_variant(let variant) => mix(3 as u64, variant as u64)
+        case .slice_literal => 4
+        case .array_ => 5
+    }
+}
+
+
+function borrow_tag(kind: hlir_op_mod.HBorrowKind) -> u64 {
+    return match kind {
+        case .let_ => 1
+        case .mutable_ => 2
+    }
+}

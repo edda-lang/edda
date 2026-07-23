@@ -1,0 +1,234 @@
+
+module refine.solver.theory.theory
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.atom.atom as atom_mod
+import local.solver.theory.engine.euf as euf_mod
+import local.solver.lia.frontend.frontend as lia_mod
+import local.solver.lia.omega.omega as omega_mod
+import local.solver.theory.quant.linearize as lin_mod
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(AtomRecipe)
+
+
+public type TheoryVerdict {
+    case consistent
+    case conflict(explanation: Vec_Lit.Vec)
+}
+
+
+public type AtomRecipe {
+    case inert
+    case arith(form: lin_mod.LinearForm, op: term_mod.SmtOp)
+    case arith_dropped
+    case equality(is_eq: bool, lid: usize, rid: usize, form: lin_mod.LinearForm)
+    case equality_nolin(is_eq: bool, lid: usize, rid: usize)
+}
+
+
+public type Theory {
+    euf: euf_mod.EufSolver
+    lia: lia_mod.LiaCtx
+    dropped_nonlinear: bool
+    lia_gave_up: bool
+    recipes: Vec_AtomRecipe.Vec
+}
+
+
+public function new(out: init Theory, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit e: euf_mod.EufSolver
+    euf_mod.new(init e, allocator)?
+    uninit l: lia_mod.LiaCtx
+    lia_mod.new_ctx(init l, allocator)?
+    uninit r: Vec_AtomRecipe.Vec
+    Vec_AtomRecipe.new(init r, allocator)?
+    out = Theory {
+        euf: e,
+        lia: l,
+        dropped_nonlinear: false,
+        lia_gave_up: false,
+        recipes: r,
+    }
+}
+
+
+public function prepare(t: mutable Theory, atoms: atom_mod.AtomTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = atom_mod.atom_count(atoms)
+    var v: usize = 0
+    loop
+        decreases (n - v)
+    {
+        if v >= n {
+            break
+        }
+        let atom = atom_mod.term_at(atoms, v)
+        let r = classify(mutable t.euf, atom, allocator)?
+        Vec_AtomRecipe.push(mutable t.recipes, take r, allocator)?
+        v = v + 1
+    }
+}
+
+
+public function begin_consult(t: mutable Theory) -> () {
+    euf_mod.reset_merges(mutable t.euf)
+    lia_mod.clear_constraints(mutable t.lia)
+    t.lia_gave_up = false
+}
+
+
+public function assert_recipe(
+    t: mutable Theory,
+    v: usize,
+    value: bool,
+    lit: lit_mod.Lit,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if v >= Vec_AtomRecipe.len(t.recipes) {
+        return
+    }
+    match Vec_AtomRecipe.at(t.recipes, v) {
+        case .inert => {}
+        case .arith(let form, let op) => {
+            let asserted = lia_mod.assert_prepared_compare(mutable t.lia, form, op, value, lit, allocator)?
+            if !asserted {
+                t.dropped_nonlinear = true
+            }
+        }
+        case .arith_dropped => {
+            t.dropped_nonlinear = true
+        }
+        case .equality(let is_eq, let lid, let rid, let form) => {
+            let as_equal = if is_eq { value } else { !value }
+            if as_equal {
+                euf_mod.merge_input(mutable t.euf, lid, rid, lit, allocator)?
+                let asserted = lia_mod.assert_prepared_equal(mutable t.lia, form, lit, allocator)?
+                if !asserted {
+                    t.dropped_nonlinear = true
+                }
+            } else {
+                euf_mod.assert_distinct(mutable t.euf, lid, rid, lit, allocator)?
+            }
+        }
+        case .equality_nolin(let is_eq, let lid, let rid) => {
+            let as_equal = if is_eq { value } else { !value }
+            if as_equal {
+                euf_mod.merge_input(mutable t.euf, lid, rid, lit, allocator)?
+            } else {
+                euf_mod.assert_distinct(mutable t.euf, lid, rid, lit, allocator)?
+            }
+        }
+    }
+}
+
+
+function is_equality(op: term_mod.SmtOp) -> bool {
+    return match op {
+        case .eq_ => true
+        case .distinct_ => true
+        case _ => false
+    }
+}
+
+
+function classify(
+    euf: mutable euf_mod.EufSolver,
+    atom: term_mod.SmtTerm,
+    allocator: Allocator,
+) -> AtomRecipe
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match atom {
+        case .app(let op, let args) => {
+            if lia_mod.is_arith_compare(op) {
+                classify_arith(op, args, allocator)?
+            } else {
+                if is_equality(op) {
+                    classify_eq(mutable euf, op, args, allocator)?
+                } else {
+                    AtomRecipe.inert
+                }
+            }
+        }
+        case _ => AtomRecipe.inert
+    }
+}
+
+
+function classify_arith(
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    allocator: Allocator,
+) -> AtomRecipe
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 2 {
+        return AtomRecipe.inert
+    }
+    let lhs = Vec_SmtTerm.at(args, 0)
+    let rhs = Vec_SmtTerm.at(args, 1)
+    return match lia_mod.diff_form(lhs, rhs, allocator)? {
+        case .nonlinear => AtomRecipe.arith_dropped
+        case .ok(let f) => AtomRecipe.arith(form: f, op: op)
+    }
+}
+
+
+function classify_eq(
+    euf: mutable euf_mod.EufSolver,
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    allocator: Allocator,
+) -> AtomRecipe
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 2 {
+        return AtomRecipe.inert
+    }
+    let lhs = Vec_SmtTerm.at(args, 0)
+    let rhs = Vec_SmtTerm.at(args, 1)
+    let lid = euf_mod.intern(mutable euf, lhs, allocator)?
+    let rid = euf_mod.intern(mutable euf, rhs, allocator)?
+    let is_eq = match op {
+        case .eq_ => true
+        case _ => false
+    }
+    return match lia_mod.diff_form(lhs, rhs, allocator)? {
+        case .nonlinear => AtomRecipe.equality_nolin(is_eq: is_eq, lid: lid, rid: rid)
+        case .ok(let f) => AtomRecipe.equality(is_eq: is_eq, lid: lid, rid: rid, form: f)
+    }
+}
+
+
+public function check(t: mutable Theory, allocator: Allocator) -> TheoryVerdict
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var s = t.euf
+    let er = euf_mod.check(mutable s, allocator)?
+    match er {
+        case .conflict(let e) => return TheoryVerdict.conflict(explanation: e)
+        case .consistent => {}
+    }
+    let lr = lia_mod.check(t.lia, allocator)?
+    match lr {
+        case .infeasible(let e) => return TheoryVerdict.conflict(explanation: e)
+        case .feasible => return TheoryVerdict.consistent
+        case .unknown => {}
+    }
+    if omega_mod.refutes(t.lia, allocator)? {
+        return TheoryVerdict.conflict(explanation: omega_mod.conflict_lits(t.lia, allocator)?)
+    }
+    t.lia_gave_up = true
+    return TheoryVerdict.consistent
+}

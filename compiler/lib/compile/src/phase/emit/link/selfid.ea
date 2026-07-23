@@ -1,0 +1,137 @@
+
+module compile.phase.emit.link.selfid
+
+import std.mem.alloc
+import std.os.env
+import std.text.string
+
+
+public function is_self_image_path(outpath: String, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let self_path = env.self_exe_path(allocator)
+    if self_path.len() == 0 || outpath.len() == 0 {
+        return false
+    }
+    let a = canon_path(self_path, allocator)?
+    let b = canon_path(outpath, allocator)?
+    return string.equals(a, b)
+}
+
+
+function path_is_absolute(p: String) -> bool {
+    let b = p.bytes()
+    let n = b.len()
+    if n >= 1 && (b[0] == (0x2F as u8) || b[0] == (0x5C as u8)) {
+        return true
+    }
+    return n >= 2 && b[1] == (0x3A as u8)
+}
+
+
+function canon_path(p: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let full = if path_is_absolute(p) {
+        p
+    } else {
+        let cwd = env.current_dir(allocator)
+        let base = string.concat(cwd, "/", allocator)?
+        string.concat(base, p, allocator)?
+    }
+    let norm = normalize_path_bytes(full, allocator)?
+    return resolve_segments(norm, allocator)?
+}
+
+
+function normalize_path_bytes(p: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let pb = p.bytes()
+    let n = pb.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        var c = pb[i]
+        if c == (0x5C as u8) { c = 0x2F as u8 }
+        if c >= (0x41 as u8) && c <= (0x5A as u8) { c = c + (0x20 as u8) }
+        buf[i] = c
+        i = i + (1 as usize)
+    }
+    return buf
+}
+
+
+function is_dot_seg(buf: [u8], start: usize, len: usize) -> bool {
+    return len == (1 as usize) && start < buf.len() && buf[start] == (0x2E as u8)
+}
+
+
+function is_dotdot_seg(buf: [u8], start: usize, len: usize) -> bool {
+    if len != (2 as usize) { return false }
+    if start + (1 as usize) >= buf.len() { return false }
+    return buf[start] == (0x2E as u8) && buf[start + (1 as usize)] == (0x2E as u8)
+}
+
+
+function resolve_segments(norm: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = norm.len()
+    let cap = n + (1 as usize)
+    let buf: [u8] = allocator.alloc_array(u8, cap)?
+    let starts: [usize] = allocator.alloc_array(usize, cap)?
+    var out_len: usize = 0
+    var seg_start: usize = 0
+    var depth: usize = 0
+    var i: usize = 0
+    loop decreases (cap - i) {
+        if i > n { break }
+        let c = if i < n { norm[i] } else { 0x2F as u8 }
+        if c == (0x2F as u8) {
+            let seg_len = if out_len >= seg_start { out_len - seg_start } else { 0 as usize }
+            if seg_len == 0 {
+                out_len = seg_start
+            } else if is_dot_seg(buf, seg_start, seg_len) {
+                out_len = seg_start
+            } else if is_dotdot_seg(buf, seg_start, seg_len) {
+                if depth > 0 && depth <= starts.len() {
+                    depth = depth - (1 as usize)
+                    out_len = starts[depth]
+                    seg_start = out_len
+                } else {
+                    out_len = seg_start
+                }
+            } else {
+                if depth < starts.len() {
+                    starts[depth] = seg_start
+                }
+                depth = depth + (1 as usize)
+                if out_len < buf.len() {
+                    buf[out_len] = 0x2F as u8
+                    out_len = out_len + (1 as usize)
+                }
+                seg_start = out_len
+            }
+        } else {
+            if out_len < buf.len() {
+                buf[out_len] = c
+                out_len = out_len + (1 as usize)
+            }
+        }
+        i = i + (1 as usize)
+    }
+    if out_len > 0 {
+        out_len = out_len - (1 as usize)
+    }
+    let final_len = if out_len <= buf.len() { out_len } else { buf.len() }
+    let out: [u8] = allocator.alloc_array(u8, final_len)?
+    var j: usize = 0
+    loop decreases (final_len - j) {
+        if j >= final_len { break }
+        out[j] = buf[j]
+        j = j + (1 as usize)
+    }
+    return string.from_owned_utf8(take out)
+}

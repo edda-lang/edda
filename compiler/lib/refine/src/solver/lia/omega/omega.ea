@@ -1,0 +1,116 @@
+
+module refine.solver.lia.omega.omega
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.rational.wide as wide_mod
+import local.solver.theory.quant.linearize as lin_mod
+import local.solver.lia.frontend.frontend as lia_mod
+import local.solver.lia.omega.rows as rows_mod
+import local.solver.lia.omega.eliminate as elim_mod
+import local.solver.lia.omega.tighten as tighten_mod
+
+
+spec std.collections.vec.Vec(lin_mod.LinearTerm)
+spec std.collections.vec.Vec(rows_mod.OmegaRow)
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(lia_mod.LiaConstraint)
+
+
+public function refutes(ctx: lia_mod.LiaCtx, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit rows: Vec_OmegaRow.Vec
+    Vec_OmegaRow.new(init rows, allocator)?
+    rows_mod.build_rows(ctx, mutable rows, allocator)?
+    if !elim_mod.eliminate(mutable rows, allocator)? {
+        return false
+    }
+    let tightened = tighten_mod.tighten(mutable rows, allocator)?
+    let infeasible_const = match tightened {
+        case .abort => return false
+        case .ok(let flag) => flag
+    }
+    if infeasible_const {
+        return true
+    }
+    uninit reduced: lia_mod.LiaCtx
+    lia_mod.new_ctx(init reduced, allocator)?
+    push_reduced(rows, mutable reduced, allocator)?
+    return match lia_mod.check(reduced, allocator)? {
+        case .infeasible(_) => true
+        case _ => false
+    }
+}
+
+
+public function conflict_lits(ctx: lia_mod.LiaCtx, allocator: Allocator) -> Vec_Lit.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Lit.Vec
+    Vec_Lit.new(init out, allocator)?
+    let n = Vec_LiaConstraint.len(ctx.constraints)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let l = Vec_LiaConstraint.at(ctx.constraints, i).lit
+        if !contains_lit(out, l) {
+            Vec_Lit.push(mutable out, take l, allocator)?
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+function contains_lit(lits: Vec_Lit.Vec, l: lit_mod.Lit) -> bool
+    with {divergence}
+{
+    let n = Vec_Lit.len(lits)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if lit_mod.lit_code(Vec_Lit.at(lits, i)) == lit_mod.lit_code(l) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function push_reduced(rows: Vec_OmegaRow.Vec, reduced: mutable lia_mod.LiaCtx, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_OmegaRow.len(rows)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let row = Vec_OmegaRow.at(rows, i)
+        if row.alive {
+            let terms = rows_mod.clone_terms(row.terms, allocator)?
+            let form = lin_mod.LinearForm { terms: terms, constant: wide_mod.wide_zero() }
+            let c = lia_mod.LiaConstraint {
+                form: form,
+                is_upper: row.is_upper,
+                bound: row.bound,
+                lit: lit_mod.Lit { code: 0 },
+            }
+            Vec_LiaConstraint.push(mutable reduced.constraints, take c, allocator)?
+        }
+        i = i + 1
+    }
+}

@@ -1,0 +1,343 @@
+
+module std.mem.rt
+
+import std.os.raw
+import std.os.pages
+import std.mem.suballoc
+import std.mem.alloc
+import std.core.overflow
+
+
+public stable function region_bytes() -> usize {
+    return 0x40000000
+}
+
+public stable function max_payload_bytes() -> usize {
+    return 0x100000000000
+}
+
+
+function copy_bytes(src: u64, dst: u64, count: usize) -> () {
+    let total: u64 = count as u64
+    let words: u64 = total / 8
+    var w: u64 = 0
+    loop
+        decreases words - w
+    {
+        if w >= words { break }
+        let off: u64 = w *% 8
+        raw.store_u64(dst +% off, raw.load_u64(src +% off))
+        w = w + 1
+    }
+    var i: u64 = words *% 8
+    loop
+        decreases total - i
+    {
+        if i >= total { break }
+        raw.store_u8(dst +% i, raw.load_u8(src +% i))
+        i = i + 1
+    }
+}
+
+function zero_bytes(dst: u64, count: usize) -> () {
+    let total: u64 = count as u64
+    let words: u64 = total / 8
+    var w: u64 = 0
+    loop
+        decreases words - w
+    {
+        if w >= words { break }
+        raw.store_u64(dst +% (w *% 8), 0)
+        w = w + 1
+    }
+    var i: u64 = words *% 8
+    loop
+        decreases total - i
+    {
+        if i >= total { break }
+        raw.store_u8(dst +% i, 0)
+        i = i + 1
+    }
+}
+
+
+function alloc_aligned(
+    base: u64 where base != 0 && base % 8 == 0,
+    byte_count: usize where byte_count >= 1 && byte_count <= max_payload_bytes(),
+    align: usize where align >= 1 && align <= 4096,
+) -> u64
+    with {err: suballoc.HeapError}
+{
+    if align <= 8 {
+        return suballoc.alloc(base, byte_count)?
+    }
+    let req: usize = byte_count + align + 8
+    let p: u64 = suballoc.alloc(base, req)?
+    let a64: u64 = align as u64
+    let aligned: u64 = ((p +% 8 +% a64 -% 1) / a64) *% a64
+    if aligned -% p < 8 || aligned -% p > a64 +% 8 {
+        raise suballoc.HeapError.corrupt
+    }
+    raw.store_u64(aligned -% 8, p)
+    return aligned
+}
+
+function payload_of(b: u64, align: usize) -> u64 {
+    if align <= 8 { return b }
+    return raw.load_u64(b -% 8)
+}
+
+function release(b: u64, align: usize) -> () {
+    if b == 0 { return }
+    let payload: u64 = payload_of(b, align)
+    let base: u64 = (b / 0x40000000) * 0x40000000
+    if base == 0 || base % 8 != 0 || payload == 0 || payload % 8 != 0 { return }
+    let region_end: u64 = raw.load_u64(base +% 8)
+    if region_end <= base || region_end % 8 != 0 || payload >= region_end { return }
+    handle err: suballoc.HeapError as _e -> () {
+        suballoc.free(base, payload)?
+    }
+}
+
+
+function region_next(base: u64) -> u64 {
+    return raw.load_u64(base +% 680)
+}
+
+function set_region_next(base: u64, link: u64) -> () {
+    raw.store_u64(base +% 680, link)
+}
+
+function region_is_huge(base: u64) -> bool {
+    return raw.load_u64(base +% 688) != 0
+}
+
+function block_span_of(byte_count: usize, align: usize) -> u64 {
+    let req: u64 = if align <= 8 { byte_count as u64 } else { (byte_count as u64) +% (align as u64) +% 8 }
+    var need: u64 = (((req +% 7) / 8) *% 8) +% 16
+    if need < 32 { need = 32 }
+    return need +% 704
+}
+
+
+function windows_reserve_exact(span: usize, r: u64, region_span: usize) -> u64
+    with {err: pages.PageError}
+{
+    if region_span < 4096 || region_span % 4096 != 0 || region_span > pages.max_map_bytes() {
+        raise pages.PageError.rejected
+    }
+    var attempt: usize = 0
+    loop
+        decreases 8 - attempt
+    {
+        if attempt >= 8 { raise pages.PageError.rejected }
+        let acquired: u64 = handle err: pages.PageError as _e -> 0 {
+            let mapped: u64 = pages.map(span)?
+            let base: u64 = ((mapped +% r -% 1) / r) *% r
+            if base == 0 || base % r != 0 || base % 4096 != 0 || base % 8 != 0 || base < mapped || base -% mapped > r {
+                raise pages.PageError.rejected
+            }
+            pages.unmap(mapped, span)?
+            pages.map_at(base, region_span)?
+            base
+        }
+        if acquired != 0 { return acquired }
+        attempt = attempt + 1
+    }
+}
+
+function create_region(region_span: usize, flags: u64) -> u64
+    with {err: pages.PageError}
+{
+    if region_span < 0x40000000 || region_span % 8 != 0 || region_span % 4096 != 0 || region_span > 0xF00000000000 {
+        raise pages.PageError.rejected
+    }
+    let span: usize = region_span + 0x40000000
+    let r: u64 = 0x40000000
+    let base: u64 = comptime if target_has("windows") {
+        windows_reserve_exact(span, r, region_span)?
+    } else {
+        let mapped: u64 = pages.map(span)?
+        let b: u64 = ((mapped +% r -% 1) / r) *% r
+        if b == 0 || b % r != 0 || b % 4096 != 0 || b % 8 != 0 || b < mapped || b -% mapped > r {
+            raise pages.PageError.rejected
+        }
+        let head: u64 = b -% mapped
+        if head > 0 {
+            if head % 4096 != 0 { raise pages.PageError.rejected }
+            pages.unmap(mapped, head as usize)?
+        }
+        let tail: u64 = (span as u64) -% (region_span as u64) -% head
+        if tail > 0 {
+            if tail % 4096 != 0 || tail > r { raise pages.PageError.rejected }
+            let tail_addr: u64 = b +% (region_span as u64)
+            if tail_addr == 0 || tail_addr % 4096 != 0 { raise pages.PageError.rejected }
+            pages.unmap(tail_addr, tail as usize)?
+        }
+        b
+    }
+    suballoc.init_region(base, region_span)
+    let meta: u64 = handle err: suballoc.HeapError as _e -> 0 {
+        suballoc.alloc(base, 16)?
+    }
+    if meta != base +% 680 {
+        raise pages.PageError.rejected
+    }
+    raw.store_u64(base +% 680, 0)
+    raw.store_u64(base +% 688, flags)
+    return base
+}
+
+function heap_alloc(
+    heap: u64 where heap != 0 && heap % 8 == 0,
+    byte_count: usize where byte_count >= 1 && byte_count <= max_payload_bytes(),
+    align: usize where align >= 1 && align <= 4096,
+) -> u64
+    with {err: alloc.AllocError}
+{
+    var r: u64 = heap
+    var fuel: u64 = 0x100000
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { raise alloc.AllocError.out_of_memory }
+        fuel = fuel - 1
+        if r == 0 || r % 8 != 0 { raise alloc.AllocError.out_of_memory }
+        if !region_is_huge(r) {
+            let p: u64 = handle err: suballoc.HeapError as _e -> 0 {
+                alloc_aligned(r, byte_count, align)?
+            }
+            if p != 0 { return p }
+        }
+        let next: u64 = region_next(r)
+        if next != 0 {
+            r = next
+            continue
+        }
+        let total: u64 = block_span_of(byte_count, align)
+        if total <= 0x40000000 {
+            let fresh: u64 = handle err: pages.PageError as _e -> (raise alloc.AllocError.out_of_memory) {
+                create_region(0x40000000, 0)?
+            }
+            if fresh == 0 || fresh % 8 != 0 { raise alloc.AllocError.out_of_memory }
+            set_region_next(r, fresh)
+            r = fresh
+        } else {
+            let huge_span: u64 = ((total +% 4095) / 4096) *% 4096
+            let fresh: u64 = handle err: pages.PageError as _e -> (raise alloc.AllocError.out_of_memory) {
+                create_region(huge_span as usize, 1)?
+            }
+            if fresh == 0 || fresh % 8 != 0 { raise alloc.AllocError.out_of_memory }
+            set_region_next(r, fresh)
+            let p: u64 = handle err: suballoc.HeapError as _e -> (raise alloc.AllocError.out_of_memory) {
+                alloc_aligned(fresh, byte_count, align)?
+            }
+            return p
+        }
+    }
+}
+
+@abi("__edda_heap_create")
+public function heap_create() -> u64 {
+    return handle err: pages.PageError as _e -> 0 {
+        create_region(0x40000000, 0)?
+    }
+}
+
+@abi("__edda_heap_fork")
+public function heap_fork(parent_heap: u64) -> u64 {
+    if parent_heap == 0 || parent_heap % 0x40000000 != 0 { return 0 }
+    return heap_create()
+}
+
+@abi("__edda_heap_destroy")
+public function heap_destroy(heap: u64) -> () {
+    if heap == 0 || heap % 0x40000000 != 0 || heap % 4096 != 0 { return }
+    var r: u64 = heap
+    var fuel: u64 = 0x100000
+    loop
+        decreases fuel
+    {
+        if r == 0 || fuel == 0 { break }
+        fuel = fuel - 1
+        if r % 0x40000000 != 0 || r % 4096 != 0 { break }
+        let next: u64 = region_next(r)
+        let region_end: u64 = raw.load_u64(r +% 8)
+        if region_end <= r { break }
+        let span: u64 = region_end -% r
+        if span < 4096 || span % 4096 != 0 || span > (pages.max_map_bytes() as u64) { break }
+        handle err: pages.PageError as _e -> () {
+            pages.unmap(r, span as usize)?
+        }
+        r = next
+    }
+}
+
+@abi("__edda_alloc_raw")
+public function alloc_raw(heap: u64, size: usize, align: usize, value_ptr: u64) -> u64
+    with {err: alloc.AllocError}
+{
+    if size == 0 { return 0 }
+    if heap == 0 || heap % 8 != 0 || align == 0 || align > 4096 || value_ptr == 0 {
+        raise alloc.AllocError.out_of_memory
+    }
+    if size > max_payload_bytes() { raise alloc.AllocError.out_of_memory }
+    let payload: u64 = heap_alloc(heap, size, align)?
+    copy_bytes(value_ptr, payload, size)
+    return payload
+}
+
+@abi("__edda_alloc_array_raw")
+public function alloc_array_raw(heap: u64, size: usize, align: usize, n: usize) -> [u8]
+    with {err: alloc.AllocError}
+{
+    if n == 0 || size == 0 { return raw.slice_from_raw(0, n) }
+    if heap == 0 || heap % 8 != 0 || align == 0 || align > 4096 {
+        raise alloc.AllocError.out_of_memory
+    }
+    let total: usize = handle err: overflow.Overflow as _e -> (raise alloc.AllocError.out_of_memory) {
+        n *? size
+    }
+    if total == 0 || total > max_payload_bytes() { raise alloc.AllocError.out_of_memory }
+    let payload: u64 = heap_alloc(heap, total, align)?
+    zero_bytes(payload, total)
+    return raw.slice_from_raw(payload, n)
+}
+
+@abi("__edda_realloc_array_raw")
+public function realloc_array_raw(heap: u64, size: usize, align: usize, data: take [u8], n: usize) -> [u8]
+    with {err: alloc.AllocError}
+{
+    let fresh: [u8] = alloc_array_raw(heap, size, align, n)?
+    let old_ptr: u64 = raw.slice_addr(data)
+    if old_ptr != 0 && data.len() > 0 && size > 0 {
+        let keep: usize = if data.len() < n { data.len() } else { n }
+        let bytes: usize = handle err: overflow.Overflow as _e -> 0 {
+            keep *? size
+        }
+        if bytes > 0 {
+            copy_bytes(old_ptr, raw.slice_addr(fresh), bytes)
+        }
+        release(old_ptr, align)
+    }
+    return fresh
+}
+
+@abi("__edda_free_raw")
+public function free_raw(size: usize, align: usize, b: u64) -> () {
+    if b == 0 || size == 0 { return }
+    release(b, align)
+}
+
+@abi("__edda_box_read_raw")
+public function box_read_raw(size: usize, align: usize, b: u64, out_ptr: u64) -> () {
+    if b == 0 || size == 0 || out_ptr == 0 { return }
+    copy_bytes(b, out_ptr, size)
+}
+
+@abi("__edda_box_unbox_raw")
+public function box_unbox_raw(heap: u64, size: usize, align: usize, b: u64, out_ptr: u64) -> () {
+    if b == 0 || size == 0 || out_ptr == 0 { return }
+    copy_bytes(b, out_ptr, size)
+    release(b, align)
+}

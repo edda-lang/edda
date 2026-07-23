@@ -1,0 +1,184 @@
+
+module cache.blob.mir.item.write.decl
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.literal as ast_literal_mod
+import local.blob.mir.ast.ops as ast_ops_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.ty.write.codec as ty_codec_mod
+import local.blob.mir.expr.write.codec as expr_codec_mod
+import local.blob.mir.expr.leaf.codec as expr_leaf_mod
+import local.blob.mir.item.leaf.codec as item_leaf_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_item_mod.AdmitsConstraint)
+spec std.collections.vec.Vec(ast_tree_mod.RefinementClause)
+
+
+public function write_fn_decl(
+    it: interner_mod.Interner,
+    decl: ast_item_mod.FnDecl,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(decl.span, mutable out, allocator)?
+    item_leaf_mod.write_option_stability(it, decl.stability, mutable out, allocator)?
+    item_leaf_mod.write_visibility(decl.visibility, mutable out, allocator)?
+    prim_mod.push_bool(mutable out, decl.refinement_stable, allocator)?
+    ast_codec_mod.write_ident(it, decl.name, mutable out, allocator)?
+    write_generic_param_vec(decl.outbound_generics, it, mutable out, allocator)?
+    write_generic_param_vec(decl.generics, it, mutable out, allocator)?
+    expr_leaf_mod.write_param_vec(decl.params, it, mutable out, allocator, expr_codec_mod.write_expr)?
+    ast_ops_mod.write_return_mode(decl.return_mode, mutable out, allocator)?
+    expr_leaf_mod.write_option_ty(decl.return_ty, it, mutable out, allocator, expr_codec_mod.write_expr)?
+    ty_codec_mod.write_option_effect_row(decl.effects, it, mutable out, allocator, expr_codec_mod.write_expr)?
+    write_refinement_clause_vec(decl.refinements, it, mutable out, allocator)?
+    write_fn_body(it, decl.body, mutable out, allocator)?
+}
+
+public function write_fn_body(
+    it: interner_mod.Interner,
+    body: ast_item_mod.FnBody,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match body {
+        case .block_(let block) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            expr_codec_mod.write_block(it, block, mutable out, allocator)?
+        }
+        case .extern_(let span, let name_span, let name, let dll) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            ast_codec_mod.write_span(span, mutable out, allocator)?
+            ast_codec_mod.write_span(name_span, mutable out, allocator)?
+            symbol_codec_mod.write_symbol(it, name, mutable out, allocator)?
+            item_leaf_mod.write_option_symbol(it, dll, mutable out, allocator)?
+        }
+    }
+}
+
+public function write_generic_param(
+    it: interner_mod.Interner,
+    param: ast_item_mod.GenericParam,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(param.span, mutable out, allocator)?
+    match param.kind {
+        case .type_param => prim_mod.push_u8(mutable out, 0, allocator)?
+        case .comptime_param => prim_mod.push_u8(mutable out, 1, allocator)?
+    }
+    ast_codec_mod.write_ident(it, param.name, mutable out, allocator)?
+    expr_leaf_mod.write_option_ty(param.ty, it, mutable out, allocator, expr_codec_mod.write_expr)?
+    write_admits_constraint_vec(param.admits, it, mutable out, allocator)?
+}
+
+public function write_generic_param_vec(
+    params: Vec_GenericParam.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_GenericParam.len(params)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_generic_param(it, Vec_GenericParam.at(params, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_admits_constraint(
+    it: interner_mod.Interner,
+    constraint: ast_item_mod.AdmitsConstraint,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match constraint {
+        case .op(let span, let op) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            ast_codec_mod.write_span(span, mutable out, allocator)?
+            ast_ops_mod.write_bin_op(op, mutable out, allocator)?
+        }
+        case .lit(let span, let value) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            ast_codec_mod.write_span(span, mutable out, allocator)?
+            ast_literal_mod.write_literal(it, value, mutable out, allocator)?
+        }
+        case .member(let span, let name, let ty) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            ast_codec_mod.write_span(span, mutable out, allocator)?
+            ast_codec_mod.write_ident(it, name, mutable out, allocator)?
+            ty_codec_mod.write_ty(it, ty, mutable out, allocator, expr_codec_mod.write_expr)?
+        }
+    }
+}
+
+public function write_admits_constraint_vec(
+    constraints: Vec_AdmitsConstraint.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_AdmitsConstraint.len(constraints)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_admits_constraint(it, Vec_AdmitsConstraint.at(constraints, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_refinement_clause(
+    it: interner_mod.Interner,
+    clause: ast_tree_mod.RefinementClause,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(clause.span, mutable out, allocator)?
+    ast_ops_mod.write_refinement_kind(clause.kind, mutable out, allocator)?
+    expr_codec_mod.write_expr(it, clause.pred, mutable out, allocator)?
+}
+
+public function write_refinement_clause_vec(
+    clauses: Vec_RefinementClause.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_RefinementClause.len(clauses)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_refinement_clause(it, Vec_RefinementClause.at(clauses, i), mutable out, allocator)?
+        i += 1
+    }
+}

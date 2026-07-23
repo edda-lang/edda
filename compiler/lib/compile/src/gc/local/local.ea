@@ -1,0 +1,294 @@
+
+module compile.gc.local.local
+
+import std.collections.vec
+import std.core.option
+import std.core.fmt as fmt_mod
+import std.mem.alloc
+import std.os.fs
+import std.os.time as time_mod
+import std.text.string
+import std.time.calendar
+import std.time.iso8601 as iso8601_mod
+import cache.addr.path.paths as paths_mod
+import cache.gc.reachability as reach_mod
+import cache.manifest.store.value as manifest_value_mod
+import cache.manifest.store.write as manifest_write_mod
+import cache.tier.global as global_mod
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import local.gc.global.global as gc_global_mod
+import local.member.cache.plan as member_cache_mod
+import local.member.cache.store.blob as blob_mod
+import local.workspace.stream as stream_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(manifest_value_mod.ArtifactEntry)
+spec std.core.option.Option(String)
+spec std.core.option.Option(global_mod.GlobalCache)
+spec std.core.option.Option(calendar.DateTime)
+
+
+public function run_gc(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    workspace_root: String,
+    wall_clock: Clock,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, wall_clock, allocator, err: fs.FsError, err: alloc.AllocError, panic, time(ops <= 1)}
+{
+    let manifest_path = paths_mod.codegen_manifest_path(workspace_root, allocator)?
+    if !fs.path_exists(rfs, manifest_path) {
+        emit_report(mutable diags, 0 as usize, "", allocator)?
+    } else {
+        var manifest = member_cache_mod.load_manifest(rfs, manifest_path, workspace_root, allocator)?
+        let roots = active_roots(rfs, workspace_root, manifest.artifacts, allocator)?
+        let unreachable = reach_mod.unreachable_paths(manifest, roots, allocator)?
+        let count = Vec_String.len(unreachable)
+        let listing = render_listing(unreachable, allocator)?
+        emit_report(mutable diags, count, listing, allocator)?
+        prune_manifest(wfs, manifest_path, mutable manifest, unreachable, allocator)?
+    }
+    let now_unix = now_unix_of(wall_clock)
+    sweep_local_specs(rfs, wfs, workspace_root, now_unix, mutable diags, allocator)?
+    sweep_global(rfs, wfs, now_unix, mutable diags, allocator)?
+}
+
+
+function now_unix_of(wall_clock: Clock) -> u64
+    with {wall_clock, time(ops <= 1)}
+{
+    let now = time_mod.now(wall_clock)
+    return (now.nanos_since_epoch / 1000000000) as u64
+}
+
+
+function sweep_local_specs(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    workspace_root: String,
+    now_unix: u64,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let specs_root = paths_mod.specs_cache_root(workspace_root, allocator)?
+    let objects_root = paths_mod.objects_cache_root(workspace_root, allocator)?
+    uninit roots: Vec_String.Vec
+    Vec_String.new(init roots, allocator)?
+    if fs.path_exists(rfs, specs_root) {
+        Vec_String.push(mutable roots, take specs_root, allocator)?
+    }
+    if fs.path_exists(rfs, objects_root) {
+        Vec_String.push(mutable roots, take objects_root, allocator)?
+    }
+    if Vec_String.len(roots) == 0 as usize { return }
+    let report = gc_global_mod.sweep_roots(
+        rfs,
+        wfs,
+        roots,
+        now_unix,
+        gc_global_mod.default_max_bytes(),
+        gc_global_mod.default_tmp_grace_secs(),
+        allocator,
+    )?
+    emit_sweep_report(mutable diags, report, "L1 local cache (specs+objects)", allocator)?
+}
+
+
+function sweep_global(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    now_unix: u64,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    match blob_mod.resolve_global(allocator)? {
+        case .none => ()
+        case .some(let g) => {
+            let report = gc_global_mod.sweep(
+                rfs,
+                wfs,
+                g,
+                now_unix,
+                gc_global_mod.default_max_bytes(),
+                gc_global_mod.default_tmp_grace_secs(),
+                allocator,
+            )?
+            emit_sweep_report(mutable diags, report, "L2 global cache", allocator)?
+        }
+    }
+}
+
+
+function emit_sweep_report(
+    diags: mutable diags_mod.Diagnostics,
+    report: gc_global_mod.SweepReport,
+    label: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let evicted_text = fmt_mod.usize_to_string(report.evicted_count, allocator)?
+    let bytes_text = fmt_mod.u64_to_string(report.evicted_bytes, allocator)?
+    let reaped_text = fmt_mod.usize_to_string(report.reaped_tmp_count, allocator)?
+    let head = string.concat("gc: ", label, allocator)?
+    let with_verb = string.concat(head, " - evicted ", allocator)?
+    let with_count = string.concat(with_verb, evicted_text, allocator)?
+    let with_label = string.concat(with_count, " artifact(s) (", allocator)?
+    let with_bytes = string.concat(with_label, bytes_text, allocator)?
+    let with_unit = string.concat(with_bytes, " bytes), reaped ", allocator)?
+    let with_reaped = string.concat(with_unit, reaped_text, allocator)?
+    let message = string.concat(with_reaped, " orphaned temp file(s)", allocator)?
+    let d = diag_mod.note_at(diag_code_mod.gc_recoverable(), span_mod.dummy(), message)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function prune_manifest(
+    wfs: Filesystem,
+    manifest_path: String,
+    manifest: mutable manifest_value_mod.Manifest,
+    unreachable: Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    let n = Vec_String.len(unreachable)
+    for i in 0..<n {
+        let path = Vec_String.at(unreachable, i)
+        remove_blob(wfs, path)?
+        remove_entry_by_path(mutable manifest.artifacts, path)
+    }
+    manifest.last_gc_run = Option_DateTime.some(value: calendar.epoch_unix())
+    write_manifest(wfs, manifest_path, manifest, allocator)?
+}
+
+
+function remove_blob(wfs: Filesystem, path: String) -> ()
+    with {wfs, err: fs.FsError}
+{
+    handle err: fs.FsError as _e -> () {
+        fs.remove(wfs, path)?
+    }
+}
+
+
+function remove_entry_by_path(entries: mutable Vec_ArtifactEntry.Vec, path: String) -> ()
+{
+    let n = Vec_ArtifactEntry.len(entries)
+    for i in 0..<n {
+        let e = Vec_ArtifactEntry.at_ref(entries, i)
+        if string.equals(e.path, path) {
+            let _ = Vec_ArtifactEntry.remove(mutable entries, i)
+            return
+        }
+    }
+}
+
+
+function write_manifest(
+    wfs: Filesystem,
+    manifest_path: String,
+    manifest: manifest_value_mod.Manifest,
+    allocator: Allocator,
+) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    let text_opt = handle err: iso8601_mod.Iso8601Error as _e -> Option_String.none {
+        Option_String.some(value: manifest_write_mod.to_text(manifest, allocator)?)
+    }
+    match text_opt {
+        case .none => ()
+        case .some(let text) => fs.write_bytes(wfs, manifest_path, text.bytes())?
+    }
+}
+
+
+function active_roots(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    entries: Vec_ArtifactEntry.Vec,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let members = stream_mod.workspace_member_dirs(rfs, workspace_root, mutable scratch_map, mutable scratch_diags, allocator)?
+
+    uninit roots: Vec_String.Vec
+    Vec_String.new(init roots, allocator)?
+    let n = Vec_String.len(members)
+    for i in 0..<n {
+        let member = Vec_String.at(members, i)
+        match last_entry_path(entries, member, allocator)? {
+            case .none => ()
+            case .some(let path) => Vec_String.push(mutable roots, take path, allocator)?
+        }
+    }
+    return roots
+}
+
+
+function last_entry_path(
+    entries: Vec_ArtifactEntry.Vec,
+    member: String,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    var found: Option_String.Option = Option_String.none
+    let n = Vec_ArtifactEntry.len(entries)
+    for i in 0..<n {
+        let e = Vec_ArtifactEntry.at_ref(entries, i)
+        if string.equals(e.short_name, member) {
+            found = Option_String.some(value: string.clone(e.path, allocator)?)
+        }
+    }
+    return found
+}
+
+
+function render_listing(
+    unreachable: Vec_String.Vec,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var listing: String = ""
+    let n = Vec_String.len(unreachable)
+    for i in 0..<n {
+        listing = string.concat(listing, "\n  recoverable: ", allocator)?
+        listing = string.concat(listing, Vec_String.at(unreachable, i), allocator)?
+    }
+    return listing
+}
+
+
+function emit_report(
+    diags: mutable diags_mod.Diagnostics,
+    count: usize,
+    listing: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let count_text = fmt_mod.usize_to_string(count, allocator)?
+    let head = string.concat("gc: ", count_text, allocator)?
+    let with_tail = string.concat(head, " recoverable artifact(s) in the codegen cache (report-only)", allocator)?
+    let message = string.concat(with_tail, listing, allocator)?
+    let d = diag_mod.note_at(diag_code_mod.gc_recoverable(), span_mod.dummy(), message)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

@@ -1,0 +1,251 @@
+
+module hermod.fetch.polite.policy.schedule
+
+import std.mem.alloc
+import std.os.time
+import local.fetch.polite.num as num_mod
+import local.fetch.polite.policy.robots as robots_mod
+
+public type HostState {
+    host: [u8]
+    last_request: time.MonotonicInstant
+    crawl_delay: time.Duration
+    has_last: bool
+    has_crawl_delay: bool
+    has_robots: bool
+}
+
+public type PoliteClient {
+    hosts: [HostState]
+    robots: [robots_mod.RobotsRules]
+    len_box: [usize]
+    user_agent: [u8]
+    min_interval: time.Duration
+    max_delay: time.Duration
+    max_redirects: usize
+    max_retries: usize
+}
+
+public type RetryAfter {
+    delay: time.Duration
+    present: bool
+}
+
+function _alloc_host_slots(allocator: Allocator, n: usize) -> [HostState]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_robots_slots(allocator: Allocator, n: usize) -> [robots_mod.RobotsRules]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _empty_host() -> HostState {
+    return HostState {
+        host: "".bytes(),
+        last_request: time.MonotonicInstant { nanos_since_clock_start: 0 as i64 },
+        crawl_delay: time.zero(),
+        has_last: false,
+        has_crawl_delay: false,
+        has_robots: false,
+    }
+}
+
+public function politeclient_new(
+    user_agent: [u8],
+    min_interval: time.Duration,
+    max_delay: time.Duration,
+    max_redirects: usize,
+    max_retries: usize,
+    host_cap: usize,
+    allocator: mutable Allocator,
+) -> PoliteClient
+    with {allocator, err: alloc.AllocError}
+{
+    let slots = _alloc_host_slots(allocator, host_cap)?
+    let rslots = _alloc_robots_slots(allocator, host_cap)?
+    let len_box = _alloc_usize_slots(allocator, 1 as usize)?
+    len_box[0] = 0 as usize
+    var ri: usize = 0 as usize
+    loop decreases rslots.len() - ri + 1 as usize {
+        if ri >= rslots.len() { break }
+        rslots[ri] = robots_mod.robots_empty_alloc(allocator)?
+        ri = ri + 1 as usize
+    }
+    return PoliteClient {
+        hosts: slots,
+        robots: rslots,
+        len_box: len_box,
+        user_agent: user_agent,
+        min_interval: min_interval,
+        max_delay: max_delay,
+        max_redirects: max_redirects,
+        max_retries: max_retries,
+    }
+}
+
+public function politeclient_host_count(c: PoliteClient) -> usize {
+    return c.len_box[0]
+}
+
+public function politeclient_user_agent(c: PoliteClient) -> [u8] {
+    return c.user_agent
+}
+
+public function politeclient_max_redirects(c: PoliteClient) -> usize {
+    return c.max_redirects
+}
+
+public function politeclient_max_retries(c: PoliteClient) -> usize {
+    return c.max_retries
+}
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    var i: usize = 0 as usize
+    loop decreases a.len() - i {
+        if i >= a.len() { return true }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+public function politeclient_find_host(c: PoliteClient, host: [u8]) -> usize {
+    let used = c.len_box[0]
+    var i: usize = 0 as usize
+    loop decreases used - i {
+        if i >= used { return used }
+        if _bytes_eq(c.hosts[i].host, host) { return i }
+        i = i + 1 as usize
+    }
+    return used
+}
+
+public function politeclient_touch_host(
+    c: mutable PoliteClient,
+    host: [u8],
+) -> usize
+    with {err: alloc.AllocError}
+{
+    let existing = politeclient_find_host(c, host)
+    if existing < c.len_box[0] { return existing }
+    let used = c.len_box[0]
+    if used >= c.hosts.len() {
+        raise alloc.AllocError.out_of_memory
+    }
+    var slot = _empty_host()
+    slot.host = host
+    c.hosts[used] = slot
+    c.len_box[0] = used + 1 as usize
+    return used
+}
+
+public function politeclient_has_robots(c: PoliteClient, idx: usize) -> bool {
+    if idx >= c.hosts.len() { return false }
+    return c.hosts[idx].has_robots
+}
+
+public function politeclient_path_allowed(
+    c: PoliteClient,
+    idx: usize,
+    path: [u8],
+) -> bool {
+    if idx >= c.hosts.len() || idx >= c.robots.len() { return true }
+    if !c.hosts[idx].has_robots { return true }
+    return robots_mod.robots_allows(c.robots[idx], path)
+}
+
+public function politeclient_set_robots(
+    c: mutable PoliteClient,
+    idx: usize,
+    rules: robots_mod.RobotsRules,
+) -> () {
+    if idx >= c.hosts.len() || idx >= c.robots.len() { return }
+    c.robots[idx] = rules
+    c.hosts[idx].has_robots = true
+    if robots_mod.robots_has_crawl_delay(rules) {
+        c.hosts[idx].crawl_delay = robots_mod.robots_crawl_delay(rules)
+        c.hosts[idx].has_crawl_delay = true
+    }
+}
+
+public function politeclient_mark_request(
+    c: mutable PoliteClient,
+    idx: usize,
+    now: time.MonotonicInstant,
+) -> () {
+    if idx >= c.hosts.len() { return }
+    c.hosts[idx].last_request = now
+    c.hosts[idx].has_last = true
+}
+
+public function politeclient_host_interval(
+    c: PoliteClient,
+    idx: usize,
+) -> time.Duration {
+    if idx >= c.hosts.len() { return c.min_interval }
+    let h = c.hosts[idx]
+    if !h.has_crawl_delay {
+        return c.min_interval
+    }
+    return if time.compare(h.crawl_delay, c.min_interval) >= 0 {
+        h.crawl_delay
+    } else {
+        c.min_interval
+    }
+}
+
+public function politeclient_required_wait(
+    c: PoliteClient,
+    idx: usize,
+    now: time.MonotonicInstant,
+) -> time.Duration {
+    if idx >= c.hosts.len() { return time.zero() }
+    let h = c.hosts[idx]
+    if !h.has_last {
+        return time.zero()
+    }
+    let interval = politeclient_host_interval(c, idx)
+    if now.nanos_since_clock_start < h.last_request.nanos_since_clock_start {
+        return time.zero()
+    }
+    let elapsed = time.duration_since(now, h.last_request)
+    return time.saturating_sub(interval, elapsed)
+}
+
+public function parse_retry_after_seconds(value: [u8]) -> RetryAfter {
+    let sc = num_mod.parse_seconds(value)
+    if !sc.present {
+        return RetryAfter { delay: time.zero(), present: false }
+    }
+    return RetryAfter { delay: time.from_secs(sc.secs), present: true }
+}
+
+public function backoff_delay(
+    c: PoliteClient,
+    attempt: usize,
+    retry_after: RetryAfter,
+) -> time.Duration {
+    var d = c.min_interval
+    var n: usize = 0 as usize
+    loop decreases attempt - n {
+        if n >= attempt { break }
+        if time.compare(d, c.max_delay) >= 0 {
+            d = c.max_delay
+            break
+        }
+        d = time.saturating_add(d, d)
+        n = n + 1 as usize
+    }
+    if time.compare(d, c.max_delay) > 0 {
+        d = c.max_delay
+    }
+    if retry_after.present && time.compare(retry_after.delay, d) > 0 {
+        return retry_after.delay
+    }
+    return d
+}

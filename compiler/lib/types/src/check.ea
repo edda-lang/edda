@@ -1,0 +1,712 @@
+
+module types.check
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.env.lower.nominals as nominals_mod
+import local.check.env.lower.merge.merge as merge_mod
+import local.check.env.lower.lean.lean as nominals_lean_mod
+import local.check.decl.indexes as indexes_mod
+import local.check.decl.items.items as items_mod
+import local.check.decl.items.lean as items_lean_mod
+import local.check.body.body as body_mod
+import local.check.env.sig as sig_mod
+import local.check.env.fields as fields_mod
+import local.check.pass.modes.calls.modes.modes as modes_mod
+import local.check.pass.modes.calls.sigs.sigs as sigs_mod
+import local.check.pass.modes.returns.returns as returns_mod
+import local.check.pass.exhaustive.walk.walk as exhaustive_mod
+import local.check.pass.argtype.walk as argtype_mod
+import local.check.pass.linearity.linearity as linearity_mod
+import local.check.consume.state as consume_state_mod
+import local.check.consume.walk.walk as flow_mod
+import local.check.typestate.walk.walk as typestate_mod
+import local.check.effect.repr.rows as effect_rows_mod
+import local.pass.validate.caps as validate_mod
+import local.pass.stable.surface as stable_mod
+import local.check.pass.stablehash.walk as stablehash_mod
+import local.check.pass.sentinel.walk as sentinel_mod
+import local.check.pass.execscope.walk as execscope_mod
+import local.check.pass.unusedcapture.walk as unusedcapture_mod
+import local.check.pass.modes.overgrab.walk as overgrab_mod
+import local.check.pass.deprecated.walk as deprecated_mod
+import local.check.pass.capescalation.walk as capescalation_mod
+import local.check.pass.filescope.walk as filescope_mod
+import local.check.pass.rettype.walk as rettype_mod
+import local.check.pass.typepath.walk as typepath_mod
+import local.check.pass.valuecycle.detect as valuecycle_mod
+import local.check.pass.avail.gate as gate_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import hir.build.file as hir_file
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import diagnostics.emit.collection as coll_mod
+import resolve.primitives.defs as primitives_mod
+import resolve.capabilities.defs as capabilities_mod
+import target.capability as cap_mod
+import target.triple as triple_mod
+import target.arch as arch_mod
+import syntax.ast.tree as ast_tree_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.core.option.Option(ty_mod.TyId)
+spec std.core.option.Option(sig_mod.FnSig)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(sigs_mod.SigSlot)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+spec std.collections.vec.Vec(fields_mod.FieldNameMatrix)
+spec std.collections.vec.Vec(fields_mod.FieldRefinementList)
+spec std.core.option.Option(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(Option_Expr)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.core.option.Option(cap_mod.Capability)
+spec std.core.option.Option(def_mod.DefId)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.core.option.Option(u32)
+spec std.collections.vec.Vec(u32)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.collections.hashmap.IntMap(def_mod.DefId)
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.vec.Vec(consume_state_mod.ConsumeFact)
+
+
+public type TypeOutput {
+    node_types: Vec_TyId.Vec
+    local_types: Vec_TyId.Vec
+    fn_signatures: Vec_FnSig.Vec
+    type_defs: Vec_TyId.Vec
+    field_tys: Vec_FieldTyList.Vec
+    variant_names: Vec_VariantNameList.Vec
+    field_names: Vec_FieldNameMatrix.Vec
+    field_refinements: Vec_FieldRefinementList.Vec
+    sum_def_by_ty: IntMap_DefId.IntMap
+    method_index: sig_mod.MethodIndex
+    variant_index_by_key: IntMap_u32.IntMap
+    node_call_method: Vec_DefId.Vec
+    diags: coll_mod.Diagnostics
+    builtins: builtins_mod.Builtins
+    prim_defs: primitives_mod.PrimitiveDefs
+    cap_defs: capabilities_mod.CapabilityDefs
+    lin_table: linearity_mod.LinTable
+    consume_facts: Vec_ConsumeFact.Vec
+}
+
+
+public type DeclTables {
+    fn_signatures: Vec_FnSig.Vec
+    type_defs: Vec_TyId.Vec
+    field_tys: Vec_FieldTyList.Vec
+    variant_names: Vec_VariantNameList.Vec
+    field_names: Vec_FieldNameMatrix.Vec
+    field_refinements: Vec_FieldRefinementList.Vec
+    call_sigs: Vec_SigSlot.Vec
+}
+
+
+public function new_decl_tables(
+    out: init DeclTables,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit fn_signatures: Vec_FnSig.Vec
+    Vec_FnSig.new(init fn_signatures, allocator)?
+    uninit type_defs: Vec_TyId.Vec
+    Vec_TyId.new(init type_defs, allocator)?
+    uninit field_tys: Vec_FieldTyList.Vec
+    Vec_FieldTyList.new(init field_tys, allocator)?
+    uninit variant_names: Vec_VariantNameList.Vec
+    Vec_VariantNameList.new(init variant_names, allocator)?
+    uninit field_names: Vec_FieldNameMatrix.Vec
+    Vec_FieldNameMatrix.new(init field_names, allocator)?
+    uninit field_refinements: Vec_FieldRefinementList.Vec
+    Vec_FieldRefinementList.new(init field_refinements, allocator)?
+    uninit call_sigs: Vec_SigSlot.Vec
+    Vec_SigSlot.new(init call_sigs, allocator)?
+    out = DeclTables {
+        fn_signatures: fn_signatures,
+        type_defs: type_defs,
+        field_tys: field_tys,
+        variant_names: variant_names,
+        field_names: field_names,
+        field_refinements: field_refinements,
+        call_sigs: call_sigs,
+    }
+}
+
+
+public function collect_file_decls(
+    tables: mutable DeclTables,
+    file: hir_file.HirFile,
+    extra_nominals: nominals_mod.NominalMap,
+    ptr_width: usize,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit nominals: nominals_mod.NominalMap
+    nominals = nominals_mod.build_nominals(file.items, interner, mutable ty_interner, allocator)?
+    merge_mod.prepend_base(mutable nominals, extra_nominals, allocator)?
+    uninit no_hints: Vec_u32.Vec
+    Vec_u32.new(init no_hints, allocator)?
+    let builtins = builtins_mod.seed_builtins(mutable ty_interner, take nominals, ptr_width, no_hints, allocator)?
+    items_mod.process_items(file, builtins, interner, mutable ty_interner, mutable effect_interner, mutable tables.fn_signatures, mutable tables.type_defs, mutable tables.field_tys, mutable tables.variant_names, mutable tables.field_names, mutable tables.field_refinements, allocator)?
+    sigs_mod.index_items(file.items, mutable tables.call_sigs, allocator)?
+}
+
+
+public function collect_file_decls_lean(
+    tables: mutable DeclTables,
+    file: hir_file.HirFileDecl,
+    extra_nominals: nominals_mod.NominalMap,
+    ptr_width: usize,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit nominals: nominals_mod.NominalMap
+    nominals = nominals_lean_mod.build_nominals_decl(file.items, interner, mutable ty_interner, allocator)?
+    merge_mod.prepend_base(mutable nominals, extra_nominals, allocator)?
+    uninit no_hints: Vec_u32.Vec
+    Vec_u32.new(init no_hints, allocator)?
+    let builtins = builtins_mod.seed_builtins(mutable ty_interner, take nominals, ptr_width, no_hints, allocator)?
+    items_lean_mod.process_items_decl(file, builtins, interner, mutable ty_interner, mutable effect_interner, mutable tables.fn_signatures, mutable tables.type_defs, mutable tables.field_tys, mutable tables.variant_names, mutable tables.field_names, mutable tables.field_refinements, allocator)?
+    sigs_mod.index_items_decl(file.items, mutable tables.call_sigs, allocator)?
+}
+
+
+public function check_file(
+    file: hir_file.HirFile,
+    decls: DeclTables,
+    indexes: indexes_mod.DeclIndexes,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    extra_nominals: nominals_mod.NominalMap,
+    shadowed_modules: Vec_Symbol.Vec,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> TypeOutput
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit nominals: nominals_mod.NominalMap
+    nominals = nominals_mod.build_nominals(file.items, interner, mutable ty_interner, allocator)?
+    merge_mod.prepend_base(mutable nominals, extra_nominals, allocator)?
+    let ptr_width = arch_mod.pointer_width(triple_mod.arch(triple))
+    let builtins = builtins_mod.seed_builtins(mutable ty_interner, take nominals, ptr_width, file.node_for_hint, allocator)?
+
+    uninit node_types: Vec_TyId.Vec
+    Vec_TyId.new(init node_types, allocator)?
+    uninit local_types: Vec_TyId.Vec
+    Vec_TyId.new(init local_types, allocator)?
+    uninit diags: coll_mod.Diagnostics
+    coll_mod.new_diagnostics(init diags, allocator)?
+
+    body_mod.process_bodies(file, builtins, interner, decls.fn_signatures, indexes.method_index, decls.type_defs, decls.field_tys, decls.variant_names, decls.field_names, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+
+    uninit node_call_method: Vec_DefId.Vec
+    Vec_DefId.new(init node_call_method, allocator)?
+    resolve_method_calls(file, decls.fn_signatures, indexes.method_index, builtins, interner, ty_interner, mutable node_types, mutable node_call_method, allocator)?
+
+    validate_mod.validate_capability_rows(file, triple, interner, mutable diags, allocator)?
+    stable_mod.check_stable_surface(file, decls.fn_signatures, node_call_method, interner, mutable diags, allocator)?
+    stablehash_mod.check_hash_iteration(file, node_types, interner, builtins, mutable diags, allocator)?
+    gate_mod.check_target_gates(file, triple, interner, mutable diags, allocator)?
+    modes_mod.check_call_modes(file, decls.call_sigs, mutable diags, allocator)?
+    returns_mod.check_return_modes(file, mutable diags, allocator)?
+    exhaustive_mod.check_match_exhaustiveness(file, node_types, decls.field_tys, decls.variant_names, local_types, builtins, ty_interner, mutable diags, allocator)?
+    argtype_mod.check_arg_types(file, node_types, ty_interner, interner, decls.fn_signatures, node_call_method, decls.field_tys, decls.field_names, builtins, mutable diags, allocator)?
+    rettype_mod.check_return_types(file, mutable node_types, ty_interner, decls.fn_signatures, builtins, mutable diags, allocator)?
+    effect_rows_mod.check_effect_containment(file, node_types, local_types, decls.fn_signatures, node_call_method, interner, ty_interner, effect_interner, mutable diags, allocator)?
+    filescope_mod.check_file_scope_paths(file, builtins.nominals, shadowed_modules, interner, mutable diags, allocator)?
+    typepath_mod.check_type_decl_paths(file, builtins, interner, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+    let _ = valuecycle_mod.check_value_cycles(file, decls.field_tys, ty_interner, mutable diags, allocator)?
+
+    let lin_table = linearity_mod.build_lin_table(file.items, allocator)?
+    uninit consume_facts: Vec_ConsumeFact.Vec
+    Vec_ConsumeFact.new(init consume_facts, allocator)?
+    flow_mod.check_flow(file, local_types, lin_table, ty_interner, mutable diags, mutable consume_facts, allocator)?
+    typestate_mod.check_typestate(file, local_types, ty_interner, mutable diags, allocator)?
+    sentinel_mod.check_error_sentinels(file, node_types, mutable diags, allocator)?
+    execscope_mod.check_exec_scope_spawn(file, mutable diags, allocator)?
+    unusedcapture_mod.check_unused_closure_capture(file, mutable diags, allocator)?
+    overgrab_mod.check_mode_overgrab(file, mutable diags, allocator)?
+    deprecated_mod.check_deprecated_use(file, interner, mutable diags, allocator)?
+    capescalation_mod.check_capability_escalation(file, interner, mutable diags, allocator)?
+
+    return TypeOutput {
+        node_types: node_types,
+        local_types: local_types,
+        fn_signatures: decls.fn_signatures,
+        type_defs: decls.type_defs,
+        field_tys: decls.field_tys,
+        variant_names: decls.variant_names,
+        field_names: decls.field_names,
+        field_refinements: decls.field_refinements,
+        sum_def_by_ty: indexes.sum_def_by_ty,
+        method_index: indexes.method_index,
+        variant_index_by_key: indexes.variant_index_by_key,
+        node_call_method: node_call_method,
+        diags: diags,
+        builtins: builtins,
+        prim_defs: prim_defs,
+        cap_defs: cap_defs,
+        lin_table: lin_table,
+        consume_facts: consume_facts,
+    }
+}
+
+
+public function check_file_decls(
+    file: hir_file.HirFile,
+    decls: DeclTables,
+    indexes: indexes_mod.DeclIndexes,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    extra_nominals: nominals_mod.NominalMap,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> TypeOutput
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit nominals: nominals_mod.NominalMap
+    nominals = nominals_mod.build_nominals(file.items, interner, mutable ty_interner, allocator)?
+    merge_mod.prepend_base(mutable nominals, extra_nominals, allocator)?
+    let ptr_width = arch_mod.pointer_width(triple_mod.arch(triple))
+    let builtins = builtins_mod.seed_builtins(mutable ty_interner, take nominals, ptr_width, file.node_for_hint, allocator)?
+
+    uninit node_types: Vec_TyId.Vec
+    Vec_TyId.new(init node_types, allocator)?
+    uninit local_types: Vec_TyId.Vec
+    Vec_TyId.new(init local_types, allocator)?
+    uninit node_call_method: Vec_DefId.Vec
+    Vec_DefId.new(init node_call_method, allocator)?
+    uninit diags: coll_mod.Diagnostics
+    coll_mod.new_diagnostics(init diags, allocator)?
+    let lin_table = linearity_mod.build_lin_table(file.items, allocator)?
+    uninit consume_facts: Vec_ConsumeFact.Vec
+    Vec_ConsumeFact.new(init consume_facts, allocator)?
+
+    return TypeOutput {
+        node_types: node_types,
+        local_types: local_types,
+        fn_signatures: decls.fn_signatures,
+        type_defs: decls.type_defs,
+        field_tys: decls.field_tys,
+        variant_names: decls.variant_names,
+        field_names: decls.field_names,
+        field_refinements: decls.field_refinements,
+        sum_def_by_ty: indexes.sum_def_by_ty,
+        method_index: indexes.method_index,
+        variant_index_by_key: indexes.variant_index_by_key,
+        node_call_method: node_call_method,
+        diags: diags,
+        builtins: builtins,
+        prim_defs: prim_defs,
+        cap_defs: cap_defs,
+        lin_table: lin_table,
+        consume_facts: consume_facts,
+    }
+}
+
+
+public function len_intrinsic_def() -> def_mod.DefId {
+    return def_mod.DefId { raw: 4294967295 as u32 }
+}
+
+public function is_len_intrinsic(d: def_mod.DefId) -> bool {
+    return d.raw == 4294967295 as u32
+}
+
+public function call_method_of(out: TypeOutput, n: node_mod.NodeId) -> def_mod.DefId {
+    let i = node_mod.index(n)
+    if i >= Vec_DefId.len(out.node_call_method) {
+        return def_mod.error()
+    }
+    return Vec_DefId.at(out.node_call_method, i)
+}
+
+public function set_call_method(out: mutable TypeOutput, n: node_mod.NodeId, def: def_mod.DefId) -> () {
+    let i = node_mod.index(n)
+    if i >= Vec_DefId.len(out.node_call_method) {
+        return
+    }
+    Vec_DefId.set_at(mutable out.node_call_method, i, def)
+}
+
+
+function resolve_method_calls(
+    file: hir_file.HirFile,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    node_call_method: mutable Vec_DefId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let total = file.next_node_id as usize
+    loop {
+        if Vec_DefId.len(node_call_method) >= total { break }
+        Vec_DefId.push(mutable node_call_method, def_mod.error(), allocator)?
+    }
+    var i: usize = 1
+    loop decreases (total - i) {
+        if i >= total { break }
+        let nid = node_mod.NodeId { raw: i as u32 }
+        if hir_file.is_method_call(file, nid) {
+            resolve_one_method_call(file, nid, fn_signatures, method_index, builtins, interner, ty_interner, mutable node_types, mutable node_call_method)
+        }
+        i = i + 1
+    }
+}
+
+
+function resolve_one_method_call(
+    file: hir_file.HirFile,
+    nid: node_mod.NodeId,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    node_call_method: mutable Vec_DefId.Vec,
+) -> ()
+    with {divergence}
+{
+    let name = hir_file.method_name_at(file, nid)
+    let recv_raw = hir_file.method_recv_at(file, nid)
+    let recv_ty = node_ty_at(node_types, recv_raw)
+    if sig_mod.sym_is(interner, name, "len") {
+        if sig_mod.is_slice_ty(recv_ty, ty_interner) {
+            write_node_ty(mutable node_types, nid.raw, builtins.usize_)
+            write_call_method(mutable node_call_method, nid.raw, len_intrinsic_def())
+            return
+        }
+    }
+    match sig_mod.resolve_method_in_index(method_index, recv_ty, name) {
+        case .some(let def) => {
+            write_node_ty(mutable node_types, nid.raw, sig_ret(fn_signatures, def))
+            write_call_method(mutable node_call_method, nid.raw, def)
+        }
+        case .none => ()
+    }
+}
+
+
+function node_ty_at(node_types: Vec_TyId.Vec, raw: u32) -> ty_mod.TyId {
+    let i = raw as usize
+    if i >= Vec_TyId.len(node_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(node_types, i)
+}
+
+function write_node_ty(node_types: mutable Vec_TyId.Vec, raw: u32, ty: ty_mod.TyId) -> () {
+    let i = raw as usize
+    if i < Vec_TyId.len(node_types) {
+        Vec_TyId.set_at(mutable node_types, i, ty)
+    }
+}
+
+function write_call_method(node_call_method: mutable Vec_DefId.Vec, raw: u32, def: def_mod.DefId) -> () {
+    let i = raw as usize
+    if i < Vec_DefId.len(node_call_method) {
+        Vec_DefId.set_at(mutable node_call_method, i, def)
+    }
+}
+
+function sig_ret(fn_signatures: Vec_FnSig.Vec, def: def_mod.DefId) -> ty_mod.TyId {
+    let i = def.raw as usize
+    if i >= Vec_FnSig.len(fn_signatures) {
+        return ty_mod.error()
+    }
+    return Vec_FnSig.at(fn_signatures, i).ret
+}
+
+
+public function type_of_node(out: TypeOutput, n: node_mod.NodeId) -> ty_mod.TyId {
+    let i = node_mod.index(n)
+    if i >= Vec_TyId.len(out.node_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(out.node_types, i)
+}
+
+public function type_of_local(out: TypeOutput, d: def_mod.DefId) -> ty_mod.TyId {
+    let i = def_mod.index(d)
+    if i >= Vec_TyId.len(out.local_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(out.local_types, i)
+}
+
+public function signature_of(out: TypeOutput, d: def_mod.DefId) -> Option_FnSig.Option {
+    let i = def_mod.index(d)
+    if i >= Vec_FnSig.len(out.fn_signatures) {
+        return Option_FnSig.none
+    }
+    return Option_FnSig.some(value: Vec_FnSig.at(out.fn_signatures, i))
+}
+
+
+public function is_integer(out: TypeOutput, t: ty_mod.TyId) -> bool {
+    let b = out.builtins
+    return t.raw == b.i8_.raw
+        || t.raw == b.i16_.raw
+        || t.raw == b.i32_.raw
+        || t.raw == b.i64_.raw
+        || t.raw == b.i128_.raw
+        || t.raw == b.u8_.raw
+        || t.raw == b.u16_.raw
+        || t.raw == b.u32_.raw
+        || t.raw == b.u64_.raw
+        || t.raw == b.u128_.raw
+        || t.raw == b.isize_.raw
+        || t.raw == b.usize_.raw
+}
+
+public function is_floating(out: TypeOutput, t: ty_mod.TyId) -> bool {
+    let b = out.builtins
+    return t.raw == b.f32_.raw || t.raw == b.f64_.raw
+}
+
+public function is_bool(out: TypeOutput, t: ty_mod.TyId) -> bool {
+    return t.raw == out.builtins.bool_.raw
+}
+
+public function fn_ref_type(out: TypeOutput, d: def_mod.DefId) -> ty_mod.TyId {
+    return match signature_of(out, d) {
+        case .some(let sig) => sig.fn_type
+        case .none => ty_mod.error()
+    }
+}
+
+
+public function variant_index_of(out: TypeOutput, sum_def: def_mod.DefId, name: symbol_mod.Symbol) -> Option_u32.Option {
+    return IntMap_u32.get(out.variant_index_by_key, indexes_mod.variant_key(def_mod.index(sum_def), name.raw))
+}
+
+public function variant_count_of(out: TypeOutput, sum_def: def_mod.DefId) -> usize {
+    let i = def_mod.index(sum_def)
+    if i >= Vec_VariantNameList.len(out.variant_names) {
+        return 0
+    }
+    return Vec_Symbol.len(Vec_VariantNameList.at(out.variant_names, i).names)
+}
+
+public function sum_def_of_ty(out: TypeOutput, t: ty_mod.TyId) -> Option_DefId.Option {
+    return IntMap_DefId.get(out.sum_def_by_ty, t.raw as i64)
+}
+
+public function discriminant_ty(out: TypeOutput) -> ty_mod.TyId {
+    return out.builtins.u32_
+}
+
+public function variant_payload_ty(out: TypeOutput, sum_def: def_mod.DefId, variant_idx: u32) -> ty_mod.TyId {
+    let i = def_mod.index(sum_def)
+    if i >= Vec_FieldTyList.len(out.field_tys) {
+        return ty_mod.error()
+    }
+    let list = Vec_FieldTyList.at(out.field_tys, i)
+    let vi = variant_idx as usize
+    if vi >= Vec_TyId.len(list.tys) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(list.tys, vi)
+}
+
+
+public function field_name_index(out: TypeOutput, def: def_mod.DefId, row_idx: u32, name: symbol_mod.Symbol) -> Option_u32.Option {
+    return fields_mod.field_index_in(out.field_names, def, row_idx, name)
+}
+
+
+public function resolve_field_index(
+    out: TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    receiver_ty: ty_mod.TyId,
+    name: symbol_mod.Symbol,
+) -> Option_u32.Option
+    with {divergence}
+{
+    if ty_mod.is_error(receiver_ty) {
+        return Option_u32.none
+    }
+    if (receiver_ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_u32.none
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, receiver_ty)
+    return match cty {
+        case .record(let def) => field_name_index(out, def, 0 as u32, name)
+        case .spec_instance(let def, _) => field_name_index(out, def, 0 as u32, name)
+        case _ => Option_u32.none
+    }
+}
+
+
+public stable function prim_def_id_to_ty_id(out: TypeOutput, def_id: def_mod.DefId) -> Option_TyId.Option {
+    let p = out.prim_defs
+    let r = def_id.raw
+    if r == p.i8_.raw         { return Option_TyId.some(value: out.builtins.i8_) }
+    if r == p.i16_.raw        { return Option_TyId.some(value: out.builtins.i16_) }
+    if r == p.i32_.raw        { return Option_TyId.some(value: out.builtins.i32_) }
+    if r == p.i64_.raw        { return Option_TyId.some(value: out.builtins.i64_) }
+    if r == p.i128_.raw       { return Option_TyId.some(value: out.builtins.i128_) }
+    if r == p.u8_.raw         { return Option_TyId.some(value: out.builtins.u8_) }
+    if r == p.u16_.raw        { return Option_TyId.some(value: out.builtins.u16_) }
+    if r == p.u32_.raw        { return Option_TyId.some(value: out.builtins.u32_) }
+    if r == p.u64_.raw        { return Option_TyId.some(value: out.builtins.u64_) }
+    if r == p.u128_.raw       { return Option_TyId.some(value: out.builtins.u128_) }
+    if r == p.isize_.raw      { return Option_TyId.some(value: out.builtins.isize_) }
+    if r == p.usize_.raw      { return Option_TyId.some(value: out.builtins.usize_) }
+    if r == p.f32_.raw        { return Option_TyId.some(value: out.builtins.f32_) }
+    if r == p.f64_.raw        { return Option_TyId.some(value: out.builtins.f64_) }
+    if r == p.bool_.raw       { return Option_TyId.some(value: out.builtins.bool_) }
+    if r == p.never_.raw      { return Option_TyId.some(value: out.builtins.never_) }
+    if r == p.codepoint_.raw  { return Option_TyId.some(value: out.builtins.codepoint_) }
+    if r == p.type_meta.raw   { return Option_TyId.some(value: out.builtins.type_meta) }
+    if r == p.string_.raw     { return Option_TyId.some(value: out.builtins.string_) }
+    return Option_TyId.none
+}
+
+
+public stable function cap_def_id_to_ty_id(out: TypeOutput, def_id: def_mod.DefId) -> Option_TyId.Option {
+    return match capabilities_mod.cap_of(out.cap_defs, def_id) {
+        case .some(let cap) => Option_TyId.some(value: builtins_mod.builtin_for_cap(out.builtins, cap))
+        case .none => Option_TyId.none
+    }
+}
+
+
+public function cap_of(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> Option_Capability.Option
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return Option_Capability.none
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .capability(let cap) => Option_Capability.some(value: cap)
+        case .refined(let base, _) => cap_of(base, ty_interner)
+        case _ => Option_Capability.none
+    }
+}
+
+public function ty_is_allocator(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    return match cap_of(t, ty_interner) {
+        case .some(let cap) => match cap {
+            case .allocator => true
+            case .bounded_allocator => true
+            case _ => false
+        }
+        case .none => false
+    }
+}
+
+public stable function type_id_of_def(out: TypeOutput, def_id: def_mod.DefId) -> Option_TyId.Option {
+    let i = def_mod.index(def_id)
+    if i >= Vec_TyId.len(out.type_defs) {
+        return Option_TyId.none
+    }
+    let ty_id = Vec_TyId.at(out.type_defs, i)
+    if ty_mod.is_error(ty_id) {
+        return Option_TyId.none
+    }
+    return Option_TyId.some(value: ty_id)
+}
+
+
+public function field_ty_count(out: TypeOutput, def: def_mod.DefId) -> usize {
+    let i = def_mod.index(def)
+    if i >= Vec_FieldTyList.len(out.field_tys) {
+        return 0 as usize
+    }
+    let list = Vec_FieldTyList.at(out.field_tys, i)
+    return Vec_TyId.len(list.tys)
+}
+
+public function field_ty_at(out: TypeOutput, def: def_mod.DefId, i: usize) -> ty_mod.TyId {
+    let d = def_mod.index(def)
+    if d >= Vec_FieldTyList.len(out.field_tys) {
+        return ty_mod.error()
+    }
+    let list = Vec_FieldTyList.at(out.field_tys, d)
+    if i >= Vec_TyId.len(list.tys) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(list.tys, i)
+}
+
+public function field_refinement_at(out: TypeOutput, def: def_mod.DefId, i: usize) -> Option_Expr.Option {
+    let d = def_mod.index(def)
+    if d >= Vec_FieldRefinementList.len(out.field_refinements) {
+        return Option_Expr.none
+    }
+    let list = Vec_FieldRefinementList.at(out.field_refinements, d)
+    if i >= Vec_Option_Expr.len(list.refinements) {
+        return Option_Expr.none
+    }
+    return Vec_Option_Expr.at(list.refinements, i)
+}
+
+public function field_name_at(out: TypeOutput, def: def_mod.DefId, row_idx: u32, i: usize) -> Option_Symbol.Option {
+    let d = def_mod.index(def)
+    if d >= Vec_FieldNameMatrix.len(out.field_names) {
+        return Option_Symbol.none
+    }
+    let matrix = Vec_FieldNameMatrix.at(out.field_names, d)
+    let ri = row_idx as usize
+    if ri >= Vec_VariantNameList.len(matrix.rows) {
+        return Option_Symbol.none
+    }
+    let row = Vec_VariantNameList.at(matrix.rows, ri)
+    if i >= Vec_Symbol.len(row.names) {
+        return Option_Symbol.none
+    }
+    return Option_Symbol.some(value: Vec_Symbol.at(row.names, i))
+}
+
+public function variant_name_at(out: TypeOutput, def: def_mod.DefId, i: usize) -> Option_Symbol.Option {
+    let d = def_mod.index(def)
+    if d >= Vec_VariantNameList.len(out.variant_names) {
+        return Option_Symbol.none
+    }
+    let list = Vec_VariantNameList.at(out.variant_names, d)
+    if i >= Vec_Symbol.len(list.names) {
+        return Option_Symbol.none
+    }
+    return Option_Symbol.some(value: Vec_Symbol.at(list.names, i))
+}
+
+public function is_linear_or_affine_ty(out: TypeOutput, t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    return linearity_mod.is_linear_or_affine(out.lin_table, t, ty_interner)
+}

@@ -1,0 +1,304 @@
+
+module compile.check.runes.resolve.emit.emit
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import std.archive.tar
+import std.archive.tar.writer as tar_writer
+import std.compress.zstd
+import std.crypto.sig.ed25519
+import cache.addr.hash as chash_mod
+import local.check.runes.util as util_mod
+
+spec std.mem.alloc.Array(u8)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+
+
+public type PayloadEntry {
+    name: String
+    bytes: [u8]
+}
+
+spec std.collections.vec.Vec(PayloadEntry)
+
+
+public function assemble_rune_archive(
+    package_name: String,
+    version: String,
+    deps: Vec_String.Vec,
+    surface_names: Vec_String.Vec,
+    surface_texts: Vec_String.Vec,
+    effect_entries: Vec_String.Vec,
+    mir_entries: Vec_PayloadEntry.Vec,
+    object_entries: Vec_PayloadEntry.Vec,
+    index_toon: String,
+    publisher_seed: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: zstd.ZstdError, err: tar.TarError}
+    requires publisher_seed.len() == 32
+    requires surface_names.len() == surface_texts.len()
+{
+    let manifest_toml = render_manifest(package_name, version, deps, allocator)?
+    let publisher_key = render_publisher_key(publisher_seed, allocator)?
+    let surface_hash = hash_surface_texts(surface_texts, allocator)?
+    let effect_hash = hash_effect_entries(effect_entries, allocator)?
+    let hashes_toon = render_hashes(
+        manifest_toml, index_toon, publisher_key,
+        surface_names, surface_texts,
+        mir_entries, object_entries,
+        surface_hash, effect_hash, allocator)?
+    let signature = sign_hashes(hashes_toon, publisher_seed, allocator)?
+
+    uninit tar_out: Vec_u8.Vec
+    Vec_u8.new(init tar_out, allocator)?
+
+    tar_writer.write_entry(mutable tar_out, "hashes.toon", hashes_toon.bytes(), allocator)?
+    tar_writer.write_entry(mutable tar_out, "index.toon", index_toon.bytes(), allocator)?
+    tar_writer.write_entry(mutable tar_out, "manifest.toml", manifest_toml.bytes(), allocator)?
+    tar_writer.write_entry(mutable tar_out, "publisher.key", publisher_key.bytes(), allocator)?
+    tar_writer.write_entry(mutable tar_out, "signature.bin", signature, allocator)?
+
+    let sn = Vec_String.len(surface_names)
+    var i: usize = 0
+    loop decreases (sn - i) {
+        if i >= sn { break }
+        tar_writer.write_entry(
+            mutable tar_out,
+            Vec_String.at(surface_names, i),
+            Vec_String.at(surface_texts, i).bytes(),
+            allocator)?
+        i = i + 1
+    }
+    write_payload_entries(mutable tar_out, mir_entries, allocator)?
+    write_payload_entries(mutable tar_out, object_entries, allocator)?
+    tar_writer.write_end(mutable tar_out, allocator)?
+
+    let tar_bytes = Vec_u8.into_array(take tar_out, allocator)?
+    return zstd.compress(tar_bytes, allocator)?
+}
+
+
+function render_manifest(
+    package_name: String,
+    version: String,
+    deps: Vec_String.Vec,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let name_line = quoted_kv("name", package_name, allocator)?
+    let version_line = quoted_kv("version", version, allocator)?
+    var acc = string.concat(name_line, version_line, allocator)?
+    let sorted = clone_sorted(deps, allocator)?
+    let n = Vec_String.len(sorted)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = string.concat("[dependencies.", Vec_String.at(sorted, i), allocator)?
+        let header = string.concat(a, "]\n", allocator)?
+        acc = string.concat(acc, header, allocator)?
+        i = i + 1
+    }
+    return acc
+}
+
+
+function render_publisher_key(publisher_seed: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires publisher_seed.len() == 32
+{
+    var pubkey: [u8] = Array_u8.alloc(allocator, 32)?
+    ed25519.public_from_private(publisher_seed, mutable pubkey)
+    let hex = bytes_to_hex(pubkey, allocator)?
+    let a = string.concat("ed25519:", hex, allocator)?
+    return string.concat(a, "\n", allocator)?
+}
+
+
+function hash_surface_texts(surface_texts: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit acc: Vec_u8.Vec
+    Vec_u8.new(init acc, allocator)?
+    let n = Vec_String.len(surface_texts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_u8.extend_from_slice(mutable acc, Vec_String.at(surface_texts, i).bytes(), allocator)?
+        i = i + 1
+    }
+    let arr = Vec_u8.into_array(take acc, allocator)?
+    return blake3_token(arr, allocator)?
+}
+
+
+function hash_effect_entries(effect_entries: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let sorted = clone_sorted(effect_entries, allocator)?
+    let canon = util_mod.join_lines(sorted, allocator)?
+    return blake3_token(canon.bytes(), allocator)?
+}
+
+
+function render_hashes(
+    manifest_toml: String,
+    index_toon: String,
+    publisher_key: String,
+    surface_names: Vec_String.Vec,
+    surface_texts: Vec_String.Vec,
+    mir_entries: Vec_PayloadEntry.Vec,
+    object_entries: Vec_PayloadEntry.Vec,
+    surface_hash: String,
+    effect_hash: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+    requires surface_names.len() == surface_texts.len()
+{
+    var acc = quoted_kv("effect_hash", effect_hash, allocator)?
+    acc = string.concat(acc, per_file_line("index.toon", index_toon, allocator)?, allocator)?
+    acc = string.concat(acc, per_file_line("manifest.toml", manifest_toml, allocator)?, allocator)?
+    acc = string.concat(acc, per_file_line("publisher.key", publisher_key, allocator)?, allocator)?
+    acc = string.concat(acc, quoted_kv("surface_hash", surface_hash, allocator)?, allocator)?
+    let n = Vec_String.len(surface_names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        acc = string.concat(
+            acc,
+            per_file_line(Vec_String.at(surface_names, i), Vec_String.at(surface_texts, i), allocator)?,
+            allocator)?
+        i = i + 1
+    }
+    acc = string.concat(acc, payload_hash_lines(mir_entries, allocator)?, allocator)?
+    acc = string.concat(acc, payload_hash_lines(object_entries, allocator)?, allocator)?
+    return acc
+}
+
+
+function write_payload_entries(
+    tar_out: mutable Vec_u8.Vec,
+    entries: Vec_PayloadEntry.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    let n = Vec_PayloadEntry.len(entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = Vec_PayloadEntry.at(entries, i)
+        tar_writer.write_entry(mutable tar_out, entry.name, entry.bytes, allocator)?
+        i = i + 1
+    }
+}
+
+
+function payload_hash_lines(entries: Vec_PayloadEntry.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out = string.clone("", allocator)?
+    let n = Vec_PayloadEntry.len(entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = Vec_PayloadEntry.at(entries, i)
+        out = string.concat(out, per_file_line_bytes(entry.name, entry.bytes, allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function sign_hashes(hashes_toon: String, publisher_seed: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+    requires publisher_seed.len() == 32
+{
+    var sig: [u8] = Array_u8.alloc(allocator, 64)?
+    ed25519.sign(publisher_seed, hashes_toon.bytes(), mutable sig)
+    return sig
+}
+
+
+function per_file_line(name: String, content: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let key = string.concat("file:", name, allocator)?
+    let tok = blake3_token(content.bytes(), allocator)?
+    return quoted_kv(key, tok, allocator)?
+}
+
+
+function per_file_line_bytes(name: String, bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let key = string.concat("file:", name, allocator)?
+    let tok = blake3_token(bytes, allocator)?
+    return quoted_kv(key, tok, allocator)?
+}
+
+
+function quoted_kv(key: String, value: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = string.concat(key, " = \"", allocator)?
+    let b = string.concat(a, value, allocator)?
+    return string.concat(b, "\"\n", allocator)?
+}
+
+
+function blake3_token(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let h = chash_mod.hash_bytes(bytes, allocator)?
+    let hex = chash_mod.to_hex_string(h, allocator)?
+    return string.concat("blake3:", hex, allocator)?
+}
+
+
+function clone_sorted(items: Vec_String.Vec, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n = Vec_String.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let owned = string.clone(Vec_String.at(items, i), allocator)?
+        Vec_String.push(mutable out, take owned, allocator)?
+        i = i + 1
+    }
+    util_mod.sort_strings(mutable out)
+    return out
+}
+
+
+function bytes_to_hex(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    let n = bytes.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = bytes[i]
+        Vec_u8.push(mutable out, nibble_hex(b / 16), allocator)?
+        Vec_u8.push(mutable out, nibble_hex(b % 16), allocator)?
+        i = i + 1
+    }
+    let arr = Vec_u8.into_array(take out, allocator)?
+    return string.from_owned_utf8(take arr)
+}
+
+
+function nibble_hex(n: u8) -> u8
+    requires n < 16
+{
+    return if n < 10 { n + 48 } else { (n - 10) + 97 }
+}

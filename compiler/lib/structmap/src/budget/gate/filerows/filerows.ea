@@ -1,0 +1,221 @@
+module structmap.budget.gate.filerows.filerows
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string as string
+import local.data.model as model
+import local.render.toon as toon
+import local.render.sections.effects as effects_sec
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.TypeEntry)
+spec std.collections.vec.Vec(model.FunctionEntry)
+
+
+function collect_file_effect_rows(tree: model.Tree, dir_idx: usize, file: String, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit rows: Vec_String.Vec
+    Vec_String.new(init rows, allocator)?
+    let total: usize = Vec_FunctionEntry.len(tree.functions)
+    var i: usize = 0
+    loop decreases (total - i) {
+        if i >= total { break }
+        let r = Vec_FunctionEntry.at(tree.functions, i)
+        if r.dir_idx == dir_idx && string.equals(r.file, file) {
+            if Vec_String.len(r.declared_effects) > 0 as usize {
+                let rs = effects_sec.row_string(r.declared_effects, allocator)?
+                if !contains(rows, rs) { Vec_String.push(mutable rows, rs, allocator)? }
+            }
+            if Vec_String.len(r.effect_cone) > 0 as usize && !effects_sec.set_equal(r.effect_cone, r.declared_effects) {
+                let cs = effects_sec.row_string(r.effect_cone, allocator)?
+                if !contains(rows, cs) { Vec_String.push(mutable rows, cs, allocator)? }
+            }
+        }
+        i += 1
+    }
+    return rows
+}
+
+function contains(v: Vec_String.Vec, s: String) -> bool {
+    let n: usize = Vec_String.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_String.at(v, i), s) { return true }
+        i += 1
+    }
+    return false
+}
+
+function count_types_for_file(tree: model.Tree, dir_idx: usize, file: String) -> usize {
+    let total: usize = Vec_TypeEntry.len(tree.types_)
+    var c: usize = 0
+    var i: usize = 0
+    loop decreases (total - i) {
+        if i >= total { break }
+        let r = Vec_TypeEntry.at(tree.types_, i)
+        if r.dir_idx == dir_idx && string.equals(r.file, file) { c += 1 }
+        i += 1
+    }
+    return c
+}
+
+function count_fns_for_file(tree: model.Tree, dir_idx: usize, file: String) -> usize {
+    let total: usize = Vec_FunctionEntry.len(tree.functions)
+    var c: usize = 0
+    var i: usize = 0
+    loop decreases (total - i) {
+        if i >= total { break }
+        let r = Vec_FunctionEntry.at(tree.functions, i)
+        if r.dir_idx == dir_idx && string.equals(r.file, file) { c += 1 }
+        i += 1
+    }
+    return c
+}
+
+function push_quoted_joined(buf: mutable Vec_u8.Vec, parts: [String], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit tmp: Vec_u8.Vec
+    Vec_u8.new(init tmp, allocator)?
+    toon.push_pipe_join(mutable tmp, parts, allocator)?
+    let joined = toon.finish_string(take tmp, allocator)?
+    toon.push_quoted(mutable buf, joined, allocator)?
+}
+
+function render_types(buf: mutable Vec_u8.Vec, tree: model.Tree, dir_idx: usize, file: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let count = count_types_for_file(tree, dir_idx, file)
+    if count == 0 as usize { return }
+    toon.push_str(mutable buf, "types[", allocator)?
+    toon.push_usize_decimal(mutable buf, count, allocator)?
+    toon.push_str(mutable buf, "]{name,kind,file,line,end,visibility,stability,generics,fields_or_variants,refinements}:\n", allocator)?
+    let total: usize = Vec_TypeEntry.len(tree.types_)
+    var i: usize = 0
+    loop decreases (total - i) {
+        if i >= total { break }
+        let r = Vec_TypeEntry.at(tree.types_, i)
+        if r.dir_idx == dir_idx && string.equals(r.file, file) {
+            toon.push_str(mutable buf, "  ", allocator)?
+            toon.push_quoted(mutable buf, r.name, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_str(mutable buf, model.type_kind_str(r.kind), allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_quoted(mutable buf, r.file, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_u32_decimal(mutable buf, r.line, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_u32_decimal(mutable buf, r.end, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_str(mutable buf, model.visibility_str(r.visibility), allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_str(mutable buf, model.stability_str(r.stability), allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            push_quoted_joined(mutable buf, r.generics.data[0..<r.generics.len], allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_quoted(mutable buf, r.fields_or_variants, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            push_quoted_joined(mutable buf, r.refinements.data[0..<r.refinements.len], allocator)?
+            toon.push_byte(mutable buf, 0x0A, allocator)?
+        }
+        i += 1
+    }
+}
+
+function render_effects(buf: mutable Vec_u8.Vec, rows: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let count = Vec_String.len(rows)
+    if count == 0 as usize { return }
+    toon.push_str(mutable buf, "effects[", allocator)?
+    toon.push_usize_decimal(mutable buf, count, allocator)?
+    toon.push_str(mutable buf, "]{id,row}:\n", allocator)?
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        toon.push_str(mutable buf, "  ", allocator)?
+        toon.push_usize_decimal(mutable buf, i, allocator)?
+        toon.push_byte(mutable buf, 0x2C, allocator)?
+        toon.push_quoted(mutable buf, Vec_String.at(rows, i), allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        i += 1
+    }
+}
+
+function push_eff(buf: mutable Vec_u8.Vec, rows: Vec_String.Vec, declared: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if Vec_String.len(declared) == 0 as usize { return }
+    let rs = effects_sec.row_string(declared, allocator)?
+    let id = effects_sec.id_of(rows, rs)
+    toon.push_usize_decimal(mutable buf, id, allocator)?
+}
+
+function push_cone(buf: mutable Vec_u8.Vec, cone: Vec_String.Vec, declared: Vec_String.Vec, rows: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if effects_sec.set_equal(cone, declared) {
+        toon.push_str(mutable buf, "=", allocator)?
+        return
+    }
+    if Vec_String.len(cone) == 0 as usize { return }
+    let cs = effects_sec.row_string(cone, allocator)?
+    let id = effects_sec.id_of(rows, cs)
+    toon.push_usize_decimal(mutable buf, id, allocator)?
+}
+
+function render_functions(buf: mutable Vec_u8.Vec, tree: model.Tree, dir_idx: usize, file: String, rows: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let count = count_fns_for_file(tree, dir_idx, file)
+    if count == 0 as usize { return }
+    toon.push_str(mutable buf, "functions[", allocator)?
+    toon.push_usize_decimal(mutable buf, count, allocator)?
+    toon.push_str(mutable buf, "]{name,file,line,end,visibility,stability,sig,eff,cone,calls}:\n", allocator)?
+    let total: usize = Vec_FunctionEntry.len(tree.functions)
+    var i: usize = 0
+    loop decreases (total - i) {
+        if i >= total { break }
+        let r = Vec_FunctionEntry.at(tree.functions, i)
+        if r.dir_idx == dir_idx && string.equals(r.file, file) {
+            toon.push_str(mutable buf, "  ", allocator)?
+            toon.push_quoted(mutable buf, r.qualified_name, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_quoted(mutable buf, r.file, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_u32_decimal(mutable buf, r.line, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_u32_decimal(mutable buf, r.end, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_str(mutable buf, model.visibility_str(r.visibility), allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_str(mutable buf, model.stability_str(r.stability), allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            toon.push_quoted(mutable buf, r.signature, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            push_eff(mutable buf, rows, r.declared_effects, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            push_cone(mutable buf, r.effect_cone, r.declared_effects, rows, allocator)?
+            toon.push_byte(mutable buf, 0x2C, allocator)?
+            push_quoted_joined(mutable buf, r.calls.data[0..<r.calls.len], allocator)?
+            toon.push_byte(mutable buf, 0x0A, allocator)?
+        }
+        i += 1
+    }
+}
+
+public function render_file_rows(tree: model.Tree, dir_idx: usize, file: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let rows = collect_file_effect_rows(tree, dir_idx, file, allocator)?
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    render_types(mutable buf, tree, dir_idx, file, allocator)?
+    render_effects(mutable buf, rows, allocator)?
+    render_functions(mutable buf, tree, dir_idx, file, rows, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}

@@ -1,0 +1,83 @@
+
+module arm64.ops.mem
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.regs as regs_mod
+import local.encoding.instr.mem.ldst as ldst_mod
+import local.abi.misc.regutil as regutil_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_load(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    addr: lir_reg_mod.MemRef,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let base = mem_base(body, addr)?
+    let imm12 = scaled_disp(addr)?
+    let dreg = regutil_mod.gp_of_pinned_vreg(body, dst)?
+    ldst_mod.encode_ldr_imm(mutable code, true, dreg, base, imm12, allocator)?
+}
+
+public function emit_store(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    value: lir_vreg_mod.LirVRegId,
+    addr: lir_reg_mod.MemRef,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let base = mem_base(body, addr)?
+    let imm12 = scaled_disp(addr)?
+    let vreg = regutil_mod.gp_of_pinned_vreg(body, value)?
+    ldst_mod.encode_str_imm(mutable code, true, vreg, base, imm12, allocator)?
+}
+
+function mem_base(
+    body: lir_body_mod.LirBody,
+    addr: lir_reg_mod.MemRef,
+) -> regs_mod.GpReg
+    with {err: lir_error_mod.LirError}
+{
+    return match addr.base {
+        case .some(let bid) => regutil_mod.gp_of_pinned_vreg(body, bid)?
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: memory reference without a base register (absolute addressing needs a relocation form)",
+        )
+    }
+}
+
+function scaled_disp(addr: lir_reg_mod.MemRef) -> u16
+    with {err: lir_error_mod.LirError}
+{
+    match addr.index {
+        case .some(_) => raise regutil_mod.unsupported()
+        case .none => ()
+    }
+    let d = addr.displacement
+    if d < (0 as i32) || (d % (8 as i32)) != (0 as i32) {
+        raise regutil_mod.unsupported()
+    }
+    let scaled = d / (8 as i32)
+    if scaled > (4095 as i32) {
+        raise regutil_mod.unsupported()
+    }
+    return scaled as u16
+}

@@ -1,0 +1,173 @@
+
+module stdlib_mir_verify.main
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.os.fs
+import std.io.stream as stream
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import mir.file.store as mir_file_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as resolve_specsurface_mod
+import resolve.bind.lookup.env.walk.uses as resolve_uses_mod
+import resolve.build.drive.surface.walk.binding.walker as resolve_walker_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import target.triple as triple_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import compile.setup.env.discover as discover_mod
+import compile.stdlib.resolve as resolve_mod
+import compile.instantiate.iter.enumerate.enumerate as enumerate_mod
+import compile.phase.pipeline.parse as parse_mod
+import compile.phase.pipeline.lower as lower_mod
+import compile.setup.env.load.triple as triple_phase_mod
+import compile.phase.analyze.analyze as analyze_mod
+import compile.trace.trace as trace_mod
+import driver.render.render as render_mod
+import specs.cachectx as cachectx_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(diag_mod.Diagnostic)
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(triple_mod.TargetTriple)
+
+
+public function main(rfs: ReadOnlyFilesystem, wfs: Filesystem, clock: MonotonicClock, errout: Stderr, allocator: Allocator) -> i32
+    with {rfs, wfs, clock, errout, allocator, panic, divergence}
+{
+    let code = handle err: fs.FsError as fe -> { let _ = fe; fail_fs(errout) } {
+        handle err: alloc.AllocError as ae -> { let _ = ae; fail_alloc(errout) } {
+            run(rfs, wfs, clock, errout, allocator)?
+        }
+    }
+    return code
+}
+
+
+function run(rfs: ReadOnlyFilesystem, wfs: Filesystem, clock: MonotonicClock, errout: Stderr, allocator: Allocator) -> i32
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit map: source_map_mod.SourceMap
+    source_map_mod.new_map(init map, allocator)?
+    uninit diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init diags, allocator)?
+
+    let triple_opt = triple_phase_mod.resolve_triple_from_string("x86-64-windows-msvc", mutable diags, allocator)?
+    let triple = match triple_opt {
+        case .some(let t) => t
+        case .none => {
+            render_mod.render_diagnostics(errout, diags, map, allocator)?
+            return 1
+        }
+    }
+
+    let workspace_root = env.current_dir(allocator)
+    let stdlib_lib_opt = resolve_mod.resolve_stdlib_lib(rfs, workspace_root, Option_String.none, mutable diags, allocator)?
+    let stdlib_lib = match stdlib_lib_opt {
+        case .some(let l) => l
+        case .none => {
+            render_mod.render_diagnostics(errout, diags, map, allocator)?
+            return 1
+        }
+    }
+
+    let stdlib_files = discover_mod.stdlib_sources(rfs, stdlib_lib, allocator)?
+    let stdlib_array = Vec_String.into_array(take stdlib_files, allocator)?
+    enumerate_mod.enumerate(rfs, stdlib_array, mutable map, allocator)?
+
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    let files = parse_mod.parse_sources(map, mutable interner, mutable diags, allocator)?
+
+    uninit ctx: resolve_ctx_mod.ResolveCtx
+    resolve_ctx_mod.new_ctx(init ctx, allocator)?
+    let wl = resolve_walker_mod.new_derive_whitelist(mutable interner, allocator)?
+    let cat = resolve_specsurface_mod.walk_package_with_catalogue(mutable ctx, files, wl, interner, allocator)?
+    resolve_specsurface_mod.register_invocations(mutable ctx, cat, files, mutable interner, allocator)?
+    resolve_uses_mod.walk_uses(mutable ctx, files, interner, allocator)?
+    drain_diagnostics(mutable diags, ctx.diags.items, allocator)?
+    let output = resolve_ctx_mod.finish(take ctx)
+    let hir_files = lower_mod.lower_to_hir(take files, output, output.next_def_id, mutable interner, allocator, allocator)?
+
+    uninit ty_interner: ty_interner_mod.Interner
+    ty_interner_mod.new_interner(init ty_interner, allocator)?
+    uninit effect_interner: effect_interner_mod.Interner
+    effect_interner_mod.new_interner(init effect_interner, allocator)?
+
+    uninit dep_hir_files: Vec_HirFile.Vec
+    Vec_HirFile.new(init dep_hir_files, allocator)?
+    uninit dep_ast: Vec_File.Vec
+    Vec_File.new(init dep_ast, allocator)?
+    let dep_def_base = output.next_def_id
+    var spec_cache_ctx = cachectx_mod.disabled()
+    let analysis = analyze_mod.analyze_seed(
+        take hir_files, take dep_hir_files, take dep_ast, dep_def_base, allocator, take output, cat, triple, true, rfs, wfs, trace_mod.off(), clock, errout, mutable spec_cache_ctx,
+        mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable map, allocator,
+    )?
+    let lowered = analyze_mod.lower_instances_build(
+        take analysis, triple, trace_mod.off(), clock, errout,
+        interner, mutable ty_interner, mutable effect_interner, mutable diags, allocator,
+    )?
+
+    ty_interner_mod.dispose(take ty_interner)
+    effect_interner_mod.dispose(take effect_interner)
+
+    let mir_count = Vec_MirFile.len(lowered.mir_files)
+    let failed = diags_mod.has_errors(diags)
+    if failed {
+        render_mod.render_diagnostics(errout, diags, map, allocator)?
+        stream.eprint_line(errout, "stdlib_mir_verify: FAIL - inspect mir over the stdlib produced errors")
+    } else {
+        let pass_msg = f"stdlib_mir_verify: PASS - {mir_count} stdlib mir modules lowered with 0 errors"
+        stream.eprint_line(errout, pass_msg)
+    }
+
+    interner_mod.dispose(take interner)
+    return if failed { 1 } else { 0 }
+}
+
+
+function drain_diagnostics(
+    target: mutable diags_mod.Diagnostics,
+    source: Vec_Diagnostic.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Diagnostic.len(source)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let d = Vec_Diagnostic.at(source, i)
+        diags_mod.emit(mutable target, take d, allocator)?
+        i = i + 1
+    }
+}
+
+
+function fail_fs(errout: Stderr) -> i32
+    with {errout}
+{
+    stream.eprint_line(errout, "stdlib_mir_verify: fatal filesystem error")
+    return 74
+}
+
+
+function fail_alloc(errout: Stderr) -> i32
+    with {errout}
+{
+    stream.eprint_line(errout, "stdlib_mir_verify: fatal allocation error")
+    return 71
+}

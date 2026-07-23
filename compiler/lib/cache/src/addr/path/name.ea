@@ -1,0 +1,151 @@
+
+module cache.addr.path.name
+
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import local.addr.hash as hash_mod
+
+spec std.core.option.Option(ArtifactName)
+
+derive eq, hash, ord, clone, debug for ArtifactName
+derive eq, hash, ord, clone, debug for ParseError
+
+
+public type ArtifactName {
+    short: String
+    hash: hash_mod.ArtifactHash
+}
+
+public type ParseError {
+    case missing_separator
+    case bad_prefix
+    case bad_short
+}
+
+
+public function new(short: take String, hash: hash_mod.ArtifactHash) -> Option_ArtifactName {
+    if !is_valid_short(short.bytes()) { return Option_ArtifactName.none }
+    return Option_ArtifactName.some(value: ArtifactName { short: short, hash: hash })
+}
+
+public stable function short(n: ArtifactName) -> String {
+    return n.short
+}
+
+public stable function hash(n: ArtifactName) -> hash_mod.ArtifactHash {
+    return n.hash
+}
+
+
+public function to_string(n: ArtifactName, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let short_bytes = n.short.bytes()
+    let short_len = short_bytes.len()
+    var buf: [u8] = allocator.alloc_array(u8, short_len + 66)?
+    copy_bytes(short_bytes, mutable buf, 0)
+    buf[short_len]     = 95
+    buf[short_len + 1] = 95
+    hash_mod.to_hex_bytes(n.hash, mutable buf, short_len + 2)
+    return string.from_owned_utf8(take buf)
+}
+
+
+public function parse(s: String, allocator: Allocator) -> ArtifactName
+    with {allocator, err: alloc.AllocError, err: ParseError}
+{
+    let bytes = s.bytes()
+    let n = bytes.len()
+    if n < 66 { raise ParseError.missing_separator }
+    if bytes[n - 66] != 95 || bytes[n - 65] != 95 {
+        raise ParseError.missing_separator
+    }
+    let hash_string = slice_to_string(bytes, n - 64, n, allocator)?
+    let hash = match hash_mod.parse_hex(hash_string) {
+        case .none        => raise ParseError.bad_prefix
+        case .some(let h) => h
+    }
+    if !is_valid_short_slice(bytes, n - 66) { raise ParseError.bad_short }
+    let short = slice_to_string(bytes, 0, n - 66, allocator)?
+    return ArtifactName { short: short, hash: hash }
+}
+
+
+function is_valid_short(s: [u8]) -> bool {
+    return is_valid_short_slice(s, s.len())
+}
+
+function is_valid_short_slice(s: [u8], end: usize) -> bool
+    requires end <= s.len()
+{
+    if end == 0 { return false }
+    return walk_short(s, 0, end)
+}
+
+function walk_short(s: [u8], i: usize, end: usize) -> bool
+    requires i <= end
+    requires end <= s.len()
+    decreases end - i
+{
+    if i >= end { return true }
+    let b: u8 = s[i]
+    if is_forbidden_short_byte(b) { return false }
+    return walk_short(s, i + 1, end)
+}
+
+function is_forbidden_short_byte(b: u8) -> bool {
+    if b == 0  { return true }
+    if b == 9  { return true }
+    if b == 10 { return true }
+    if b == 13 { return true }
+    if b == 32 { return true }
+    if b == 47 { return true }
+    if b == 92 { return true }
+    return false
+}
+
+
+function slice_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let len = hi - lo
+    var buf: [u8] = allocator.alloc_array(u8, len)?
+    copy_range(bytes, lo, hi, mutable buf, 0)
+    return string.from_owned_utf8(take buf)
+}
+
+function copy_range(src: [u8], lo: usize, hi: usize, dst: mutable [u8], offset: usize) -> ()
+    requires lo <= hi
+    requires hi <= src.len()
+    requires offset + (hi - lo) <= dst.len()
+{
+    copy_range_acc(src, lo, hi, mutable dst, offset, 0)
+}
+
+function copy_range_acc(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    dst: mutable [u8],
+    offset: usize,
+    i: usize,
+) -> ()
+    requires lo <= hi
+    requires hi <= src.len()
+    requires offset + (hi - lo) <= dst.len()
+    requires i <= hi - lo
+    decreases (hi - lo) - i
+{
+    if i >= hi - lo { return () }
+    dst[offset + i] = src[lo + i]
+    copy_range_acc(src, lo, hi, mutable dst, offset, i + 1)
+}
+
+function copy_bytes(src: [u8], dst: mutable [u8], offset: usize) -> ()
+    requires offset + src.len() <= dst.len()
+{
+    copy_range(src, 0, src.len(), mutable dst, offset)
+}

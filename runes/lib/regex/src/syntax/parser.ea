@@ -1,0 +1,536 @@
+
+module regex.syntax.parser
+
+import std.mem.alloc
+import regex.syntax.grammar.ast
+import regex.syntax.grammar.mode
+import regex.syntax.errors
+import regex.engine.exec.utf8
+import regex.syntax.parser.util
+import regex.syntax.parser.escape
+import regex.syntax.parser.charclass
+
+spec std.mem.alloc.Box(ast.RegexAst)
+
+
+function _parse_dec_u32(src: [u8], pos: usize) -> (u32, usize)
+    with {err: errors.CompileError}
+{
+    let n = src.len()
+    if pos >= n || !util.is_digit(src[pos]) {
+        raise errors.CompileError.bad_repeat_count(at: pos)
+    }
+    var v: u32 = 0 as u32
+    var i: usize = pos
+    let cap: u32 = 0x7FFFFFFF as u32
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if !util.is_digit(src[i]) { break }
+        let d = (src[i] - 48 as u8) as u32
+        if v > cap / (10 as u32) {
+            raise errors.CompileError.bad_repeat_count(at: pos)
+        }
+        v = v *% (10 as u32) +% d
+        i = i + 1 as usize
+    }
+    return (v, i)
+}
+
+
+function _parse_inline_flags(
+    src: [u8],
+    pos: usize,
+    base: mode.Flags,
+) -> (mode.Flags, usize, bool)
+    with {err: errors.CompileError}
+{
+    let n = src.len()
+    var f = base
+    var i = pos
+    var negate: bool = false
+    loop decreases n - i + 1 as usize {
+        if i >= n {
+            raise errors.CompileError.bad_group_flag(at: pos)
+        }
+        let c = src[i]
+        if c == 41 as u8 {
+            return (f, i, false)
+        }
+        if c == 58 as u8 {
+            return (f, i + 1 as usize, true)
+        }
+        if c == 45 as u8 {
+            negate = true
+            i = i + 1 as usize
+        } else if c == 105 as u8 {
+            f = mode.with_case_insensitive(f, !negate)
+            i = i + 1 as usize
+        } else if c == 109 as u8 {
+            f = mode.with_multiline(f, !negate)
+            i = i + 1 as usize
+        } else if c == 115 as u8 {
+            f = mode.with_dotall(f, !negate)
+            i = i + 1 as usize
+        } else if c == 120 as u8 {
+            f = mode.with_extended(f, !negate)
+            i = i + 1 as usize
+        } else if c == 85 as u8 {
+            f = mode.with_ungreedy(f, !negate)
+            i = i + 1 as usize
+        } else {
+            raise errors.CompileError.bad_group_flag(at: pos)
+        }
+    }
+    return (f, i, false)
+}
+
+function _consume_leading_toggles(
+    src: [u8],
+    pos: usize,
+    base: mode.Flags,
+) -> (mode.Flags, usize)
+    with {err: errors.CompileError}
+{
+    var p: usize = pos
+    var f: mode.Flags = base
+    let n = src.len()
+    loop decreases n - p + 1 as usize {
+        if p + 1 as usize >= n { break }
+        if src[p] != 40 as u8 || src[p + 1 as usize] != 63 as u8 { break }
+        var q: usize = p + 2 as usize
+        var saw_flag_char: bool = false
+        loop decreases n - q + 1 as usize {
+            if q >= n { break }
+            let c = src[q]
+            if c == 41 as u8 || c == 58 as u8 { break }
+            let is_flag = c == 105 as u8 || c == 109 as u8 || c == 115 as u8
+                || c == 120 as u8 || c == 85 as u8 || c == 45 as u8
+            if !is_flag { break }
+            saw_flag_char = true
+            q = q + 1 as usize
+        }
+        if !saw_flag_char { break }
+        if q >= n { break }
+        if src[q] != 41 as u8 { break }
+        let (new_f, after_f, scoped) = _parse_inline_flags(src, p + 2 as usize, f)?
+        if scoped { break }
+        f = new_f
+        p = after_f + 1 as usize
+    }
+    return (f, p)
+}
+
+function _scan_capture_name(
+    src: [u8],
+    pos: usize,
+    diag_pos: usize,
+) -> (usize, usize)
+    with {err: errors.CompileError}
+{
+    let n = src.len()
+    if pos >= n { raise errors.CompileError.bad_group_flag(at: diag_pos) }
+    if !util.is_name_start(src[pos]) { raise errors.CompileError.bad_group_flag(at: diag_pos) }
+    var q: usize = pos + 1 as usize
+    loop decreases n - q + 1 as usize {
+        if q >= n { raise errors.CompileError.bad_group_flag(at: diag_pos) }
+        let c = src[q]
+        if c == 62 as u8 { break }
+        if !util.is_name_continue(c) {
+            raise errors.CompileError.bad_group_flag(at: diag_pos)
+        }
+        q = q + 1 as usize
+    }
+    if q == pos { raise errors.CompileError.bad_group_flag(at: diag_pos) }
+    return (q, q + 1 as usize)
+}
+
+
+function _parse_group(
+    src: [u8],
+    pos: usize,
+    depth: u32,
+    cap_box: [u32],
+    name_table: [ast.NamedCapture],
+    name_count: [u32],
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError, divergence}
+{
+    let n = src.len()
+    var i: usize = pos + 1 as usize
+    var kind_marker: u8 = 0 as u8
+    var named_name_start: usize = 0 as usize
+    var named_name_end: usize = 0 as usize
+    var inner_flags: mode.Flags = flags
+    if i < n && src[i] == 63 as u8 {
+        let next_i = i + 1 as usize
+        if next_i >= n {
+            raise errors.CompileError.unbalanced_paren(at: pos)
+        }
+        let m = src[next_i]
+        if m == 58 as u8 {
+            kind_marker = 1 as u8
+            i = next_i + 1 as usize
+        } else if m == 61 as u8 {
+            kind_marker = 2 as u8
+            i = next_i + 1 as usize
+        } else if m == 33 as u8 {
+            kind_marker = 3 as u8
+            i = next_i + 1 as usize
+        } else if m == 80 as u8 {
+            let after_p = next_i + 1 as usize
+            if after_p >= n {
+                raise errors.CompileError.bad_group_flag(at: pos)
+            }
+            let after_p_byte = src[after_p]
+            if after_p_byte == 60 as u8 {
+                let ns = after_p + 1 as usize
+                let (name_end, after_gt) = _scan_capture_name(src, ns, pos)?
+                named_name_start = ns
+                named_name_end = name_end
+                i = after_gt
+            } else if after_p_byte == 61 as u8 {
+                raise errors.CompileError.unsupported_feature(at: pos)
+            } else {
+                raise errors.CompileError.bad_group_flag(at: pos)
+            }
+        } else if m == 60 as u8 {
+            let after_lt = next_i + 1 as usize
+            if after_lt >= n {
+                raise errors.CompileError.bad_group_flag(at: pos)
+            }
+            let lb = src[after_lt]
+            if lb == 61 as u8 {
+                kind_marker = 4 as u8
+                i = after_lt + 1 as usize
+            } else if lb == 33 as u8 {
+                kind_marker = 5 as u8
+                i = after_lt + 1 as usize
+            } else if util.is_name_start(lb) {
+                let (name_end, after_gt) = _scan_capture_name(src, after_lt, pos)?
+                named_name_start = after_lt
+                named_name_end = name_end
+                i = after_gt
+            } else {
+                raise errors.CompileError.bad_group_flag(at: pos)
+            }
+        } else {
+            let (new_flags, after_flag, scoped) = _parse_inline_flags(src, next_i, flags)?
+            inner_flags = new_flags
+            if scoped {
+                kind_marker = 1 as u8
+                i = after_flag
+            } else {
+                if after_flag >= n || src[after_flag] != 41 as u8 {
+                    raise errors.CompileError.bad_group_flag(at: pos)
+                }
+                return (ast.ast_empty(), after_flag + 1 as usize)
+            }
+        }
+    }
+    var assigned_index: u32 = 0 as u32
+    if kind_marker == 0 as u8 {
+        assigned_index = cap_box[0 as usize] + 1 as u32
+        cap_box[0 as usize] = assigned_index
+        if named_name_end > named_name_start {
+            let nc_slot = name_count[0 as usize] as usize
+            if nc_slot < name_table.len() {
+                let name_bytes = src[named_name_start..<named_name_end]
+                let name_str = handle err: alloc.AllocError -> { raise errors.CompileError.allocation_failed } {
+                    util.bytes_to_string(name_bytes, allocator)?
+                }
+                name_table[nc_slot] = ast.NamedCapture {
+                    name: name_str,
+                    index: assigned_index,
+                }
+                name_count[0 as usize] = name_count[0 as usize] + 1 as u32
+            }
+        }
+    }
+    let (inner_ast, after_inner) = _parse_alt(src, i, depth + 1 as u32, cap_box, name_table, name_count, inner_flags, mutable allocator)?
+    if after_inner >= n || src[after_inner] != 41 as u8 {
+        raise errors.CompileError.unbalanced_paren(at: pos)
+    }
+    let inner_box = util.box_node(take inner_ast, mutable allocator)?
+    var kind: ast.GroupKind = ast.GroupKind.non_capturing
+    if kind_marker == 0 as u8 {
+        kind = ast.GroupKind.capture(index: assigned_index)
+    } else if kind_marker == 1 as u8 {
+        kind = ast.GroupKind.non_capturing
+    } else if kind_marker == 2 as u8 {
+        kind = ast.GroupKind.lookaround(kind: ast.LookaroundKind.ahead_positive)
+    } else if kind_marker == 3 as u8 {
+        kind = ast.GroupKind.lookaround(kind: ast.LookaroundKind.ahead_negative)
+    } else if kind_marker == 4 as u8 {
+        kind = ast.GroupKind.lookaround(kind: ast.LookaroundKind.behind_positive)
+    } else {
+        kind = ast.GroupKind.lookaround(kind: ast.LookaroundKind.behind_negative)
+    }
+    return (ast.ast_group(take inner_box, kind), after_inner + 1 as usize)
+}
+
+
+function _parse_atom(
+    src: [u8],
+    pos: usize,
+    depth: u32,
+    cap_box: [u32],
+    name_table: [ast.NamedCapture],
+    name_count: [u32],
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError, divergence}
+{
+    let n = src.len()
+    if pos >= n {
+        raise errors.CompileError.unexpected_end
+    }
+    let c = src[pos]
+    if c == 46 as u8 {
+        return (ast.ast_any_char(), pos + 1 as usize)
+    }
+    if c == 94 as u8 {
+        let anchor = if flags.multiline {
+            ast.Anchor.start_of_line
+        } else {
+            ast.Anchor.start_of_text
+        }
+        return (ast.ast_anchor(anchor), pos + 1 as usize)
+    }
+    if c == 36 as u8 {
+        let anchor = if flags.multiline {
+            ast.Anchor.end_of_line
+        } else {
+            ast.Anchor.end_of_text
+        }
+        return (ast.ast_anchor(anchor), pos + 1 as usize)
+    }
+    if c == 91 as u8 {
+        let (cs, np) = charclass.parse_class(src, pos, flags, mutable allocator)?
+        return (ast.ast_class(cs), np)
+    }
+    if c == 40 as u8 {
+        return _parse_group(src, pos, depth, cap_box, name_table, name_count, flags, mutable allocator)?
+    }
+    if c == 92 as u8 {
+        return escape.parse_escape(src, pos, flags, mutable allocator)?
+    }
+    if c == 42 as u8 || c == 43 as u8 || c == 63 as u8 || c == 123 as u8 {
+        raise errors.CompileError.repeat_without_atom(at: pos)
+    }
+    if c == 124 as u8 || c == 41 as u8 || c == 93 as u8 {
+        raise errors.CompileError.unexpected_end
+    }
+    let (cp, byte_len) = utf8.decode_at(src, pos)
+    return (escape.make_literal(cp, flags, allocator)?, pos + byte_len)
+}
+
+function _parse_quantifier_suffix(
+    inner: take ast.RegexAst,
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    if pos >= n {
+        return (inner, pos)
+    }
+    let c = src[pos]
+    var bound: ast.RepeatBound = ast.bound_star_greedy()
+    var consumed: usize = 0 as usize
+    if c == 42 as u8 {
+        bound = ast.bound_star_greedy()
+        consumed = 1 as usize
+    } else if c == 43 as u8 {
+        bound = ast.bound_plus_greedy()
+        consumed = 1 as usize
+    } else if c == 63 as u8 {
+        bound = ast.bound_question_greedy()
+        consumed = 1 as usize
+    } else if c == 123 as u8 {
+        let (b, after) = _parse_brace_bound(src, pos)?
+        bound = b
+        consumed = after - pos
+    } else {
+        return (inner, pos)
+    }
+    var new_pos = pos + consumed
+    if new_pos < n && src[new_pos] == 63 as u8 {
+        bound = ast.bound_lazy(bound)
+        new_pos = new_pos + 1 as usize
+    }
+    if flags.ungreedy {
+        bound = ast.bound_lazy(bound)
+    }
+    if new_pos < n {
+        let after_c = src[new_pos]
+        if after_c == 42 as u8 || after_c == 43 as u8 || after_c == 63 as u8 || after_c == 123 as u8 {
+            raise errors.CompileError.nested_repetition(at: new_pos)
+        }
+    }
+    let inner_box = util.box_node(take inner, mutable allocator)?
+    return (ast.ast_repeat(take inner_box, bound), new_pos)
+}
+
+function _parse_brace_bound(src: [u8], pos: usize) -> (ast.RepeatBound, usize)
+    with {err: errors.CompileError}
+{
+    let n = src.len()
+    var i = pos + 1 as usize
+    let (min_v, after_min) = _parse_dec_u32(src, i)?
+    i = after_min
+    if i >= n {
+        raise errors.CompileError.bad_quantifier(at: pos)
+    }
+    if src[i] == 125 as u8 {
+        return (ast.bound_exact(min_v), i + 1 as usize)
+    }
+    if src[i] != 44 as u8 {
+        raise errors.CompileError.bad_quantifier(at: pos)
+    }
+    i = i + 1 as usize
+    if i < n && src[i] == 125 as u8 {
+        return (ast.bound_at_least(min_v), i + 1 as usize)
+    }
+    let (max_v, after_max) = _parse_dec_u32(src, i)?
+    i = after_max
+    if i >= n || src[i] != 125 as u8 {
+        raise errors.CompileError.bad_quantifier(at: pos)
+    }
+    if max_v < min_v {
+        raise errors.CompileError.bad_repeat_count(at: pos)
+    }
+    return (ast.bound_range(min_v, max_v), i + 1 as usize)
+}
+
+
+function _parse_seq(
+    src: [u8],
+    pos: usize,
+    depth: u32,
+    cap_box: [u32],
+    name_table: [ast.NamedCapture],
+    name_count: [u32],
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError, divergence}
+{
+    let n = src.len()
+    let cap = n - pos + 1 as usize
+    let slots = util.alloc_box_slots(allocator, cap)?
+    var count: usize = 0 as usize
+    var i: usize = pos
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = src[i]
+        if c == 124 as u8 || c == 41 as u8 { break }
+        let (atom, after_atom) = _parse_atom(src, i, depth, cap_box, name_table, name_count, flags, mutable allocator)?
+        let (wrapped, after_q) = _parse_quantifier_suffix(take atom, src, after_atom, flags, mutable allocator)?
+        slots[count] = util.box_node(take wrapped, mutable allocator)?
+        count = count + 1 as usize
+        i = after_q
+    }
+    if count == 0 as usize {
+        return (ast.ast_empty(), i)
+    }
+    if count == 1 as usize {
+        let only = slots[0 as usize].get()
+        return (only, i)
+    }
+    let trimmed = _shrink_box_slots(slots, count, allocator)?
+    return (ast.ast_concat(take trimmed), i)
+}
+
+function _parse_alt(
+    src: [u8],
+    pos: usize,
+    depth: u32,
+    cap_box: [u32],
+    name_table: [ast.NamedCapture],
+    name_count: [u32],
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError, divergence}
+{
+    let (current_flags, start_pos) = _consume_leading_toggles(src, pos, flags)?
+    let n = src.len()
+    let cap = n - start_pos + 2 as usize
+    let branches = util.alloc_box_slots(allocator, cap)?
+    var count: usize = 0 as usize
+    var i: usize = start_pos
+    let (first, after_first) = _parse_seq(src, i, depth, cap_box, name_table, name_count, current_flags, mutable allocator)?
+    branches[count] = util.box_node(take first, mutable allocator)?
+    count = count + 1 as usize
+    i = after_first
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if src[i] != 124 as u8 { break }
+        i = i + 1 as usize
+        let (next_seq, after_seq) = _parse_seq(src, i, depth, cap_box, name_table, name_count, current_flags, mutable allocator)?
+        branches[count] = util.box_node(take next_seq, mutable allocator)?
+        count = count + 1 as usize
+        i = after_seq
+    }
+    if count == 1 as usize {
+        let only = branches[0 as usize].get()
+        return (only, i)
+    }
+    let trimmed = _shrink_box_slots(branches, count, allocator)?
+    return (ast.ast_alternate(take trimmed), i)
+}
+
+function _shrink_box_slots(
+    slots: [Box_RegexAst],
+    count: usize,
+    allocator: Allocator,
+) -> [Box_RegexAst]
+    with {allocator, err: errors.CompileError}
+{
+    let out = util.alloc_box_slots(allocator, count)?
+    var i: usize = 0 as usize
+    loop decreases count - i + 1 as usize {
+        if i >= count { break }
+        out[i] = slots[i]
+        i = i + 1 as usize
+    }
+    return out
+}
+
+
+public function parse_bytes(
+    pattern_bytes: [u8],
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, u32, [ast.NamedCapture])
+    with {allocator, err: errors.CompileError, divergence}
+{
+    let cap_box = util.alloc_u32_slots(allocator, 1 as usize)?
+    cap_box[0 as usize] = 0 as u32
+    let max_names = pattern_bytes.len() + 1 as usize
+    let name_table = util.alloc_name_slots(allocator, max_names)?
+    let name_count = util.alloc_u32_slots(allocator, 1 as usize)?
+    name_count[0 as usize] = 0 as u32
+    let (node, end_pos) = _parse_alt(pattern_bytes, 0 as usize, 0 as u32, cap_box, name_table, name_count, flags, mutable allocator)?
+    if end_pos < pattern_bytes.len() {
+        raise errors.CompileError.unbalanced_paren(at: end_pos)
+    }
+    let n_names = name_count[0 as usize] as usize
+    return (node, cap_box[0 as usize], name_table[0 as usize..<n_names])
+}
+
+public function parse(
+    pattern: String,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, u32, [ast.NamedCapture])
+    with {allocator, err: errors.CompileError, divergence}
+{
+    return parse_bytes(pattern.bytes(), flags, mutable allocator)?
+}

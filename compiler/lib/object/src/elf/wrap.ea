@@ -1,0 +1,259 @@
+
+module object.elf.wrap
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.fmt.elf as elf_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(elf_mod.ElfSection)
+spec std.collections.vec.Vec(elf_mod.ElfSymbol)
+spec std.collections.vec.Vec(elf_mod.ElfRela)
+
+
+public function wrap_function_obj(
+    out: init elf_mod.ElfFile,
+    machine: elf_mod.ElfMachine,
+    code: take Vec_u8.Vec,
+    symbol_name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit file: elf_mod.ElfFile
+    new_object(init file, machine, allocator)?
+    add_function(mutable file, symbol_name, take code, allocator)?
+    out = file
+}
+
+
+public function add_function(
+    file: mutable elf_mod.ElfFile,
+    symbol_name: String,
+    code: take Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit relocs: Vec_ElfRela.Vec
+    Vec_ElfRela.new(init relocs, allocator)?
+    add_function_relocated(mutable file, symbol_name, take code, take relocs, allocator)?
+}
+
+
+public function add_function_relocated(
+    file: mutable elf_mod.ElfFile,
+    symbol_name: String,
+    code: take Vec_u8.Vec,
+    relocations: take Vec_ElfRela.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    add_section(mutable file, ".text", elf_mod.ElfSectionType.progbits, text_flags(), 16 as u64, take code, take relocations, allocator)?
+    let section_index = (Vec_ElfSection.len(file.sections) - 1) as u16
+    add_symbol(mutable file, symbol_name, elf_mod.ElfSymbolBinding.global_, elf_mod.ElfSymbolType.func, section_index, 0 as u64, 0 as u64, allocator)?
+}
+
+
+public function text_flags() -> u64 {
+    return 6 as u64
+}
+
+public function data_flags() -> u64 {
+    return 3 as u64
+}
+
+public function rodata_flags() -> u64 {
+    return 2 as u64
+}
+
+
+public function new_object(
+    out: init elf_mod.ElfFile,
+    machine: elf_mod.ElfMachine,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit null_data: Vec_u8.Vec
+    Vec_u8.new(init null_data, allocator)?
+    uninit null_relocs: Vec_ElfRela.Vec
+    Vec_ElfRela.new(init null_relocs, allocator)?
+    let null_header = elf_mod.ElfSectionHeader {
+        sh_name: 0 as u32,
+        sh_type: elf_mod.ElfSectionType.null_,
+        sh_flags: 0 as u64,
+        sh_addr: 0 as u64,
+        sh_offset: 0 as u64,
+        sh_size: 0 as u64,
+        sh_link: 0 as u32,
+        sh_info: 0 as u32,
+        sh_addralign: 0 as u64,
+        sh_entsize: 0 as u64,
+    }
+    let null_section = elf_mod.ElfSection {
+        header: null_header,
+        data: null_data,
+        relocations: null_relocs,
+    }
+    uninit sections: Vec_ElfSection.Vec
+    Vec_ElfSection.new(init sections, allocator)?
+    Vec_ElfSection.push(mutable sections, take null_section, allocator)?
+
+    let null_symbol = elf_mod.ElfSymbol {
+        st_name: 0 as u32,
+        st_info: 0 as u8,
+        st_other: 0 as u8,
+        st_shndx: 0 as u16,
+        st_value: 0 as u64,
+        st_size: 0 as u64,
+    }
+    uninit symbols: Vec_ElfSymbol.Vec
+    Vec_ElfSymbol.new(init symbols, allocator)?
+    Vec_ElfSymbol.push(mutable symbols, take null_symbol, allocator)?
+
+    uninit sym_names: Vec_u8.Vec
+    Vec_u8.new(init sym_names, allocator)?
+    Vec_u8.push(mutable sym_names, take (0 as u8), allocator)?
+    uninit sec_names: Vec_u8.Vec
+    Vec_u8.new(init sec_names, allocator)?
+    Vec_u8.push(mutable sec_names, take (0 as u8), allocator)?
+
+    let header = elf_mod.ElfHeader {
+        class: elf_mod.ElfClass.class64,
+        data: elf_mod.ElfData.lsb,
+        os_abi: 0 as u8,
+        abi_version: 0 as u8,
+        type_: elf_mod.ElfType.rel,
+        machine: machine,
+        version: 1 as u32,
+        entry: 0 as u64,
+        phoff: 0 as u64,
+        shoff: 0 as u64,
+        flags: 0 as u32,
+        ehsize: 64 as u16,
+        phentsize: 0 as u16,
+        phnum: 0 as u16,
+        shentsize: 64 as u16,
+        shnum: 0 as u16,
+        shstrndx: 0 as u16,
+    }
+
+    out = elf_mod.ElfFile {
+        header: header,
+        sections: sections,
+        symbols: symbols,
+        symbol_names: elf_mod.ElfStringTable { bytes: sym_names },
+        section_names: elf_mod.ElfStringTable { bytes: sec_names },
+    }
+}
+
+public function intern_string(
+    table: mutable elf_mod.ElfStringTable,
+    name_bytes: [u8],
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let offset = Vec_u8.len(table.bytes) as u32
+    let n = name_bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let byte_value = name_bytes[i]
+        Vec_u8.push(mutable table.bytes, take byte_value, allocator)?
+        i += 1
+    }
+    Vec_u8.push(mutable table.bytes, take (0 as u8), allocator)?
+    return offset
+}
+
+public function add_section(
+    file: mutable elf_mod.ElfFile,
+    name_str: String,
+    sh_type: elf_mod.ElfSectionType,
+    sh_flags: u64,
+    sh_addralign: u64,
+    data: take Vec_u8.Vec,
+    relocations: take Vec_ElfRela.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let sh_name = intern_string(mutable file.section_names, name_str.bytes(), allocator)?
+    let header = elf_mod.ElfSectionHeader {
+        sh_name: sh_name,
+        sh_type: sh_type,
+        sh_flags: sh_flags,
+        sh_addr: 0 as u64,
+        sh_offset: 0 as u64,
+        sh_size: 0 as u64,
+        sh_link: 0 as u32,
+        sh_info: 0 as u32,
+        sh_addralign: sh_addralign,
+        sh_entsize: 0 as u64,
+    }
+    let section = elf_mod.ElfSection {
+        header: header,
+        data: data,
+        relocations: relocations,
+    }
+    Vec_ElfSection.push(mutable file.sections, take section, allocator)?
+}
+
+public function add_symbol(
+    file: mutable elf_mod.ElfFile,
+    name_str: String,
+    binding: elf_mod.ElfSymbolBinding,
+    sym_type: elf_mod.ElfSymbolType,
+    section_index: u16,
+    value: u64,
+    size: u64,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let st_name = intern_string(mutable file.symbol_names, name_str.bytes(), allocator)?
+    let sym = elf_mod.ElfSymbol {
+        st_name: st_name,
+        st_info: elf_mod.make_st_info(binding, sym_type),
+        st_other: 0 as u8,
+        st_shndx: section_index,
+        st_value: value,
+        st_size: size,
+    }
+    Vec_ElfSymbol.push(mutable file.symbols, take sym, allocator)?
+}
+
+public function make_rela(
+    offset: u64,
+    symbol: u32,
+    reloc_type: u32,
+    addend: i64,
+) -> elf_mod.ElfRela {
+    return elf_mod.ElfRela {
+        r_offset: offset,
+        r_info: elf_mod.make_r_info(symbol, reloc_type),
+        r_addend: addend,
+    }
+}
+
+
+public function rel_x86_64_64() -> u32 {
+    return 1 as u32
+}
+
+public function rel_x86_64_pc32() -> u32 {
+    return 2 as u32
+}
+
+public function rel_aarch64_adr_prel_pg_hi21() -> u32 {
+    return 275 as u32
+}
+
+public function rel_aarch64_add_abs_lo12_nc() -> u32 {
+    return 277 as u32
+}

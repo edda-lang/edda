@@ -1,0 +1,336 @@
+
+module refine.solver.theory.quant.linearize
+
+import std.collections.vec
+import std.mem.alloc
+import local.smt.term as term_mod
+import local.solver.rational.wide as wide_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(LinearTerm)
+
+
+public type LinearTerm {
+    atom: term_mod.SmtTerm
+    coeff: i128
+}
+
+
+public type LinearForm {
+    terms: Vec_LinearTerm.Vec
+    constant: wide_mod.Wide
+}
+
+
+public type LinResult {
+    case ok(form: LinearForm)
+    case nonlinear
+}
+
+
+type Folded {
+    ok: bool
+    value: i128
+}
+
+
+function i128_top() -> i128 {
+    let p32 = 4294967296 as i128
+    let p96 = p32 * p32 * p32
+    let p126 = p96 * (1073741824 as i128)
+    return (p126 - (1 as i128)) * (2 as i128) + (1 as i128)
+}
+
+
+function fold_mul(a: i128, b: i128) -> Folded {
+    if a == (0 as i128) || b == (0 as i128) {
+        return Folded { ok: true, value: 0 as i128 }
+    }
+    let top = i128_top()
+    let bottom = (0 as i128) - top - (1 as i128)
+    if a == bottom || b == bottom {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    let aa = if a < (0 as i128) { (0 as i128) - a } else { a }
+    let ab = if b < (0 as i128) { (0 as i128) - b } else { b }
+    if aa > top / ab {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    return Folded { ok: true, value: a * b }
+}
+
+
+function fold_add(a: i128, b: i128) -> Folded {
+    let top = i128_top()
+    let bottom = (0 as i128) - top - (1 as i128)
+    if b > (0 as i128) && a > top - b {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    if b < (0 as i128) && a < bottom - b {
+        return Folded { ok: false, value: 0 as i128 }
+    }
+    let s = a + b
+    return Folded { ok: s != bottom, value: s }
+}
+
+
+function lin_const(c: i128, allocator: Allocator) -> LinearForm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit terms: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init terms, allocator)?
+    return LinearForm {
+        terms: terms,
+        constant: wide_mod.wide_from_i128(c),
+    }
+}
+
+
+function lin_atom(atom: term_mod.SmtTerm, allocator: Allocator) -> LinearForm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit terms: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init terms, allocator)?
+    let lt = LinearTerm {
+        atom: atom,
+        coeff: 1 as i128,
+    }
+    Vec_LinearTerm.push(mutable terms, take lt, allocator)?
+    return LinearForm {
+        terms: terms,
+        constant: wide_mod.wide_zero(),
+    }
+}
+
+
+public function scale(f: LinearForm, k: i128, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit terms: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init terms, allocator)?
+    let n = Vec_LinearTerm.len(f.terms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_LinearTerm.at(f.terms, i)
+        let folded = fold_mul(t.coeff, k)
+        if !folded.ok {
+            return LinResult.nonlinear
+        }
+        let scaled = LinearTerm {
+            atom: t.atom,
+            coeff: folded.value,
+        }
+        Vec_LinearTerm.push(mutable terms, take scaled, allocator)?
+        i = i + 1
+    }
+    let fc = wide_mod.wide_mul(f.constant, wide_mod.wide_from_i128(k))
+    if !fc.ok {
+        return LinResult.nonlinear
+    }
+    return LinResult.ok(form: LinearForm {
+        terms: terms,
+        constant: fc.value,
+    })
+}
+
+
+public function negate(f: LinearForm, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return scale(f, (0 - 1) as i128, allocator)?
+}
+
+
+function add_term(dst: mutable Vec_LinearTerm.Vec, t: LinearTerm, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_LinearTerm.len(dst)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let existing = Vec_LinearTerm.at(dst, i)
+        if existing.atom == t.atom {
+            let folded = fold_add(existing.coeff, t.coeff)
+            if !folded.ok {
+                return false
+            }
+            let merged = LinearTerm {
+                atom: existing.atom,
+                coeff: folded.value,
+            }
+            Vec_LinearTerm.set_at(mutable dst, i, take merged)
+            return true
+        }
+        i = i + 1
+    }
+    Vec_LinearTerm.push(mutable dst, take t, allocator)?
+    return true
+}
+
+
+public function add(a: LinearForm, b: LinearForm, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit terms: Vec_LinearTerm.Vec
+    Vec_LinearTerm.new(init terms, allocator)?
+    let na = Vec_LinearTerm.len(a.terms)
+    var i: usize = 0
+    loop
+        decreases (na - i)
+    {
+        if i >= na {
+            break
+        }
+        let t = Vec_LinearTerm.at(a.terms, i)
+        let merged_a = add_term(mutable terms, t, allocator)?
+        if !merged_a {
+            return LinResult.nonlinear
+        }
+        i = i + 1
+    }
+    let nb = Vec_LinearTerm.len(b.terms)
+    var j: usize = 0
+    loop
+        decreases (nb - j)
+    {
+        if j >= nb {
+            break
+        }
+        let t = Vec_LinearTerm.at(b.terms, j)
+        let merged_b = add_term(mutable terms, t, allocator)?
+        if !merged_b {
+            return LinResult.nonlinear
+        }
+        j = j + 1
+    }
+    let fc = wide_mod.wide_add(a.constant, b.constant)
+    if !fc.ok {
+        return LinResult.nonlinear
+    }
+    return LinResult.ok(form: LinearForm {
+        terms: terms,
+        constant: fc.value,
+    })
+}
+
+
+function as_numeral(term: term_mod.SmtTerm) -> i128 {
+    return match term {
+        case .numeral(let v) => v
+        case _ => 0 as i128
+    }
+}
+
+
+function is_numeral(term: term_mod.SmtTerm) -> bool {
+    return match term {
+        case .numeral(_) => true
+        case _ => false
+    }
+}
+
+
+public function linearize(term: term_mod.SmtTerm, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match term {
+        case .numeral(let v) => LinResult.ok(form: lin_const(v, allocator)?)
+        case .var_(_, _) => LinResult.ok(form: lin_atom(term, allocator)?)
+        case .app(let op, let args) => linearize_app(op, args, term, allocator)?
+        case _ => LinResult.nonlinear
+    }
+}
+
+
+function linearize_app(
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    whole: term_mod.SmtTerm,
+    allocator: Allocator,
+) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match op {
+        case .add => combine_binary(args, false, allocator)?
+        case .sub => combine_binary(args, true, allocator)?
+        case .neg => combine_neg(args, allocator)?
+        case .mul => combine_mul(args, allocator)?
+        case _ => LinResult.ok(form: lin_atom(whole, allocator)?)
+    }
+}
+
+
+function combine_binary(args: Vec_SmtTerm.Vec, subtract: bool, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 2 {
+        return LinResult.nonlinear
+    }
+    let ra = linearize(Vec_SmtTerm.at(args, 0), allocator)?
+    return match ra {
+        case .nonlinear => LinResult.nonlinear
+        case .ok(let fa) => {
+            let rb = linearize(Vec_SmtTerm.at(args, 1), allocator)?
+            match rb {
+                case .nonlinear => LinResult.nonlinear
+                case .ok(let fb) => {
+                    let rhs_r = if subtract { negate(fb, allocator)? } else { LinResult.ok(form: fb) }
+                    match rhs_r {
+                        case .nonlinear => LinResult.nonlinear
+                        case .ok(let rhs) => add(fa, rhs, allocator)?
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+function combine_neg(args: Vec_SmtTerm.Vec, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 1 {
+        return LinResult.nonlinear
+    }
+    let r = linearize(Vec_SmtTerm.at(args, 0), allocator)?
+    return match r {
+        case .nonlinear => LinResult.nonlinear
+        case .ok(let f) => negate(f, allocator)?
+    }
+}
+
+
+function combine_mul(args: Vec_SmtTerm.Vec, allocator: Allocator) -> LinResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(args) != 2 {
+        return LinResult.nonlinear
+    }
+    let lhs = Vec_SmtTerm.at(args, 0)
+    let rhs = Vec_SmtTerm.at(args, 1)
+    if is_numeral(lhs) {
+        let r = linearize(rhs, allocator)?
+        return match r {
+            case .nonlinear => LinResult.nonlinear
+            case .ok(let f) => scale(f, as_numeral(lhs), allocator)?
+        }
+    }
+    if is_numeral(rhs) {
+        let r = linearize(lhs, allocator)?
+        return match r {
+            case .nonlinear => LinResult.nonlinear
+            case .ok(let f) => scale(f, as_numeral(rhs), allocator)?
+        }
+    }
+    return LinResult.nonlinear
+}

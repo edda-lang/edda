@@ -1,0 +1,173 @@
+
+module optimize.refine_elim.divzero.elim
+
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.id.block as mir_block_mod
+import local.refine_elim.facts.facts as facts_mod
+import local.refine_elim.proven.proven as proven_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Obligation)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+
+public type OptRvalue {
+    case some(rv: mir_rvalue_mod.Rvalue)
+    case none
+}
+
+
+public function elim_divzero_checks(
+    body: mutable mir_body_mod.MirBody,
+    sf: facts_mod.SiteFacts,
+    proven: proven_mod.ProvenSet,
+) -> ()
+{
+    let n = Vec_Obligation.len(body.obligations)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ob = Vec_Obligation.at(body.obligations, i)
+        elim_obligation(mutable body, sf, proven, ob)
+        i = i + 1
+    }
+}
+
+
+function elim_obligation(
+    body: mutable mir_body_mod.MirBody,
+    sf: facts_mod.SiteFacts,
+    proven: proven_mod.ProvenSet,
+    ob: mir_body_mod.Obligation,
+) -> ()
+{
+    let kind = mir_body_mod.ObligationKind.div_by_zero
+    if !facts_mod.kind_matches(ob.kind, kind) {
+        return
+    }
+    let block = ob.block
+    let s_idx = ob.stmt_index as usize
+    if !facts_mod.site_is_proven(body, sf, proven, block, s_idx, kind) {
+        return
+    }
+    let b_idx = mir_block_mod.index(block)
+    let new_value = proven_rvalue_at(body, b_idx, s_idx)
+    match new_value {
+        case .some(let rv) => write_back(mutable body, b_idx, s_idx, rv)
+        case .none => return
+    }
+}
+
+
+function proven_rvalue_at(
+    body: mir_body_mod.MirBody,
+    b_idx: usize,
+    s_idx: usize,
+) -> OptRvalue
+{
+    if b_idx >= Vec_BasicBlock.len(body.blocks) {
+        return OptRvalue.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b_idx)
+    if s_idx >= Vec_Statement.len(bb.statements) {
+        return OptRvalue.none
+    }
+    let stmt = Vec_Statement.at(bb.statements, s_idx)
+    return match stmt.kind {
+        case .assign(_, let value) => proven_from_rvalue(value)
+        case .storage_live(_) => OptRvalue.none
+        case .storage_dead(_) => OptRvalue.none
+        case .nop_ => OptRvalue.none
+    }
+}
+
+
+function proven_from_rvalue(value: mir_rvalue_mod.Rvalue) -> OptRvalue {
+    return match value {
+        case .binary(let op, let lhs, let rhs) => proven_from_binary(op, lhs, rhs)
+        case .use_(_) => OptRvalue.none
+        case .unary(_, _) => OptRvalue.none
+        case .cast(_, _, _, _) => OptRvalue.none
+        case .aggregate(_, _, _) => OptRvalue.none
+        case .ref_(_, _) => OptRvalue.none
+        case .len(_) => OptRvalue.none
+        case .discriminant(_) => OptRvalue.none
+        case .make_closure(_, _) => OptRvalue.none
+    }
+}
+
+
+function proven_from_binary(
+    op: mir_rvalue_mod.MBinOp,
+    lhs: mir_rvalue_mod.Operand,
+    rhs: mir_rvalue_mod.Operand,
+) -> OptRvalue {
+    if !op_is_unproven_divisor(op) {
+        return OptRvalue.none
+    }
+    let new_op = mark_proven(op)
+    let rv = mir_rvalue_mod.Rvalue.binary(op: new_op, lhs: lhs, rhs: rhs)
+    return OptRvalue.some(rv: rv)
+}
+
+
+function op_is_unproven_divisor(op: mir_rvalue_mod.MBinOp) -> bool {
+    return match op {
+        case .div(_, let p, _) => !p
+        case .mod_(_, let p, _) => !p
+        case _ => false
+    }
+}
+
+
+function mark_proven(op: mir_rvalue_mod.MBinOp) -> mir_rvalue_mod.MBinOp {
+    return match op {
+        case .div(let mode, _, let pno) =>
+            mir_rvalue_mod.MBinOp.div(mode: mode, proven_nonzero: true, proven_no_overflow: pno)
+        case .mod_(let mode, _, let pno) =>
+            mir_rvalue_mod.MBinOp.mod_(mode: mode, proven_nonzero: true, proven_no_overflow: pno)
+        case _ => op
+    }
+}
+
+
+function write_back(
+    body: mutable mir_body_mod.MirBody,
+    b_idx: usize,
+    s_idx: usize,
+    new_value: mir_rvalue_mod.Rvalue,
+) -> ()
+{
+    if b_idx >= Vec_BasicBlock.len(body.blocks) {
+        return
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b_idx)
+    if s_idx >= Vec_Statement.len(bb.statements) {
+        return
+    }
+    let stmt = Vec_Statement.at(bb.statements, s_idx)
+    let new_kind = match stmt.kind {
+        case .assign(let dest, _) =>
+            mir_stmt_mod.MStmtKind.assign(dest: dest, value: new_value)
+        case .storage_live(_) => stmt.kind
+        case .storage_dead(_) => stmt.kind
+        case .nop_ => stmt.kind
+    }
+    let new_stmt = mir_stmt_mod.Statement {
+        origin: stmt.origin,
+        kind: new_kind,
+    }
+    var new_stmts: Vec_Statement.Vec = bb.statements
+    Vec_Statement.set_at(mutable new_stmts, s_idx, take new_stmt)
+    let new_bb = mir_body_mod.BasicBlock {
+        node_id_origin: bb.node_id_origin,
+        statements: new_stmts,
+        terminator: bb.terminator,
+        coherence_region: bb.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, b_idx, take new_bb)
+}

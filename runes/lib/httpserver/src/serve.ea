@@ -1,0 +1,139 @@
+module httpserver.serve
+
+import std.mem.alloc
+import std.net.socket
+import std.text.string
+import hermod.error as herr
+import hermod.message.request as request_mod
+import hermod.message.response as response_mod
+import hermod.codec.wire.decode.decode as codec_decode
+import hermod.codec.wire.encode.encode as codec_encode
+import local.frame as frame
+
+public affine type Server {
+    listener: socket.Listener
+    bound_port: u16
+}
+
+public function bind(net: Network, fs: ReadOnlyFilesystem, host: [u8], port: u16, allocator: Allocator) -> Server
+    with {net, fs, allocator, err: herr.TransportError, err: alloc.AllocError}
+{
+    if port == 0 as u16 {
+        raise herr.TransportError.bind_failed
+    }
+    let host_s = string.bytes_slice_to_string(host, 0, host.len(), allocator)?
+    let lis = handle err: socket.SocketError as e -> (raise frame.sock_err(e)) {
+        socket.listen(net, fs, host_s, port)?
+    }
+    return Server { listener: lis, bound_port: port }
+}
+
+public function server_port(s: Server) -> u16 { return s.bound_port }
+
+public function close(s: take Server) -> () {
+    socket.close_listener(take s.listener)
+}
+
+function _config(conn: mutable socket.Connection) -> ()
+    with {err: herr.TransportError}
+{
+    handle err: socket.SocketError as e -> (raise frame.sock_err(e)) {
+        socket.set_read_timeout(mutable conn, frame.default_read_timeout_millis())?
+    }
+}
+
+function _write_all(conn: mutable socket.Connection, data: [u8]) -> ()
+    with {err: herr.TransportError}
+{
+    var remaining: [u8] = data
+    loop decreases remaining.len() {
+        if remaining.len() == 0 as usize { break }
+        let wrote = handle err: socket.SocketError as e -> (raise frame.sock_err(e)) {
+            socket.write(mutable conn, remaining)?
+        }
+        if wrote == 0 as usize { raise herr.TransportError.write_failed }
+        let adv = if wrote > remaining.len() { remaining.len() } else { wrote }
+        remaining = remaining[adv..]
+    }
+}
+
+public function accept(s: mutable Server) -> socket.Connection
+    with {err: herr.TransportError}
+{
+    return handle err: socket.SocketError as e -> (raise frame.sock_err(e)) {
+        socket.accept(mutable s.listener)?
+    }
+}
+
+function _serve_conn(
+    conn: take socket.Connection,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: herr.CodecError},
+    allocator: mutable Allocator,
+    cap: usize,
+) -> ()
+    with {allocator, err: herr.TransportError, err: herr.CodecError, err: alloc.AllocError}
+    requires cap > 0
+{
+    _config(mutable conn)?
+    let req_bytes = frame.read_full_request(mutable conn, allocator, cap)?
+    let req = codec_decode.decode_request(req_bytes, mutable allocator)?
+    let resp = handler(req, mutable allocator)?
+    let wire = codec_encode.encode_response(resp, mutable allocator)?
+    _write_all(mutable conn, wire)?
+    socket.close(take conn)
+}
+
+public function serve_connection_quiet(
+    conn: take socket.Connection,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: herr.CodecError},
+    allocator: mutable Allocator,
+    cap: usize,
+) -> ()
+    with {allocator}
+    requires cap > 0
+{
+    handle err: herr.TransportError -> () {
+        handle err: herr.CodecError -> () {
+            handle err: alloc.AllocError -> () {
+                _config(mutable conn)?
+                let req_bytes = frame.read_full_request(mutable conn, allocator, cap)?
+                let req = codec_decode.decode_request(req_bytes, mutable allocator)?
+                let resp = handler(req, mutable allocator)?
+                let wire = codec_encode.encode_response(resp, mutable allocator)?
+                _write_all(mutable conn, wire)?
+                ()
+            }
+        }
+    }
+    socket.close(take conn)
+}
+
+public function serve_n(
+    s: mutable Server,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: herr.CodecError},
+    allocator: mutable Allocator,
+    n: usize,
+) -> ()
+    with {allocator, err: herr.TransportError, err: herr.CodecError, err: alloc.AllocError}
+{
+    var i: usize = n
+    loop decreases i {
+        if i == 0 as usize { break }
+        let conn = accept(mutable s)?
+        _serve_conn(take conn, handler, mutable allocator, frame.default_max_request_bytes())?
+        i = i - (1 as usize)
+    }
+}
+
+public function serve_forever(
+    s: mutable Server,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: herr.CodecError},
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, divergence, err: herr.TransportError, err: herr.CodecError, err: alloc.AllocError}
+{
+    loop {
+        let conn = accept(mutable s)?
+        _serve_conn(take conn, handler, mutable allocator, frame.default_max_request_bytes())?
+    }
+}

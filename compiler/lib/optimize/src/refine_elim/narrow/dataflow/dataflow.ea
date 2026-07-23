@@ -1,0 +1,395 @@
+
+module optimize.refine_elim.narrow.dataflow.dataflow
+
+import std.collections.vec
+import std.mem.alloc as alloc
+
+import local.refine_elim.range.range as range_mod
+import local.refine_elim.narrow.util.util as util_mod
+import local.refine_elim.narrow.intervals.intervals as intervals_mod
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.place as mir_place_mod
+import mir.rvalue as mir_rvalue_mod
+
+import types.ty.interner as ty_interner_mod
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+public function solve(
+    cur: mutable range_mod.RangeTable,
+    defined: mutable Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    body: mir_body_mod.MirBody,
+    it_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_locals = range_mod.local_count(cur)
+    uninit site_block: Vec_usize.Vec
+    Vec_usize.new(init site_block, allocator)?
+    uninit site_stmt: Vec_usize.Vec
+    Vec_usize.new(init site_stmt, allocator)?
+    uninit site_dest: Vec_usize.Vec
+    Vec_usize.new(init site_dest, allocator)?
+    collect_sites(mutable site_block, mutable site_stmt, mutable site_dest, declared, pinned, body, n_locals, allocator)?
+    let n_sites = Vec_usize.len(site_block)
+    if n_sites == 0 { return }
+
+    uninit dep_off: Vec_usize.Vec
+    Vec_usize.new(init dep_off, allocator)?
+    uninit dep_site: Vec_usize.Vec
+    Vec_usize.new(init dep_site, allocator)?
+    build_dep_index(mutable dep_off, mutable dep_site, site_block, site_stmt, site_dest, body, n_locals, allocator)?
+
+    uninit queued: Vec_bool.Vec
+    Vec_bool.new(init queued, allocator)?
+    uninit queue: Vec_usize.Vec
+    Vec_usize.new(init queue, allocator)?
+    var sid: usize = 0
+    loop decreases (n_sites - sid) {
+        if sid >= n_sites { break }
+        Vec_bool.push(mutable queued, true, allocator)?
+        Vec_usize.push(mutable queue, sid, allocator)?
+        sid = sid + 1
+    }
+
+    var head: usize = 0
+    var fuel = n_sites + Vec_usize.len(dep_site) * 8 + 64
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        if head >= Vec_usize.len(queue) { break }
+        let cur_sid = Vec_usize.at(queue, head)
+        head += 1
+        if cur_sid < Vec_bool.len(queued) {
+            Vec_bool.set_at(mutable queued, cur_sid, false)
+        }
+        let hit = update_site(mutable cur, mutable defined, declared, pinned, site_block, site_stmt, cur_sid, body, it_interner)
+        if hit {
+            let d = Vec_usize.at(site_dest, cur_sid)
+            if d + 1 < Vec_usize.len(dep_off) {
+                var e = Vec_usize.at(dep_off, d)
+                let e_end = Vec_usize.at(dep_off, d + 1)
+                loop decreases (e_end - e) {
+                    if e >= e_end { break }
+                    if e < Vec_usize.len(dep_site) {
+                        let tsid = Vec_usize.at(dep_site, e)
+                        if tsid < Vec_bool.len(queued) {
+                            if Vec_bool.at(queued, tsid) == false {
+                                Vec_bool.set_at(mutable queued, tsid, true)
+                                Vec_usize.push(mutable queue, tsid, allocator)?
+                            }
+                        }
+                    }
+                    e = e + 1
+                }
+            }
+        }
+    }
+
+    if head < Vec_usize.len(queue) {
+        var z: usize = 0
+        let nz = Vec_bool.len(defined)
+        loop decreases (nz - z) {
+            if z >= nz { break }
+            Vec_bool.set_at(mutable defined, z, false)
+            z = z + 1
+        }
+    }
+}
+
+function collect_sites(
+    site_block: mutable Vec_usize.Vec,
+    site_stmt: mutable Vec_usize.Vec,
+    site_dest: mutable Vec_usize.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    body: mir_body_mod.MirBody,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases (nb - b) {
+        if b >= nb { break }
+        let block = Vec_BasicBlock.at(body.blocks, b)
+        let ns = Vec_Statement.len(block.statements)
+        var s: usize = 0
+        loop decreases (ns - s) {
+            if s >= ns { break }
+            let st = Vec_Statement.at(block.statements, s)
+            match st.kind {
+                case .assign(let dest, _) => {
+                    let li = util_mod.bare_local_of(dest)
+                    if li >= (0 as i64) {
+                        let idx = li as usize
+                        if idx < n_locals {
+                            if util_mod.pinned_at(pinned, idx) == false {
+                                let decl = range_mod.get_at(declared, idx)
+                                if decl.known {
+                                    Vec_usize.push(mutable site_block, b, allocator)?
+                                    Vec_usize.push(mutable site_stmt, s, allocator)?
+                                    Vec_usize.push(mutable site_dest, idx, allocator)?
+                                }
+                            }
+                        }
+                    }
+                }
+                case _ => ()
+            }
+            s = s + 1
+        }
+        b = b + 1
+    }
+}
+
+function build_dep_index(
+    dep_off: mutable Vec_usize.Vec,
+    dep_site: mutable Vec_usize.Vec,
+    site_block: Vec_usize.Vec,
+    site_stmt: Vec_usize.Vec,
+    site_dest: Vec_usize.Vec,
+    body: mir_body_mod.MirBody,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_sites = Vec_usize.len(site_block)
+    uninit dep_cnt: Vec_usize.Vec
+    Vec_usize.with_capacity(init dep_cnt, n_locals, allocator)?
+    var z: usize = 0
+    loop decreases (n_locals - z) {
+        if z >= n_locals { break }
+        Vec_usize.push(mutable dep_cnt, 0, allocator)?
+        z = z + 1
+    }
+
+    uninit tmp: Vec_usize.Vec
+    Vec_usize.new(init tmp, allocator)?
+
+    var sid: usize = 0
+    loop decreases (n_sites - sid) {
+        if sid >= n_sites { break }
+        collect_site_deps(mutable tmp, site_block, site_stmt, site_dest, sid, body, n_locals, allocator)?
+        var i: usize = 0
+        let nd = Vec_usize.len(tmp)
+        loop decreases (nd - i) {
+            if i >= nd { break }
+            let d = Vec_usize.at(tmp, i)
+            if d < Vec_usize.len(dep_cnt) {
+                Vec_usize.set_at(mutable dep_cnt, d, Vec_usize.at(dep_cnt, d) + 1)
+            }
+            i = i + 1
+        }
+        sid = sid + 1
+    }
+
+    var total: usize = 0
+    Vec_usize.push(mutable dep_off, 0, allocator)?
+    var l: usize = 0
+    loop decreases (n_locals - l) {
+        if l >= n_locals { break }
+        total = total + Vec_usize.at(dep_cnt, l)
+        Vec_usize.push(mutable dep_off, total, allocator)?
+        l = l + 1
+    }
+
+    uninit cursor: Vec_usize.Vec
+    Vec_usize.with_capacity(init cursor, n_locals, allocator)?
+    var c: usize = 0
+    loop decreases (n_locals - c) {
+        if c >= n_locals { break }
+        Vec_usize.push(mutable cursor, Vec_usize.at(dep_off, c), allocator)?
+        c = c + 1
+    }
+
+    var f: usize = 0
+    loop decreases (total - f) {
+        if f >= total { break }
+        Vec_usize.push(mutable dep_site, 0, allocator)?
+        f = f + 1
+    }
+
+    var sid2: usize = 0
+    loop decreases (n_sites - sid2) {
+        if sid2 >= n_sites { break }
+        collect_site_deps(mutable tmp, site_block, site_stmt, site_dest, sid2, body, n_locals, allocator)?
+        var i2: usize = 0
+        let nd2 = Vec_usize.len(tmp)
+        loop decreases (nd2 - i2) {
+            if i2 >= nd2 { break }
+            let d2 = Vec_usize.at(tmp, i2)
+            if d2 < Vec_usize.len(cursor) {
+                let at2 = Vec_usize.at(cursor, d2)
+                if at2 < Vec_usize.len(dep_site) {
+                    Vec_usize.set_at(mutable dep_site, at2, sid2)
+                    Vec_usize.set_at(mutable cursor, d2, at2 + 1)
+                }
+            }
+            i2 = i2 + 1
+        }
+        sid2 = sid2 + 1
+    }
+}
+
+function collect_site_deps(
+    tmp: mutable Vec_usize.Vec,
+    site_block: Vec_usize.Vec,
+    site_stmt: Vec_usize.Vec,
+    site_dest: Vec_usize.Vec,
+    sid: usize,
+    body: mir_body_mod.MirBody,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_usize.clear(mutable tmp)
+    if sid >= Vec_usize.len(site_dest) { return }
+    Vec_usize.push(mutable tmp, Vec_usize.at(site_dest, sid), allocator)?
+    let b = Vec_usize.at(site_block, sid)
+    if b >= Vec_BasicBlock.len(body.blocks) { return }
+    let block = Vec_BasicBlock.at(body.blocks, b)
+    let s = Vec_usize.at(site_stmt, sid)
+    if s >= Vec_Statement.len(block.statements) { return }
+    let st = Vec_Statement.at(block.statements, s)
+    match st.kind {
+        case .assign(_, let value) => {
+            match value {
+                case .use_(let op) => push_operand_dep(mutable tmp, op, n_locals, allocator)?
+                case .binary(_, let lhs, let rhs) => {
+                    push_operand_dep(mutable tmp, lhs, n_locals, allocator)?
+                    push_operand_dep(mutable tmp, rhs, n_locals, allocator)?
+                }
+                case .unary(_, let op) => push_operand_dep(mutable tmp, op, n_locals, allocator)?
+                case .cast(let op, _, _, _) => push_operand_dep(mutable tmp, op, n_locals, allocator)?
+                case _ => ()
+            }
+        }
+        case _ => ()
+    }
+}
+
+function push_operand_dep(
+    tmp: mutable Vec_usize.Vec,
+    op: mir_rvalue_mod.Operand,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match op {
+        case .copy_(let place, _) => push_place_dep(mutable tmp, place, n_locals, allocator)?
+        case .move_(let place, _) => push_place_dep(mutable tmp, place, n_locals, allocator)?
+        case .constant(_) => ()
+    }
+}
+
+function push_place_dep(
+    tmp: mutable Vec_usize.Vec,
+    place: mir_place_mod.Place,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let li = util_mod.bare_local_of(place)
+    if li < (0 as i64) { return }
+    let idx = li as usize
+    if idx >= n_locals { return }
+    Vec_usize.push(mutable tmp, idx, allocator)?
+}
+
+function update_site(
+    cur: mutable range_mod.RangeTable,
+    defined: mutable Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    site_block: Vec_usize.Vec,
+    site_stmt: Vec_usize.Vec,
+    sid: usize,
+    body: mir_body_mod.MirBody,
+    it_interner: ty_interner_mod.Interner,
+) -> bool {
+    if sid >= Vec_usize.len(site_block) { return false }
+    let b = Vec_usize.at(site_block, sid)
+    if b >= Vec_BasicBlock.len(body.blocks) { return false }
+    let block = Vec_BasicBlock.at(body.blocks, b)
+    let s = Vec_usize.at(site_stmt, sid)
+    if s >= Vec_Statement.len(block.statements) { return false }
+    let st = Vec_Statement.at(block.statements, s)
+    return update_stmt(mutable cur, mutable defined, declared, pinned, st.kind, it_interner)
+}
+
+function update_stmt(
+    cur: mutable range_mod.RangeTable,
+    defined: mutable Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    kind: mir_stmt_mod.MStmtKind,
+    it_interner: ty_interner_mod.Interner,
+) -> bool {
+    return match kind {
+        case .assign(let dest, let value) =>
+            update_assign(mutable cur, mutable defined, declared, pinned, dest, value, it_interner)
+        case _ => false
+    }
+}
+
+function update_assign(
+    cur: mutable range_mod.RangeTable,
+    defined: mutable Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    dest: mir_place_mod.Place,
+    value: mir_rvalue_mod.Rvalue,
+    it_interner: ty_interner_mod.Interner,
+) -> bool {
+    let li = util_mod.bare_local_of(dest)
+    if li < (0 as i64) { return false }
+    let idx = li as usize
+    if idx >= range_mod.local_count(cur) { return false }
+    if util_mod.pinned_at(pinned, idx) { return false }
+    let decl = range_mod.get_at(declared, idx)
+    if !decl.known { return false }
+    let cand = intervals_mod.rvalue_range(value, cur, defined, declared, pinned, it_interner)
+    let was_def = Vec_bool.at(defined, idx)
+    let old = range_mod.get_at(cur, idx)
+    let neu = if was_def {
+        widen(old, cand, decl)
+    } else {
+        range_mod.meet(if cand.known { cand } else { decl }, decl)
+    }
+    if !was_def {
+        Vec_bool.set_at(mutable defined, idx, true)
+    }
+    range_mod.set_at(mutable cur, idx, neu)
+    return (!was_def) || !range_eq(neu, old)
+}
+
+function range_eq(a: range_mod.IntRange, b: range_mod.IntRange) -> bool {
+    return a.known == b.known && a.lo == b.lo && a.hi == b.hi
+}
+
+function widen(
+    old: range_mod.IntRange,
+    cand: range_mod.IntRange,
+    decl: range_mod.IntRange,
+) -> range_mod.IntRange {
+    let o = if old.known { old } else { decl }
+    let c = if cand.known { cand } else { decl }
+    let j = range_mod.join(o, c)
+    let lo = if j.lo < o.lo { decl.lo } else { o.lo }
+    let hi = if j.hi > o.hi { decl.hi } else { o.hi }
+    return range_mod.meet(range_mod.interval(lo, hi), decl)
+}

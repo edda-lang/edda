@@ -1,0 +1,177 @@
+
+module compile.check.stablecontract.upsert
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import manifest.build.lockfile.tamper.tamper as tamper_mod
+import manifest.model.lockfile.lockfile as lf_mod
+import source.map as source_map_mod
+import specs.address.contract as contract_mod
+import specs.address.hash as hash_mod
+import local.check.stablecontract.stablecontract as stablecontract_mod
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(stablecontract_mod.StableItem)
+spec std.collections.vec.Vec(lf_mod.Rune)
+spec std.collections.vec.Vec(lf_mod.ContractBaseline)
+spec std.core.option.Option(lf_mod.LoadedLockfile)
+spec std.core.option.Option(usize)
+
+
+public function empty_contract_baselines(allocator: Allocator) -> Vec_ContractBaseline.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_ContractBaseline.Vec
+    Vec_ContractBaseline.new(init out, allocator)?
+    return out
+}
+
+
+public function compute_contract_baselines(
+    hir_files: Vec_HirFile.Vec,
+    version: String,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_ContractBaseline.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let items = stablecontract_mod.collect_stable_items(hir_files, interner, allocator)?
+    uninit out: Vec_ContractBaseline.Vec
+    Vec_ContractBaseline.new(init out, allocator)?
+    let n = Vec_StableItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_StableItem.at(items, i)
+        let h = contract_mod.contract_hash(item.qualified_name, item.decl, item.attributes, map, allocator)?
+        let hex = hash_mod.to_hex(h, allocator)?
+        let cb = lf_mod.contract_baseline_of(item.qualified_name, hex, version)
+        Vec_ContractBaseline.push(mutable out, take cb, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function upsert_lockfile(
+    lockfile_opt: Option_LoadedLockfile.Option,
+    computed_runes: take Vec_Rune.Vec,
+    computed: take Vec_ContractBaseline.Vec,
+    allocator: Allocator,
+) -> lf_mod.LoadedLockfile
+    with {allocator, err: alloc.AllocError}
+{
+    uninit runes: Vec_Rune.Vec
+    Vec_Rune.new(init runes, allocator)?
+    uninit merged: Vec_ContractBaseline.Vec
+    Vec_ContractBaseline.new(init merged, allocator)?
+    match lockfile_opt {
+        case .some(let lf) => {
+            copy_runes(lf, mutable runes, allocator)?
+            copy_baselines(lf, mutable merged, allocator)?
+        }
+        case .none => ()
+    }
+    let rn = Vec_Rune.len(computed_runes)
+    var r: usize = 0
+    loop decreases (rn - r) {
+        if r >= rn { break }
+        let rune = Vec_Rune.at(computed_runes, r)
+        upsert_rune(mutable runes, take rune, allocator)?
+        r = r + 1
+    }
+    let n = Vec_ContractBaseline.len(computed)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let cb = Vec_ContractBaseline.at(computed, i)
+        upsert_one(mutable merged, take cb, allocator)?
+        i = i + 1
+    }
+    let hash = tamper_mod.compute_lockfile_hash_from_parts(runes, merged, allocator)?
+    return lf_mod.lockfile_of(take runes, hash, take merged)
+}
+
+
+function find_rune_index(runes: Vec_Rune.Vec, name: String) -> Option_usize.Option {
+    let n = Vec_Rune.len(runes)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(lf_mod.name(Vec_Rune.at(runes, i)), name) {
+            return Option_usize.some(value: i)
+        }
+        i = i + 1
+    }
+    return Option_usize.none
+}
+
+
+function upsert_rune(runes: mutable Vec_Rune.Vec, rune: take lf_mod.Rune, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let idx_opt = find_rune_index(runes, lf_mod.name(rune))
+    match idx_opt {
+        case .some(let idx) => Vec_Rune.set_at(mutable runes, idx, take rune)
+        case .none => Vec_Rune.push(mutable runes, take rune, allocator)?
+    }
+}
+
+
+function copy_runes(lf: lf_mod.LoadedLockfile, out: mutable Vec_Rune.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = lf_mod.rune_count(lf)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let r = lf_mod.rune_at(lf, i)
+        Vec_Rune.push(mutable out, take r, allocator)?
+        i = i + 1
+    }
+}
+
+
+function copy_baselines(lf: lf_mod.LoadedLockfile, out: mutable Vec_ContractBaseline.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = lf_mod.contract_baseline_count(lf)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let cb = lf_mod.contract_baseline_at(lf, i)
+        Vec_ContractBaseline.push(mutable out, take cb, allocator)?
+        i = i + 1
+    }
+}
+
+
+function find_index(merged: Vec_ContractBaseline.Vec, qualified_name: String) -> Option_usize.Option {
+    let n = Vec_ContractBaseline.len(merged)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let existing = Vec_ContractBaseline.at(merged, i)
+        if string.equals(lf_mod.qualified_name(existing), qualified_name) {
+            return Option_usize.some(value: i)
+        }
+        i = i + 1
+    }
+    return Option_usize.none
+}
+
+
+function upsert_one(merged: mutable Vec_ContractBaseline.Vec, cb: take lf_mod.ContractBaseline, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let idx_opt = find_index(merged, lf_mod.qualified_name(cb))
+    match idx_opt {
+        case .some(let idx) => Vec_ContractBaseline.set_at(mutable merged, idx, take cb)
+        case .none => Vec_ContractBaseline.push(mutable merged, take cb, allocator)?
+    }
+}

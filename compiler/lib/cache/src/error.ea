@@ -1,0 +1,165 @@
+
+module cache.error
+
+import std.core.fmt
+import std.io.stream
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import local.addr.hash as hash_mod
+
+derive eq, clone, debug for CacheError
+
+
+public type CacheError {
+
+    case io(path: String, op: String, source: stream.IoError)
+
+    case manifest_parse(path: String, line: u32, message: String)
+
+    case header_parse(path: String, message: String)
+
+
+    case schema_version_mismatch(path: String, found: u32, supported: u32)
+
+    case hash_mismatch(path: String, expected: hash_mod.ArtifactHash, actual: hash_mod.ArtifactHash)
+
+    case staging_corrupt(path: String, message: String)
+
+    case marker_stuck(path: String)
+
+    case body_parse(message: String)
+
+    case unsupported_body(message: String)
+
+    case unsupported_pat(message: String)
+
+    case unsupported_ty(message: String)
+}
+
+
+public stable function io_error(path: String, op: String, source: stream.IoError) -> CacheError {
+    return CacheError.io(path: path, op: op, source: source)
+}
+
+
+public function to_diagnostic(e: CacheError, at: span_mod.Span, allocator: Allocator) -> diag_mod.Diagnostic
+    with {allocator, err: alloc.AllocError}
+{
+    let msg = format_message(e, allocator)?
+    return diag_mod.error_at(code_mod.cache_error(), at, msg)
+}
+
+
+function format_message(e: CacheError, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .io(let path, let op, let _src)            => fmt_io(path, op, allocator)?
+        case .manifest_parse(let p, let line, let msg)  => fmt_manifest_parse(p, line, msg, allocator)?
+        case .header_parse(let path, let msg)           => fmt_header_parse(path, msg, allocator)?
+        case .schema_version_mismatch(let p, let f, let s) => fmt_schema_mismatch(p, f, s, allocator)?
+        case .hash_mismatch(let path, let exp, let act) => fmt_hash_mismatch(path, exp, act, allocator)?
+        case .staging_corrupt(let path, let msg)        => fmt_staging_corrupt(path, msg, allocator)?
+        case .marker_stuck(let path)                    => fmt_marker_stuck(path, allocator)?
+        case .body_parse(let msg)                       => fmt_body_parse(msg, allocator)?
+        case .unsupported_body(let msg)                 => fmt_unsupported_body(msg, allocator)?
+        case .unsupported_pat(let msg)                  => fmt_unsupported_pat(msg, allocator)?
+        case .unsupported_ty(let msg)                   => fmt_unsupported_ty(msg, allocator)?
+    }
+}
+
+function fmt_io(path: String, op: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(op, " ", allocator)?
+    return string.concat(p1, path, allocator)?
+}
+
+function fmt_manifest_parse(path: String, line: u32, message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if line == 0 {
+        let p1 = string.concat(path, ": ", allocator)?
+        return string.concat(p1, message, allocator)?
+    }
+    let p1 = string.concat(path, ":", allocator)?
+    let line_str = fmt.u32_to_string(line, allocator)?
+    let p2 = string.concat(p1, line_str, allocator)?
+    let p3 = string.concat(p2, ": ", allocator)?
+    return string.concat(p3, message, allocator)?
+}
+
+function fmt_header_parse(path: String, message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(path, ": artifact header: ", allocator)?
+    return string.concat(p1, message, allocator)?
+}
+
+function fmt_schema_mismatch(path: String, found: u32, supported: u32, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(path, ": schema_version ", allocator)?
+    let found_str = fmt.u32_to_string(found, allocator)?
+    let p2 = string.concat(p1, found_str, allocator)?
+    let p3 = string.concat(p2, " not supported by this build (expected ", allocator)?
+    let sup_str = fmt.u32_to_string(supported, allocator)?
+    let p4 = string.concat(p3, sup_str, allocator)?
+    return string.concat(p4, ")", allocator)?
+}
+
+function fmt_hash_mismatch(
+    path: String,
+    expected: hash_mod.ArtifactHash,
+    actual: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let exp_hex = hash_mod.to_hex_string(expected, allocator)?
+    let act_hex = hash_mod.to_hex_string(actual, allocator)?
+    let p1 = string.concat(path, ": content hash mismatch: expected ", allocator)?
+    let p2 = string.concat(p1, exp_hex, allocator)?
+    let p3 = string.concat(p2, ", got ", allocator)?
+    return string.concat(p3, act_hex, allocator)?
+}
+
+function fmt_staging_corrupt(path: String, message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(path, ": staging directory corrupt: ", allocator)?
+    return string.concat(p1, message, allocator)?
+}
+
+function fmt_marker_stuck(path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(path, ": GC marker file is stuck", allocator)?
+}
+
+function fmt_body_parse(message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("artifact body: ", message, allocator)?
+}
+
+function fmt_unsupported_body(message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("artifact body not cacheable: ", message, allocator)?
+}
+
+function fmt_unsupported_pat(message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("pattern not cacheable: ", message, allocator)?
+}
+
+function fmt_unsupported_ty(message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("type not cacheable: ", message, allocator)?
+}

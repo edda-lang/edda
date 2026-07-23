@@ -1,0 +1,268 @@
+
+module cache.manifest.store.write
+
+import std.collections.vec
+import std.core.fmt
+import std.mem.alloc
+import std.text.string
+import std.time.calendar
+import std.time.iso8601
+import local.addr.hash as hash_mod
+import local.manifest.store.value as manifest_value
+import local.tier.tier as tier_mod
+import local.toon.emit.write as write_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(manifest_value.ArtifactEntry)
+spec std.collections.vec.Vec(manifest_value.ArgumentEntry)
+
+
+public function to_text(m: manifest_value.Manifest, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: iso8601.Iso8601Error, panic}
+{
+    uninit w: write_mod.Writer
+    write_mod.new(init w, allocator)?
+    write_mod.comment(mutable w, "manifest.toon — codegen artifact manifest", allocator)?
+    write_mod.comment(mutable w, "Generated automatically; do not edit by hand.", allocator)?
+    write_mod.blank_line(mutable w, allocator)?
+    let schema_text = fmt.u32_to_string(m.schema_version, allocator)?
+    write_mod.scalar(mutable w, "schema_version", schema_text, allocator)?
+    write_mod.scalar(mutable w, "project", m.project, allocator)?
+    let generated_at_text = format_datetime(m.generated_at, allocator)?
+    write_mod.scalar(mutable w, "generated_at", generated_at_text, allocator)?
+    match m.last_gc_run {
+        case .none => ()
+        case .some(let ts) => {
+            let last_gc_text = format_datetime(ts, allocator)?
+            write_mod.scalar(mutable w, "last_gc_run", last_gc_text, allocator)?
+        }
+    }
+    write_mod.blank_line(mutable w, allocator)?
+    write_artifacts_section(mutable w, m.artifacts, allocator)?
+    return write_mod.finish(take w, allocator)?
+}
+
+
+function write_artifacts_section(
+    w: mutable write_mod.Writer,
+    entries: Vec_ArtifactEntry,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: iso8601.Iso8601Error}
+{
+    let count = Vec_ArtifactEntry.len(entries)
+    write_mod.list_with_schema_open(
+        mutable w,
+        "artifacts",
+        "path,hash,short_name,tier,inputs,reachable_from,generated_at",
+        count,
+        allocator,
+    )?
+    write_artifact_entries(mutable w, entries, 0, count, allocator)?
+    write_mod.list_with_schema_close(mutable w)
+}
+
+function write_artifact_entries(
+    w: mutable write_mod.Writer,
+    entries: Vec_ArtifactEntry,
+    i: usize,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: iso8601.Iso8601Error}
+    requires n <= Vec_ArtifactEntry.len(entries)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let entry = Vec_ArtifactEntry.at(entries, i)
+    write_artifact_entry(mutable w, entry, allocator)?
+    return write_artifact_entries(mutable w, entries, i + 1, n, allocator)?
+}
+
+
+function write_artifact_entry(
+    w: mutable write_mod.Writer,
+    entry: manifest_value.ArtifactEntry,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: iso8601.Iso8601Error}
+{
+    write_mod.list_item_open(mutable w, "path", entry.path, allocator)?
+    let hash_hex = hash_mod.to_hex_string(entry.hash, allocator)?
+    write_mod.scalar(mutable w, "hash", hash_hex, allocator)?
+    write_mod.scalar(mutable w, "short_name", entry.short_name, allocator)?
+    write_mod.scalar(mutable w, "tier", tier_mod.name(entry.tier), allocator)?
+    write_inputs_block(mutable w, entry.inputs, allocator)?
+    write_reachable_block(mutable w, entry.reachable_from, allocator)?
+    let generated_at_text = format_datetime(entry.generated_at, allocator)?
+    write_mod.scalar(mutable w, "generated_at", generated_at_text, allocator)?
+    write_mod.list_item_close(mutable w)
+}
+
+
+function write_inputs_block(
+    w: mutable write_mod.Writer,
+    inputs: manifest_value.ArtifactInputs,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    write_mod.block_open(mutable w, "inputs", allocator)?
+    let body_version_text = format_body_version(inputs.body_version, allocator)?
+    write_mod.scalar(mutable w, "body_version", body_version_text, allocator)?
+    write_mod.scalar(mutable w, "spec_qualified_name", inputs.spec_qualified_name, allocator)?
+    write_argument_tuple(mutable w, inputs.argument_tuple, allocator)?
+    write_nested_deps(mutable w, inputs.nested_deps, allocator)?
+    write_mod.block_close(mutable w)
+}
+
+function write_argument_tuple(
+    w: mutable write_mod.Writer,
+    args: Vec_ArgumentEntry,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_ArgumentEntry.len(args)
+    if n == 0 {
+        write_mod.empty_list(mutable w, "argument_tuple", allocator)?
+        return ()
+    }
+    write_mod.block_open(mutable w, "argument_tuple", allocator)?
+    write_argument_entries(mutable w, args, 0, n, allocator)?
+    write_mod.block_close(mutable w)
+}
+
+function write_argument_entries(
+    w: mutable write_mod.Writer,
+    args: Vec_ArgumentEntry,
+    i: usize,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= Vec_ArgumentEntry.len(args)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let arg = Vec_ArgumentEntry.at(args, i)
+    let kind_name = manifest_value.argument_kind_name(arg.kind)
+    write_mod.list_item_open(mutable w, "kind", kind_name, allocator)?
+    write_mod.scalar(mutable w, "value", arg.value, allocator)?
+    write_mod.list_item_close(mutable w)
+    return write_argument_entries(mutable w, args, i + 1, n, allocator)?
+}
+
+function write_nested_deps(
+    w: mutable write_mod.Writer,
+    deps: Vec_String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(deps)
+    if n == 0 {
+        write_mod.empty_list(mutable w, "nested_deps", allocator)?
+        return ()
+    }
+    write_mod.block_open(mutable w, "nested_deps", allocator)?
+    write_string_list(mutable w, deps, 0, n, allocator)?
+    write_mod.block_close(mutable w)
+}
+
+
+function write_reachable_block(
+    w: mutable write_mod.Writer,
+    r: manifest_value.ReachableFrom,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    write_mod.block_open(mutable w, "reachable_from", allocator)?
+    write_string_list_block(mutable w, "sources", r.sources, allocator)?
+    write_string_list_block(mutable w, "artifacts", r.artifacts, allocator)?
+    write_mod.block_close(mutable w)
+}
+
+function write_string_list_block(
+    w: mutable write_mod.Writer,
+    key: String,
+    items: Vec_String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(items)
+    if n == 0 {
+        write_mod.empty_list(mutable w, key, allocator)?
+        return ()
+    }
+    write_mod.block_open(mutable w, key, allocator)?
+    write_string_list(mutable w, items, 0, n, allocator)?
+    write_mod.block_close(mutable w)
+}
+
+function write_string_list(
+    w: mutable write_mod.Writer,
+    items: Vec_String,
+    i: usize,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= Vec_String.len(items)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let item = Vec_String.at(items, i)
+    write_mod.list_item_scalar(mutable w, item, allocator)?
+    return write_string_list(mutable w, items, i + 1, n, allocator)?
+}
+
+
+function format_datetime(dt: calendar.DateTime, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: iso8601.Iso8601Error}
+{
+    var scratch: [u8] = allocator.alloc_array(u8, iso8601.max_format_len())?
+    let end: usize = iso8601.format(dt, mutable scratch, 0)?
+    var out: [u8] = allocator.alloc_array(u8, end)?
+    copy_prefix(scratch, end, mutable out)
+    return string.from_owned_utf8(take out)
+}
+
+function format_body_version(v: hash_mod.BodyVersion, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let buf: [u8] = allocator.alloc_array(u8, 4)?
+    buf[0] = 48
+    buf[1] = 120
+    buf[2] = nibble_to_hex((v.value >> 4) & 15)
+    buf[3] = nibble_to_hex(v.value & 15)
+    return string.from_owned_utf8(take buf)
+}
+
+function nibble_to_hex(n: u8 where n < 16) -> u8 {
+    return if n < 10 { n + 48 } else { (n - 10) + 97 }
+}
+
+
+function copy_prefix(src: [u8], n: usize, dst: mutable [u8]) -> ()
+    requires n <= src.len()
+    requires n <= dst.len()
+{
+    copy_prefix_acc(src, n, mutable dst, 0)
+}
+
+function copy_prefix_acc(src: [u8], n: usize, dst: mutable [u8], i: usize) -> ()
+    requires n <= src.len()
+    requires n <= dst.len()
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    dst[i] = src[i]
+    return copy_prefix_acc(src, n, mutable dst, i + 1)
+}

@@ -1,0 +1,201 @@
+
+module refine.solver.cdcl.analyze
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.cdcl.core.trail as trail_mod
+import local.solver.cdcl.prop.clause as clause_mod
+import local.solver.cdcl.core.state as state_mod
+
+
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(usize)
+spec std.core.option.Option(lit_mod.Lit)
+
+
+public type Learned {
+    lits: Vec_Lit.Vec
+    bt_level: u32
+    core: Vec_usize.Vec
+}
+
+
+type ResolveOut {
+    counter: usize
+    bt_level: u32
+}
+
+
+type PivotOut {
+    pivot: Option_Lit.Option
+    index: usize
+}
+
+
+public function run(s: state_mod.Solver, conflict_ci: usize, allocator: Allocator) -> Learned
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var seen = init_seen(s.n_vars, allocator)?
+    uninit learnt: Vec_Lit.Vec
+    Vec_Lit.new(init learnt, allocator)?
+    let placeholder = lit_mod.make_lit(0, false)
+    Vec_Lit.push(mutable learnt, take placeholder, allocator)?
+    uninit origin_acc: Vec_usize.Vec
+    Vec_usize.new(init origin_acc, allocator)?
+    var counter: usize = 0
+    var pivot = Option_Lit.none
+    var confl = conflict_ci
+    var index = trail_mod.stack_len(s.trail)
+    var bt_level: u32 = 0
+    loop {
+        clause_mod.union_origin_into(mutable origin_acc, s.db, confl, allocator)?
+        let r = resolve_clause(s, confl, pivot, mutable seen, mutable learnt, counter, bt_level, allocator)?
+        counter = r.counter
+        bt_level = r.bt_level
+        let np = next_pivot(s, seen, index)
+        pivot = np.pivot
+        index = np.index
+        match pivot {
+            case .some(let pl) => {
+                set_seen(mutable seen, lit_mod.lit_var(pl), false)
+                if counter > 0 {
+                    counter = counter - 1
+                }
+                match trail_mod.var_reason(s.trail, lit_mod.lit_var(pl)) {
+                    case .propagated(let c) => {
+                        confl = c
+                    }
+                    case .decision => {}
+                }
+            }
+            case .none => {
+                break
+            }
+        }
+        if counter == 0 {
+            break
+        }
+    }
+    match pivot {
+        case .some(let pl) => {
+            let asserting = lit_mod.lit_negate(pl)
+            Vec_Lit.set_at(mutable learnt, 0, take asserting)
+        }
+        case .none => {}
+    }
+    return Learned {
+        lits: learnt,
+        bt_level: bt_level,
+        core: origin_acc,
+    }
+}
+
+
+function resolve_clause(
+    s: state_mod.Solver,
+    confl: usize,
+    pivot: Option_Lit.Option,
+    seen: mutable Vec_bool.Vec,
+    learnt: mutable Vec_Lit.Vec,
+    counter: usize,
+    bt_level: u32,
+    allocator: Allocator,
+) -> ResolveOut
+    with {allocator, err: alloc.AllocError}
+{
+    var cnt = counter
+    var bt = bt_level
+    let cur = trail_mod.decision_level(s.trail)
+    let n = clause_mod.clause_len(s.db, confl)
+    var k: usize = 0
+    loop
+        decreases (n - k)
+    {
+        if k >= n {
+            break
+        }
+        let q = clause_mod.clause_lit(s.db, confl, k)
+        k = k + 1
+        let skip = match pivot {
+            case .some(let pl) => q == pl
+            case .none => false
+        }
+        if !skip {
+            let v = lit_mod.lit_var(q)
+            if !seen_at(seen, v) {
+                let lv = trail_mod.var_level(s.trail, v)
+                if lv > 0 as u32 {
+                    set_seen(mutable seen, v, true)
+                    if lv == cur {
+                        cnt = cnt + 1
+                    } else {
+                        Vec_Lit.push(mutable learnt, take q, allocator)?
+                        if lv > bt {
+                            bt = lv
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ResolveOut {
+        counter: cnt,
+        bt_level: bt,
+    }
+}
+
+
+function next_pivot(s: state_mod.Solver, seen: Vec_bool.Vec, index: usize) -> PivotOut {
+    var idx = index
+    loop
+        decreases idx
+    {
+        if idx == 0 {
+            return PivotOut { pivot: Option_Lit.none, index: idx }
+        }
+        idx = idx - 1
+        let tl = trail_mod.stack_at(s.trail, idx)
+        if seen_at(seen, lit_mod.lit_var(tl)) {
+            return PivotOut { pivot: Option_Lit.some(value: tl), index: idx }
+        }
+    }
+}
+
+
+function init_seen(n_vars: usize, allocator: Allocator) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit seen: Vec_bool.Vec
+    Vec_bool.new(init seen, allocator)?
+    var i: usize = 0
+    loop
+        decreases (n_vars - i)
+    {
+        if i >= n_vars {
+            break
+        }
+        let f = false
+        Vec_bool.push(mutable seen, take f, allocator)?
+        i = i + 1
+    }
+    return seen
+}
+
+
+function seen_at(seen: Vec_bool.Vec, v: usize) -> bool {
+    if v >= Vec_bool.len(seen) {
+        return false
+    }
+    return Vec_bool.at(seen, v)
+}
+
+
+function set_seen(seen: mutable Vec_bool.Vec, v: usize, value: bool) -> () {
+    if v >= Vec_bool.len(seen) {
+        return
+    }
+    Vec_bool.set_at(mutable seen, v, take value)
+}

@@ -1,0 +1,170 @@
+
+module cache.blob.mir.item.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.attr as ast_attr_mod
+import span.loc.pos.span as span_mod
+import local.error as error_mod
+import local.addr.hash as hash_mod
+import local.blob.header as header_mod
+import local.blob.kind as kind_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.item.write.codec as item_write_mod
+import local.blob.mir.item.read.codec as item_read_mod
+
+
+spec std.mem.alloc.Box(ast_item_mod.TypeDecl)
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_attr_mod.Attribute)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+
+spec std.core.option.Option(ast_item_mod.Stability)
+spec std.core.option.Option(ast_item_mod.Linearity)
+
+
+public function encode_items(items: Vec_Item.Vec, it: interner_mod.Interner, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+
+    let reserved = header_mod.header_len()
+    var h: usize = 0
+    loop decreases reserved - h {
+        if h >= reserved { break }
+        prim_mod.push_u8(mutable out, 0, allocator)?
+        h += 1
+    }
+
+    item_write_mod.write_item_vec(items, it, mutable out, allocator)?
+
+    return Vec_u8.into_array(take out, allocator)?
+}
+
+public function decode_items(bytes: [u8], it: mutable interner_mod.Interner, allocator: Allocator) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    var cur = prim_mod.reader_at_start()
+    return item_read_mod.read_item_vec(bytes, mutable cur, mutable it, allocator)?
+}
+
+public function write_blob(items: Vec_Item.Vec, it: interner_mod.Interner, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    var buf = encode_items(items, it, allocator)?
+    if buf.len() < 43 {
+        raise error_mod.CacheError.body_parse(message: "encoded item blob shorter than blob header")
+    }
+    let total = buf.len()
+    let hash = hash_mod.hash_bytes(buf[43..<total], allocator)?
+    let header = header_mod.BlobHeader {
+        format_version: header_mod.current_format_version(),
+        hash: hash,
+        body_version: hash_mod.current_body_version(),
+        kind: kind_mod.BlobKind.ast,
+        payload_len: (total - 43) as u64,
+    }
+    header_mod.write(header, mutable buf, 0)
+    return buf
+}
+
+public function read_blob(
+    bytes: [u8],
+    path: String,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let header = header_mod.parse(bytes, path, allocator)?
+    let hlen = header_mod.header_len()
+    let payload_len = header.payload_len as usize
+    if (hlen + payload_len) > bytes.len() {
+        raise error_mod.CacheError.body_parse(message: "blob shorter than declared payload length")
+    }
+    let payload = bytes[hlen..<(hlen + payload_len)]
+    return decode_items(payload, mutable it, allocator)?
+}
+
+@property()
+function round_trip_preserves_items(filler_count: u8, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    uninit it: interner_mod.Interner
+    interner_mod.new_interner(init it, allocator)?
+    let type_name = interner_mod.intern(mutable it, "MyType", allocator)?
+
+    uninit attrs: Vec_Attribute.Vec
+    Vec_Attribute.new(init attrs, allocator)?
+    uninit generics: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init generics, allocator)?
+    uninit fields: Vec_TypeField.Vec
+    Vec_TypeField.new(init fields, allocator)?
+
+    let decl = ast_item_mod.TypeDecl {
+        span: span_mod.dummy(),
+        stability: Option_Stability.none,
+        visibility: ast_item_mod.Visibility.public_,
+        linearity: Option_Linearity.none,
+        name: ident_mod.Ident { name: type_name, span: span_mod.dummy() },
+        generics: generics,
+        kind: ast_item_mod.TypeDeclKind.product(fields: fields),
+        synthesize_box_ptr: false,
+    }
+    let boxed = Box_TypeDecl.new(take decl, allocator)?
+
+    let item = ast_item_mod.Item {
+        span: span_mod.dummy(),
+        attributes: attrs,
+        kind: ast_item_mod.ItemKind.type_decl(decl: boxed),
+    }
+
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    Vec_Item.push(mutable items, take item, allocator)?
+
+    let bytes = write_blob(items, it, allocator)?
+
+    uninit it2: interner_mod.Interner
+    interner_mod.new_interner(init it2, allocator)?
+    if filler_count > 0 {
+        let _ = interner_mod.intern(mutable it2, "decode_side_filler", allocator)?
+    }
+
+    let decoded = read_blob(bytes, "property", mutable it2, allocator)?
+
+    let name_ok = match Vec_Item.at(decoded, 0).kind {
+        case .type_decl(let d) => bytes_equal(
+            interner_mod.lookup(it2, Box_TypeDecl.get(d).name.name),
+            "MyType".bytes(),
+        )
+        case _ => false
+    }
+
+    let matches = Vec_Item.len(decoded) == 1 && name_ok
+
+    interner_mod.dispose(take it)
+    interner_mod.dispose(take it2)
+    return matches
+}
+
+function bytes_equal(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}

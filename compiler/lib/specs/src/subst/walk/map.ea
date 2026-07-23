@@ -1,0 +1,292 @@
+
+module specs.subst.walk.map
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.symbol as sym_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.item as item_mod
+import cteval.state.value as value_mod
+import resolve.paths.modules as mt_mod
+import resolve.paths.imports as imports_mod
+import resolve.build.drive.surface.registry as registry_mod
+import local.error as err_mod
+
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(item_mod.GenericParam)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(tree_mod.Ty)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(SubstEntry)
+spec std.collections.vec.Vec(Rename)
+spec std.core.option.Option(SubstTarget)
+
+
+public type SubstTarget {
+    case to_type(path: ident_mod.Path)
+    case to_tuple(ty: tree_mod.Ty)
+    case to_expr(expr: tree_mod.Expr)
+}
+
+public type SubstEntry {
+    name: sym_mod.Symbol
+    target: SubstTarget
+}
+
+public type Rename {
+    from: sym_mod.Symbol
+    to: sym_mod.Symbol
+}
+
+public type Subst {
+    entries: Vec_SubstEntry.Vec
+    renames: Vec_Rename.Vec
+    origin_segs: Vec_Symbol.Vec
+    import_scope: imports_mod.ImportScope
+    registry: registry_mod.Registry
+    mt: mt_mod.ModuleTree
+    body_names: Vec_Symbol.Vec
+}
+
+
+function new_subst(
+    out: init Subst,
+    origin_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    body_names: take Vec_Symbol.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit es: Vec_SubstEntry.Vec
+    Vec_SubstEntry.new(init es, allocator)?
+    uninit rs: Vec_Rename.Vec
+    Vec_Rename.new(init rs, allocator)?
+    out = Subst {
+        entries: es,
+        renames: rs,
+        origin_segs: origin_segs,
+        import_scope: import_scope,
+        registry: registry,
+        mt: mt,
+        body_names: take body_names,
+    }
+}
+
+
+public function is_body_name(s: Subst, name: sym_mod.Symbol) -> bool
+    with {divergence}
+{
+    let n = Vec_Symbol.len(s.body_names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_Symbol.at(s.body_names, i).raw == name.raw {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+public function add_rename(s: mutable Subst, from: sym_mod.Symbol, to: sym_mod.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_Rename.push(mutable s.renames, Rename { from: from, to: to }, allocator)?
+}
+
+
+public function rename_head(s: Subst, p: ident_mod.Path, allocator: Allocator) -> ident_mod.Path
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let nseg = Vec_Ident.len(p.segments)
+    if nseg == 0 {
+        return p
+    }
+    let head = Vec_Ident.at(p.segments, 0).name
+    let nr = Vec_Rename.len(s.renames)
+    var ri: usize = 0
+    loop decreases (nr - ri) {
+        if ri >= nr { break }
+        let r = Vec_Rename.at(s.renames, ri)
+        if r.from.raw == head.raw {
+            return rebuild_with_head(p, r.to, allocator)?
+        }
+        ri = ri + 1
+    }
+    return p
+}
+
+
+function rebuild_with_head(p: ident_mod.Path, to: sym_mod.Symbol, allocator: Allocator) -> ident_mod.Path
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let seg = Vec_Ident.at(p.segments, i)
+        let new_seg = if i == 0 {
+            ident_mod.Ident { name: to, span: seg.span }
+        } else {
+            seg
+        }
+        Vec_Ident.push(mutable segs, new_seg, allocator)?
+        i = i + 1
+    }
+    return ident_mod.Path { span: p.span, segments: segs }
+}
+
+
+function lookup(s: Subst, name: sym_mod.Symbol) -> Option_SubstTarget.Option
+    with {divergence}
+{
+    let n = Vec_SubstEntry.len(s.entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_SubstEntry.at(s.entries, i)
+        if e.name.raw == name.raw {
+            return Option_SubstTarget.some(value: e.target)
+        }
+        i = i + 1
+    }
+    return Option_SubstTarget.none
+}
+
+
+public function lookup_path_param(s: Subst, p: ident_mod.Path) -> Option_SubstTarget.Option
+    with {divergence}
+{
+    if Vec_Ident.len(p.segments) != (1 as usize) {
+        return Option_SubstTarget.none
+    }
+    let seg = Vec_Ident.at(p.segments, 0)
+    return lookup(s, seg.name)
+}
+
+
+public function build(
+    spec_name: take String,
+    generics: Vec_GenericParam.Vec,
+    args: Vec_ComptimeValue.Vec,
+    arg_exprs: Vec_Expr.Vec,
+    at: span_mod.Span,
+    origin_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    body_names: take Vec_Symbol.Vec,
+    allocator: Allocator,
+) -> Subst
+    with {allocator, divergence, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    let n = Vec_GenericParam.len(generics)
+    let na = Vec_ComptimeValue.len(args)
+    if na != n {
+        raise err_mod.SpecError.arity_mismatch(
+            at: at,
+            spec_name: spec_name,
+            expected: n as u32,
+            actual: na as u32,
+        )
+    }
+    if Vec_Expr.len(arg_exprs) != n {
+        raise err_mod.SpecError.encoding_failed(
+            at: at,
+            kind: "arg_count",
+            message: "evaluated comptime-arg count does not match the invocation's syntactic argument count",
+        )
+    }
+    uninit out: Subst
+    new_subst(init out, origin_segs, import_scope, registry, mt, take body_names, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let gp = Vec_GenericParam.at(generics, i)
+        let cv = Vec_ComptimeValue.at(args, i)
+        let ae = Vec_Expr.at(arg_exprs, i)
+        let target = build_target(cv, ae, at, allocator)?
+        Vec_SubstEntry.push(
+            mutable out.entries,
+            SubstEntry { name: gp.name.name, target: target },
+            allocator,
+        )?
+        i = i + 1
+    }
+    return out
+}
+
+
+function build_target(
+    cv: value_mod.ComptimeValue,
+    ae: tree_mod.Expr,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> SubstTarget
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    if value_mod.is_type(cv) {
+        return type_target(ae, at, allocator)?
+    }
+    return SubstTarget.to_expr(expr: ae)
+}
+
+
+function type_target(ae: tree_mod.Expr, at: span_mod.Span, allocator: Allocator) -> SubstTarget
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    match ae.kind {
+        case .path(let p) => return SubstTarget.to_type(path: p)
+        case .tuple(_) => return SubstTarget.to_tuple(ty: expr_to_ty(ae, at, allocator, 16 as usize)?)
+        case _ => raise err_mod.SpecError.encoding_failed(
+            at: at,
+            kind: "type_arg",
+            message: "type-valued comptime argument is not a simple type path; spec type arguments must be named-type paths in V1.0",
+        )
+    }
+}
+
+
+function expr_to_ty(e: tree_mod.Expr, at: span_mod.Span, allocator: Allocator, fuel: usize) -> tree_mod.Ty
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+    decreases fuel
+{
+    if fuel == 0 as usize {
+        raise err_mod.SpecError.encoding_failed(
+            at: at,
+            kind: "type_arg",
+            message: "tuple type argument nests too deeply",
+        )
+    }
+    match e.kind {
+        case .path(let p) => return tree_mod.Ty { span: e.span, kind: tree_mod.TyKind.path(path: p) }
+        case .tuple(let elements) => {
+            uninit elems: Vec_Ty.Vec
+            Vec_Ty.new(init elems, allocator)?
+            var i: usize = 0
+            loop decreases (Vec_Expr.len(elements) - i) {
+                if i >= Vec_Expr.len(elements) { break }
+                let ety = expr_to_ty(Vec_Expr.at(elements, i), at, allocator, fuel - 1)?
+                Vec_Ty.push(mutable elems, take ety, allocator)?
+                i = i + 1
+            }
+            return tree_mod.Ty { span: e.span, kind: tree_mod.TyKind.tuple(elements: elems) }
+        }
+        case _ => raise err_mod.SpecError.encoding_failed(
+            at: at,
+            kind: "type_arg",
+            message: "type-valued comptime argument is not a simple type path or tuple of them",
+        )
+    }
+}

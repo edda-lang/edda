@@ -1,0 +1,258 @@
+
+module structmap.walk.core.util
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import source.map as source_map_mod
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import span.loc.loc as loc_mod
+import intern.symbol as sym_mod
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.ident as ast_ident
+import local.data.model as model
+import local.render.toon as toon
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.mem.alloc.Box(ast_item_mod.TypeDecl)
+spec std.mem.alloc.Box(ast_item_mod.Spec)
+spec std.mem.alloc.Box(ast_item_mod.SpecInvocation)
+spec std.mem.alloc.Box(ast_item_mod.LetDecl)
+
+
+public function box_FnDecl_get(b: Box_FnDecl.Box) -> ast_item_mod.FnDecl {
+    return Box_FnDecl.get(b)
+}
+
+public function box_TypeDecl_get(b: Box_TypeDecl.Box) -> ast_item_mod.TypeDecl {
+    return Box_TypeDecl.get(b)
+}
+
+public function box_Spec_get(b: Box_Spec.Box) -> ast_item_mod.Spec {
+    return Box_Spec.get(b)
+}
+
+
+public function item_target_qualified(
+    item: ast_item_mod.Item,
+    module_path: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let bare = match item.kind {
+        case .function_(let b) => sym_to_string(box_FnDecl_get(b).name.name, interner, allocator)?
+        case .type_decl(let b) => sym_to_string(box_TypeDecl_get(b).name.name, interner, allocator)?
+        case .spec_(let b) => sym_to_string(box_Spec_get(b).name.name, interner, allocator)?
+        case .spec_invocation(let b) => path_to_string(Box_SpecInvocation.get(b).path, interner, allocator)?
+        case .let_(let b) => sym_to_string(Box_LetDecl.get(b).name.name, interner, allocator)?
+        case .import_(let imp) => path_to_string(imp.path, interner, allocator)?
+        case .module_(let m) => path_to_string(m.path, interner, allocator)?
+        case .derive_(_) => clone_str("<derive>", allocator)?
+    }
+    return qualify_str(module_path, bare, allocator)?
+}
+
+public function path_to_string(
+    p: ast_ident.Path,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let n: usize = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i > 0 {
+            toon.push_byte(mutable buf, 0x2E, allocator)?
+        }
+        push_sym(mutable buf, Vec_Ident.at(p.segments, i).name, interner, allocator)?
+        i += 1
+    }
+    return toon.finish_string(take buf, allocator)?
+}
+
+
+public function qualify(
+    module_path: String,
+    name_sym: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bare = sym_to_string(name_sym, interner, allocator)?
+    return qualify_str(module_path, bare, allocator)?
+}
+
+public function qualify_str(module_path: String, bare: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    toon.push_str(mutable buf, module_path, allocator)?
+    toon.push_byte(mutable buf, 0x2E, allocator)?
+    toon.push_str(mutable buf, bare, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}
+
+
+public function sym_to_string(
+    sym: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(interner) {
+        return clone_str("<missing>", allocator)?
+    }
+    let bytes = interner_mod.lookup(interner, sym)
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+public function push_sym(
+    buf: mutable Vec_u8.Vec,
+    sym: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(interner) {
+        toon.push_str(mutable buf, "<missing>", allocator)?
+        return
+    }
+    let bytes = interner_mod.lookup(interner, sym)
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        toon.push_byte(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+}
+
+public function bytes_equals_ascii(bytes: [u8], s: String) -> bool {
+    let sb = s.bytes()
+    let an: usize = bytes.len()
+    let bn: usize = sb.len()
+    if an != bn { return false }
+    var i: usize = 0
+    loop
+        decreases an - i
+    {
+        if i >= an { break }
+        if bytes[i] != sb[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+
+public function vis_to_map(v: ast_item_mod.Visibility) -> model.Visibility {
+    return match v {
+        case .public_ => model.Visibility.public_()
+        case .module_ => model.Visibility.module_()
+    }
+}
+
+spec std.core.option.Option(ast_item_mod.Stability)
+
+public function stability_to_map(s: Option_Stability.Option) -> model.StabilityMarker {
+    return match s {
+        case .some(let inner) => match inner {
+            case .stable_(_) => model.StabilityMarker.stable_()
+            case .unstable_  => model.StabilityMarker.unstable_()
+        }
+        case .none => model.StabilityMarker.absent()
+    }
+}
+
+public function fn_stability_to_map(fd: ast_item_mod.FnDecl) -> model.StabilityMarker {
+    return stability_to_map(fd.stability)
+}
+
+
+public function line_of(map: source_map_mod.SourceMap, file_id: file_mod.FileId, sp: span_mod.Span) -> u32 {
+    if span_mod.is_dummy(sp) { return 0 as u32 }
+    if (file_id.raw as usize) >= source_map_mod.file_count(map) { return 0 as u32 }
+    let loc = loc_mod.loc_of(file_id, sp.start)
+    let lc = source_map_mod.byte_to_linecol(map, loc)
+    return lc.line as u32
+}
+
+public function end_line_of(map: source_map_mod.SourceMap, file_id: file_mod.FileId, sp: span_mod.Span) -> u32 {
+    if span_mod.is_dummy(sp) { return 0 as u32 }
+    if (file_id.raw as usize) >= source_map_mod.file_count(map) { return 0 as u32 }
+    let loc = loc_mod.loc_of(file_id, sp.end)
+    let lc = source_map_mod.byte_to_linecol(map, loc)
+    return lc.line as u32
+}
+
+
+public function module_name_from_rel(rel: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = rel.bytes()
+    let n: usize = bytes.len()
+    var stop: usize = n
+    if n >= 3 && bytes[n - 3] == 0x2E && bytes[n - 2] == 0x65 && bytes[n - 1] == 0x61 {
+        stop = n - 3
+    } else {
+        if n >= 5 && bytes[n - 5] == 0x2E && bytes[n - 4] == 0x65 && bytes[n - 3] == 0x64 && bytes[n - 2] == 0x64 && bytes[n - 1] == 0x61 {
+            stop = n - 5
+        }
+    }
+    let buf: [u8] = allocator.alloc_array(u8, stop)?
+    var i: usize = 0
+    loop
+        decreases stop - i
+    {
+        if i >= stop { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+public function clone_str(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}

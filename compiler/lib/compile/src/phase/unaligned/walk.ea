@@ -1,0 +1,565 @@
+
+module compile.phase.unaligned.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import std.core.fmt as fmt_mod
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.tree as hir_tree
+import intern.symbol as symbol_mod
+import types.check as check_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import target.triple as triple_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+import cteval.builtin.target.layout.layout as layout_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+
+
+spec std.collections.vec.Vec(hir_file.HirFile)
+spec std.collections.vec.Vec(check_mod.TypeOutput)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+
+
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(ty_mod.TyId)
+
+
+public function check_unaligned_field_access_files(
+    files: Vec_HirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HirFile.len(files)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_HirFile.at(files, i)
+        let out = Vec_TypeOutput.at(type_outputs, i)
+        walk_items(file, file.items, out, ty_interner, triple, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_items(
+    file: hir_file.HirFile,
+    items: Vec_HItem.Vec,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_item(file, Vec_HItem.at(items, i), out, ty_interner, triple, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_item(
+    file: hir_file.HirFile,
+    item: hir_item.HItem,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(_, let body) => {
+            walk_block(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function walk_block(
+    file: hir_file.HirFile,
+    block: hir_tree.HBlock,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_stmt(file, Vec_HStmt.at(block.stmts, i), out, ty_interner, triple, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+    match block.trailing {
+        case .some(let box_e) => walk_expr(file, Box_HExpr.get(box_e), out, ty_interner, triple, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+
+function walk_stmt(
+    file: hir_file.HirFile,
+    stmt: hir_tree.HStmt,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match stmt.kind {
+        case .let_(_, _, _, _, let init_) => {
+            walk_expr(file, init_, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .uninit_(_, _, _) => ()
+        case .assign(let target, _, let rhs) => {
+            walk_expr(file, target, out, ty_interner, triple, mutable diags, allocator)?
+            walk_expr(file, rhs, out, ty_interner, triple, mutable diags, allocator)?
+        }
+    }
+}
+
+
+function walk_expr(
+    file: hir_file.HirFile,
+    expr: hir_tree.HExpr,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match expr.kind {
+        case .field(let recv, let accessor) => {
+            check_field_access(file, expr, recv, accessor, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, recv, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .binary(_, let lhs, let rhs) => {
+            walk_boxed(file, lhs, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, rhs, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .unary(_, let inner) => {
+            walk_boxed(file, inner, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .call(_, let args) => {
+            walk_args(file, args, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .variant_ctor(_, _, let args) => {
+            walk_args(file, args, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .dyn_call(let callee, let args) => {
+            walk_boxed(file, callee, out, ty_interner, triple, mutable diags, allocator)?
+            walk_args(file, args, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .method_call(_, let args) => {
+            walk_args(file, args, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .positional(let recv, let index) => {
+            walk_boxed(file, recv, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, index, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .index(let recv, let idx) => {
+            walk_boxed(file, recv, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, idx, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .subrange(let recv, let lo, let hi, _) => {
+            walk_boxed(file, recv, out, ty_interner, triple, mutable diags, allocator)?
+            walk_opt_boxed(file, lo, out, ty_interner, triple, mutable diags, allocator)?
+            walk_opt_boxed(file, hi, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .if_(let cond, let then_b, let else_opt) => {
+            walk_boxed(file, cond, out, ty_interner, triple, mutable diags, allocator)?
+            walk_block(file, then_b, out, ty_interner, triple, mutable diags, allocator)?
+            walk_opt_block(file, else_opt, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .match_(let scrut, let arms) => {
+            walk_boxed(file, scrut, out, ty_interner, triple, mutable diags, allocator)?
+            walk_arms(file, arms, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .block_(let body) => {
+            walk_block(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .loop_(let body, _, let dec_opt) => {
+            walk_block(file, body, out, ty_interner, triple, mutable diags, allocator)?
+            walk_opt_boxed(file, dec_opt, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .cast(let inner, _, _) => {
+            walk_boxed(file, inner, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .tuple(let elements) => {
+            walk_exprs(file, elements, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .struct_lit(_, let fields) => {
+            walk_args(file, fields, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .raise_(let inner) => {
+            walk_boxed(file, inner, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .panic_(let inner) => {
+            walk_boxed(file, inner, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .return_(let opt) => {
+            walk_opt_boxed(file, opt, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .break_(_, let opt) => {
+            walk_opt_boxed(file, opt, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .comptime_(let inner) => {
+            walk_boxed(file, inner, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .comptime_block(let body) => {
+            walk_block(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .comptime_for(_, let lo, let hi, _, let body) => {
+            walk_boxed(file, lo, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, hi, out, ty_interner, triple, mutable diags, allocator)?
+            walk_block(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .handle_(_, _, let recovery, let body) => {
+            walk_boxed(file, recovery, out, ty_interner, triple, mutable diags, allocator)?
+            walk_block(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .closure(let boxed) => {
+            walk_block(file, Box_HClosure.get(boxed).body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .spawn_(let boxed) => {
+            let sp = Box_HSpawn.get(boxed)
+            walk_spawn_args(file, sp.args, out, ty_interner, triple, mutable diags, allocator)?
+            walk_block(file, sp.body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .forall_(_, let iter, let body) => {
+            walk_boxed(file, iter, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .exists_(_, let iter, let body) => {
+            walk_boxed(file, iter, out, ty_interner, triple, mutable diags, allocator)?
+            walk_boxed(file, body, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function walk_boxed(
+    file: hir_file.HirFile,
+    boxed: Box_HExpr,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_expr(file, Box_HExpr.get(boxed), out, ty_interner, triple, mutable diags, allocator)?
+}
+
+
+function walk_opt_boxed(
+    file: hir_file.HirFile,
+    opt: Option_Box_HExpr.Option,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match opt {
+        case .some(let boxed) => walk_boxed(file, boxed, out, ty_interner, triple, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+
+function walk_opt_block(
+    file: hir_file.HirFile,
+    opt: Option_HBlock.Option,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match opt {
+        case .some(let block) => walk_block(file, block, out, ty_interner, triple, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+
+function walk_exprs(
+    file: hir_file.HirFile,
+    exprs: Vec_HExpr.Vec,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_expr(file, Vec_HExpr.at(exprs, i), out, ty_interner, triple, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_args(
+    file: hir_file.HirFile,
+    args: Vec_HArg.Vec,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_expr(file, Vec_HArg.at(args, i).expr, out, ty_interner, triple, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_arms(
+    file: hir_file.HirFile,
+    arms: Vec_HArm.Vec,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        walk_expr(file, arm.body, out, ty_interner, triple, mutable diags, allocator)?
+        match arm.guard {
+            case .some(let g) => walk_expr(file, g, out, ty_interner, triple, mutable diags, allocator)?
+            case .none => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_spawn_args(
+    file: hir_file.HirFile,
+    args: Vec_HSpawnArg.Vec,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HSpawnArg.len(args)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_expr(file, Vec_HSpawnArg.at(args, i).init_, out, ty_interner, triple, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function check_field_access(
+    file: hir_file.HirFile,
+    expr: hir_tree.HExpr,
+    recv: Box_HExpr,
+    accessor: hir_tree.FieldAccessor,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match accessor {
+        case .named(let field_name) => {
+            let recv_expr = Box_HExpr.get(recv)
+            let recv_ty = check_mod.type_of_node(out, recv_expr.node_id)
+            check_named_field(file, expr, recv_ty, field_name, out, ty_interner, triple, mutable diags, allocator)?
+        }
+        case .indexed(_) => ()
+    }
+}
+
+
+function check_named_field(
+    file: hir_file.HirFile,
+    expr: hir_tree.HExpr,
+    recv_ty: ty_mod.TyId,
+    field_name: symbol_mod.Symbol,
+    out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match layout_mod.offset_of(recv_ty, field_name, ty_interner, out, triple) {
+        case .unsupported(_) => ()
+        case .ok(let offset) => {
+            match field_ty_by_name(recv_ty, field_name, ty_interner, out) {
+                case .none => ()
+                case .some(let field_ty) => {
+                    match layout_mod.align_of(field_ty, ty_interner, out, triple) {
+                        case .unsupported(_) => ()
+                        case .ok(let align) => {
+                            if align != 0 as usize && offset % align != 0 as usize {
+                                emit_unaligned(file, expr, offset, align, mutable diags, allocator)?
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+function field_ty_by_name(
+    t: ty_mod.TyId,
+    field_name: symbol_mod.Symbol,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+) -> Option_TyId.Option
+    with {divergence}
+{
+    return match layout_mod.field_count(t, ty_interner, out) {
+        case .unsupported(_) => Option_TyId.none
+        case .ok(let count) => {
+            var i: usize = 0 as usize
+            var found: Option_TyId.Option = Option_TyId.none
+            loop decreases (count - i) {
+                if i >= count { break }
+                if field_matches_at(t, i, field_name, ty_interner, out) {
+                    found = field_type_of(t, i, ty_interner, out)
+                    break
+                }
+                i = i + 1 as usize
+            }
+            found
+        }
+    }
+}
+
+
+function field_matches_at(
+    t: ty_mod.TyId,
+    i: usize,
+    field_name: symbol_mod.Symbol,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+) -> bool
+    with {divergence}
+{
+    return match layout_mod.field_name_at(t, i, ty_interner, out) {
+        case .ok(let name) => name.raw == field_name.raw
+        case _ => false
+    }
+}
+
+
+function field_type_of(
+    t: ty_mod.TyId,
+    i: usize,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+) -> Option_TyId.Option
+    with {divergence}
+{
+    return match layout_mod.field_type_at(t, i, ty_interner, out) {
+        case .ok(let ty) => Option_TyId.some(value: ty)
+        case _ => Option_TyId.none
+    }
+}
+
+
+function emit_unaligned(
+    file: hir_file.HirFile,
+    expr: hir_tree.HExpr,
+    offset: usize,
+    align: usize,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match hir_file.span_of_opt(file, expr.node_id) {
+        case .some(let span) => {
+            let message = format_message(offset, align, allocator)?
+            let d = diag_mod.warn_at(code_mod.unaligned_field_access(), span, message)
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function format_message(offset: usize, align: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let offset_str = fmt_mod.usize_to_string(offset, allocator)?
+    let align_str = fmt_mod.usize_to_string(align, allocator)?
+    let part1 = string.concat("field access at offset ", offset_str, allocator)?
+    let part2 = string.concat(part1, " is not a multiple of its type's alignment (", allocator)?
+    let part3 = string.concat(part2, align_str, allocator)?
+    return string.concat(part3, ")", allocator)?
+}

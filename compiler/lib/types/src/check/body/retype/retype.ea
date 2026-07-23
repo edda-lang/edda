@@ -1,0 +1,163 @@
+module types.check.body.retype.retype
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.core.option.Option(Box_HExpr)
+
+
+public function retype_value(
+    e: hir_tree.HExpr,
+    peer_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    match e.kind {
+        case .block_(let body) => {
+            set_node(mutable node_types, e.node_id, peer_ty)
+            retype_block(body, peer_ty, ty_interner, mutable node_types)
+        }
+        case .if_(_, let then_b, let else_opt) => {
+            set_node(mutable node_types, e.node_id, peer_ty)
+            retype_block(then_b, peer_ty, ty_interner, mutable node_types)
+            match else_opt {
+                case .some(let else_b) => retype_block(else_b, peer_ty, ty_interner, mutable node_types)
+                case .none => ()
+            }
+        }
+        case .match_(_, let arms) => {
+            set_node(mutable node_types, e.node_id, peer_ty)
+            retype_all_arms(arms, peer_ty, ty_interner, mutable node_types)
+        }
+        case .tuple(let elements) => {
+            set_node(mutable node_types, e.node_id, peer_ty)
+            retype_tuple(elements, peer_ty, ty_interner, mutable node_types)
+        }
+        case _ => retype(e, peer_ty, mutable node_types)
+    }
+}
+
+function retype_block(
+    block: hir_tree.HBlock,
+    peer_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    set_node(mutable node_types, block.node_id, peer_ty)
+    match block.trailing {
+        case .some(let b) => retype_value(Box_HExpr.get(b), peer_ty, ty_interner, mutable node_types)
+        case .none => ()
+    }
+}
+
+function retype_all_arms(
+    arms: Vec_HArm.Vec,
+    peer_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        retype_value(arm.body, peer_ty, ty_interner, mutable node_types)
+        i = i + 1
+    }
+}
+
+function retype_tuple(
+    elements: Vec_HExpr.Vec,
+    peer_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    if (peer_ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return
+    }
+    let elem_tys = match ty_interner_mod.lookup(ty_interner, peer_ty) {
+        case .tuple_(let tys) => tys
+        case _ => return
+    }
+    let n = Vec_HExpr.len(elements)
+    if n != Vec_TyId.len(elem_tys) {
+        return
+    }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let elem = Vec_HExpr.at(elements, i)
+        let elem_ty = Vec_TyId.at(elem_tys, i)
+        if node_ty_at(node_types, elem.node_id).raw != elem_ty.raw {
+            retype_value(elem, elem_ty, ty_interner, mutable node_types)
+        }
+        i = i + 1
+    }
+}
+
+public function retype_arith(
+    e: hir_tree.HExpr,
+    peer_ty: ty_mod.TyId,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    match e.kind {
+        case .binary(_, let l, let r) => {
+            set_node(mutable node_types, e.node_id, peer_ty)
+            retype_arith(Box_HExpr.get(l), peer_ty, mutable node_types)
+            retype_arith(Box_HExpr.get(r), peer_ty, mutable node_types)
+        }
+        case _ => retype(e, peer_ty, mutable node_types)
+    }
+}
+
+function retype(
+    e: hir_tree.HExpr,
+    peer_ty: ty_mod.TyId,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+{
+    set_node(mutable node_types, e.node_id, peer_ty)
+    match e.kind {
+        case .unary(_, let inner) => set_node(mutable node_types, Box_HExpr.get(inner).node_id, peer_ty)
+        case _ => ()
+    }
+}
+
+public function node_ty_at(node_types: Vec_TyId.Vec, n: node_mod.NodeId) -> ty_mod.TyId {
+    let idx = node_mod.index(n)
+    if idx >= Vec_TyId.len(node_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(node_types, idx)
+}
+
+function set_node(
+    node_types: mutable Vec_TyId.Vec,
+    n: node_mod.NodeId,
+    ty: ty_mod.TyId,
+) -> ()
+{
+    let idx = node_mod.index(n)
+    if idx < Vec_TyId.len(node_types) {
+        Vec_TyId.set_at(mutable node_types, idx, ty)
+    }
+}

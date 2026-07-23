@@ -1,0 +1,391 @@
+
+module resolve.build.drive.surface.walk.catalogue.specsurface
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.core.fmt as fmt_mod
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol
+import hir.def as def_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import manifest.lex.toml.val.values as values_mod
+import local.ctx as ctx_mod
+import local.bind.bindings as bindings_mod
+import local.bind.lookup.lookup as lookup_mod
+import local.paths.modules as mt_mod
+import local.paths.imports as imports_mod
+import local.build.drive.surface.walk.binding.walker as walker_mod
+import local.build.drive.surface.walk.catalogue.disambig as disambig_mod
+import local.build.drive.surface.walk.catalogue.specbody as specbody_mod
+
+spec std.mem.alloc.Box(ast_item.Spec)
+spec std.mem.alloc.Box(ast_item.SpecInvocation)
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(CatEntry)
+spec std.collections.vec.Vec(specbody_mod.VariantInfo)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(usize)
+
+
+public type CatEntry {
+    path: Vec_Symbol.Vec
+    names: Vec_Symbol.Vec
+    variants: Vec_VariantInfo.Vec
+}
+
+public type SpecCatalogue {
+    entries: Vec_CatEntry.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+}
+
+
+public function walk_package_with_catalogue(
+    ctx: mutable ctx_mod.ResolveCtx,
+    files: Vec_File.Vec,
+    wl: walker_mod.DeriveWhitelist,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> SpecCatalogue
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit entries: Vec_CatEntry.Vec
+    Vec_CatEntry.new(init entries, allocator)?
+    let head = IntMap_usize.new(allocator)?
+    uninit nexts: Vec_usize.Vec
+    Vec_usize.new(init nexts, allocator)?
+    var cat = SpecCatalogue { entries: entries, head: head, nexts: nexts }
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        let _ = walker_mod.walk_file(mutable ctx, f, wl, interner, allocator)?
+        let mp = lookup_mod.module_path_of(f.items, allocator)?
+        add_specs_from_file(mutable cat, f.items, mp, allocator)?
+        i = i + 1
+    }
+    return cat
+}
+
+
+public function register_invocations(ctx: mutable ctx_mod.ResolveCtx, cat: SpecCatalogue, files: Vec_File.Vec, interner: mutable interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        let mp = lookup_mod.module_path_of(f.items, allocator)?
+        let file_mod_id = ctx_mod.module_id_of(ctx, mp)
+        let imports = imports_mod.build(f.items, mp, ctx_mod.module_tree(ctx), interner, allocator)?
+        register_file_invocations(mutable ctx, cat, f.items, file_mod_id, mp, imports, mutable interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function add_specs_from_file(cat: mutable SpecCatalogue, items: Vec_Item.Vec, module_path: Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .spec_(let decl) => {
+                let d = Box_Spec.get(decl)
+                let full_path = imports_mod.append_sym(module_path, d.name.name, allocator)?
+                let names = specbody_mod.spec_body_names(d.body, allocator)?
+                let variants = specbody_mod.spec_body_variants(d.body, allocator)?
+                let entry = CatEntry { path: full_path, names: names, variants: variants }
+                insert_catalogue_entry(mutable cat, take entry, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function insert_catalogue_entry(cat: mutable SpecCatalogue, entry: take CatEntry, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let path = entry.path
+    let bucket = mt_mod.prefix_hash(path, Vec_Symbol.len(path)) as i64 wrapping
+    let new_index = Vec_CatEntry.len(cat.entries)
+    let prev = match IntMap_usize.get(cat.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable cat.nexts, prev, allocator)?
+    Vec_CatEntry.push(mutable cat.entries, take entry, allocator)?
+    let _ = IntMap_usize.insert(mutable cat.head, bucket, new_index + 1 as usize, allocator)?
+}
+
+
+function register_file_invocations(ctx: mutable ctx_mod.ResolveCtx, cat: SpecCatalogue, items: Vec_Item.Vec, file_mod_id: mt_mod.ModuleId, file_segs: Vec_Symbol.Vec, imports: imports_mod.ImportScope, interner: mutable interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .spec_invocation(let inv) => register_invocation(mutable ctx, cat, Box_SpecInvocation.get(inv), file_mod_id, file_segs, imports, mutable interner, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function register_invocation(ctx: mutable ctx_mod.ResolveCtx, cat: SpecCatalogue, inv: ast_item.SpecInvocation, file_mod_id: mt_mod.ModuleId, file_segs: Vec_Symbol.Vec, imports: imports_mod.ImportScope, interner: mutable interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_syms = path_to_syms(inv.path, allocator)?
+    let expanded = imports_mod.expand_path_head(imports, path_syms, allocator)?
+    let first = find_catalogue_entry(cat, path_syms)
+    let hit = match first {
+        case .some(_) => first
+        case .none => if paths_equal(path_syms, expanded) { Option_usize.none } else { find_catalogue_entry(cat, expanded) }
+    }
+    match hit {
+        case .some(let idx) => {
+            let e = Vec_CatEntry.at(cat.entries, idx)
+            let mangled = mangle(inv.path, inv.args, mutable interner, allocator)?
+            let full = if ctx_mod.is_colliding(ctx, mangled) {
+                disambig_mod.disambiguated_full(ctx, file_mod_id, file_segs, imports, inv, mangled, mutable interner, allocator)?
+            } else {
+                mangled
+            }
+            ctx_mod.register_invoked_spec(mutable ctx, file_mod_id, mangled, allocator)?
+            if full.raw != mangled.raw {
+                ctx_mod.register_invoked_spec(mutable ctx, file_mod_id, full, allocator)?
+                ctx_mod.register_inst_bare(mutable ctx, full, mangled, allocator)?
+            }
+            ctx_mod.register_inst_primary(mutable ctx, full, leaf_of(inv.path), allocator)?
+            ctx_mod.register_instance_full(mutable ctx, file_mod_id, mangled, full, allocator)?
+            register_synthetic_module(mutable ctx, full, e.names, e.variants, leaf_of(inv.path), allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function find_catalogue_entry(cat: SpecCatalogue, probe: Vec_Symbol.Vec) -> Option_usize.Option {
+    let bucket = mt_mod.prefix_hash(probe, Vec_Symbol.len(probe)) as i64 wrapping
+    let slot = match IntMap_usize.get(cat.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    let fuel = Vec_CatEntry.len(cat.entries) + 1 as usize
+    return walk_catalogue_chain(cat, probe, slot, fuel)
+}
+
+function walk_catalogue_chain(cat: SpecCatalogue, probe: Vec_Symbol.Vec, slot_one_based: usize, fuel: usize) -> Option_usize.Option
+    decreases fuel
+{
+    if fuel == 0 { return Option_usize.none }
+    if slot_one_based == 0 { return Option_usize.none }
+    let idx = slot_one_based - 1
+    if idx >= Vec_CatEntry.len(cat.entries) { return Option_usize.none }
+    let e = Vec_CatEntry.at(cat.entries, idx)
+    if paths_equal(e.path, probe) {
+        return Option_usize.some(value: idx)
+    }
+    if idx >= Vec_usize.len(cat.nexts) { return Option_usize.none }
+    let nxt = Vec_usize.at(cat.nexts, idx)
+    return walk_catalogue_chain(cat, probe, nxt, fuel - 1)
+}
+
+function register_synthetic_module(ctx: mutable ctx_mod.ResolveCtx, mangled: symbol.Symbol, names: Vec_Symbol.Vec, variants: Vec_VariantInfo.Vec, primary_name: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if already_registered(ctx, mangled, allocator)? {
+        return
+    }
+    let mod_id = ctx_mod.alloc_module_id(mutable ctx)
+    uninit table: bindings_mod.SymbolTable
+    table = bindings_mod.new_table(allocator)?
+    let n = Vec_Symbol.len(names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let def = ctx_mod.alloc_def(mutable ctx)
+        let _ = bindings_mod.insert(mutable table, Vec_Symbol.at(names, i), def, allocator)?
+        ctx_mod.record_synthetic_nominal(mutable ctx, mangled, Vec_Symbol.at(names, i), def, allocator)?
+        i = i + 1
+    }
+    let primary_def = unwrap_def(bindings_mod.lookup(table, primary_name))
+    if !def_mod.is_error(primary_def) {
+        let _ = bindings_mod.insert(mutable table, mangled, primary_def, allocator)?
+    }
+    uninit variant_table: bindings_mod.SymbolTable
+    variant_table = bindings_mod.new_table(allocator)?
+    let vn = Vec_VariantInfo.len(variants)
+    var vi: usize = 0
+    loop decreases (vn - vi) {
+        if vi >= vn { break }
+        let v = Vec_VariantInfo.at(variants, vi)
+        let owner_def = unwrap_def(bindings_mod.lookup(table, v.owner))
+        if !def_mod.is_error(owner_def) {
+            let _ = bindings_mod.insert(mutable variant_table, v.name, owner_def, allocator)?
+        }
+        vi = vi + 1
+    }
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    Vec_Symbol.push(mutable segs, mangled, allocator)?
+    ctx_mod.register_module_path(mutable ctx, take segs, mod_id, allocator)?
+    ctx_mod.register_module(mutable ctx, mod_id, take table, allocator)?
+    ctx_mod.register_module_variants(mutable ctx, mod_id, take variant_table, allocator)?
+}
+
+
+function unwrap_def(opt: Option_DefId.Option) -> def_mod.DefId {
+    return match opt {
+        case .some(let d) => d
+        case .none => def_mod.error()
+    }
+}
+
+
+function already_registered(ctx: ctx_mod.ResolveCtx, mangled: symbol.Symbol, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    Vec_Symbol.push(mutable segs, mangled, allocator)?
+    return ctx_mod.module_id_of(ctx, segs).raw != 0
+}
+
+
+public function mangle(path: ast_ident.Path, args: Vec_Expr.Vec, interner: mutable interner_mod.Interner, allocator: Allocator) -> symbol.Symbol
+    with {allocator, err: alloc.AllocError}
+{
+    var acc = sym_to_string(leaf_of(path), interner, allocator)?
+    let n = Vec_Expr.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Expr.at(args, i).kind {
+            case .path(let ap) => {
+                let sep = string.concat(acc, "_", allocator)?
+                acc = string.concat(sep, arg_path_mangle(ap, interner, allocator)?, allocator)?
+            }
+            case .literal(let lit) => {
+                match lit {
+                    case .int(let value, _) => {
+                        let sep = string.concat(acc, "_", allocator)?
+                        acc = string.concat(sep, fmt_mod.usize_to_string(value as usize, allocator)?, allocator)?
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return interner_mod.intern(mutable interner, acc, allocator)?
+}
+
+
+function arg_path_mangle(p: ast_ident.Path, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Ident.len(p.segments)
+    if n == 0 {
+        return ""
+    }
+    var start: usize = 0
+    loop decreases (n - start) {
+        if start + 1 >= n { break }
+        if !starts_lowercase(sym_to_string(Vec_Ident.at(p.segments, start).name, interner, allocator)?) { break }
+        start = start + 1
+    }
+    var acc = sym_to_string(Vec_Ident.at(p.segments, start).name, interner, allocator)?
+    var i = start + 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sep = string.concat(acc, "_", allocator)?
+        acc = string.concat(sep, sym_to_string(Vec_Ident.at(p.segments, i).name, interner, allocator)?, allocator)?
+        i = i + 1
+    }
+    return acc
+}
+
+
+function starts_lowercase(s: String) -> bool {
+    let bs = s.bytes()
+    if bs.len() == 0 {
+        return false
+    }
+    let c = bs[0]
+    return c >= 97 && c <= 122
+}
+
+
+function sym_to_string(s: symbol.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = interner_mod.lookup(interner, s)
+    return values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+
+function leaf_of(p: ast_ident.Path) -> symbol.Symbol {
+    let n = Vec_Ident.len(p.segments)
+    if n == 0 {
+        return symbol.empty()
+    }
+    return Vec_Ident.at(p.segments, n - 1).name
+}
+
+
+function path_to_syms(p: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function paths_equal(a: Vec_Symbol.Vec, b: Vec_Symbol.Vec) -> bool {
+    let an = Vec_Symbol.len(a)
+    let bn = Vec_Symbol.len(b)
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    loop decreases (an - i) {
+        if i >= an { break }
+        if Vec_Symbol.at(a, i).raw != Vec_Symbol.at(b, i).raw {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

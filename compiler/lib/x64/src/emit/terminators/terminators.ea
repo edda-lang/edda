@@ -1,0 +1,198 @@
+
+module x64.emit.terminators.terminators
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.term as lir_term_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.block as lir_block_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.control.branch as branch_mod
+import local.emit.types as etypes_mod
+import local.emit.regsel as regsel_mod
+import local.emit.fixup as fixup_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_body_mod.LirCalleeSave)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_term_mod.LirSwitchCase)
+spec std.collections.vec.Vec(etypes_mod.BranchFixup)
+
+
+public function emit_terminator(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_BranchFixup.Vec,
+    body: lir_body_mod.LirBody,
+    block_idx: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    let block = Vec_LirBlock.at(body.blocks, block_idx)
+    match block.terminator.kind {
+        case .jump(let target, _) => emit_jump_to(mutable code, mutable fixups, target, allocator)?
+        case .branch_if(let cond, let true_, _, let false_, _) => emit_branch_if(mutable code, mutable fixups, body, cond, true_, false_, allocator)?
+        case .switch_(let discr, let targets) => emit_switch(mutable code, mutable fixups, body, discr, targets, allocator)?
+        case .return_(let values) => emit_return(mutable code, body, values, allocator)?
+        case .unreachable_ => branch_mod.encode_ud2(mutable code, allocator)?
+        case .raise_(let value, _) => emit_raise_terminator(mutable code, body, value, allocator)?
+        case .panic_(let message) => emit_trap_terminator(mutable code, body, message, allocator)?
+        case .coherence_enter(let body_entry, _) => emit_jump_to(mutable code, mutable fixups, body_entry, allocator)?
+        case .coherence_exit(let target) => emit_jump_to(mutable code, mutable fixups, target, allocator)?
+    }
+}
+
+function emit_jump_to(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_BranchFixup.Vec,
+    target: lir_block_mod.LirBlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    branch_mod.encode_jmp_rel32(mutable code, 0, allocator)?
+    let site = fixup_mod.tail_site(code)?
+    fixup_mod.record_fixup(mutable fixups, site, target.raw, allocator)?
+}
+
+function emit_branch_if(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_BranchFixup.Vec,
+    body: lir_body_mod.LirBody,
+    cond: lir_vreg_mod.LirVRegId,
+    true_: lir_block_mod.LirBlockId,
+    false_: lir_block_mod.LirBlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let cg = regsel_mod.vreg_gp(body, cond)?
+    alu_mod.encode_test_rm_r(mutable code, regs_mod.OpSize.qword_, cg, cg, allocator)?
+    branch_mod.encode_jcc_rel32(mutable code, branch_mod.Cond.ne_, 0, allocator)?
+    let site_t = fixup_mod.tail_site(code)?
+    fixup_mod.record_fixup(mutable fixups, site_t, true_.raw, allocator)?
+    branch_mod.encode_jmp_rel32(mutable code, 0, allocator)?
+    let site_f = fixup_mod.tail_site(code)?
+    fixup_mod.record_fixup(mutable fixups, site_f, false_.raw, allocator)?
+}
+
+function emit_switch(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_BranchFixup.Vec,
+    body: lir_body_mod.LirBody,
+    discr: lir_vreg_mod.LirVRegId,
+    targets: lir_term_mod.LirSwitchTargets,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dg = regsel_mod.vreg_gp(body, discr)?
+    let n = Vec_LirSwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let cs = Vec_LirSwitchCase.at(targets.cases, i)
+        let imm = switch_value_i32(cs.value)?
+        alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, dg, imm, allocator)?
+        branch_mod.encode_jcc_rel32(mutable code, branch_mod.Cond.e_, 0, allocator)?
+        let site = fixup_mod.tail_site(code)?
+        fixup_mod.record_fixup(mutable fixups, site, cs.target.raw, allocator)?
+        i += 1
+    }
+    emit_jump_to(mutable code, mutable fixups, targets.default, allocator)?
+}
+
+function switch_value_i32(value: i128) -> i32
+    with {err: lir_error_mod.LirError}
+{
+    let i32_min: i128 = -2147483648 as i128
+    let i32_max: i128 = 2147483647 as i128
+    if value >= i32_min && value <= i32_max {
+        return value as i32
+    }
+    raise lir_error_mod.LirError.internal_lowering_invariant(
+        at: span_mod.dummy(),
+        message: "x64.gen.emit: switch case value exceeds i32; needs register materialization",
+    )
+}
+
+function emit_return(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    values: Vec_LirVRegId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_LirVRegId.len(values)
+    if n > 1 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: multi-value return reached emit unlowered — the abi pass must lower it to an sret write-through with an empty return list",
+        )
+    }
+    emit_callee_restores(mutable code, body, allocator)?
+    branch_mod.encode_clc(mutable code, allocator)?
+    branch_mod.encode_leave(mutable code, allocator)?
+    branch_mod.encode_ret(mutable code, allocator)?
+}
+
+
+function emit_raise_terminator(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    value: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let vg = regsel_mod.vreg_gp(body, value)?
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rax, vg, allocator)?
+    emit_callee_restores(mutable code, body, allocator)?
+    branch_mod.encode_stc(mutable code, allocator)?
+    branch_mod.encode_leave(mutable code, allocator)?
+    branch_mod.encode_ret(mutable code, allocator)?
+}
+
+
+function emit_callee_restores(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_LirCalleeSave.len(body.callee_saved)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let cs = Vec_LirCalleeSave.at(body.callee_saved, i)
+        let reg = regsel_mod.preg_gp(lir_reg_mod.PReg { raw: cs.preg_raw })?
+        alu_mod.encode_mov_r_mem(mutable code, regs_mod.OpSize.qword_, reg, regs_mod.Gp64Reg.rbp, cs.frame_disp, allocator)?
+        i += 1
+    }
+}
+
+function emit_trap_terminator(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    value: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let _ = body
+    let _ = value
+    branch_mod.encode_ud2(mutable code, allocator)?
+}

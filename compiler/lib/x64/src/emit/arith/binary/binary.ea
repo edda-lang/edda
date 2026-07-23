@@ -1,0 +1,437 @@
+
+module x64.emit.arith.binary.binary
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.hlir.op as hlir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.integer.shift.shift as shift_mod
+import local.encoding.control.branch as branch_mod
+import local.encoding.simd.vector as vector_mod
+import local.emit.regsel as regsel_mod
+import local.emit.value.convert.emit as convert_mod
+import local.emit.arith.subwidth.subwidth as subwidth_mod
+import local.emit.arith.sat.wide as sat64_mod
+import local.emit.arith.binary.divrem.divrem as divrem_mod
+import local.emit.arith.binary.compare.compare as compare_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_binary(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    flags: hlir_op_mod.OpFlags,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if is_compare(op) {
+        if regsel_mod.vreg_is_fp(body, lhs)? {
+            compare_mod.emit_fcmp(mutable code, body, op, lhs, rhs, dst, allocator)?
+        } else {
+            compare_mod.emit_icmp(mutable code, body, op, lhs, rhs, dst, allocator)?
+        }
+        return ()
+    }
+    if regsel_mod.vreg_is_fp(body, dst)? {
+        emit_binary_fp(mutable code, body, op, lhs, rhs, dst, allocator)?
+        return ()
+    }
+    emit_binary_gp(mutable code, body, op, flags, lhs, rhs, dst, allocator)?
+}
+
+function is_compare(op: lir_op_mod.LBinOp) -> bool {
+    return match op {
+        case .icmp_eq => true
+        case .icmp_ne => true
+        case .icmp_slt => true
+        case .icmp_sle => true
+        case .icmp_sgt => true
+        case .icmp_sge => true
+        case .icmp_ult => true
+        case .icmp_ule => true
+        case .icmp_ugt => true
+        case .icmp_uge => true
+        case _ => false
+    }
+}
+
+function emit_binary_gp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    flags: hlir_op_mod.OpFlags,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dreg = regsel_mod.vreg_gp(body, dst)?
+    let lreg = regsel_mod.vreg_gp(body, lhs)?
+    match op {
+        case .add => {
+            var lea_done = false
+            if flags.overflow_safe {
+                match regsel_mod.resolve_gp_operand(body, rhs)? {
+                    case .imm32(let v) => {
+                        alu_mod.encode_lea(mutable code, regs_mod.OpSize.qword_, dreg, lreg, v, allocator)?
+                        lea_done = true
+                    }
+                    case _ => ()
+                }
+            }
+            if !lea_done {
+                regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+                apply_alu(mutable code, alu_mod.AluOp.add_, dreg, rhs, body, allocator)?
+                if !flags.overflow_safe { emit_addsub_overflow_trap(mutable code, body, dst, allocator)? }
+            }
+        }
+        case .sub => {
+            regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+            apply_alu(mutable code, alu_mod.AluOp.sub_, dreg, rhs, body, allocator)?
+            if !flags.overflow_safe { emit_addsub_overflow_trap(mutable code, body, dst, allocator)? }
+        }
+        case .bit_and => { regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?; apply_alu(mutable code, alu_mod.AluOp.and_, dreg, rhs, body, allocator)? }
+        case .bit_or => { regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?; apply_alu(mutable code, alu_mod.AluOp.or_, dreg, rhs, body, allocator)? }
+        case .bit_xor => { regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?; apply_alu(mutable code, alu_mod.AluOp.xor_, dreg, rhs, body, allocator)? }
+        case .mul => {
+            let v = regsel_mod.vreg_at(body, dst)?
+            if !flags.overflow_safe && v.int_width >= (8 as u32) && !v.int_signed {
+                emit_mul_unsigned_trap(mutable code, body, dreg, lreg, rhs, allocator)?
+            } else {
+                emit_mul(mutable code, body, dreg, lreg, rhs, allocator)?
+                if !flags.overflow_safe {
+                    if v.int_width < (8 as u32) {
+                        emit_subwidth_overflow_trap(mutable code, body, dst, allocator)?
+                    } else {
+                        if v.int_signed {
+                            emit_overflow_trap(mutable code, branch_mod.Cond.no_, allocator)?
+                        }
+                    }
+                }
+            }
+        }
+        case .udiv => divrem_mod.emit_divrem(mutable code, body, dreg, lreg, rhs, false, false, flags.nonzero_divisor, flags.div_overflow, flags.div_overflow_safe, allocator)?
+        case .sdiv => divrem_mod.emit_divrem(mutable code, body, dreg, lreg, rhs, true, false, flags.nonzero_divisor, flags.div_overflow, flags.div_overflow_safe, allocator)?
+        case .urem => divrem_mod.emit_divrem(mutable code, body, dreg, lreg, rhs, false, true, flags.nonzero_divisor, flags.div_overflow, flags.div_overflow_safe, allocator)?
+        case .srem => divrem_mod.emit_divrem(mutable code, body, dreg, lreg, rhs, true, true, flags.nonzero_divisor, flags.div_overflow, flags.div_overflow_safe, allocator)?
+        case .shl => emit_shift(mutable code, body, shift_mod.ShiftOp.shl_, dreg, lreg, rhs, allocator)?
+        case .lshr => emit_shift(mutable code, body, shift_mod.ShiftOp.shr_, dreg, lreg, rhs, allocator)?
+        case .ashr => emit_shift(mutable code, body, shift_mod.ShiftOp.sar_, dreg, lreg, rhs, allocator)?
+        case .add_sat => emit_sat_gp(mutable code, body, op, dreg, lreg, rhs, dst, allocator)?
+        case .sub_sat => emit_sat_gp(mutable code, body, op, dreg, lreg, rhs, dst, allocator)?
+        case .mul_sat => emit_sat_gp(mutable code, body, op, dreg, lreg, rhs, dst, allocator)?
+        case .umulhi => emit_mulhi(mutable code, body, dreg, lreg, rhs, false, allocator)?
+        case .smulhi => emit_mulhi(mutable code, body, dreg, lreg, rhs, true, allocator)?
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: comparison op routed to integer arithmetic path",
+        )
+    }
+    subwidth_mod.canonicalize_sub_width(mutable code, body, dst, allocator)?
+}
+
+function emit_sat_gp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let v = regsel_mod.vreg_at(body, dst)?
+    if v.int_width >= (8 as u32) {
+        sat64_mod.emit_sat64_gp(mutable code, body, op, dreg, lreg, rhs, v.int_signed, allocator)?
+        return ()
+    }
+    match op {
+        case .add_sat => {
+            regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+            apply_alu(mutable code, alu_mod.AluOp.add_, dreg, rhs, body, allocator)?
+        }
+        case .sub_sat => {
+            regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+            apply_alu(mutable code, alu_mod.AluOp.sub_, dreg, rhs, body, allocator)?
+        }
+        case _ => emit_mul(mutable code, body, dreg, lreg, rhs, allocator)?
+    }
+    let one: i64 = 1
+    let bits = (v.int_width as i64) * 8
+    if v.int_signed {
+        let hi = (one << (bits - 1)) - 1
+        let lo = 0 - (one << (bits - 1))
+        convert_mod.clamp_bound(mutable code, dreg, hi, branch_mod.Cond.g_, allocator)?
+        convert_mod.clamp_bound(mutable code, dreg, lo, branch_mod.Cond.l_, allocator)?
+        return ()
+    }
+    let hi = (one << bits) - 1
+    match op {
+        case .sub_sat => convert_mod.clamp_bound(mutable code, dreg, 0, branch_mod.Cond.l_, allocator)?
+        case _ => convert_mod.clamp_bound(mutable code, dreg, hi, branch_mod.Cond.a_, allocator)?
+    }
+}
+
+function emit_binary_fp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dx = regsel_mod.vreg_xmm(body, dst)?
+    let lx = regsel_mod.vreg_xmm(body, lhs)?
+    let rx = regsel_mod.operand_xmm(body, rhs)?
+    let dv = regsel_mod.vreg_at(body, dst)?
+    let is_f32 = dv.size == (4 as u32)
+    if regs_mod.xmm_reg_num(dx) != regs_mod.xmm_reg_num(lx) {
+        if is_f32 {
+            vector_mod.encode_movss(mutable code, dx, lx, allocator)?
+        } else {
+            vector_mod.encode_movsd(mutable code, dx, lx, allocator)?
+        }
+    }
+    match op {
+        case .add => {
+            if is_f32 { vector_mod.encode_addss(mutable code, dx, rx, allocator)? }
+            else { vector_mod.encode_addsd(mutable code, dx, rx, allocator)? }
+        }
+        case .sub => {
+            if is_f32 { vector_mod.encode_subss(mutable code, dx, rx, allocator)? }
+            else { vector_mod.encode_subsd(mutable code, dx, rx, allocator)? }
+        }
+        case .mul => {
+            if is_f32 { vector_mod.encode_mulss(mutable code, dx, rx, allocator)? }
+            else { vector_mod.encode_mulsd(mutable code, dx, rx, allocator)? }
+        }
+        case .sdiv | .udiv => {
+            if is_f32 { vector_mod.encode_divss(mutable code, dx, rx, allocator)? }
+            else { vector_mod.encode_divsd(mutable code, dx, rx, allocator)? }
+        }
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: binary op not valid on floating-point operands",
+        )
+    }
+}
+
+function apply_alu(
+    code: mutable Vec_u8.Vec,
+    op: alu_mod.AluOp,
+    dst: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_alu_rm_r(mutable code, op, regs_mod.OpSize.qword_, dst, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_alu_rm_imm(mutable code, op, regs_mod.OpSize.qword_, dst, v, allocator)?
+    }
+}
+
+function emit_addsub_overflow_trap(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let v = regsel_mod.vreg_at(body, dst)?
+    if v.int_width < (8 as u32) {
+        emit_subwidth_overflow_trap(mutable code, body, dst, allocator)?
+        return ()
+    }
+    let skip = if v.int_signed { branch_mod.Cond.no_ } else { branch_mod.Cond.ae_ }
+    emit_overflow_trap(mutable code, skip, allocator)?
+}
+
+function emit_subwidth_overflow_trap(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let v = regsel_mod.vreg_at(body, dst)?
+    if v.int_width >= (8 as u32) {
+        return ()
+    }
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let one: i64 = 1
+    let bits = (v.int_width as i64) * 8
+    if v.int_signed {
+        let hi = (one << (bits - 1)) - 1
+        let lo = 0 - (one << (bits - 1))
+        emit_bound_trap(mutable code, dg, hi, branch_mod.Cond.le_, allocator)?
+        emit_bound_trap(mutable code, dg, lo, branch_mod.Cond.ge_, allocator)?
+        return ()
+    }
+    let hi = (one << bits) - 1
+    emit_bound_trap(mutable code, dg, hi, branch_mod.Cond.be_, allocator)?
+}
+
+function emit_bound_trap(
+    code: mutable Vec_u8.Vec,
+    dg: regs_mod.Gp64Reg,
+    bound: i64,
+    skip: branch_mod.Cond,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let scratch = regs_mod.Gp64Reg.r11
+    alu_mod.encode_mov_r64_imm64(mutable code, scratch, bound, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, dg, scratch, allocator)?
+    emit_overflow_trap(mutable code, skip, allocator)?
+}
+
+function emit_overflow_trap(
+    code: mutable Vec_u8.Vec,
+    skip: branch_mod.Cond,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    branch_mod.encode_jcc_rel8(mutable code, skip, 2 as i8, allocator)?
+    branch_mod.encode_ud2(mutable code, allocator)?
+}
+
+function emit_mul(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_imul_r_rm(mutable code, regs_mod.OpSize.qword_, dreg, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_imul_r_rm_imm32(mutable code, regs_mod.OpSize.qword_, dreg, dreg, v, allocator)?
+    }
+}
+
+function emit_mul_unsigned_trap(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let rax = regs_mod.Gp64Reg.rax
+    let rdx = regs_mod.Gp64Reg.rdx
+    let r11 = regs_mod.Gp64Reg.r11
+    let scratch = if regs_mod.gp64_reg_num(lreg) == regs_mod.gp64_reg_num(r11) { regs_mod.Gp64Reg.r10 } else { r11 }
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, scratch, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_mov_r64_imm64(mutable code, scratch, v as i64, allocator)?
+    }
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, rax, lreg, allocator)?
+    alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.mul_, regs_mod.OpSize.qword_, scratch, allocator)?
+    alu_mod.encode_test_rm_r(mutable code, regs_mod.OpSize.qword_, rdx, rdx, allocator)?
+    emit_overflow_trap(mutable code, branch_mod.Cond.e_, allocator)?
+    regsel_mod.mov_if_diff(mutable code, dreg, rax, allocator)?
+}
+
+function emit_mulhi(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    signed_: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let rax = regs_mod.Gp64Reg.rax
+    let rdx = regs_mod.Gp64Reg.rdx
+    let r11 = regs_mod.Gp64Reg.r11
+    let scratch = if regs_mod.gp64_reg_num(lreg) == regs_mod.gp64_reg_num(r11) { regs_mod.Gp64Reg.r10 } else { r11 }
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, scratch, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_mov_r64_imm64(mutable code, scratch, v as i64, allocator)?
+    }
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, rax, lreg, allocator)?
+    let g3 = if signed_ { alu_mod.Grp3Op.imul1_ } else { alu_mod.Grp3Op.mul_ }
+    alu_mod.encode_grp3_rm(mutable code, g3, regs_mod.OpSize.qword_, scratch, allocator)?
+    regsel_mod.mov_if_diff(mutable code, dreg, rdx, allocator)?
+}
+
+function emit_shift(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: shift_mod.ShiftOp,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .imm32(let v) => {
+            regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+            shift_mod.encode_shift_imm(mutable code, op, regs_mod.OpSize.qword_, dreg, v as u8 wrapping, allocator)?
+        }
+        case .reg(let r) => {
+            let rcx = regs_mod.Gp64Reg.rcx
+            let r11 = regs_mod.Gp64Reg.r11
+            let work = if regs_mod.gp64_reg_num(dreg) == regs_mod.gp64_reg_num(rcx) {
+                if regs_mod.gp64_reg_num(r) == regs_mod.gp64_reg_num(r11) { regs_mod.Gp64Reg.r10 } else { r11 }
+            } else {
+                dreg
+            }
+            if regs_mod.gp64_reg_num(r) == regs_mod.gp64_reg_num(work) {
+                if regs_mod.gp64_reg_num(lreg) == regs_mod.gp64_reg_num(rcx) {
+                    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, r11, lreg, allocator)?
+                    regsel_mod.mov_if_diff(mutable code, rcx, r, allocator)?
+                    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, work, r11, allocator)?
+                } else {
+                    regsel_mod.mov_if_diff(mutable code, rcx, r, allocator)?
+                    regsel_mod.mov_if_diff(mutable code, work, lreg, allocator)?
+                }
+            } else {
+                regsel_mod.mov_if_diff(mutable code, work, lreg, allocator)?
+                regsel_mod.mov_if_diff(mutable code, rcx, r, allocator)?
+            }
+            shift_mod.encode_shift_cl(mutable code, op, regs_mod.OpSize.qword_, work, allocator)?
+            regsel_mod.mov_if_diff(mutable code, dreg, work, allocator)?
+        }
+    }
+}
+

@@ -1,0 +1,329 @@
+
+module optimize.effect_gvn.licm.rel.invariant.invariant
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.op as op_mod
+import ir.hlir.id.block as block_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.analysis.purity as purity_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+import local.effect_gvn.licm.cfg as cfg_mod
+import local.effect_gvn.licm.rel.worklist.worklist as worklist_mod
+
+
+spec std.collections.vec.Vec(Hoist)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(op_mod.OpId)
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.IntMap(u8)
+spec std.collections.hashmap.IntMap(worklist_mod.OpUses)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(u8)
+
+
+public type Hoist {
+    op: op_mod.OpId
+    result_: value_mod.ValueId
+    header: block_mod.BlockId
+    preheader: block_mod.BlockId
+}
+
+
+public function build_op_block_map(
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var map = IntMap_u32.new(allocator)?
+    let n = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop
+        decreases n - b
+    {
+        if b >= n { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        record_block_ops(mutable map, block, b as u32, allocator)?
+        b = b + 1
+    }
+    return map
+}
+
+
+function record_block_ops(
+    map: mutable IntMap_u32.IntMap,
+    block: hlir_body_mod.HlirBlock,
+    block_raw: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let m = Vec_OpId.len(block.ops)
+    var k: usize = 0
+    loop
+        decreases m - k
+    {
+        if k >= m { break }
+        let op_id = Vec_OpId.at(block.ops, k)
+        if op_id.raw != 0 {
+            let _ = IntMap_u32.insert(mutable map, op_id.raw as i64, block_raw, allocator)?
+        }
+        k = k + 1
+    }
+}
+
+
+public function hoist_loop_invariants(
+    hoists: mutable Vec_Hoist.Vec,
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var invariant = IntMap_u8.new(allocator)?
+    let n = Vec_HlirOp.len(body.ops)
+
+    var uses = IntMap_OpUses.new(allocator)?
+    var edges: usize = 0
+    var bi: usize = 1
+    loop
+        decreases n - bi
+    {
+        if bi >= n { break }
+        let op = Vec_HlirOp.at(body.ops, bi)
+        edges = edges +| worklist_mod.index_op_operands(mutable uses, op, bi as u32, allocator)?
+        bi = bi + 1
+    }
+
+    uninit worklist: Vec_u32.Vec
+    Vec_u32.new(init worklist, allocator)?
+    var si: usize = 1
+    loop
+        decreases n - si
+    {
+        if si >= n { break }
+        Vec_u32.push(mutable worklist, si as u32, allocator)?
+        si = si + 1
+    }
+
+    var fuel: usize = (n +| edges) +| 1
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        let wl_len = Vec_u32.len(worklist)
+        if wl_len == 0 { break }
+        fuel = fuel - 1
+        let op_raw = Vec_u32.at(worklist, wl_len - 1)
+        let _ = Vec_u32.pop(mutable worklist)
+        if (op_raw as usize) < n {
+            let op = Vec_HlirOp.at(body.ops, op_raw as usize)
+            let did = consider_op(mutable invariant, body, built, op_block, lp, op, op_raw, allocator)?
+            if did {
+                worklist_mod.enqueue_consumers(mutable worklist, uses, op.result_, allocator)?
+            }
+        }
+    }
+
+    emit_hoists(mutable hoists, body, invariant, op_block, lp, allocator)?
+}
+
+
+function consider_op(
+    invariant: mutable IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    built: mapping_mod.BuildResult,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    op: hlir_op_mod.HlirOp,
+    op_raw: u32,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let result_raw = op.result_.raw
+    if result_raw == 0 { return false }
+    if IntMap_u8.contains(invariant, result_raw as i64) { return false }
+    if !op_in_loop(op_block, lp, op_raw) { return false }
+    if !purity_mod.is_movable(mapping_mod.purity_of_value(built, op.result_)) { return false }
+    if !operands_invariant(invariant, body, op_block, lp, op) { return false }
+    let _ = IntMap_u8.insert(mutable invariant, result_raw as i64, 1 as u8, allocator)?
+    return true
+}
+
+
+function op_in_loop(op_block: IntMap_u32.IntMap, lp: cfg_mod.Loop, op_raw: u32) -> bool {
+    return match IntMap_u32.get(op_block, op_raw as i64) {
+        case .some(let blk_raw) => cfg_mod.block_in_loop(lp, blk_raw)
+        case .none => false
+    }
+}
+
+
+function operands_invariant(
+    invariant: IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    op: hlir_op_mod.HlirOp,
+) -> bool
+    with {panic}
+{
+    return match op.kind {
+        case .literal(let c) => true
+        case .binary(let bop, let lhs, let rhs) => binary_operands_invariant(invariant, body, op_block, lp, lhs, rhs)
+        case .unary(let uop, let operand) => value_invariant(invariant, body, op_block, lp, operand)
+        case .cast(let value, let from, let to, let ck) => value_invariant(invariant, body, op_block, lp, value)
+        case .call_(let callee, let args) => false
+        case .call_indirect(let callee, let args) => false
+        case .make_closure(let code, let env) => value_invariant(invariant, body, op_block, lp, env)
+        case .field(let operand, let index) => value_invariant(invariant, body, op_block, lp, operand)
+        case .index(let operand, let index_v) => index_operands_invariant(invariant, body, op_block, lp, operand, index_v)
+        case .slice_subrange(let operand, let lo_v, let hi_v) => false
+        case .len(let operand) => value_invariant(invariant, body, op_block, lp, operand)
+        case .discriminant(let operand) => value_invariant(invariant, body, op_block, lp, operand)
+        case .aggregate(let kind, let elems) => values_invariant(invariant, body, op_block, lp, elems)
+        case .ref_(let kind, let operand) => value_invariant(invariant, body, op_block, lp, operand)
+        case .deref_(_) => false
+        case .field_addr(_, _) => false
+        case .index_addr(_, _) => false
+        case .subrange_addr(_, _, _) => false
+        case .deref_addr(_) => false
+        case .store_(_, _) => false
+        case .stack_alloc(_) => false
+        case .err_flag => false
+    }
+}
+
+
+function binary_operands_invariant(
+    invariant: IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    lhs: value_mod.ValueId,
+    rhs: value_mod.ValueId,
+) -> bool
+    with {panic}
+{
+    if !value_invariant(invariant, body, op_block, lp, lhs) { return false }
+    return value_invariant(invariant, body, op_block, lp, rhs)
+}
+
+
+function index_operands_invariant(
+    invariant: IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    operand: value_mod.ValueId,
+    index_v: value_mod.ValueId,
+) -> bool
+    with {panic}
+{
+    if !value_invariant(invariant, body, op_block, lp, operand) { return false }
+    return value_invariant(invariant, body, op_block, lp, index_v)
+}
+
+
+function values_invariant(
+    invariant: IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    values: Vec_ValueId.Vec,
+) -> bool
+    with {panic}
+{
+    let n = Vec_ValueId.len(values)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let v = Vec_ValueId.at(values, i)
+        if !value_invariant(invariant, body, op_block, lp, v) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+
+function value_invariant(
+    invariant: IntMap_u8.IntMap,
+    body: hlir_body_mod.HlirBody,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    v: value_mod.ValueId,
+) -> bool
+    with {panic}
+{
+    if v.raw == 0 { return false }
+    if (v.raw as usize) >= Vec_HlirValue.len(body.values) { return false }
+    let value = Vec_HlirValue.at(body.values, v.raw as usize)
+    return match value.def {
+        case .block_param(let block, let pos) => !cfg_mod.block_in_loop(lp, block.raw)
+        case .op_result(let op_id) => op_result_invariant(invariant, op_block, lp, op_id, v)
+    }
+}
+
+
+function op_result_invariant(
+    invariant: IntMap_u8.IntMap,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    op_id: op_mod.OpId,
+    v: value_mod.ValueId,
+) -> bool {
+    if !op_in_loop(op_block, lp, op_id.raw) {
+        return true
+    }
+    return IntMap_u8.contains(invariant, v.raw as i64)
+}
+
+
+function emit_hoists(
+    hoists: mutable Vec_Hoist.Vec,
+    body: hlir_body_mod.HlirBody,
+    invariant: IntMap_u8.IntMap,
+    op_block: IntMap_u32.IntMap,
+    lp: cfg_mod.Loop,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        if op.result_.raw != 0 {
+            if IntMap_u8.contains(invariant, op.result_.raw as i64) {
+                if op_in_loop(op_block, lp, i as u32) {
+                    let hoist = Hoist {
+                        op: op_mod.OpId { raw: i as u32 },
+                        result_: op.result_,
+                        header: lp.header,
+                        preheader: lp.preheader,
+                    }
+                    Vec_Hoist.push(mutable hoists, take hoist, allocator)?
+                }
+            }
+        }
+        i = i + 1
+    }
+}

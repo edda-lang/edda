@@ -1,0 +1,213 @@
+
+module cache.blob.mir.item.read.decl
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.literal as ast_literal_mod
+import local.blob.mir.ast.ops as ast_ops_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.ty.read.codec as ty_codec_mod
+import local.blob.mir.expr.read.codec as expr_codec_mod
+import local.blob.mir.expr.leaf.codec as expr_leaf_mod
+import local.blob.mir.item.leaf.codec as item_leaf_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_item_mod.AdmitsConstraint)
+spec std.collections.vec.Vec(ast_tree_mod.RefinementClause)
+
+
+public function read_fn_decl(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.FnDecl
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let stability = item_leaf_mod.read_option_stability(bytes, mutable cur, mutable it, allocator)?
+    let visibility = item_leaf_mod.read_visibility(bytes, mutable cur)?
+    let refinement_stable = prim_mod.read_bool(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let outbound_generics = read_generic_param_vec(bytes, mutable cur, mutable it, allocator)?
+    let generics = read_generic_param_vec(bytes, mutable cur, mutable it, allocator)?
+    let params = expr_leaf_mod.read_param_vec(bytes, mutable cur, mutable it, allocator, expr_codec_mod.read_expr)?
+    let return_mode = ast_ops_mod.read_return_mode(bytes, mutable cur)?
+    let return_ty = expr_leaf_mod.read_option_ty(bytes, mutable cur, mutable it, allocator, expr_codec_mod.read_expr)?
+    let effects = ty_codec_mod.read_option_effect_row(bytes, mutable cur, mutable it, allocator, expr_codec_mod.read_expr)?
+    let refinements = read_refinement_clause_vec(bytes, mutable cur, mutable it, allocator)?
+    let body = read_fn_body(bytes, mutable cur, mutable it, allocator)?
+    return ast_item_mod.FnDecl {
+        span: span,
+        stability: stability,
+        visibility: visibility,
+        refinement_stable: refinement_stable,
+        name: name,
+        outbound_generics: outbound_generics,
+        generics: generics,
+        params: params,
+        return_mode: return_mode,
+        return_ty: return_ty,
+        effects: effects,
+        refinements: refinements,
+        body: body,
+    }
+}
+
+public function read_fn_body(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.FnBody
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_item_mod.FnBody.block_(body: expr_codec_mod.read_block(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => {
+            let span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let name_span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let name = symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?
+            let dll = item_leaf_mod.read_option_symbol(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.FnBody.extern_(span: span, name_span: name_span, name: name, dll: dll)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown FnBody tag")
+    }
+}
+
+public function read_generic_param(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.GenericParam
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let kind_tag = prim_mod.read_u8(bytes, mutable cur)?
+    let kind = match kind_tag {
+        case 0 => ast_item_mod.GenericKind.type_param
+        case 1 => ast_item_mod.GenericKind.comptime_param
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown GenericKind tag")
+    }
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let ty = expr_leaf_mod.read_option_ty(bytes, mutable cur, mutable it, allocator, expr_codec_mod.read_expr)?
+    let admits = read_admits_constraint_vec(bytes, mutable cur, mutable it, allocator)?
+    return ast_item_mod.GenericParam { span: span, kind: kind, name: name, ty: ty, admits: admits }
+}
+
+public function read_generic_param_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_GenericParam.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit params: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init params, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let p = read_generic_param(bytes, mutable cur, mutable it, allocator)?
+        Vec_GenericParam.push(mutable params, take p, allocator)?
+        i += 1
+    }
+    return params
+}
+
+public function read_admits_constraint(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_item_mod.AdmitsConstraint
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => {
+            let span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let op = ast_ops_mod.read_bin_op(bytes, mutable cur)?
+            ast_item_mod.AdmitsConstraint.op(span: span, op: op)
+        }
+        case 1 => {
+            let span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let value = ast_literal_mod.read_literal(bytes, mutable cur, mutable it, allocator)?
+            ast_item_mod.AdmitsConstraint.lit(span: span, value: value)
+        }
+        case 2 => {
+            let span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let ty = ty_codec_mod.read_ty(bytes, mutable cur, mutable it, allocator, expr_codec_mod.read_expr)?
+            ast_item_mod.AdmitsConstraint.member(span: span, name: name, ty: ty)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown AdmitsConstraint tag")
+    }
+}
+
+public function read_admits_constraint_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_AdmitsConstraint.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit constraints: Vec_AdmitsConstraint.Vec
+    Vec_AdmitsConstraint.new(init constraints, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = read_admits_constraint(bytes, mutable cur, mutable it, allocator)?
+        Vec_AdmitsConstraint.push(mutable constraints, take c, allocator)?
+        i += 1
+    }
+    return constraints
+}
+
+public function read_refinement_clause(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.RefinementClause
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let kind = ast_ops_mod.read_refinement_kind(bytes, mutable cur)?
+    let pred = expr_codec_mod.read_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.RefinementClause { span: span, kind: kind, pred: pred }
+}
+
+public function read_refinement_clause_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_RefinementClause.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit clauses: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init clauses, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = read_refinement_clause(bytes, mutable cur, mutable it, allocator)?
+        Vec_RefinementClause.push(mutable clauses, take c, allocator)?
+        i += 1
+    }
+    return clauses
+}

@@ -1,0 +1,391 @@
+module cteval.builtin.target.layout.compute.engine
+
+import std.collections.vec
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import hir.def as def_mod
+import target.triple as triple_mod
+import target.arch as arch_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+public type Layout {
+    size: usize
+    align: usize
+}
+
+public type LayoutOrErr {
+    case ok(layout: Layout)
+    case unsupported(message: String)
+}
+
+public type OffsetResult {
+    case ok(offset: usize)
+    case unsupported(message: String)
+}
+
+public type SumParts {
+    disc_size: usize
+    payload_off: usize
+    payload_size: usize
+    total_size: usize
+    align: usize
+}
+
+public type SumPartsOrErr {
+    case ok(parts: SumParts)
+    case unsupported(message: String)
+}
+
+
+public function prim_kind_size_of(kind: ty_kind_mod.PrimKind) -> LayoutOrErr {
+    return match kind {
+        case .i8_ => ok_size(1 as usize)
+        case .u8_ => ok_size(1 as usize)
+        case .bool_ => ok_size(1 as usize)
+        case .i16_ => ok_size(2 as usize)
+        case .u16_ => ok_size(2 as usize)
+        case .i32_ => ok_size(4 as usize)
+        case .u32_ => ok_size(4 as usize)
+        case .f32_ => ok_size(4 as usize)
+        case .codepoint_ => ok_size(4 as usize)
+        case .i64_ => ok_size(8 as usize)
+        case .u64_ => ok_size(8 as usize)
+        case .f64_ => ok_size(8 as usize)
+        case .isize_ => ok_size(8 as usize)
+        case .usize_ => ok_size(8 as usize)
+        case .heap_ptr => ok_size(8 as usize)
+        case .i128_ => ok_size(16 as usize)
+        case .u128_ => ok_size(16 as usize)
+        case .unit_ => ok_size(0 as usize)
+        case .never_ => ok_size(0 as usize)
+        case .type_meta =>
+            LayoutOrErr.unsupported(message: "size_of(Type) — comptime meta-type has no runtime size")
+    }
+}
+
+public function prim_kind_align_of(kind: ty_kind_mod.PrimKind) -> LayoutOrErr {
+    return match kind {
+        case .i8_ => ok_size(1 as usize)
+        case .u8_ => ok_size(1 as usize)
+        case .bool_ => ok_size(1 as usize)
+        case .unit_ => ok_size(1 as usize)
+        case .never_ => ok_size(1 as usize)
+        case .i16_ => ok_size(2 as usize)
+        case .u16_ => ok_size(2 as usize)
+        case .i32_ => ok_size(4 as usize)
+        case .u32_ => ok_size(4 as usize)
+        case .f32_ => ok_size(4 as usize)
+        case .codepoint_ => ok_size(4 as usize)
+        case .i64_ => ok_size(8 as usize)
+        case .u64_ => ok_size(8 as usize)
+        case .f64_ => ok_size(8 as usize)
+        case .isize_ => ok_size(8 as usize)
+        case .usize_ => ok_size(8 as usize)
+        case .heap_ptr => ok_size(8 as usize)
+        case .i128_ => ok_size(16 as usize)
+        case .u128_ => ok_size(16 as usize)
+        case .type_meta =>
+            LayoutOrErr.unsupported(message: "align_of(Type) — comptime meta-type has no runtime alignment")
+    }
+}
+
+function ok_size(v: usize) -> LayoutOrErr {
+    return LayoutOrErr.ok(layout: Layout { size: v, align: 1 as usize })
+}
+
+
+public function align_up_to(offset: usize, align: usize) -> usize {
+    if align == (0 as usize) {
+        return offset
+    }
+    let rem = offset % align
+    if rem == (0 as usize) {
+        return offset
+    }
+    return (offset - rem) + align
+}
+
+
+public function compute_layout(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutOrErr
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return LayoutOrErr.unsupported(message: "type-check error sentinel")
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .primitive(let kind) => prim_layout(kind)
+        case .refined(let base, _) => compute_layout(base, ty_interner, out, triple)
+        case .string_ => LayoutOrErr.ok(layout: fat_pointer_layout(triple))
+        case .slice(_) => LayoutOrErr.ok(layout: fat_pointer_layout(triple))
+        case .array(let elem, let len) => array_layout(elem, len, ty_interner, out, triple)
+        case .tuple_(let elems) => tuple_layout(elems, ty_interner, out, triple)
+        case .record(let def) => record_layout(def, ty_interner, out, triple)
+        case .sum_(let def) => sum_layout(def, ty_interner, out, triple)
+        case .fn_(_, _, _) => LayoutOrErr.ok(layout: fat_pointer_layout(triple))
+        case .spec_instance(_, _) =>
+            LayoutOrErr.unsupported(message: "layout on unmonomorphised spec instance — specs pass missed it")
+        case .capability(_) =>
+            LayoutOrErr.ok(layout: thin_pointer_layout(triple))
+        case .opaque(_) =>
+            LayoutOrErr.unsupported(message: "layout not defined for opaque types (representation is hidden — no comptime-computable layout)")
+        case .error_ => LayoutOrErr.unsupported(message: "type-check error sentinel")
+    }
+}
+
+public function field_offset_at(
+    t: ty_mod.TyId,
+    idx: usize,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> OffsetResult
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return OffsetResult.unsupported(message: "field_offset_at: type-check error sentinel")
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .refined(let base, _) => field_offset_at(base, idx, ty_interner, out, triple)
+        case .tuple_(let elems) => tuple_field_offset(elems, idx, ty_interner, out, triple)
+        case .record(let def) => record_field_offset(def, idx, ty_interner, out, triple)
+        case _ =>
+            OffsetResult.unsupported(message: "field_offset_at: field offset is defined only for record and tuple types")
+    }
+}
+
+function tuple_field_offset(
+    elems: Vec_TyId.Vec,
+    idx: usize,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> OffsetResult
+    with {divergence}
+{
+    let n = Vec_TyId.len(elems)
+    if idx >= n {
+        return OffsetResult.unsupported(message: "field_offset_at: tuple element index out of range")
+    }
+    var acc: Layout = Layout { size: 0 as usize, align: 1 as usize }
+    var i: usize = 0
+    loop decreases (idx - i) {
+        if i >= idx { break }
+        let el = match compute_layout(Vec_TyId.at(elems, i), ty_interner, out, triple) {
+            case .ok(let l) => l
+            case .unsupported(let msg) => return OffsetResult.unsupported(message: msg)
+        }
+        acc = fold_layout(acc, el)
+        i = i + 1
+    }
+    let target = match compute_layout(Vec_TyId.at(elems, idx), ty_interner, out, triple) {
+        case .ok(let l) => l
+        case .unsupported(let msg) => return OffsetResult.unsupported(message: msg)
+    }
+    return OffsetResult.ok(offset: align_up_to(acc.size, target.align))
+}
+
+function record_field_offset(
+    def: def_mod.DefId,
+    idx: usize,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> OffsetResult
+    with {divergence}
+{
+    let n = check_mod.field_ty_count(out, def)
+    if idx >= n {
+        return OffsetResult.unsupported(message: "field_offset_at: record field index out of range")
+    }
+    var acc: Layout = Layout { size: 0 as usize, align: 1 as usize }
+    var i: usize = 0
+    loop decreases (idx - i) {
+        if i >= idx { break }
+        let fl = match compute_layout(check_mod.field_ty_at(out, def, i), ty_interner, out, triple) {
+            case .ok(let l) => l
+            case .unsupported(let msg) => return OffsetResult.unsupported(message: msg)
+        }
+        acc = fold_layout(acc, fl)
+        i = i + 1
+    }
+    let target = match compute_layout(check_mod.field_ty_at(out, def, idx), ty_interner, out, triple) {
+        case .ok(let l) => l
+        case .unsupported(let msg) => return OffsetResult.unsupported(message: msg)
+    }
+    return OffsetResult.ok(offset: align_up_to(acc.size, target.align))
+}
+
+public function prim_layout(kind: ty_kind_mod.PrimKind) -> LayoutOrErr {
+    let s = match prim_kind_size_of(kind) {
+        case .ok(let l) => l.size
+        case .unsupported(let msg) => return LayoutOrErr.unsupported(message: msg)
+    }
+    let a = match prim_kind_align_of(kind) {
+        case .ok(let l) => l.size
+        case .unsupported(let msg) => return LayoutOrErr.unsupported(message: msg)
+    }
+    return LayoutOrErr.ok(layout: Layout { size: s, align: a })
+}
+
+public function word_size(triple: triple_mod.TargetTriple) -> usize {
+    return arch_mod.pointer_width(triple_mod.arch(triple))
+}
+
+public function thin_pointer_layout(triple: triple_mod.TargetTriple) -> Layout {
+    let w = word_size(triple)
+    return Layout { size: w, align: w }
+}
+
+public function fat_pointer_layout(triple: triple_mod.TargetTriple) -> Layout {
+    let arch = triple_mod.arch(triple)
+    return Layout { size: arch_mod.fat_pointer_width(arch), align: arch_mod.pointer_width(arch) }
+}
+
+@unverified(reason: "array total = stride * len is a product of two runtime values — non-linear arithmetic outside the V1.0 AUFLIA decidable fragment")
+public function array_layout(
+    elem: ty_mod.TyId,
+    len: u64,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutOrErr
+    with {divergence}
+{
+    let el = match compute_layout(elem, ty_interner, out, triple) {
+        case .ok(let l) => l
+        case .unsupported(let msg) => return LayoutOrErr.unsupported(message: msg)
+    }
+    let stride = align_up_to(el.size, el.align)
+    let n = len as usize
+    let total = stride * n
+    return LayoutOrErr.ok(layout: Layout { size: total, align: el.align })
+}
+
+public function sum_layout_parts(
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> SumPartsOrErr
+    with {divergence}
+{
+    let tag = match compute_layout(check_mod.discriminant_ty(out), ty_interner, out, triple) {
+        case .ok(let l) => l
+        case .unsupported(let msg) => return SumPartsOrErr.unsupported(message: msg)
+    }
+    var payload_size: usize = 0 as usize
+    var payload_align: usize = 1 as usize
+    let n = check_mod.variant_count_of(out, def)
+    if n == 0 {
+        return SumPartsOrErr.unsupported(message: "sum variants not visible in this check context")
+    }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let pty = check_mod.variant_payload_ty(out, def, i as u32)
+        let pl = match compute_layout(pty, ty_interner, out, triple) {
+            case .ok(let l) => l
+            case .unsupported(let msg) => return SumPartsOrErr.unsupported(message: msg)
+        }
+        if pl.size > payload_size { payload_size = pl.size }
+        if pl.align > payload_align { payload_align = pl.align }
+        i = i + 1
+    }
+    let align = if tag.align > payload_align { tag.align } else { payload_align }
+    let payload_off = align_up_to(tag.size, payload_align)
+    let raw = payload_off + payload_size
+    return SumPartsOrErr.ok(parts: SumParts {
+        disc_size: tag.size,
+        payload_off: payload_off,
+        payload_size: payload_size,
+        total_size: align_up_to(raw, align),
+        align: align,
+    })
+}
+
+public function sum_layout(
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutOrErr
+    with {divergence}
+{
+    return match sum_layout_parts(def, ty_interner, out, triple) {
+        case .ok(let p) => LayoutOrErr.ok(layout: Layout { size: p.total_size, align: p.align })
+        case .unsupported(let msg) => LayoutOrErr.unsupported(message: msg)
+    }
+}
+
+public function record_layout(
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutOrErr
+    with {divergence}
+{
+    var acc: Layout = Layout { size: 0 as usize, align: 1 as usize }
+    let n = check_mod.field_ty_count(out, def)
+    if n == 0 {
+        return LayoutOrErr.unsupported(message: "record fields not visible in this check context")
+    }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let fty = check_mod.field_ty_at(out, def, i)
+        let fl = match compute_layout(fty, ty_interner, out, triple) {
+            case .ok(let l) => l
+            case .unsupported(let msg) => return LayoutOrErr.unsupported(message: msg)
+        }
+        acc = fold_layout(acc, fl)
+        i = i + 1
+    }
+    return LayoutOrErr.ok(layout: pad_to_align(acc))
+}
+
+public function tuple_layout(
+    elems: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> LayoutOrErr
+    with {divergence}
+{
+    var acc: Layout = Layout { size: 0 as usize, align: 1 as usize }
+    let n = Vec_TyId.len(elems)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ety = Vec_TyId.at(elems, i)
+        let el = match compute_layout(ety, ty_interner, out, triple) {
+            case .ok(let l) => l
+            case .unsupported(let msg) => return LayoutOrErr.unsupported(message: msg)
+        }
+        acc = fold_layout(acc, el)
+        i = i + 1
+    }
+    return LayoutOrErr.ok(layout: pad_to_align(acc))
+}
+
+public function fold_layout(acc: Layout, item: Layout) -> Layout {
+    let off = align_up_to(acc.size, item.align)
+    let new_align = if item.align > acc.align { item.align } else { acc.align }
+    return Layout { size: off + item.size, align: new_align }
+}
+
+public function pad_to_align(l: Layout) -> Layout {
+    return Layout { size: align_up_to(l.size, l.align), align: l.align }
+}

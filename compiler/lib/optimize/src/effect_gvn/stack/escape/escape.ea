@@ -1,0 +1,316 @@
+
+module optimize.effect_gvn.stack.escape.escape
+
+import std.mem.alloc
+import std.collections.vec
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.block as block_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as term_mod
+import ir.hlir.tree.body as hlir_body_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(term_mod.SwitchCase)
+
+
+public type EscapeSet {
+    flags: Vec_bool.Vec
+}
+
+
+public function compute(
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> EscapeSet
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirValue.len(body.values)
+    var flags = empty_flags(n, allocator)?
+    seed(mutable flags, body)
+    var fuel: usize = n + 1
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        let changed_ops = propagate_ops(mutable flags, body)
+        let changed_args = propagate_block_args(mutable flags, body)
+        if !changed_ops && !changed_args { break }
+        fuel = fuel - 1
+    }
+    return EscapeSet { flags: flags }
+}
+
+
+public function escapes(set: EscapeSet, v: value_mod.ValueId) -> bool
+    with {panic}
+{
+    return is_set(set.flags, v)
+}
+
+
+function empty_flags(n: usize, allocator: Allocator) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit flags: Vec_bool.Vec
+    Vec_bool.new(init flags, allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_bool.push(mutable flags, take false, allocator)?
+        i = i + 1
+    }
+    return flags
+}
+
+
+function is_set(flags: Vec_bool.Vec, v: value_mod.ValueId) -> bool
+    with {panic}
+{
+    if value_mod.is_error(v) { return false }
+    let idx = value_mod.index(v)
+    if idx >= Vec_bool.len(flags) { return false }
+    return Vec_bool.at(flags, idx)
+}
+
+
+function mark(flags: mutable Vec_bool.Vec, v: value_mod.ValueId) -> bool
+    with {panic}
+{
+    if value_mod.is_error(v) { return false }
+    let idx = value_mod.index(v)
+    if idx >= Vec_bool.len(flags) { return false }
+    if Vec_bool.at(flags, idx) { return false }
+    Vec_bool.set_at(mutable flags, idx, take true)
+    return true
+}
+
+
+function mark_all(flags: mutable Vec_bool.Vec, vals: Vec_ValueId.Vec) -> bool
+    with {panic}
+{
+    var changed: bool = false
+    let n = Vec_ValueId.len(vals)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let v = Vec_ValueId.at(vals, i)
+        if mark(mutable flags, v) { changed = true }
+        i = i + 1
+    }
+    return changed
+}
+
+
+function seed(flags: mutable Vec_bool.Vec, body: hlir_body_mod.HlirBody) -> ()
+    with {panic}
+{
+    seed_call_args(mutable flags, body)
+    seed_terminators(mutable flags, body)
+}
+
+
+function seed_call_args(flags: mutable Vec_bool.Vec, body: hlir_body_mod.HlirBody) -> ()
+    with {panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        match op.kind {
+            case .call_(_, let args) => { let _ = mark_all(mutable flags, args) }
+            case .call_indirect(_, let args) => { let _ = mark_all(mutable flags, args) }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function seed_terminators(flags: mutable Vec_bool.Vec, body: hlir_body_mod.HlirBody) -> ()
+    with {panic}
+{
+    let n = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop
+        decreases n - b
+    {
+        if b >= n { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        seed_term(mutable flags, block.terminator)
+        b = b + 1
+    }
+}
+
+
+function seed_term(flags: mutable Vec_bool.Vec, term: term_mod.HlirTerminator) -> ()
+    with {panic}
+{
+    match term.kind {
+        case .return_(let values) => { let _ = mark_all(mutable flags, values) }
+        case .raise_(let value, _) => { let _ = mark(mutable flags, value) }
+        case .panic_(let message) => { let _ = mark(mutable flags, message) }
+        case _ => ()
+    }
+}
+
+
+function propagate_ops(flags: mutable Vec_bool.Vec, body: hlir_body_mod.HlirBody) -> bool
+    with {panic}
+{
+    var changed: bool = false
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        if is_set(flags, op.result_) {
+            if propagate_op_operands(mutable flags, op.kind) { changed = true }
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+
+function propagate_op_operands(
+    flags: mutable Vec_bool.Vec,
+    kind: hlir_op_mod.HlirOpKind,
+) -> bool
+    with {panic}
+{
+    return match kind {
+        case .ref_(_, let operand) => mark(mutable flags, operand)
+        case .field(let operand, _) => mark(mutable flags, operand)
+        case .index(let operand, _) => mark(mutable flags, operand)
+        case .slice_subrange(let operand, _, _) => mark(mutable flags, operand)
+        case .field_addr(let operand, _) => mark(mutable flags, operand)
+        case .index_addr(let operand, _) => mark(mutable flags, operand)
+        case .subrange_addr(let operand, _, _) => mark(mutable flags, operand)
+        case .deref_addr(let operand) => mark(mutable flags, operand)
+        case .cast(let value, _, _, _) => mark(mutable flags, value)
+        case .aggregate(_, let elems) => mark_all(mutable flags, elems)
+        case _ => false
+    }
+}
+
+
+function propagate_block_args(flags: mutable Vec_bool.Vec, body: hlir_body_mod.HlirBody) -> bool
+    with {panic}
+{
+    var changed: bool = false
+    let n = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop
+        decreases n - b
+    {
+        if b >= n { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        if propagate_term_args(mutable flags, block.terminator, body) { changed = true }
+        b = b + 1
+    }
+    return changed
+}
+
+
+function propagate_term_args(
+    flags: mutable Vec_bool.Vec,
+    term: term_mod.HlirTerminator,
+    body: hlir_body_mod.HlirBody,
+) -> bool
+    with {panic}
+{
+    return match term.kind {
+        case .goto_(let target, let args) => prop_edge(mutable flags, body, target, args)
+        case .branch(_, let t, let ta, let f, let fa) =>
+            prop_branch(mutable flags, body, t, ta, f, fa)
+        case .switch_(_, let targets) => prop_switch(mutable flags, body, targets)
+        case _ => false
+    }
+}
+
+
+function prop_branch(
+    flags: mutable Vec_bool.Vec,
+    body: hlir_body_mod.HlirBody,
+    t: block_mod.BlockId,
+    ta: Vec_ValueId.Vec,
+    f: block_mod.BlockId,
+    fa: Vec_ValueId.Vec,
+) -> bool
+    with {panic}
+{
+    var changed: bool = false
+    if prop_edge(mutable flags, body, t, ta) { changed = true }
+    if prop_edge(mutable flags, body, f, fa) { changed = true }
+    return changed
+}
+
+
+function prop_switch(
+    flags: mutable Vec_bool.Vec,
+    body: hlir_body_mod.HlirBody,
+    targets: term_mod.SwitchTargets,
+) -> bool
+    with {panic}
+{
+    var changed: bool = false
+    let n = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let sc = Vec_SwitchCase.at(targets.cases, i)
+        if prop_edge(mutable flags, body, sc.target, sc.args) { changed = true }
+        i = i + 1
+    }
+    if prop_edge(mutable flags, body, targets.default, targets.default_args) { changed = true }
+    return changed
+}
+
+
+function prop_edge(
+    flags: mutable Vec_bool.Vec,
+    body: hlir_body_mod.HlirBody,
+    target: block_mod.BlockId,
+    args: Vec_ValueId.Vec,
+) -> bool
+    with {panic}
+{
+    if block_mod.is_error(target) { return false }
+    let bidx = block_mod.index(target)
+    if bidx >= Vec_HlirBlock.len(body.blocks) { return false }
+    let tblock = Vec_HlirBlock.at(body.blocks, bidx)
+    let params = tblock.params
+    var changed: bool = false
+    let np = Vec_ValueId.len(params)
+    let na = Vec_ValueId.len(args)
+    var i: usize = 0
+    loop
+        decreases np - i
+    {
+        if i >= np { break }
+        if i >= na { break }
+        let param = Vec_ValueId.at(params, i)
+        let arg = Vec_ValueId.at(args, i)
+        if is_set(flags, param) {
+            if mark(mutable flags, arg) { changed = true }
+        }
+        i = i + 1
+    }
+    return changed
+}

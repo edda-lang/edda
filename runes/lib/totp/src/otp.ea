@@ -1,0 +1,142 @@
+module totp.otp
+
+import std.mem.alloc
+import std.crypto.mac.hmac.sha256 as hmac
+import std.crypto.subtle
+import std.encoding.base32
+import std.text.string
+
+
+function pow10_u32(digits: u32) -> u32
+    ensures result >= 1
+{
+    return match digits {
+        case 0 => 1
+        case 1 => 10
+        case 2 => 100
+        case 3 => 1000
+        case 4 => 10000
+        case 5 => 100000
+        case 6 => 1000000
+        case 7 => 10000000
+        case 8 => 100000000
+        case 9 => 1000000000
+        case _ => 4294967295
+    }
+}
+
+function _counter_bytes(counter: u64, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let msg: [u8] = allocator.alloc_array(u8, 8 as usize)?
+    var i: usize = 0
+    loop decreases 8 - i + 1 as usize {
+        if i >= 8 as usize { break }
+        let shift: u64 = (((7 as usize) - i) * (8 as usize)) as u64
+        msg[i] = (counter >> shift) as u8 wrapping
+        i = i + 1 as usize
+    }
+    return msg
+}
+
+function _truncate(mac: [u8] where mac.len() == 32, digits: u32) -> u32 {
+    let last_byte: u8 = mac[31 as usize]
+    let o: usize = (last_byte as usize) % (16 as usize)
+    let b0: u32 = mac[o] as u32
+    let b1: u32 = mac[o + 1 as usize] as u32
+    let b2: u32 = mac[o + 2 as usize] as u32
+    let b3: u32 = mac[o + 3 as usize] as u32
+    let bin: u32 = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) & 0x7FFFFFFF
+    return bin % pow10_u32(digits)
+}
+
+public function hotp(secret: [u8], counter: u64, digits: u32, allocator: Allocator) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let msg: [u8] = _counter_bytes(counter, allocator)?
+    var mac: [u8] = allocator.alloc_array(u8, 32 as usize)?
+    hmac.hmac_sha256(secret, msg, mutable mac, 0 as usize)
+    return _truncate(mac, digits)
+}
+
+public function totp(
+    secret: [u8],
+    unix_seconds: u64,
+    period: u64,
+    digits: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+    requires period > 0
+{
+    let counter: u64 = unix_seconds / period
+    return hotp(secret, counter, digits, allocator)?
+}
+
+public function totp_b32(
+    secret_b32: String,
+    unix_seconds: u64,
+    period: u64,
+    digits: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError, err: base32.Base32Error}
+    requires period > 0
+{
+    let secret: [u8] = base32.decode(secret_b32, allocator)?
+    return totp(secret, unix_seconds, period, digits, allocator)?
+}
+
+public function format_code(code: u32, digits: u32, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let width: usize = digits as usize
+    let buf: [u8] = allocator.alloc_array(u8, width)?
+    var n: u32 = code
+    var i: usize = width
+    loop decreases i {
+        if i == 0 as usize { break }
+        i = i - 1 as usize
+        let digit: u32 = 48 + (n % (10 as u32))
+        buf[i] = digit as u8
+        n = n / (10 as u32)
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+public function verify(
+    secret: [u8],
+    unix_seconds: u64,
+    code: u32,
+    period: u64,
+    digits: u32,
+    window: u32,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+    requires period > 0
+{
+    let c: u64 = unix_seconds / period
+    let provided: String = format_code(code, digits, allocator)?
+    let w: usize = window as usize
+    let total: usize = w * 2 + 1
+    var matched: bool = false
+    var i: usize = 0
+    loop decreases total - i + 1 as usize {
+        if i >= total { break }
+        var cur: u64 = c
+        if i >= w {
+            let up: usize = i - w
+            cur = c +| (up as u64)
+        } else {
+            let down: usize = w - i
+            cur = c -| (down as u64)
+        }
+        let expected: u32 = hotp(secret, cur, digits, allocator)?
+        let expected_str: String = format_code(expected, digits, allocator)?
+        let eq: bool = subtle.eq_bytes(expected_str.bytes(), provided.bytes())
+        matched = matched || eq
+        i = i + 1 as usize
+    }
+    return matched
+}

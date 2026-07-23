@@ -1,0 +1,171 @@
+
+module types.check.env.lower.lean.lean
+
+import std.mem.alloc
+import std.collections.vec
+import intern.symbol
+import intern.interner as interner_mod
+import hir.item as hir_item
+import syntax.ast.ident as ast_ident
+import types.ty.interner as ty_interner_mod
+import local.check.env.lower.nominals as nominals_mod
+
+
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+
+spec std.collections.vec.Vec(hir_item.HDeclItem)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(nominals_mod.NominalEntry)
+spec std.collections.vec.Vec(nominals_mod.AliasEntry)
+spec std.collections.vec.Vec(symbol.Symbol)
+
+
+public function build_nominals_decl(
+    items: Vec_HDeclItem.Vec,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> nominals_mod.NominalMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit entries: Vec_NominalEntry.Vec
+    Vec_NominalEntry.new(init entries, allocator)?
+    let leaf = file_module_leaf_decl(items)
+    let mod_path = file_module_path_decl(items, allocator)?
+    collect_decl(items, leaf, mod_path, mutable entries, mutable ty_interner, allocator)?
+    let root = nominals_mod.module_root(mod_path)
+    let aliases = build_import_aliases_decl(items, root, interner, allocator)?
+    return nominals_mod.from_parts(entries, aliases, allocator)?
+}
+
+
+function file_module_leaf_decl(items: Vec_HDeclItem.Vec) -> symbol.Symbol
+    with {divergence}
+{
+    let n = Vec_HDeclItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HDeclItem.at(items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let segs = decl.path.segments
+                        let sn = Vec_Ident.len(segs)
+                        if sn != 0 as usize {
+                            return Vec_Ident.at(segs, sn - 1 as usize).name
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return symbol.empty()
+}
+
+
+public function file_module_path_decl(items: Vec_HDeclItem.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_HDeclItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HDeclItem.at(items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let segs = decl.path.segments
+                        let sn = Vec_Ident.len(segs)
+                        var s: usize = 0 as usize
+                        loop decreases (sn - s) {
+                            if s >= sn { break }
+                            Vec_Symbol.push(mutable out, Vec_Ident.at(segs, s).name, allocator)?
+                            s = s + 1 as usize
+                        }
+                        return out
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return out
+}
+
+
+function collect_decl(
+    items: Vec_HDeclItem.Vec,
+    module_leaf: symbol.Symbol,
+    module_path: Vec_Symbol.Vec,
+    entries: mutable Vec_NominalEntry.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HDeclItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HDeclItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                let sig = Box_HTypeSignature.get(sig_box)
+                let nominal_ty = nominals_mod.intern_nominal(sig, item.def_id, mutable ty_interner, allocator)?
+                Vec_NominalEntry.push(mutable entries, nominals_mod.NominalEntry { name: sig.name, module_leaf: module_leaf, module_path: module_path, ty: nominal_ty }, allocator)?
+            }
+            case .spec_decl(_, let inner) => {
+                collect_decl(inner, module_leaf, module_path, mutable entries, mutable ty_interner, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function build_import_aliases_decl(items: Vec_HDeclItem.Vec, root: symbol.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> Vec_AliasEntry.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_AliasEntry.Vec
+    Vec_AliasEntry.new(init out, allocator)?
+    let n = Vec_HDeclItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HDeclItem.at(items, i)
+        match item.kind {
+            case .import_decl => {
+                match item.ast_item.kind {
+                    case .import_(let imp) => {
+                        match imp.selection {
+                            case .some(_) => ()
+                            case .none => {
+                                let bound = match imp.alias {
+                                    case .some(let a) => a.name
+                                    case .none => nominals_mod.import_last_segment(imp.path)
+                                }
+                                let path = nominals_mod.copy_path_segments_rooted(imp.path, root, interner, allocator)?
+                                Vec_AliasEntry.push(mutable out, nominals_mod.AliasEntry { name: bound, path: path }, allocator)?
+                            }
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return out
+}

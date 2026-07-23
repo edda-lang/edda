@@ -1,0 +1,161 @@
+module optimize.alias_mem.sroa.plan.plan
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.id.local as mir_local_mod
+
+import types.pass.ty as ty_mod
+import intern.symbol as symbol_mod
+import hir.node as node_mod
+
+import local.alias_mem.sroa.model as model_mod
+import local.alias_mem.sroa.plan.step.leaf.scan as scan_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(node_mod.NodeId)
+
+
+public function allocate_element_locals(
+    plan: mutable model_mod.Plan,
+    body: mutable mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_cands: usize = Vec_u32.len(plan.candidate_base_index)
+    var ci: usize = 0
+    loop decreases n_cands - ci {
+        if ci >= n_cands { break }
+        let in_range: bool = ci < Vec_u32.len(plan.candidate_n_fields)
+            && ci < Vec_u32.len(plan.candidate_first_new)
+        if in_range {
+            let base_index: usize = Vec_u32.at(plan.candidate_base_index, ci) as usize
+            let n_fields: usize = Vec_u32.at(plan.candidate_n_fields, ci) as usize
+            let first_new: usize = Vec_Local.len(body.locals)
+            if first_new < 4294967295 {
+                Vec_u32.set_at(mutable plan.candidate_first_new, ci, first_new as u32)
+                emit_element_locals(mutable plan, mutable body, base_index, n_fields, allocator)?
+            }
+        }
+        ci += 1
+    }
+}
+
+
+function emit_element_locals(
+    plan: mutable model_mod.Plan,
+    body: mutable mir_body_mod.MirBody,
+    base_index: usize,
+    n_fields: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var fi: usize = 0
+    loop decreases n_fields - fi {
+        if fi >= n_fields { break }
+        let elem_ty: ty_mod.TyId = element_ty(body, base_index, fi)
+        let slot_len: usize = Vec_Local.len(body.locals)
+        if slot_len < 4294967295 {
+            let element = mir_body_mod.Local {
+                ty: elem_ty,
+                mutability: mir_body_mod.Mutability.immutable_,
+                consumption: mir_body_mod.Consumption.copy_,
+                name: Option_Symbol.none,
+                origin: Option_NodeId.none,
+            }
+            Vec_Local.push(mutable body.locals, take element, allocator)?
+            Vec_u32.push(mutable plan.field_to_local, slot_len as u32, allocator)?
+        }
+        fi += 1
+    }
+}
+
+
+function element_ty(body: mir_body_mod.MirBody, base_index: usize, field_idx: usize) -> ty_mod.TyId {
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        let n_stmts: usize = Vec_Statement.len(block.statements)
+        var si: usize = 0
+        loop decreases n_stmts - si {
+            if si >= n_stmts { break }
+            let stmt = Vec_Statement.at(block.statements, si)
+            match stmt.kind {
+                case .assign(let dest, let value) => {
+                    if scan_mod.place_is_bare_local(dest, base_index) {
+                        return aggregate_elem_ty(value, field_idx)
+                    }
+                }
+                case _ => ()
+            }
+            si += 1
+        }
+        bi += 1
+    }
+    return ty_mod.error()
+}
+
+
+function aggregate_elem_ty(rv: mir_rvalue_mod.Rvalue, field_idx: usize) -> ty_mod.TyId {
+    return match rv {
+        case .aggregate(_, let elems, _) => {
+            if field_idx < Vec_Operand.len(elems) {
+                operand_ty(Vec_Operand.at(elems, field_idx))
+            } else {
+                ty_mod.error()
+            }
+        }
+        case _ => ty_mod.error()
+    }
+}
+
+
+function operand_ty(op: mir_rvalue_mod.Operand) -> ty_mod.TyId {
+    return match op {
+        case .copy_(_, let ty) => ty
+        case .move_(_, let ty) => ty
+        case .constant(let c) => c.ty
+    }
+}
+
+
+public function candidate_index_for_base(plan: model_mod.Plan, base_index: usize) -> i64 {
+    let n_cands: usize = Vec_u32.len(plan.candidate_base_index)
+    var ci: usize = 0
+    loop decreases n_cands - ci {
+        if ci >= n_cands { break }
+        if Vec_u32.at(plan.candidate_base_index, ci) as usize == base_index {
+            return ci as i64
+        }
+        ci += 1
+    }
+    return -1
+}
+
+
+public function field_local_for(plan: model_mod.Plan, ci: usize, field_idx: usize) -> mir_local_mod.LocalId {
+    if ci >= Vec_u32.len(plan.candidate_first_new) {
+        return mir_local_mod.error()
+    }
+    let map_index: usize = (Vec_u32.at(plan.candidate_first_new, ci) as usize) + field_idx
+    if map_index >= Vec_u32.len(plan.field_to_local) {
+        return mir_local_mod.error()
+    }
+    let raw: u32 = Vec_u32.at(plan.field_to_local, map_index)
+    return mir_local_mod.LocalId { raw: raw }
+}

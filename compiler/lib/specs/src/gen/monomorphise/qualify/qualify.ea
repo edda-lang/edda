@@ -1,0 +1,233 @@
+
+module specs.gen.monomorphise.qualify.qualify
+
+import std.collections.vec
+import std.mem.alloc
+import std.core.option
+import hir.def as def_mod
+import intern.symbol as sym_mod
+import resolve.paths.modules as mt_mod
+import resolve.paths.imports as imports_mod
+import resolve.build.drive.surface.registry as registry_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.item as item_mod
+import syntax.ast.tree as tree_mod
+
+
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(item_mod.Item)
+
+
+spec std.core.option.Option(imports_mod.ImportEntry)
+
+
+public function invoker_module_segments(items: Vec_Item.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .module_(let decl) => return path_to_segments(decl.path, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+    uninit empty: Vec_Symbol.Vec
+    Vec_Symbol.new(init empty, allocator)?
+    return empty
+}
+
+
+function path_to_segments(path: ast_ident_mod.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(path.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(path.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function qualify_type_args(
+    arg_exprs: Vec_Expr.Vec,
+    invoker_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    allocator: Allocator,
+) -> Vec_Expr.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Expr.Vec
+    Vec_Expr.new(init out, allocator)?
+    let nsegs = Vec_Symbol.len(invoker_segs)
+    let n = Vec_Expr.len(arg_exprs)
+    if nsegs == 0 as usize {
+        var k: usize = 0
+        loop decreases (n - k) {
+            if k >= n { break }
+            Vec_Expr.push(mutable out, Vec_Expr.at(arg_exprs, k), allocator)?
+            k = k + 1
+        }
+        return out
+    }
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let q = qualify_one(Vec_Expr.at(arg_exprs, i), invoker_segs, import_scope, registry, mt, allocator)?
+        Vec_Expr.push(mutable out, q, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function qualify_one(
+    ae: tree_mod.Expr,
+    invoker_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    allocator: Allocator,
+) -> tree_mod.Expr
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match ae.kind {
+        case .path(let p) => {
+            let qp = qualify_path(p, invoker_segs, import_scope, registry, mt, allocator)?
+            return tree_mod.Expr { span: ae.span, kind: tree_mod.ExprKind.path(path: qp) }
+        }
+        case _ => return ae
+    }
+}
+
+
+public function qualify_path(
+    p: ast_ident_mod.Path,
+    invoker_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    allocator: Allocator,
+) -> ast_ident_mod.Path
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let np = Vec_Ident.len(p.segments)
+    if np == 1 as usize {
+        let seg = Vec_Ident.at(p.segments, 0 as usize)
+        if Vec_Symbol.len(invoker_segs) > 0 as usize {
+            let full = append_segment(invoker_segs, seg.name, allocator)?
+            let d = registry_mod.lookup_path(registry, full, mt)
+            if !def_mod.is_error(d) {
+                return rebuild_path(full, seg.span, p.span, allocator)?
+            }
+        }
+        match imports_mod.lookup(import_scope, seg.name) {
+            case .some(let entry) => {
+                if entry.is_selected {
+                    let d2 = registry_mod.lookup_path(registry, entry.path, mt)
+                    if !def_mod.is_error(d2) {
+                        return rebuild_path(entry.path, seg.span, p.span, allocator)?
+                    }
+                }
+            }
+            case .none => ()
+        }
+    }
+    if np >= 2 as usize {
+        let head = Vec_Ident.at(p.segments, 0 as usize)
+        match imports_mod.lookup(import_scope, head.name) {
+            case .some(let entry) => {
+                let cand = alias_expand(entry.path, p.segments, allocator)?
+                if Vec_Symbol.len(cand) >= 2 as usize {
+                    let d = registry_mod.lookup_path(registry, cand, mt)
+                    if !def_mod.is_error(d) {
+                        return rebuild_path(cand, head.span, p.span, allocator)?
+                    }
+                }
+            }
+            case .none => ()
+        }
+        if Vec_Symbol.len(invoker_segs) > 0 as usize {
+            let full_head = append_segment(invoker_segs, head.name, allocator)?
+            let dh = registry_mod.lookup_path(registry, full_head, mt)
+            if !def_mod.is_error(dh) {
+                let cand2 = alias_expand(full_head, p.segments, allocator)?
+                return rebuild_path(cand2, head.span, p.span, allocator)?
+            }
+        }
+    }
+    return p
+}
+
+
+function alias_expand(prefix: Vec_Symbol.Vec, segs: Vec_Ident.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let pn = Vec_Symbol.len(prefix)
+    var i: usize = 0
+    loop decreases (pn - i) {
+        if i >= pn { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(prefix, i), allocator)?
+        i = i + 1
+    }
+    let sn = Vec_Ident.len(segs)
+    var j: usize = 1
+    loop decreases (sn - j) {
+        if j >= sn { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(segs, j).name, allocator)?
+        j = j + 1
+    }
+    return out
+}
+
+
+function rebuild_path(
+    syms: Vec_Symbol.Vec,
+    seg_span: span_mod.Span,
+    path_span: span_mod.Span,
+    allocator: Allocator,
+) -> ast_ident_mod.Path
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit qsegs: Vec_Ident.Vec
+    Vec_Ident.new(init qsegs, allocator)?
+    let n = Vec_Symbol.len(syms)
+    var k: usize = 0
+    loop decreases (n - k) {
+        if k >= n { break }
+        Vec_Ident.push(mutable qsegs, ast_ident_mod.Ident { name: Vec_Symbol.at(syms, k as usize), span: seg_span }, allocator)?
+        k = k + 1
+    }
+    return ast_ident_mod.Path { segments: qsegs, span: path_span }
+}
+
+
+function append_segment(base: Vec_Symbol.Vec, extra: sym_mod.Symbol, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Symbol.len(base)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(base, i), allocator)?
+        i = i + 1
+    }
+    Vec_Symbol.push(mutable out, extra, allocator)?
+    return out
+}

@@ -1,0 +1,294 @@
+
+module tls.handshake.client.hello
+
+import std.mem.alloc
+import local.error
+import local.wire
+import local.version as version_mod
+import local.crypto.ciphersuite as suite_mod
+import local.crypto.group as group_mod
+import local.crypto.signature as sig_mod
+import local.handshake.kind as hs_kind
+import local.handshake.message as hs_msg
+import local.handshake.extension as ext_type
+import local.handshake.extensions as exts_mod
+
+unstable public type ParsedClientHello {
+    client_random: [u8]
+    session_id: [u8]
+    offers_aes_128_gcm: bool
+    offers_chacha20: bool
+    tls13_offered: bool
+    offers_rsa_pss: bool
+    key_share_x25519: [u8]
+}
+
+function _client_hello_body_fixed() -> usize { return 77 as usize }
+
+function _extensions_size_for(hostname: [u8]) -> usize {
+    return (78 as usize) + hostname.len()
+}
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+public function encode_client_hello(
+    hostname: [u8],
+    client_random: [u8] where client_random.len() == 32,
+    session_id: [u8] where session_id.len() == 32,
+    client_public_key: [u8] where client_public_key.len() == 32,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let ext_size = _extensions_size_for(hostname)
+    let body_len = _client_hello_body_fixed() + ext_size
+    let total = hs_msg.header_len() + body_len
+    var buf = _alloc_bytes(allocator, total)?
+    var pos = hs_msg.write_header(
+        mutable buf,
+        0 as usize,
+        hs_kind.HandshakeKind.client_hello,
+        body_len as u32,
+    )?
+    pos = wire.write_u16_be(mutable buf, pos, version_mod.legacy_record_version())?
+    pos = wire.write_bytes(mutable buf, pos, client_random)?
+    pos = wire.write_u8(mutable buf, pos, 32 as u8)?
+    pos = wire.write_bytes(mutable buf, pos, session_id)?
+    pos = wire.write_u16_be(mutable buf, pos, 4 as u16)?
+    pos = wire.write_u16_be(
+        mutable buf,
+        pos,
+        suite_mod.ciphersuite_wire(suite_mod.CipherSuite.tls_aes_128_gcm_sha256),
+    )?
+    pos = wire.write_u16_be(
+        mutable buf,
+        pos,
+        suite_mod.ciphersuite_wire(suite_mod.CipherSuite.tls_chacha20_poly1305_sha256),
+    )?
+    pos = wire.write_u8(mutable buf, pos, 1 as u8)?
+    pos = wire.write_u8(mutable buf, pos, 0 as u8)?
+    pos = wire.write_u16_be(mutable buf, pos, ext_size as u16)?
+    pos = exts_mod.write_client_extensions(mutable buf, pos, hostname, client_public_key)?
+    let _ = pos
+    return buf
+}
+
+function _empty_bytes() -> [u8] { return "".bytes() }
+
+function _slice_copy(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    if hi < lo || hi > src.len() { raise error.TlsError.bad_handshake }
+    let n = hi - lo
+    var out = _alloc_bytes(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        out[i] = src[lo + i]
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+function _alloc_u16_slots(allocator: Allocator, n: usize) -> [u16]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_flags(allocator: Allocator) -> [u16]
+    with {allocator, err: error.TlsError}
+{
+    let flags = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u16_slots(allocator, 2 as usize)?
+    }
+    flags[0 as usize] = 0 as u16
+    flags[1 as usize] = 0 as u16
+    return flags
+}
+
+function _alloc_key_slots(allocator: Allocator, n: usize) -> [[u8]]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_key_slot(allocator: Allocator) -> [[u8]]
+    with {allocator, err: error.TlsError}
+{
+    let slot = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_key_slots(allocator, 1 as usize)?
+    }
+    slot[0 as usize] = _empty_bytes()
+    return slot
+}
+
+function _scan_supported_versions(body: [u8], lo: usize, hi: usize) -> bool
+    with {err: error.TlsError}
+{
+    if lo >= hi { return false }
+    let list_len = wire.read_u8(body, lo)? as usize
+    var p = lo + (1 as usize)
+    if p + list_len > hi { raise error.TlsError.bad_handshake }
+    let list_end = p + list_len
+    loop decreases list_end - p {
+        if p + (2 as usize) > list_end { break }
+        if wire.read_u16_be(body, p)? == version_mod.tls13_value() { return true }
+        p = p + (2 as usize)
+    }
+    return false
+}
+
+function _scan_signature_algorithms(body: [u8], lo: usize, hi: usize) -> bool
+    with {err: error.TlsError}
+{
+    if lo + (2 as usize) > hi { raise error.TlsError.bad_handshake }
+    let list_len = wire.read_u16_be(body, lo)? as usize
+    var p = lo + (2 as usize)
+    if p + list_len > hi { raise error.TlsError.bad_handshake }
+    let list_end = p + list_len
+    let want = sig_mod.sig_scheme_wire(sig_mod.SignatureScheme.rsa_pss_rsae_sha256)
+    loop decreases list_end - p {
+        if p + (2 as usize) > list_end { break }
+        if wire.read_u16_be(body, p)? == want { return true }
+        p = p + (2 as usize)
+    }
+    return false
+}
+
+function _scan_key_share(
+    body: [u8],
+    lo: usize,
+    hi: usize,
+    key_out: mutable [[u8]],
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    if lo + (2 as usize) > hi { raise error.TlsError.bad_handshake }
+    let shares_len = wire.read_u16_be(body, lo)? as usize
+    var p = lo + (2 as usize)
+    if p + shares_len > hi { raise error.TlsError.bad_handshake }
+    let shares_end = p + shares_len
+    let want = group_mod.named_group_wire(group_mod.NamedGroup.x25519)
+    loop decreases shares_end - p {
+        if p + (4 as usize) > shares_end { break }
+        let g_wire = wire.read_u16_be(body, p)?
+        let key_len = wire.read_u16_be(body, p + (2 as usize))? as usize
+        let key_lo = p + (4 as usize)
+        let key_hi = key_lo + key_len
+        if key_hi > shares_end { raise error.TlsError.bad_handshake }
+        if g_wire == want && key_len == (32 as usize) {
+            key_out[0 as usize] = _slice_copy(body, key_lo, key_hi, allocator)?
+        }
+        p = key_hi
+    }
+}
+
+function _process_one_extension(
+    body: [u8],
+    pos: usize,
+    flags: mutable [u16],
+    key_out: mutable [[u8]],
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: error.TlsError}
+{
+    let ext_wire = wire.read_u16_be(body, pos)?
+    let ext_len = wire.read_u16_be(body, pos + (2 as usize))? as usize
+    let body_lo = pos + (4 as usize)
+    let body_hi = body_lo + ext_len
+    if body_hi > body.len() { raise error.TlsError.bad_handshake }
+    let parsed = ext_type.extension_type_from_wire(ext_wire)
+    match parsed {
+        case .supported_versions => {
+            if _scan_supported_versions(body, body_lo, body_hi)? {
+                flags[0 as usize] = 1 as u16
+            }
+        }
+        case .signature_algorithms => {
+            if _scan_signature_algorithms(body, body_lo, body_hi)? {
+                flags[1 as usize] = 1 as u16
+            }
+        }
+        case .key_share => {
+            _scan_key_share(body, body_lo, body_hi, mutable key_out, allocator)?
+        }
+        case _ => {
+        }
+    }
+    return body_hi
+}
+
+public function decode_client_hello(
+    body: [u8],
+    allocator: Allocator,
+) -> ParsedClientHello
+    with {allocator, err: error.TlsError}
+{
+    if body.len() < (41 as usize) { raise error.TlsError.bad_handshake }
+    var pos: usize = 0 as usize
+    if wire.read_u16_be(body, pos)? != version_mod.legacy_record_version() {
+        raise error.TlsError.unsupported_version
+    }
+    pos = pos + (2 as usize)
+    let client_random = _slice_copy(body, pos, pos + (32 as usize), allocator)?
+    pos = pos + (32 as usize)
+    let sid_len = wire.read_u8(body, pos)? as usize
+    pos = pos + (1 as usize)
+    if sid_len > (32 as usize) { raise error.TlsError.bad_handshake }
+    let session_id = _slice_copy(body, pos, pos + sid_len, allocator)?
+    pos = pos + sid_len
+    if pos + (2 as usize) > body.len() { raise error.TlsError.bad_handshake }
+    let suites_len = wire.read_u16_be(body, pos)? as usize
+    pos = pos + (2 as usize)
+    let suites_end = pos + suites_len
+    if suites_end > body.len() { raise error.TlsError.bad_handshake }
+    var offers_aes = false
+    var offers_chacha = false
+    let aes_wire = suite_mod.ciphersuite_wire(suite_mod.CipherSuite.tls_aes_128_gcm_sha256)
+    let chacha_wire = suite_mod.ciphersuite_wire(suite_mod.CipherSuite.tls_chacha20_poly1305_sha256)
+    loop decreases suites_end - pos {
+        if pos + (2 as usize) > suites_end { break }
+        let s = wire.read_u16_be(body, pos)?
+        if s == aes_wire { offers_aes = true }
+        if s == chacha_wire { offers_chacha = true }
+        pos = pos + (2 as usize)
+    }
+    pos = suites_end
+    if pos + (1 as usize) > body.len() { raise error.TlsError.bad_handshake }
+    let comp_len = wire.read_u8(body, pos)? as usize
+    pos = pos + (1 as usize) + comp_len
+    if pos + (2 as usize) > body.len() { raise error.TlsError.bad_handshake }
+    let ext_total = wire.read_u16_be(body, pos)? as usize
+    pos = pos + (2 as usize)
+    let ext_end = pos + ext_total
+    if ext_end > body.len() { raise error.TlsError.bad_handshake }
+    var flags = _alloc_flags(allocator)?
+    var key_slot = _alloc_key_slot(allocator)?
+    var ext_pos = pos
+    loop decreases ext_end - ext_pos {
+        if ext_pos >= ext_end { break }
+        ext_pos = _process_one_extension(body, ext_pos, mutable flags, mutable key_slot, allocator)?
+    }
+    return ParsedClientHello {
+        client_random: client_random,
+        session_id: session_id,
+        offers_aes_128_gcm: offers_aes,
+        offers_chacha20: offers_chacha,
+        tls13_offered: flags[0 as usize] == (1 as u16),
+        offers_rsa_pss: flags[1 as usize] == (1 as u16),
+        key_share_x25519: key_slot[0 as usize],
+    }
+}

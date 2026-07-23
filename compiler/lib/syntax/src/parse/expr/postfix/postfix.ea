@@ -1,0 +1,498 @@
+
+module syntax.parse.expr.postfix.postfix
+
+import std.mem.alloc
+import std.mem.raw
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.kind as kind_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ops as ops_mod
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+import local.parse.ty.core.core as ty_mod
+
+spec std.collections.vec.Vec(tree_mod.CallArg)
+spec std.mem.alloc.Box(tree_mod.Expr)
+spec std.mem.alloc.Box(tree_mod.Ty)
+spec std.mem.raw.Mem(tree_mod.Expr)
+spec std.core.option.Option(ops_mod.CallMode)
+spec std.core.option.Option(ident_mod.Ident)
+
+public function parse_postfix(
+    tokens: [lexed_mod.Lexed],
+    base: take tree_mod.Expr,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var cur: tree_mod.Expr = base
+    var cur_pos = pos
+    loop {
+        let tok = util_mod.peek(tokens, cur_pos)
+        if is_glue_suppressed(tok, util_mod.peek_newline(tokens, cur_pos)) { break }
+        match tok {
+            case .l_paren => { cur_pos = parse_call_postfix(tokens, mutable cur, cur_pos, mutable diags, allocator, parse_expr_fn, depth)? }
+            case .l_bracket => { cur_pos = parse_index_postfix(tokens, mutable cur, cur_pos, mutable diags, allocator, parse_expr_fn, depth)? }
+            case .question => { cur_pos = parse_try_postfix(tokens, mutable cur, cur_pos, allocator)? }
+            case .kw_as => { cur_pos = parse_cast_postfix(tokens, mutable cur, cur_pos, mutable diags, allocator, parse_expr_fn, depth)? }
+            case .dot => {
+                let next = util_mod.peek_at(tokens, cur_pos, 1)
+                match next {
+                    case .kw_await => { cur_pos = finish_await(tokens, mutable cur, cur_pos, allocator)? }
+                    case .int(let value, let int_base) => { cur_pos = finish_tuple_index(tokens, mutable cur, cur_pos, value, int_base, mutable diags, allocator)? }
+                    case .ident(let sym) => { cur_pos = finish_field_or_method(tokens, mutable cur, cur_pos, sym, mutable diags, allocator, parse_expr_fn, depth)? }
+                    case .l_paren => { cur_pos = finish_positional(tokens, mutable cur, cur_pos, mutable diags, allocator, parse_expr_fn, depth)? }
+                    case _ => {
+                        let dot_span = util_mod.span_at(tokens, cur_pos)
+                        util_mod.emit_error(mutable diags, dot_span, "expected field name, method name, tuple index, or `await` after `.`", allocator)?
+                        cur_pos = cur_pos + 1
+                        break
+                    }
+                }
+            }
+            case _ => break
+        }
+    }
+    return (cur, cur_pos)
+}
+
+function is_glue_suppressed(tok: kind_mod.Token, leading_newline: bool) -> bool {
+    if !leading_newline { return false }
+    return match tok {
+        case .l_paren => true
+        case .l_bracket => true
+        case .dot => true
+        case _ => false
+    }
+}
+
+
+function parse_call_postfix(
+    tokens: [lexed_mod.Lexed],
+    callee: mutable tree_mod.Expr,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let callee_span = callee.span
+    let args_r = parse_call_arg_list(tokens, pos + 1, mutable diags, allocator, parse_expr_fn, depth)?
+    var p = args_r.1
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` to close call arguments", allocator)?
+        }
+    }
+    let full_span = merge_spans(callee_span, close_span)
+    let placeholder = tree_mod.Expr { span: callee_span, kind: tree_mod.ExprKind.error }
+    let old_callee = Mem_Expr.replace(mutable callee, take placeholder)
+    let callee_box = Box_Expr.new(take old_callee, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.call(callee: callee_box, args: args_r.0),
+    }
+    let _ = Mem_Expr.replace(mutable callee, take expr)
+    return p
+}
+
+
+function parse_index_postfix(
+    tokens: [lexed_mod.Lexed],
+    receiver: mutable tree_mod.Expr,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_span = receiver.span
+    let inner_r = parse_expr_fn(tokens, pos + 1, mutable diags, allocator, depth + 1)?
+    var p = inner_r.1
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_bracket => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `]` to close index expression", allocator)?
+        }
+    }
+    let full_span = merge_spans(receiver_span, close_span)
+    let placeholder = tree_mod.Expr { span: receiver_span, kind: tree_mod.ExprKind.error }
+    let old_receiver = Mem_Expr.replace(mutable receiver, take placeholder)
+    let receiver_box = Box_Expr.new(take old_receiver, allocator)?
+    let index_box = Box_Expr.new(take inner_r.0, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.index(receiver: receiver_box, index: index_box),
+    }
+    let _ = Mem_Expr.replace(mutable receiver, take expr)
+    return p
+}
+
+
+function finish_positional(
+    tokens: [lexed_mod.Lexed],
+    receiver: mutable tree_mod.Expr,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_span = receiver.span
+    let inner_r = parse_expr_fn(tokens, pos + 2, mutable diags, allocator, depth + 1)?
+    var p = inner_r.1
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` to close positional projection", allocator)?
+        }
+    }
+    let full_span = merge_spans(receiver_span, close_span)
+    let placeholder = tree_mod.Expr { span: receiver_span, kind: tree_mod.ExprKind.error }
+    let old_receiver = Mem_Expr.replace(mutable receiver, take placeholder)
+    let receiver_box = Box_Expr.new(take old_receiver, allocator)?
+    let index_box = Box_Expr.new(take inner_r.0, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.positional(receiver: receiver_box, index: index_box),
+    }
+    let _ = Mem_Expr.replace(mutable receiver, take expr)
+    return p
+}
+
+function finish_field_or_method(
+    tokens: [lexed_mod.Lexed],
+    receiver: mutable tree_mod.Expr,
+    pos: usize,
+    name_sym: symbol.Symbol,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_span = receiver.span
+    let name_span = util_mod.span_at(tokens, pos + 1)
+    let name = ident_mod.Ident { name: name_sym, span: name_span }
+    let after_name = pos + 2
+    return match util_mod.peek(tokens, after_name) {
+        case .l_paren => finish_method_call(tokens, mutable receiver, receiver_span, name, after_name, mutable diags, allocator, parse_expr_fn, depth)?
+        case _ => finish_field(mutable receiver, receiver_span, name, name_span, after_name, allocator)?
+    }
+}
+
+function finish_method_call(
+    tokens: [lexed_mod.Lexed],
+    receiver: mutable tree_mod.Expr,
+    receiver_span: span_mod.Span,
+    name: ident_mod.Ident,
+    pos_at_lparen: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let args_r = parse_call_arg_list(tokens, pos_at_lparen + 1, mutable diags, allocator, parse_expr_fn, depth)?
+    var p = args_r.1
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` to close method arguments", allocator)?
+        }
+    }
+    let full_span = merge_spans(receiver_span, close_span)
+    let placeholder = tree_mod.Expr { span: receiver_span, kind: tree_mod.ExprKind.error }
+    let old_receiver = Mem_Expr.replace(mutable receiver, take placeholder)
+    let receiver_box = Box_Expr.new(take old_receiver, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.method_call(receiver: receiver_box, name: name, args: args_r.0),
+    }
+    let _ = Mem_Expr.replace(mutable receiver, take expr)
+    return p
+}
+
+function finish_field(
+    receiver: mutable tree_mod.Expr,
+    receiver_span: span_mod.Span,
+    name: ident_mod.Ident,
+    name_span: span_mod.Span,
+    pos_after_name: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let full_span = merge_spans(receiver_span, name_span)
+    let placeholder = tree_mod.Expr { span: receiver_span, kind: tree_mod.ExprKind.error }
+    let old_receiver = Mem_Expr.replace(mutable receiver, take placeholder)
+    let receiver_box = Box_Expr.new(take old_receiver, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.field(receiver: receiver_box, name: name),
+    }
+    let _ = Mem_Expr.replace(mutable receiver, take expr)
+    return pos_after_name
+}
+
+function finish_tuple_index(
+    tokens: [lexed_mod.Lexed],
+    receiver: mutable tree_mod.Expr,
+    pos: usize,
+    value: u128,
+    base: kind_mod.IntBase,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_span = receiver.span
+    let int_span = util_mod.span_at(tokens, pos + 1)
+    let after = pos + 2
+    let full_span = merge_spans(receiver_span, int_span)
+    let bad_base = match base {
+        case .dec => false
+        case _ => true
+    }
+    if bad_base {
+        util_mod.emit_error(mutable diags, int_span, "tuple-index after `.` must be a base-10 integer literal", allocator)?
+    }
+    let u32_max_as_u128: u128 = 4294967295
+    var index: u32 = 0
+    if value > u32_max_as_u128 {
+        util_mod.emit_error(mutable diags, int_span, "tuple-index exceeds the maximum admitted (u32 max)", allocator)?
+    } else {
+        index = value as u32
+    }
+    let placeholder = tree_mod.Expr { span: receiver_span, kind: tree_mod.ExprKind.error }
+    let old_receiver = Mem_Expr.replace(mutable receiver, take placeholder)
+    let receiver_box = Box_Expr.new(take old_receiver, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.tuple_index(receiver: receiver_box, index: index),
+    }
+    let _ = Mem_Expr.replace(mutable receiver, take expr)
+    return after
+}
+
+function finish_await(
+    tokens: [lexed_mod.Lexed],
+    receiver: mutable tree_mod.Expr,
+    pos: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_span = receiver.span
+    let await_span = util_mod.span_at(tokens, pos + 1)
+    let after = pos + 2
+    let full_span = merge_spans(receiver_span, await_span)
+    let placeholder = tree_mod.Expr { span: receiver_span, kind: tree_mod.ExprKind.error }
+    let old_receiver = Mem_Expr.replace(mutable receiver, take placeholder)
+    let receiver_box = Box_Expr.new(take old_receiver, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.await_(expr: receiver_box),
+    }
+    let _ = Mem_Expr.replace(mutable receiver, take expr)
+    return after
+}
+
+
+function parse_try_postfix(
+    tokens: [lexed_mod.Lexed],
+    inner: mutable tree_mod.Expr,
+    pos: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner_span = inner.span
+    let q_span = util_mod.span_at(tokens, pos)
+    let full_span = merge_spans(inner_span, q_span)
+    let placeholder = tree_mod.Expr { span: inner_span, kind: tree_mod.ExprKind.error }
+    let old_inner = Mem_Expr.replace(mutable inner, take placeholder)
+    let inner_box = Box_Expr.new(take old_inner, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.try_(expr: inner_box),
+    }
+    let _ = Mem_Expr.replace(mutable inner, take expr)
+    return pos + 1
+}
+
+
+function parse_call_arg_list(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_CallArg.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_CallArg.Vec
+    Vec_CallArg.new(init args, allocator)?
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .r_paren => return (args, p)
+        case .eof => return (args, p)
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let arg_r = parse_call_arg(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_CallArg.push(mutable args, arg_r.0, allocator)?
+        p = arg_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    return (args, p)
+}
+
+function parse_call_arg(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.CallArg, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var p = pos
+    let start_span = util_mod.span_at(tokens, p)
+
+    var mode: Option_CallMode.Option = Option_CallMode.none
+    match util_mod.peek(tokens, p) {
+        case .kw_mutable => {
+            mode = Option_CallMode.some(value: ops_mod.CallMode.mutable_)
+            p = p + 1
+        }
+        case .kw_take => {
+            mode = Option_CallMode.some(value: ops_mod.CallMode.take_)
+            p = p + 1
+        }
+        case .kw_init => {
+            mode = Option_CallMode.some(value: ops_mod.CallMode.init_)
+            p = p + 1
+        }
+        case _ => ()
+    }
+
+    var name: Option_Ident.Option = Option_Ident.none
+    match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            match util_mod.peek_at(tokens, p, 1) {
+                case .colon => {
+                    let id_span = util_mod.span_at(tokens, p)
+                    let id = ident_mod.Ident { name: sym, span: id_span }
+                    name = Option_Ident.some(value: id)
+                    p = p + 2
+                }
+                case _ => ()
+            }
+        }
+        case _ => ()
+    }
+
+    let expr_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+    let end_span = expr_r.0.span
+    let full_span = merge_spans(start_span, end_span)
+    let arg = tree_mod.CallArg {
+        span: full_span,
+        mode: mode,
+        name: name,
+        expr: expr_r.0,
+    }
+    return (arg, expr_r.1)
+}
+
+
+function parse_cast_postfix(
+    tokens: [lexed_mod.Lexed],
+    base: mutable tree_mod.Expr,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let base_span = base.span
+    let ty_r = ty_mod.parse_ty(tokens, pos + 1, mutable diags, allocator, parse_expr_fn, depth)?
+    var p = ty_r.1
+    var mode: ops_mod.CastMode = ops_mod.CastMode.trap
+    var end_span: span_mod.Span = ty_r.0.span
+    match util_mod.peek(tokens, p) {
+        case .kw_wrapping => {
+            mode = ops_mod.CastMode.wrapping_
+            end_span = util_mod.span_at(tokens, p)
+            p = p + 1
+        }
+        case .kw_saturating => {
+            mode = ops_mod.CastMode.saturating_
+            end_span = util_mod.span_at(tokens, p)
+            p = p + 1
+        }
+        case .kw_checked => {
+            mode = ops_mod.CastMode.checked_
+            end_span = util_mod.span_at(tokens, p)
+            p = p + 1
+        }
+        case _ => ()
+    }
+    let placeholder = tree_mod.Expr { span: base_span, kind: tree_mod.ExprKind.error }
+    let old_base = Mem_Expr.replace(mutable base, take placeholder)
+    let base_box = Box_Expr.new(take old_base, allocator)?
+    let ty_box = Box_Ty.new(take ty_r.0, allocator)?
+    let full_span = merge_spans(base_span, end_span)
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.cast(expr: base_box, ty: ty_box, mode: mode),
+    }
+    let _ = Mem_Expr.replace(mutable base, take expr)
+    return p
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

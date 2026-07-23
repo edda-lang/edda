@@ -1,0 +1,122 @@
+module arm64.abi.misc.fixup
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.error as lir_error_mod
+import ir.emitted as etypes_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(Arm64Fixup)
+spec std.collections.vec.Vec(etypes_mod.EmittedReloc)
+
+
+public type Arm64Fixup {
+    site: u32
+    target_block: u32
+    cond: bool
+}
+
+
+public function record_reloc(
+    relocs: mutable Vec_EmittedReloc.Vec,
+    offset: u32,
+    target: etypes_mod.RelocTarget,
+    kind: etypes_mod.RelocKind,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_EmittedReloc.push(mutable relocs, take etypes_mod.EmittedReloc {
+        offset: offset,
+        target: target,
+        kind: kind,
+    }, allocator)?
+}
+
+public function tail_site(code: Vec_u8.Vec) -> u32
+    with {err: lir_error_mod.LirError}
+{
+    let len = Vec_u8.len(code)
+    if len < 4 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: instruction-word tail underflow",
+        )
+    }
+    return (len - 4) as u32 wrapping
+}
+
+
+public function resolve_fixups(
+    code: mutable Vec_u8.Vec,
+    fixups: Vec_Arm64Fixup.Vec,
+    offsets: Vec_u32.Vec,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let nf = Vec_Arm64Fixup.len(fixups)
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        let fx = Vec_Arm64Fixup.at(fixups, i)
+        let tb = fx.target_block as usize
+        if tb >= Vec_u32.len(offsets) {
+            raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "arm64.gen.emit: branch fixup target block out of range",
+            )
+        }
+        patch_branch(mutable code, fx.site, Vec_u32.at(offsets, tb), fx.cond)?
+        i += 1
+    }
+}
+
+function patch_branch(
+    code: mutable Vec_u8.Vec,
+    site: u32,
+    target_off: u32,
+    cond: bool,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let s = site as usize
+    if s + (4 as usize) > Vec_u8.len(code) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: branch fixup site lacks a full 32-bit instruction word",
+        )
+    }
+    let instr = read_u32_le(code, s)
+    let word_rel: i64 = ((target_off as i64) - (site as i64)) / (4 as i64)
+    let patched = if cond {
+        let imm19: u32 = (word_rel as u32 wrapping) & 0x7FFFF
+        (instr & 0xFF00001F) | (imm19 << 5)
+    } else {
+        let imm26: u32 = (word_rel as u32 wrapping) & 0x03FFFFFF
+        (instr & 0xFC000000) | imm26
+    }
+    write_u32_le(mutable code, s, patched)
+}
+
+function read_u32_le(code: Vec_u8.Vec, s: usize) -> u32
+    requires s + (4 as usize) <= Vec_u8.len(code)
+{
+    let b0 = Vec_u8.at(code, s) as u32
+    let b1 = Vec_u8.at(code, s + (1 as usize)) as u32
+    let b2 = Vec_u8.at(code, s + (2 as usize)) as u32
+    let b3 = Vec_u8.at(code, s + (3 as usize)) as u32
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+function write_u32_le(code: mutable Vec_u8.Vec, s: usize, value: u32) -> ()
+    requires s + (4 as usize) <= Vec_u8.len(code)
+{
+    Vec_u8.set_at(mutable code, s, value as u8 wrapping)
+    Vec_u8.set_at(mutable code, s + (1 as usize), (value >> 8) as u8 wrapping)
+    Vec_u8.set_at(mutable code, s + (2 as usize), (value >> 16) as u8 wrapping)
+    Vec_u8.set_at(mutable code, s + (3 as usize), (value >> 24) as u8 wrapping)
+}

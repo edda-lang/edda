@@ -1,0 +1,399 @@
+
+module std.archive.tar
+
+import std.core.option
+import std.mem.alloc
+import std.text.string
+
+spec std.core.option.Option(Entry)
+spec std.mem.alloc.Array(u8)
+
+
+public type Entry {
+    name_offset: usize
+    name_len: usize
+    prefix_offset: usize
+    prefix_len: usize
+    data_offset: usize
+    size: usize
+    type_flag: u8
+}
+
+public type TarError {
+    case truncated_header
+    case invalid_checksum
+    case invalid_number
+    case truncated_data
+    case malformed_pax
+    case name_too_long
+}
+
+type Span {
+    off: usize
+    len: usize
+}
+
+
+public function is_regular_file(e: Entry) -> bool {
+    return e.type_flag == 0x30 || e.type_flag == 0x00
+}
+
+public function next_offset(e: Entry) -> usize {
+    return e.data_offset +| ((e.size +| 511) / 512) *| 512
+}
+
+public function entry_data(data: [u8], e: Entry) -> [u8]
+    with {err: TarError}
+{
+    if e.data_offset +| e.size > data.len() { raise TarError.truncated_data }
+    return data[e.data_offset ..< e.data_offset + e.size]
+}
+
+public function name_equals(data: [u8], e: Entry, name: String) -> bool {
+    if e.name_offset +| e.name_len > data.len() { return false }
+    if e.prefix_offset +| e.prefix_len > data.len() { return false }
+    let nb: [u8] = name.bytes()
+    if e.prefix_len == 0 {
+        if nb.len() != e.name_len { return false }
+        return span_matches(data, e.name_offset, nb, 0, e.name_len)
+    }
+    if nb.len() != e.prefix_len + 1 + e.name_len { return false }
+    if !span_matches(data, e.prefix_offset, nb, 0, e.prefix_len) { return false }
+    if nb[e.prefix_len] != 0x2F { return false }
+    return span_matches(data, e.name_offset, nb, e.prefix_len + 1, e.name_len)
+}
+
+function span_matches(
+    data: [u8],
+    data_off: usize,
+    nb: [u8],
+    nb_off: usize,
+    count: usize where data_off + count <= data.len() && nb_off + count <= nb.len(),
+) -> bool {
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        if data[data_off + i] != nb[nb_off + i] { return false }
+        i += 1
+    }
+    return true
+}
+
+public function entry_name(data: [u8], e: Entry, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: TarError}
+{
+    if e.name_offset +| e.name_len > data.len() { raise TarError.truncated_header }
+    if e.prefix_offset +| e.prefix_len > data.len() { raise TarError.truncated_header }
+    if e.prefix_len == 0 {
+        var out: [u8] = Array_u8.alloc(allocator, e.name_len)?
+        copy_span(data, e.name_offset, mutable out, 0, e.name_len)
+        return string.from_owned_utf8(take out)
+    }
+    var out: [u8] = Array_u8.alloc(allocator, e.prefix_len + 1 + e.name_len)?
+    copy_span(data, e.prefix_offset, mutable out, 0, e.prefix_len)
+    out[e.prefix_len] = 0x2F
+    copy_span(data, e.name_offset, mutable out, e.prefix_len + 1, e.name_len)
+    return string.from_owned_utf8(take out)
+}
+
+function copy_span(
+    data: [u8],
+    data_off: usize,
+    out: mutable [u8],
+    out_off: usize,
+    count: usize where data_off + count <= data.len() && out_off + count <= out.len(),
+) -> () {
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        out[out_off + i] = data[data_off + i]
+        i += 1
+    }
+}
+
+
+public function entry_at(data: [u8], offset: usize) -> Option_Entry
+    with {err: TarError}
+{
+    var off: usize = offset
+    var ovr_off: usize = 0
+    var ovr_len: usize = 0
+    var has_ovr: bool = false
+    loop
+        decreases data.len() - off
+    {
+        if off >= data.len() { return Option_Entry.none }
+        if off + 512 > data.len() { raise TarError.truncated_header }
+        if is_zero_block(data, off) { return Option_Entry.none }
+        verify_checksum(data, off)?
+        let size: usize = parse_number(data, off + 124, 12)?
+        let data_off: usize = off + 512
+        if size > data.len() { raise TarError.truncated_data }
+        if data_off +| size > data.len() { raise TarError.truncated_data }
+        let flag: u8 = data[off + 156]
+        let padded: usize = ((size + 511) / 512) * 512
+        if flag == 0x78 {
+            let s: Span = pax_path(data, data_off, size)?
+            if s.len != 0 {
+                ovr_off = s.off
+                ovr_len = s.len
+                has_ovr = true
+            }
+            if data_off +| padded >= data.len() { return Option_Entry.none }
+            off = data_off + padded
+            continue
+        }
+        if flag == 0x4C {
+            ovr_off = data_off
+            ovr_len = field_len(data, data_off, size)
+            has_ovr = true
+            if data_off +| padded >= data.len() { return Option_Entry.none }
+            off = data_off + padded
+            continue
+        }
+        if flag == 0x67 || flag == 0x4B {
+            if data_off +| padded >= data.len() { return Option_Entry.none }
+            off = data_off + padded
+            continue
+        }
+        if has_ovr {
+            return Option_Entry.some(value: Entry {
+                name_offset: ovr_off,
+                name_len: ovr_len,
+                prefix_offset: 0,
+                prefix_len: 0,
+                data_offset: data_off,
+                size: size,
+                type_flag: flag,
+            })
+        }
+        let nlen: usize = field_len(data, off, 100)
+        var plen: usize = 0
+        if has_ustar_magic(data, off) {
+            plen = field_len(data, off + 345, 155)
+        }
+        return Option_Entry.some(value: Entry {
+            name_offset: off,
+            name_len: nlen,
+            prefix_offset: off + 345,
+            prefix_len: plen,
+            data_offset: data_off,
+            size: size,
+            type_flag: flag,
+        })
+    }
+}
+
+public function find_entry(data: [u8], name: String) -> Option_Entry
+    with {err: TarError}
+{
+    var off: usize = 0
+    loop
+        decreases data.len() - off
+    {
+        if off >= data.len() { return Option_Entry.none }
+        match entry_at(data, off)? {
+            case .none => { return Option_Entry.none }
+            case .some(let e) => {
+                if name_equals(data, e, name) { return Option_Entry.some(value: e) }
+                let nxt: usize = next_offset(e)
+                if nxt <= off || nxt >= data.len() { return Option_Entry.none }
+                off = nxt
+            }
+        }
+    }
+}
+
+public function count_entries(data: [u8]) -> usize
+    with {err: TarError}
+{
+    var off: usize = 0
+    var count: usize = 0
+    loop
+        decreases data.len() - off
+    {
+        if off >= data.len() { return count }
+        match entry_at(data, off)? {
+            case .none => { return count }
+            case .some(let e) => {
+                count += 1
+                let nxt: usize = next_offset(e)
+                if nxt <= off || nxt >= data.len() { return count }
+                off = nxt
+            }
+        }
+    }
+}
+
+
+function field_len(
+    data: [u8],
+    off: usize,
+    max: usize where off + max <= data.len(),
+) -> usize
+    ensures result <= max
+{
+    var i: usize = 0
+    loop
+        decreases max - i
+    {
+        if i >= max { break }
+        if data[off + i] == 0x00 { break }
+        i += 1
+    }
+    return i
+}
+
+function has_ustar_magic(
+    data: [u8],
+    off: usize where off + 512 <= data.len(),
+) -> bool {
+    return data[off + 257] == 0x75
+        && data[off + 258] == 0x73
+        && data[off + 259] == 0x74
+        && data[off + 260] == 0x61
+        && data[off + 261] == 0x72
+}
+
+function is_zero_block(
+    data: [u8],
+    off: usize where off + 512 <= data.len(),
+) -> bool {
+    var i: usize = 0
+    loop
+        decreases 512 - i
+    {
+        if i >= 512 { break }
+        if data[off + i] != 0x00 { return false }
+        i += 1
+    }
+    return true
+}
+
+function verify_checksum(
+    data: [u8],
+    off: usize where off + 512 <= data.len(),
+) -> ()
+    with {err: TarError}
+{
+    var sum: usize = 0
+    var i: usize = 0
+    loop
+        decreases 512 - i
+    {
+        if i >= 512 { break }
+        if i >= 148 && i < 156 {
+            sum = sum +% 0x20
+        } else {
+            sum = sum +% (data[off + i] as usize)
+        }
+        i += 1
+    }
+    let expect: usize = parse_number(data, off + 148, 8)?
+    if sum != expect { raise TarError.invalid_checksum }
+}
+
+function parse_number(
+    data: [u8],
+    off: usize,
+    len: usize where off + len <= data.len(),
+) -> usize
+    with {err: TarError}
+{
+    if len == 0 { raise TarError.invalid_number }
+    if (data[off] & 0x80) != 0 {
+        var v: usize = (data[off] & 0x7F) as usize
+        var i: usize = 1
+        loop
+            decreases len - i
+        {
+            if i >= len { break }
+            if v > 0x00FFFFFFFFFFFFFF { raise TarError.invalid_number }
+            v = v * 256 + (data[off + i] as usize)
+            i += 1
+        }
+        return v
+    }
+    var i: usize = 0
+    loop
+        decreases len - i
+    {
+        if i >= len { break }
+        let c: u8 = data[off + i]
+        if c != 0x20 && c != 0x00 { break }
+        i += 1
+    }
+    var v: usize = 0
+    var any: bool = false
+    loop
+        decreases len - i
+    {
+        if i >= len { break }
+        let c: u8 = data[off + i]
+        if c == 0x20 || c == 0x00 { break }
+        if c < 0x30 || c > 0x37 { raise TarError.invalid_number }
+        if v > 0x0FFFFFFFFFFFFFFF { raise TarError.invalid_number }
+        v = v * 8 + ((c - 0x30) as usize)
+        any = true
+        i += 1
+    }
+    if !any { raise TarError.invalid_number }
+    return v
+}
+
+function pax_path(
+    data: [u8],
+    rec_off: usize,
+    rec_len: usize where rec_off + rec_len <= data.len(),
+) -> Span
+    with {err: TarError}
+{
+    var found: Span = Span { off: 0, len: 0 }
+    var p: usize = rec_off
+    let stop: usize = rec_off + rec_len
+    loop
+        decreases stop - p
+    {
+        if p >= stop { break }
+        var reclen: usize = 0
+        var q: usize = p
+        loop
+            decreases stop - q
+        {
+            if q >= stop { raise TarError.malformed_pax }
+            let c: u8 = data[q]
+            if c == 0x20 { break }
+            if c < 0x30 || c > 0x39 { raise TarError.malformed_pax }
+            if reclen > 0x0FFFFFFFFFFFFFFF { raise TarError.malformed_pax }
+            reclen = reclen * 10 + ((c - 0x30) as usize)
+            q += 1
+        }
+        if reclen == 0 { raise TarError.malformed_pax }
+        if p +| reclen > stop { raise TarError.malformed_pax }
+        let rec_end: usize = p + reclen
+        var k: usize = q + 1
+        loop
+            decreases rec_end - k
+        {
+            if k >= rec_end { raise TarError.malformed_pax }
+            if data[k] == 0x3D { break }
+            k += 1
+        }
+        let key_off: usize = q + 1
+        if k - key_off == 4
+            && data[key_off] == 0x70
+            && data[key_off + 1] == 0x61
+            && data[key_off + 2] == 0x74
+            && data[key_off + 3] == 0x68
+        {
+            if rec_end - 1 < k + 1 { raise TarError.malformed_pax }
+            found = Span { off: k + 1, len: rec_end - 1 - (k + 1) }
+        }
+        p = rec_end
+    }
+    return found
+}

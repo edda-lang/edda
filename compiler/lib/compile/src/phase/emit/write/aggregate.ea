@@ -1,0 +1,133 @@
+
+module compile.phase.emit.write.aggregate
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+
+import source.map as source_map_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as body_mod
+import mir.id.hir as hir_id_mod
+import hir.build.file as origin_file_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(body_mod.MirBody)
+spec std.collections.vec.Vec(origin_file_mod.HirFile)
+spec std.collections.vec.Vec(String)
+
+
+spec std.collections.hashmap.StringMap(u32)
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+
+
+public function aggregate_by_package(
+    optimized: mutable Vec_MirFile.Vec,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> Vec_MirFile.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit merged: Vec_MirFile.Vec
+    Vec_MirFile.new(init merged, allocator)?
+    var key_to_slot = StringMap_u32.new(allocator)?
+    loop decreases (Vec_MirFile.len(optimized) + 1 as usize) {
+        if Vec_MirFile.is_empty(optimized) { break }
+        var f = Vec_MirFile.remove(mutable optimized, 0 as usize)
+        let key = package_key_of(f, source_map, allocator)?
+        let slot = find_slot(key_to_slot, key, Vec_MirFile.len(merged))
+        if slot < Vec_MirFile.len(merged) {
+            merge_into(mutable Vec_MirFile.at_mut(merged, slot), mutable f, allocator)?
+        } else {
+            if !string.is_empty(key) {
+                let _ = StringMap_u32.insert(mutable key_to_slot, key, Vec_MirFile.len(merged) as u32, allocator)?
+            }
+            Vec_MirFile.push(mutable merged, take f, allocator)?
+        }
+    }
+    return merged
+}
+
+
+function find_slot(key_to_slot: StringMap_u32.StringMap, key: String, len: usize) -> usize {
+    if string.is_empty(key) { return len }
+    return match StringMap_u32.get(key_to_slot, key) {
+        case .some(let s) => s as usize
+        case .none => len
+    }
+}
+
+
+function merge_into(
+    dst: mutable mir_file_mod.MirFile,
+    src: mutable mir_file_mod.MirFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let base = Vec_HirFile.len(dst.hir_files)
+    var seen = IntMap_u32.new(allocator)?
+    let nd = Vec_MirBody.len(dst.bodies)
+    var di: usize = 0
+    loop decreases nd - di {
+        if di >= nd { break }
+        let _ = IntMap_u32.insert(mutable seen, Vec_MirBody.at(dst.bodies, di).def_id.raw as i64, 1 as u32, allocator)?
+        di += 1
+    }
+    loop decreases (Vec_MirBody.len(src.bodies) + 1 as usize) {
+        if Vec_MirBody.is_empty(src.bodies) { break }
+        let b = Vec_MirBody.remove(mutable src.bodies, 0 as usize)
+        let draw = b.def_id.raw
+        let is_shim = (draw & (2147483648 as u32)) != (0 as u32)
+        if is_shim && IntMap_u32.contains(seen, draw as i64) {
+            continue
+        }
+        let r = b.origin_file.raw
+        let new_id = if r == 0 as u32 {
+            hir_id_mod.error()
+        } else {
+            hir_id_mod.HirFileId { raw: (base as u32) + (r - 1 as u32) }
+        }
+        Vec_MirBody.push(mutable dst.bodies, take body_mod.set_origin_file(take b, new_id), allocator)?
+        let _ = IntMap_u32.insert(mutable seen, draw as i64, 1 as u32, allocator)?
+    }
+    if !Vec_HirFile.is_empty(src.hir_files) {
+        let _ = Vec_HirFile.remove(mutable src.hir_files, 0 as usize)
+    }
+    loop decreases (Vec_HirFile.len(src.hir_files) + 1 as usize) {
+        if Vec_HirFile.is_empty(src.hir_files) { break }
+        let hf = Vec_HirFile.remove(mutable src.hir_files, 0 as usize)
+        Vec_HirFile.push(mutable dst.hir_files, take hf, allocator)?
+    }
+}
+
+
+function package_key_of(
+    f: mir_file_mod.MirFile,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if Vec_HirFile.len(f.hir_files) < 2 as usize { return "" }
+    let hf = Vec_HirFile.at(f.hir_files, 1 as usize)
+    let fid = hf.source.span.file
+    if (fid.raw as usize) >= source_map_mod.file_count(source_map) { return "" }
+    let path = source_map_mod.file_name_of(source_map, fid)
+    let parts = string.split(path, "/src/", allocator)?
+    let np = parts.len()
+    if np <= 1 as usize { return string.clone(path, allocator)? }
+    var acc: String = string.clone(parts[0 as usize], allocator)?
+    var i: usize = 1
+    loop decreases (np - 1 as usize) - i {
+        if i >= np - 1 as usize { break }
+        let with_sep = string.concat(acc, "/src/", allocator)?
+        acc = string.concat(with_sep, parts[i], allocator)?
+        i += 1
+    }
+    return acc
+}

@@ -1,0 +1,77 @@
+
+module tls.crypto.transcript
+
+import std.mem.alloc
+import std.crypto.hash.sha256 as sha2
+import local.error
+
+function _max_transcript_len() -> usize { return 65536 as usize }
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _alloc_length_box(allocator: Allocator) -> [usize]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_usize_slots(allocator, 1 as usize)?
+    }
+}
+
+unstable public type Transcript {
+    buf: [u8]
+    len_box: [usize]
+}
+
+public function transcript_new(allocator: Allocator) -> Transcript
+    with {allocator, err: error.TlsError}
+{
+    let buf = _alloc_bytes(allocator, _max_transcript_len())?
+    var len_box = _alloc_length_box(allocator)?
+    len_box[0 as usize] = 0 as usize
+    return Transcript { buf: buf, len_box: len_box }
+}
+
+public function transcript_len(t: Transcript) -> usize {
+    return t.len_box[0 as usize]
+}
+
+public function transcript_reset(t: mutable Transcript) -> () {
+    t.len_box[0 as usize] = 0 as usize
+}
+
+public function transcript_append(t: mutable Transcript, data: [u8]) -> ()
+    with {err: error.TlsError}
+{
+    let cur = t.len_box[0 as usize]
+    let n = data.len()
+    if cur + n > t.buf.len() { raise error.TlsError.bad_handshake }
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        t.buf[cur + i] = data[i]
+        i = i + (1 as usize)
+    }
+    t.len_box[0 as usize] = cur + n
+}
+
+public function transcript_hash_sha256(
+    t: Transcript,
+    out: mutable [u8] where out.len() == 32 as usize,
+) -> () {
+    let len = t.len_box[0 as usize]
+    sha2.sha256(t.buf[0 as usize..<len], mutable out, 0 as usize)
+}

@@ -1,0 +1,358 @@
+
+module yaml.parse.scalar
+
+import std.mem.alloc
+import std.text.str
+
+import yaml.error
+import yaml.value.core as value
+import yaml.parse.scan
+
+
+function _region_eq(src: [u8], lo: usize, hi: usize, lit: [u8]) -> bool {
+    let want = lit.len()
+    if hi - lo != want { return false }
+    var i: usize = 0
+    loop decreases want - i + 1 as usize {
+        if i >= want { break }
+        if src[lo + i] != lit[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _is_null_literal(src: [u8], lo: usize, hi: usize) -> bool {
+    if hi <= lo { return true }
+    if hi - lo == 1 as usize && src[lo] == 126 as u8 { return true }
+    if _region_eq(src, lo, hi, "null".bytes()) { return true }
+    if _region_eq(src, lo, hi, "Null".bytes()) { return true }
+    if _region_eq(src, lo, hi, "NULL".bytes()) { return true }
+    return false
+}
+
+function _bool_literal(src: [u8], lo: usize, hi: usize) -> value.YamlValue
+    with {err: error.ParseError}
+{
+    if _region_eq(src, lo, hi, "true".bytes()) { return value.YamlValue.bool_value(true) }
+    if _region_eq(src, lo, hi, "True".bytes()) { return value.YamlValue.bool_value(true) }
+    if _region_eq(src, lo, hi, "TRUE".bytes()) { return value.YamlValue.bool_value(true) }
+    if _region_eq(src, lo, hi, "false".bytes()) { return value.YamlValue.bool_value(false) }
+    if _region_eq(src, lo, hi, "False".bytes()) { return value.YamlValue.bool_value(false) }
+    if _region_eq(src, lo, hi, "FALSE".bytes()) { return value.YamlValue.bool_value(false) }
+    raise error.ParseError.unexpected_byte(at: lo)
+}
+
+function _is_bool_literal(src: [u8], lo: usize, hi: usize) -> bool {
+    if _region_eq(src, lo, hi, "true".bytes()) { return true }
+    if _region_eq(src, lo, hi, "True".bytes()) { return true }
+    if _region_eq(src, lo, hi, "TRUE".bytes()) { return true }
+    if _region_eq(src, lo, hi, "false".bytes()) { return true }
+    if _region_eq(src, lo, hi, "False".bytes()) { return true }
+    if _region_eq(src, lo, hi, "FALSE".bytes()) { return true }
+    return false
+}
+
+function _is_int_shape(src: [u8], lo: usize, hi: usize) -> bool {
+    if hi <= lo { return false }
+    var i: usize = lo
+    if src[i] == 43 as u8 || src[i] == 45 as u8 { i = i + 1 as usize }
+    if i >= hi { return false }
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        if !scan.is_digit(src[i]) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _is_float_shape(src: [u8], lo: usize, hi: usize) -> bool {
+    if hi <= lo { return false }
+    var i: usize = lo
+    if src[i] == 43 as u8 || src[i] == 45 as u8 { i = i + 1 as usize }
+    if i >= hi { return false }
+    var saw_digit: bool = false
+    var saw_dot: bool = false
+    var saw_exp: bool = false
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        let c = src[i]
+        if scan.is_digit(c) {
+            saw_digit = true
+            i = i + 1 as usize
+        } else if c == 46 as u8 && !saw_dot && !saw_exp {
+            saw_dot = true
+            i = i + 1 as usize
+        } else if (c == 101 as u8 || c == 69 as u8) && !saw_exp && saw_digit {
+            saw_exp = true
+            i = i + 1 as usize
+            if i < hi && (src[i] == 43 as u8 || src[i] == 45 as u8) {
+                i = i + 1 as usize
+            }
+            if i >= hi || !scan.is_digit(src[i]) { return false }
+        } else {
+            return false
+        }
+    }
+    return saw_digit && (saw_dot || saw_exp)
+}
+
+function _is_special_float(src: [u8], lo: usize, hi: usize) -> bool {
+    if _region_eq(src, lo, hi, ".inf".bytes()) { return true }
+    if _region_eq(src, lo, hi, ".Inf".bytes()) { return true }
+    if _region_eq(src, lo, hi, ".INF".bytes()) { return true }
+    if _region_eq(src, lo, hi, "-.inf".bytes()) { return true }
+    if _region_eq(src, lo, hi, "-.Inf".bytes()) { return true }
+    if _region_eq(src, lo, hi, "-.INF".bytes()) { return true }
+    if _region_eq(src, lo, hi, ".nan".bytes()) { return true }
+    if _region_eq(src, lo, hi, ".NaN".bytes()) { return true }
+    if _region_eq(src, lo, hi, ".NAN".bytes()) { return true }
+    return false
+}
+
+function _classify_plain(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> value.YamlValue
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    if _is_null_literal(src, lo, hi) { return value.YamlValue.null_value }
+    if _is_bool_literal(src, lo, hi) { return _bool_literal(src, lo, hi)? }
+    if _is_int_shape(src, lo, hi) {
+        return handle err: str.ParseIntError -> {
+            value.YamlValue.str_value(scan.substring(src, lo, hi, allocator)?)
+        } {
+            value.YamlValue.int_value(str.parse_i64(src[lo..<hi])?)
+        }
+    }
+    if _is_float_shape(src, lo, hi) || _is_special_float(src, lo, hi) {
+        return handle err: str.ParseFloatError -> {
+            value.YamlValue.str_value(scan.substring(src, lo, hi, allocator)?)
+        } {
+            value.YamlValue.float_value(str.parse_f64(src[lo..<hi])?)
+        }
+    }
+    return value.YamlValue.str_value(scan.substring(src, lo, hi, allocator)?)
+}
+
+
+public function find_squote_end(src: [u8], lo: usize, limit: usize) -> usize
+    with {err: error.ParseError}
+{
+    var i: usize = lo + 1 as usize
+    loop decreases limit - i + 1 as usize {
+        if i >= limit { raise error.ParseError.unexpected_byte(at: lo) }
+        if src[i] == 39 as u8 {
+            if i + 1 as usize < limit && src[i + 1 as usize] == 39 as u8 {
+                i = i + 2 as usize
+            } else {
+                return i + 1 as usize
+            }
+        } else {
+            i = i + 1 as usize
+        }
+    }
+    raise error.ParseError.unexpected_byte(at: lo)
+}
+
+public function find_dquote_end(src: [u8], lo: usize, limit: usize) -> usize
+    with {err: error.ParseError}
+{
+    var i: usize = lo + 1 as usize
+    loop decreases limit - i + 1 as usize {
+        if i >= limit { raise error.ParseError.unexpected_byte(at: lo) }
+        if src[i] == 92 as u8 {
+            i = i + 2 as usize
+        } else if src[i] == 34 as u8 {
+            return i + 1 as usize
+        } else {
+            i = i + 1 as usize
+        }
+    }
+    raise error.ParseError.unexpected_byte(at: lo)
+}
+
+function _decode_squote(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let inner_lo = lo + 1 as usize
+    let inner_hi = hi - 1 as usize
+    let cap = inner_hi - inner_lo
+    let buf = scan.alloc_byte_slab(allocator, cap)?
+    var p: usize = 0
+    var i: usize = inner_lo
+    loop decreases inner_hi - i + 1 as usize {
+        if i >= inner_hi { break }
+        if src[i] == 39 as u8 && i + 1 as usize < inner_hi && src[i + 1 as usize] == 39 as u8 {
+            buf[p] = 39 as u8
+            p = p + 1 as usize
+            i = i + 2 as usize
+        } else {
+            buf[p] = src[i]
+            p = p + 1 as usize
+            i = i + 1 as usize
+        }
+    }
+    return scan.bytes_to_string(buf[0 as usize..<p], allocator)?
+}
+
+function _hex_value(c: u8) -> u32 {
+    if c >= 48 as u8 && c <= 57 as u8 { return (c - 48 as u8) as u32 }
+    if c >= 97 as u8 && c <= 102 as u8 { return ((c - 97 as u8) as u32) + (10 as u32) }
+    return ((c - 65 as u8) as u32) + (10 as u32)
+}
+
+function _emit_utf8(buf: mutable [u8], pos: usize, cp: u32) -> usize {
+    if cp < (0x80 as u32) {
+        buf[pos] = (cp & (0xFF as u32)) as u8
+        return pos + 1 as usize
+    }
+    if cp < (0x800 as u32) {
+        buf[pos]              = (((0xC0 as u32) | (cp >> (6 as u32))) & (0xFF as u32)) as u8
+        buf[pos + 1 as usize] = (((0x80 as u32) | (cp & (0x3F as u32))) & (0xFF as u32)) as u8
+        return pos + 2 as usize
+    }
+    if cp < (0x10000 as u32) {
+        buf[pos]              = (((0xE0 as u32) | (cp >> (12 as u32))) & (0xFF as u32)) as u8
+        buf[pos + 1 as usize] = (((0x80 as u32) | ((cp >> (6 as u32)) & (0x3F as u32))) & (0xFF as u32)) as u8
+        buf[pos + 2 as usize] = (((0x80 as u32) | (cp & (0x3F as u32))) & (0xFF as u32)) as u8
+        return pos + 3 as usize
+    }
+    buf[pos]              = (((0xF0 as u32) | (cp >> (18 as u32))) & (0xFF as u32)) as u8
+    buf[pos + 1 as usize] = (((0x80 as u32) | ((cp >> (12 as u32)) & (0x3F as u32))) & (0xFF as u32)) as u8
+    buf[pos + 2 as usize] = (((0x80 as u32) | ((cp >> (6 as u32)) & (0x3F as u32))) & (0xFF as u32)) as u8
+    buf[pos + 3 as usize] = (((0x80 as u32) | (cp & (0x3F as u32))) & (0xFF as u32)) as u8
+    return pos + 4 as usize
+}
+
+function _hex_scalar(src: [u8], i: usize, count: usize, limit: usize) -> u32
+    with {err: error.ParseError}
+{
+    var cp: u32 = 0 as u32
+    var k: usize = 0
+    loop decreases count - k + 1 as usize {
+        if k >= count { break }
+        let j = i + k
+        if j >= limit { raise error.ParseError.unexpected_byte(at: i) }
+        cp = (cp << (4 as u32)) | _hex_value(src[j])
+        k = k + 1 as usize
+    }
+    return cp
+}
+
+function _decode_dquote(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let inner_lo = lo + 1 as usize
+    let inner_hi = hi - 1 as usize
+    let cap = inner_hi - inner_lo
+    var buf = scan.alloc_byte_slab(allocator, (cap + 1 as usize) * (4 as usize))?
+    var p: usize = 0
+    var i: usize = inner_lo
+    loop decreases inner_hi - i + 1 as usize {
+        if i >= inner_hi { break }
+        let c = src[i]
+        if c != 92 as u8 {
+            buf[p] = c
+            p = p + 1 as usize
+            i = i + 1 as usize
+        } else {
+            let nx = src[i + 1 as usize]
+            if nx == 34 as u8 { buf[p] = 34 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 92 as u8 { buf[p] = 92 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 47 as u8 { buf[p] = 47 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 110 as u8 { buf[p] = 10 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 116 as u8 { buf[p] = 9 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 114 as u8 { buf[p] = 13 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 48 as u8 { buf[p] = 0 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 98 as u8 { buf[p] = 8 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 102 as u8 { buf[p] = 12 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 120 as u8 {
+                let cp = _hex_scalar(src, i + 2 as usize, 2 as usize, inner_hi)?
+                p = _emit_utf8(mutable buf, p, cp)
+                i = i + 4 as usize
+            }
+            else if nx == 117 as u8 {
+                let cp = _hex_scalar(src, i + 2 as usize, 4 as usize, inner_hi)?
+                p = _emit_utf8(mutable buf, p, cp)
+                i = i + 6 as usize
+            }
+            else if nx == 85 as u8 {
+                let cp = _hex_scalar(src, i + 2 as usize, 8 as usize, inner_hi)?
+                if cp > (0x10FFFF as u32) { raise error.ParseError.unexpected_byte(at: i) }
+                p = _emit_utf8(mutable buf, p, cp)
+                i = i + 10 as usize
+            }
+            else { raise error.ParseError.unexpected_byte(at: i) }
+        }
+    }
+    return scan.bytes_to_string(buf[0 as usize..<p], allocator)?
+}
+
+
+public function classify(
+    src: [u8],
+    value_lo: usize,
+    line_hi: usize,
+    allocator: Allocator,
+) -> value.YamlValue
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    if value_lo >= line_hi {
+        return value.YamlValue.null_value
+    }
+    if src[value_lo] == 39 as u8 {
+        let close = find_squote_end(src, value_lo, line_hi)?
+        return value.YamlValue.str_value(_decode_squote(src, value_lo, close, allocator)?)
+    }
+    if src[value_lo] == 34 as u8 {
+        let close = find_dquote_end(src, value_lo, line_hi)?
+        return value.YamlValue.str_value(_decode_dquote(src, value_lo, close, allocator)?)
+    }
+    let trimmed_hi = scan.trim_right_ws(src, value_lo, line_hi)
+    return _classify_plain(src, value_lo, trimmed_hi, allocator)?
+}
+
+public function flow_key(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let start = _skip_ws_fwd(src, lo, hi)
+    if start >= hi { raise error.ParseError.empty_key(at: lo) }
+    if src[start] == 39 as u8 {
+        let close = find_squote_end(src, start, hi)?
+        return _decode_squote(src, start, close, allocator)?
+    }
+    if src[start] == 34 as u8 {
+        let close = find_dquote_end(src, start, hi)?
+        return _decode_dquote(src, start, close, allocator)?
+    }
+    let key_hi = scan.trim_right_ws(src, start, hi)
+    if start >= key_hi { raise error.ParseError.empty_key(at: lo) }
+    return scan.substring(src, start, key_hi, allocator)?
+}
+
+function _skip_ws_fwd(src: [u8], p: usize, limit: usize) -> usize {
+    var i: usize = p
+    loop decreases limit - i + 1 as usize {
+        if i >= limit { break }
+        if !scan.is_ws(src[i]) { break }
+        i = i + 1 as usize
+    }
+    return i
+}

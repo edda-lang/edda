@@ -1,0 +1,549 @@
+
+module optimize.refine_elim.narrow.rewrite.rewrite
+
+import std.collections.vec
+import std.mem.alloc as alloc
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.term as mir_term_mod
+import mir.place as mir_place_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.id.local as mir_local_mod
+
+import types.pass.ty as ty_mod
+import intern.symbol as symbol_mod
+import hir.node as node_mod
+
+import std.core.option
+
+import local.refine_elim.narrow.plan.plan as plan_mod
+import local.refine_elim.narrow.rewrite.scan as scan_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(node_mod.NodeId)
+
+
+public function apply(
+    body: mutable mir_body_mod.MirBody,
+    plan: plan_mod.NarrowPlan,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Local.len(body.locals)
+    if !any_narrowed(plan, n) {
+        return
+    }
+    let blocked = scan_mod.compute_blocked(body, n, allocator)?
+    if !any_applicable(plan, blocked, n) {
+        return
+    }
+    let orig_tys = snapshot_tys(body, n, allocator)?
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var b: usize = 0
+    loop decreases (nb - b) {
+        if b >= nb { break }
+        rebuild_block(mutable body, b, plan, blocked, orig_tys, allocator)?
+        b = b + 1
+    }
+    retype_narrowed(mutable body, plan, blocked, n)
+}
+
+
+function is_narrowed(plan: plan_mod.NarrowPlan, blocked: Vec_bool.Vec, idx: usize) -> bool {
+    if !plan_mod.narrows_at(plan, idx) {
+        return false
+    }
+    if idx < Vec_bool.len(blocked) && Vec_bool.at(blocked, idx) {
+        return false
+    }
+    return !ty_mod.is_error(plan_mod.narrowed_ty_at(plan, idx))
+}
+
+
+function any_narrowed(plan: plan_mod.NarrowPlan, n: usize) -> bool {
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if plan_mod.narrows_at(plan, i) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function any_applicable(plan: plan_mod.NarrowPlan, blocked: Vec_bool.Vec, n: usize) -> bool {
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if is_narrowed(plan, blocked, i) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function orig_ty_at(orig_tys: Vec_TyId.Vec, idx: usize) -> ty_mod.TyId {
+    if idx >= Vec_TyId.len(orig_tys) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(orig_tys, idx)
+}
+
+
+function snapshot_tys(body: mir_body_mod.MirBody, n: usize, allocator: Allocator) -> Vec_TyId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_TyId.Vec
+    Vec_TyId.new(init out, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let loc = Vec_Local.at(body.locals, i)
+        Vec_TyId.push(mutable out, take loc.ty, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function retype_narrowed(
+    body: mutable mir_body_mod.MirBody,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    n: usize,
+) -> () {
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if is_narrowed(plan, blocked, i) {
+            let old = Vec_Local.at(body.locals, i)
+            let nl = mir_body_mod.Local {
+                ty: plan_mod.narrowed_ty_at(plan, i),
+                mutability: old.mutability,
+                consumption: old.consumption,
+                name: old.name,
+                origin: old.origin,
+            }
+            Vec_Local.set_at(mutable body.locals, i, take nl)
+        }
+        i = i + 1
+    }
+}
+
+
+function mint_local(
+    body: mutable mir_body_mod.MirBody,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> mir_local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let idx = Vec_Local.len(body.locals)
+    let loc = mir_body_mod.Local {
+        ty: ty,
+        mutability: mir_body_mod.Mutability.immutable_,
+        consumption: mir_body_mod.Consumption.copy_,
+        name: Option_Symbol.none,
+        origin: Option_NodeId.none,
+    }
+    Vec_Local.push(mutable body.locals, take loc, allocator)?
+    return mir_local_mod.LocalId { raw: idx as u32 }
+}
+
+
+function push_cast_stmt(
+    out: mutable Vec_Statement.Vec,
+    origin: node_mod.NodeId,
+    dest: mir_place_mod.Place,
+    src: mir_local_mod.LocalId,
+    from: ty_mod.TyId,
+    to: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let op = mir_rvalue_mod.Operand.copy_(place: mir_place_mod.bare(src), ty: from)
+    let rv = mir_rvalue_mod.Rvalue.cast(
+        operand: op,
+        from: from,
+        to: to,
+        kind: mir_rvalue_mod.CastKind.int_to_int(mode: mir_rvalue_mod.OverflowMode.wrapping_),
+    )
+    let st = mir_stmt_mod.Statement {
+        origin: origin,
+        kind: mir_stmt_mod.MStmtKind.assign(dest: dest, value: rv),
+    }
+    Vec_Statement.push(mutable out, take st, allocator)?
+}
+
+
+function rebuild_block(
+    body: mutable mir_body_mod.MirBody,
+    b: usize,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if b >= Vec_BasicBlock.len(body.blocks) {
+        return
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b)
+    uninit out: Vec_Statement.Vec
+    Vec_Statement.new(init out, allocator)?
+    let ns = Vec_Statement.len(bb.statements)
+    var s: usize = 0
+    loop decreases (ns - s) {
+        if s >= ns { break }
+        let st = Vec_Statement.at(bb.statements, s)
+        process_stmt(mutable body, mutable out, st, plan, blocked, orig_tys, allocator)?
+        s = s + 1
+    }
+    let nterm = process_term(mutable body, mutable out, bb.terminator, plan, blocked, orig_tys, allocator)?
+    let nbb = mir_body_mod.BasicBlock {
+        node_id_origin: bb.node_id_origin,
+        statements: out,
+        terminator: nterm,
+        coherence_region: bb.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, b, take nbb)
+}
+
+
+function process_stmt(
+    body: mutable mir_body_mod.MirBody,
+    out: mutable Vec_Statement.Vec,
+    st: mir_stmt_mod.Statement,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match st.kind {
+        case .assign(let dest, let value) => {
+            let li = bare_narrowed_dest(dest, plan, blocked)
+            if li >= (0 as i64) && is_arith_reducible(value, plan_mod.narrowed_ty_at(plan, li as usize), plan, blocked) {
+                let nst = mir_stmt_mod.Statement {
+                    origin: st.origin,
+                    kind: mir_stmt_mod.MStmtKind.assign(dest: dest, value: value),
+                }
+                Vec_Statement.push(mutable out, take nst, allocator)?
+            } else {
+                let value2 = widen_rvalue(mutable body, mutable out, value, plan, blocked, orig_tys, st.origin, allocator)?
+                let dty = if li < (0 as i64) { ty_mod.error() } else { orig_ty_at(orig_tys, li as usize) }
+                if li < (0 as i64) || ty_mod.is_error(dty) {
+                    let nst = mir_stmt_mod.Statement {
+                        origin: st.origin,
+                        kind: mir_stmt_mod.MStmtKind.assign(dest: dest, value: value2),
+                    }
+                    Vec_Statement.push(mutable out, take nst, allocator)?
+                } else {
+                    let l_idx = li as usize
+                    let tty = plan_mod.narrowed_ty_at(plan, l_idx)
+                    let d = mint_local(mutable body, dty, allocator)?
+                    let dstmt = mir_stmt_mod.Statement {
+                        origin: st.origin,
+                        kind: mir_stmt_mod.MStmtKind.assign(dest: mir_place_mod.bare(d), value: value2),
+                    }
+                    Vec_Statement.push(mutable out, take dstmt, allocator)?
+                    push_cast_stmt(mutable out, st.origin, dest, d, dty, tty, allocator)?
+                }
+            }
+        }
+        case _ => {
+            Vec_Statement.push(mutable out, take st, allocator)?
+        }
+    }
+}
+
+
+function bare_narrowed_dest(
+    dest: mir_place_mod.Place,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+) -> i64 {
+    if mir_place_mod.proj_len(dest) != (0 as usize) {
+        return (0 as i64) - (1 as i64)
+    }
+    let idx = mir_local_mod.index(dest.local)
+    if !is_narrowed(plan, blocked, idx) {
+        return (0 as i64) - (1 as i64)
+    }
+    return idx as i64
+}
+
+
+function is_arith_reducible(
+    value: mir_rvalue_mod.Rvalue,
+    dest_target: ty_mod.TyId,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+) -> bool {
+    return match value {
+        case .binary(let bop, let lhs, let rhs) =>
+            is_reducible_binop(bop)
+                && operand_stays_narrow(lhs, dest_target, plan, blocked)
+                && operand_stays_narrow(rhs, dest_target, plan, blocked)
+        case .unary(_, let operand) =>
+            operand_stays_narrow(operand, dest_target, plan, blocked)
+        case _ => false
+    }
+}
+
+
+function is_reducible_binop(op: mir_rvalue_mod.MBinOp) -> bool {
+    return match op {
+        case .add(_) => true
+        case .sub(_) => true
+        case .mul(_) => true
+        case .bit_and => true
+        case .bit_or => true
+        case .bit_xor => true
+        case .shl => true
+        case .shr => true
+        case _ => false
+    }
+}
+
+
+function operand_stays_narrow(
+    op: mir_rvalue_mod.Operand,
+    target: ty_mod.TyId,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+) -> bool {
+    return match op {
+        case .copy_(let place, _) => place_stays_narrow(place, target, plan, blocked)
+        case .move_(let place, _) => place_stays_narrow(place, target, plan, blocked)
+        case .constant(_) => false
+    }
+}
+
+
+function place_stays_narrow(
+    place: mir_place_mod.Place,
+    target: ty_mod.TyId,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+) -> bool {
+    if mir_place_mod.proj_len(place) != (0 as usize) {
+        return false
+    }
+    let idx = mir_local_mod.index(place.local)
+    if !is_narrowed(plan, blocked, idx) {
+        return false
+    }
+    return ty_mod.index(plan_mod.narrowed_ty_at(plan, idx)) == ty_mod.index(target)
+}
+
+
+function widen_rvalue(
+    body: mutable mir_body_mod.MirBody,
+    out: mutable Vec_Statement.Vec,
+    value: mir_rvalue_mod.Rvalue,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> mir_rvalue_mod.Rvalue
+    with {allocator, err: alloc.AllocError}
+{
+    return match value {
+        case .use_(let op) =>
+            mir_rvalue_mod.Rvalue.use_(
+                operand: widen_operand(mutable body, mutable out, op, plan, blocked, orig_tys, origin, allocator)?,
+            )
+        case .binary(let bop, let lhs, let rhs) =>
+            mir_rvalue_mod.Rvalue.binary(
+                op: bop,
+                lhs: widen_operand(mutable body, mutable out, lhs, plan, blocked, orig_tys, origin, allocator)?,
+                rhs: widen_operand(mutable body, mutable out, rhs, plan, blocked, orig_tys, origin, allocator)?,
+            )
+        case .unary(let uop, let operand) =>
+            mir_rvalue_mod.Rvalue.unary(
+                op: uop,
+                operand: widen_operand(mutable body, mutable out, operand, plan, blocked, orig_tys, origin, allocator)?,
+            )
+        case .cast(let operand, let from, let to, let kind) =>
+            mir_rvalue_mod.Rvalue.cast(
+                operand: widen_operand(mutable body, mutable out, operand, plan, blocked, orig_tys, origin, allocator)?,
+                from: from,
+                to: to,
+                kind: kind,
+            )
+        case .aggregate(let kind, let elems, let result_ty) =>
+            mir_rvalue_mod.Rvalue.aggregate(
+                kind: kind,
+                elems: widen_operands(mutable body, mutable out, elems, plan, blocked, orig_tys, origin, allocator)?,
+                result_ty: result_ty,
+            )
+        case .make_closure(let code, let env) =>
+            mir_rvalue_mod.Rvalue.make_closure(
+                code: code,
+                env: widen_operand(mutable body, mutable out, env, plan, blocked, orig_tys, origin, allocator)?,
+            )
+        case .ref_(_, _) => value
+        case .len(_) => value
+        case .discriminant(_) => value
+    }
+}
+
+
+function widen_operands(
+    body: mutable mir_body_mod.MirBody,
+    out: mutable Vec_Statement.Vec,
+    elems: Vec_Operand.Vec,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    var acc: Vec_Operand.Vec = elems
+    let n = Vec_Operand.len(acc)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let op = Vec_Operand.at(acc, i)
+        let nop = widen_operand(mutable body, mutable out, op, plan, blocked, orig_tys, origin, allocator)?
+        Vec_Operand.set_at(mutable acc, i, take nop)
+        i = i + 1
+    }
+    return acc
+}
+
+
+function widen_operand(
+    body: mutable mir_body_mod.MirBody,
+    out: mutable Vec_Statement.Vec,
+    op: mir_rvalue_mod.Operand,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> mir_rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    return match op {
+        case .copy_(let place, _) =>
+            widen_read(mutable body, mutable out, place, op, plan, blocked, orig_tys, origin, allocator)?
+        case .move_(let place, _) =>
+            widen_read(mutable body, mutable out, place, op, plan, blocked, orig_tys, origin, allocator)?
+        case .constant(_) => op
+    }
+}
+
+
+function widen_read(
+    body: mutable mir_body_mod.MirBody,
+    out: mutable Vec_Statement.Vec,
+    place: mir_place_mod.Place,
+    original: mir_rvalue_mod.Operand,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> mir_rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    if mir_place_mod.proj_len(place) != (0 as usize) {
+        return original
+    }
+    let l_idx = mir_local_mod.index(place.local)
+    if !is_narrowed(plan, blocked, l_idx) {
+        return original
+    }
+    let to = orig_ty_at(orig_tys, l_idx)
+    if ty_mod.is_error(to) {
+        return original
+    }
+    let from = plan_mod.narrowed_ty_at(plan, l_idx)
+    let w = mint_local(mutable body, to, allocator)?
+    push_cast_stmt(mutable out, origin, mir_place_mod.bare(w), place.local, from, to, allocator)?
+    return mir_rvalue_mod.Operand.copy_(place: mir_place_mod.bare(w), ty: to)
+}
+
+
+function process_term(
+    body: mutable mir_body_mod.MirBody,
+    out: mutable Vec_Statement.Vec,
+    term: mir_term_mod.Terminator,
+    plan: plan_mod.NarrowPlan,
+    blocked: Vec_bool.Vec,
+    orig_tys: Vec_TyId.Vec,
+    allocator: Allocator,
+) -> mir_term_mod.Terminator
+    with {allocator, err: alloc.AllocError}
+{
+    let nk = match term.kind {
+        case .branch(let cond, let t, let f) =>
+            mir_term_mod.TermKind.branch(
+                cond: widen_operand(mutable body, mutable out, cond, plan, blocked, orig_tys, term.origin, allocator)?,
+                true_: t,
+                false_: f,
+            )
+        case .switch_(let discr, let targets) =>
+            mir_term_mod.TermKind.switch_(
+                discr: widen_operand(mutable body, mutable out, discr, plan, blocked, orig_tys, term.origin, allocator)?,
+                targets: targets,
+            )
+        case .raise_(let value, let unwind) =>
+            mir_term_mod.TermKind.raise_(
+                value: widen_operand(mutable body, mutable out, value, plan, blocked, orig_tys, term.origin, allocator)?,
+                unwind: unwind,
+            )
+        case .panic_(let message) =>
+            mir_term_mod.TermKind.panic_(
+                message: widen_operand(mutable body, mutable out, message, plan, blocked, orig_tys, term.origin, allocator)?,
+            )
+        case .call_(let callee, let args, let dest, let ret, let unwind) =>
+            mir_term_mod.TermKind.call_(
+                callee: widen_operand(mutable body, mutable out, callee, plan, blocked, orig_tys, term.origin, allocator)?,
+                args: widen_operands(mutable body, mutable out, args, plan, blocked, orig_tys, term.origin, allocator)?,
+                dest: dest,
+                return_: ret,
+                unwind: unwind,
+            )
+        case .spawn_(let child, let args, let group_local, let handle_dest, let ret, let unwind) =>
+            mir_term_mod.TermKind.spawn_(
+                child: child,
+                args: widen_operands(mutable body, mutable out, args, plan, blocked, orig_tys, term.origin, allocator)?,
+                group_local: group_local,
+                handle_dest: handle_dest,
+                return_: ret,
+                unwind: unwind,
+            )
+        case .await_(let handle, let dest, let ret, let unwind) =>
+            mir_term_mod.TermKind.await_(
+                handle: widen_operand(mutable body, mutable out, handle, plan, blocked, orig_tys, term.origin, allocator)?,
+                dest: dest,
+                return_: ret,
+                unwind: unwind,
+            )
+        case _ => term.kind
+    }
+    return mir_term_mod.Terminator { origin: term.origin, kind: nk }
+}

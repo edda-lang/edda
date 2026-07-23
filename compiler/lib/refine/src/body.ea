@@ -1,0 +1,759 @@
+
+module refine.body
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import symname.lib as symname_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.tree as ast_tree_mod
+import mir.body.model as mir_body
+import mir.term as mir_term_mod
+import mir.stmt as mir_stmt_mod
+import mir.id.block as block_mod
+import types.check as check_mod
+import types.check.env.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.discharge.output as output_mod
+import local.solver.query.query as query_mod
+import local.smt.encode.encode as encode_mod
+import local.smt.render.render as render_mod
+import local.smt.term as term_mod
+import local.vcgen.vcgen.vcgen as vcgen_mod
+import local.vcgen.assume.assume as assume_mod
+import local.vcgen.basis.basis as basis_mod
+import local.vcgen.bounds.locals as locals_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+import local.vcgen.term.term as vterm_mod
+
+
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.mem.alloc.Box(term_mod.SmtTerm)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_body.Local)
+spec std.collections.vec.Vec(mir_body.Obligation)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(err_mod.UnsupportedFragment)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(String)
+
+
+type ContextResult {
+    case ok(terms: Vec_SmtTerm.Vec, dropped: Vec_UnsupportedFragment.Vec)
+    case unsupported(fragment: err_mod.UnsupportedFragment)
+}
+
+
+public function process_body(
+    body: mir_body.MirBody,
+    type_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    anchor_sym: symbol_mod.Symbol,
+    ptr_width: usize,
+    output: mutable output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let _ = type_out
+    if !trust_is_discharged(body.function_trust) {
+        skip_all_obligations(body, mutable output, allocator)?
+        return
+    }
+    let vars = build_scope(body, allocator)?
+    let len_sym = locals_mod.len_symbol(interner)
+    let bidx = bodyidx_mod.build(body, allocator)?
+    uninit req_terms: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init req_terms, allocator)?
+    basis_mod.append_requires_context(mutable req_terms, body.requires_assumptions, vars, ty_interner, builtins, allocator)?
+    let n_obl = Vec_Obligation.len(body.obligations)
+    var i: usize = 0
+    loop
+        decreases (n_obl - i)
+    {
+        if i >= n_obl {
+            break
+        }
+        let obligation = Vec_Obligation.at(body.obligations, i)
+        process_one_obligation(obligation, body, bidx, body.def_id.raw, vars, req_terms, ty_interner, builtins, interner, len_sym, anchor_sym, ptr_width, mutable output, allocator)?
+        i = i + 1
+    }
+}
+
+
+function trust_is_discharged(trust: mir_body.TrustAnnotation) -> bool {
+    return match trust {
+        case .discharged => true
+        case .unverified(_) => false
+        case .site_trusted(_) => false
+    }
+}
+
+function skip_all_obligations(
+    body: mir_body.MirBody,
+    output: mutable output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let _ = allocator
+    let n_obl = Vec_Obligation.len(body.obligations)
+    var i: usize = 0
+    loop
+        decreases (n_obl - i)
+    {
+        if i >= n_obl {
+            break
+        }
+        output_mod.record_skipped(mutable output)
+        i = i + 1
+    }
+}
+
+
+function process_one_obligation(
+    obligation: mir_body.Obligation,
+    body: mir_body.MirBody,
+    bidx: bodyidx_mod.BodyIndex,
+    def_raw: u32,
+    vars: Vec_VariableBinding.Vec,
+    req_terms: Vec_SmtTerm.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    anchor_sym: symbol_mod.Symbol,
+    ptr_width: usize,
+    output: mutable output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if !trust_is_discharged(obligation.trust) {
+        output_mod.record_skipped(mutable output)
+        return
+    }
+    if is_builtin_trap(obligation.kind) {
+        process_builtin_trap(obligation, body, bidx, def_raw, vars, req_terms, ty_interner, builtins, interner, len_sym, anchor_sym, ptr_width, mutable output, allocator)?
+        return
+    }
+    let goal = match encode_mod.encode_predicate(obligation.predicate, vars, ty_interner, builtins, allocator)? {
+        case .encoded(let term) => term
+        case .unsupported(let fragment) => {
+            if is_hard_fragment(fragment) {
+                if precondition_in_branching_body(obligation.kind, body) {
+                    output_mod.record_skipped(mutable output)
+                } else {
+                    let failure = err_mod.RefineError.encoding_unsupported(
+                        at: obligation.predicate.span,
+                        predicate: kind_label(obligation.kind),
+                        fragment: fragment,
+                    )
+                    output_mod.push_failure(mutable output, take failure, allocator)?
+                }
+            } else {
+                let skip_note = err_mod.RefineError.skipped_undecidable(
+                    at: obligation.predicate.span,
+                    predicate: kind_label(obligation.kind),
+                    reason: Option_String.some(value: err_mod.fmt_unsupported_fragment(fragment)),
+                )
+                output_mod.push_failure(mutable output, take skip_note, allocator)?
+                output_mod.record_skipped(mutable output)
+            }
+            return
+        }
+    }
+    var dropped_note = Option_String.none
+    var ctx_terms = match encode_context(obligation.context, vars, ty_interner, builtins, allocator)? {
+        case .ok(let terms, let dropped) => {
+            dropped_note = dropped_assumption_note(dropped, allocator)?
+            terms
+        }
+        case .unsupported(let fragment) => {
+            let skip_note = err_mod.RefineError.skipped_undecidable(
+                at: obligation.predicate.span,
+                predicate: kind_label(obligation.kind),
+                reason: Option_String.some(value: err_mod.fmt_unsupported_fragment(fragment)),
+            )
+            output_mod.push_failure(mutable output, take skip_note, allocator)?
+            output_mod.record_skipped(mutable output)
+            return
+        }
+    }
+    assume_mod.append_guard_context(mutable ctx_terms, body, bidx, obligation.block, allocator)?
+    append_terms(mutable ctx_terms, req_terms, allocator)?
+    append_range_facts(mutable ctx_terms, vars, ty_interner, ptr_width, anchor_sym, allocator)?
+    if term_uses_var(goal, anchor_sym) || terms_use_var_upto(ctx_terms, Vec_SmtTerm.len(ctx_terms), anchor_sym) {
+        Vec_SmtTerm.push(mutable ctx_terms, vterm_mod.anchor_def_term(anchor_sym, allocator)?, allocator)?
+    }
+    let verdict = query_mod.decide(ctx_terms, goal, interner, allocator)?
+    if !verdict_is_proven(verdict) && contains_udf(goal) {
+        let rendered = append_caller(render_mod.render_term(goal, interner, allocator)?, body.name, interner, allocator)?
+        let reason = match verdict {
+            case .unknown(let r) => Option_String.some(value: r)
+            case .sat(_) => Option_String.some(value: "counterexample discarded — a user-function call in the predicate is uninterpreted in the discharge encoding")
+            case _ => Option_String.none
+        }
+        let skip_note = err_mod.RefineError.skipped_undecidable(
+            at: obligation.predicate.span,
+            predicate: rendered,
+            reason: reason,
+        )
+        output_mod.push_failure(mutable output, take skip_note, allocator)?
+        output_mod.record_skipped(mutable output)
+        return
+    }
+    if !verdict_is_proven(verdict) && precondition_in_branching_body(obligation.kind, body) {
+        output_mod.record_skipped(mutable output)
+        return
+    }
+    record_verdict(
+        verdict,
+        obligation.predicate.span,
+        goal,
+        body.name,
+        interner,
+        def_raw,
+        block_mod.index(obligation.block),
+        obligation.stmt_index,
+        obligation.kind,
+        dropped_note,
+        mutable output,
+        allocator,
+    )?
+}
+
+
+function process_builtin_trap(
+    obligation: mir_body.Obligation,
+    body: mir_body.MirBody,
+    bidx: bodyidx_mod.BodyIndex,
+    def_raw: u32,
+    vars: Vec_VariableBinding.Vec,
+    req_terms: Vec_SmtTerm.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    anchor_sym: symbol_mod.Symbol,
+    ptr_width: usize,
+    output: mutable output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let goal = match vcgen_mod.vc_for_obligation(body, bidx, obligation, ty_interner, len_sym, ptr_width, anchor_sym, allocator)? {
+        case .some(let term) => term
+        case .none => {
+            output_mod.record_skipped(mutable output)
+            return
+        }
+    }
+    var ctx_terms = match encode_context(obligation.context, vars, ty_interner, builtins, allocator)? {
+        case .ok(let terms, _) => terms
+        case .unsupported(_) => {
+            output_mod.record_skipped(mutable output)
+            return
+        }
+    }
+    assume_mod.append_guard_context(mutable ctx_terms, body, bidx, obligation.block, allocator)?
+    append_terms(mutable ctx_terms, req_terms, allocator)?
+    append_range_facts(mutable ctx_terms, vars, ty_interner, ptr_width, anchor_sym, allocator)?
+    if term_uses_var(goal, anchor_sym) || terms_use_var_upto(ctx_terms, Vec_SmtTerm.len(ctx_terms), anchor_sym) {
+        Vec_SmtTerm.push(mutable ctx_terms, vterm_mod.anchor_def_term(anchor_sym, allocator)?, allocator)?
+    }
+    let verdict = query_mod.decide(ctx_terms, goal, interner, allocator)?
+    if !verdict_is_proven(verdict) && contains_udf(goal) {
+        output_mod.record_skipped(mutable output)
+        return
+    }
+    record_verdict(
+        verdict,
+        obligation.predicate.span,
+        goal,
+        body.name,
+        interner,
+        def_raw,
+        block_mod.index(obligation.block),
+        obligation.stmt_index,
+        obligation.kind,
+        Option_String.none,
+        mutable output,
+        allocator,
+    )?
+}
+
+
+function append_terms(
+    ctx_terms: mutable Vec_SmtTerm.Vec,
+    src: Vec_SmtTerm.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_SmtTerm.len(src)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let t = Vec_SmtTerm.at(src, i)
+        Vec_SmtTerm.push(mutable ctx_terms, take t, allocator)?
+        i = i + 1
+    }
+}
+
+
+function is_hard_fragment(fragment: err_mod.UnsupportedFragment) -> bool {
+    return match fragment {
+        case .nla => true
+        case .bitvector => true
+        case .floating_point => true
+        case .string_content => true
+        case .other(_) => false
+    }
+}
+
+
+function kind_label(kind: mir_body.ObligationKind) -> String {
+    return match kind {
+        case .int_overflow => "integer-overflow check"
+        case .div_by_zero => "division-by-zero check"
+        case .div_overflow => "division-overflow check"
+        case .index_in_bounds => "index-in-bounds check"
+        case .slice_subrange_in_bounds => "slice-subrange-in-bounds check"
+        case .narrowing_cast_range => "narrowing-cast-range check"
+        case .precondition => "precondition"
+        case .postcondition => "postcondition"
+        case .decreases_decreasing => "decreases measure"
+    }
+}
+
+
+function is_builtin_trap(kind: mir_body.ObligationKind) -> bool {
+    return match kind {
+        case .int_overflow => true
+        case .div_by_zero => true
+        case .div_overflow => true
+        case .index_in_bounds => true
+        case .slice_subrange_in_bounds => true
+        case .narrowing_cast_range => true
+        case .precondition => false
+        case .postcondition => false
+        case .decreases_decreasing => false
+    }
+}
+
+
+function verdict_is_proven(verdict: query_mod.Verdict) -> bool {
+    return match verdict {
+        case .unsat(_) => true
+        case _ => false
+    }
+}
+
+
+function precondition_in_branching_body(kind: mir_body.ObligationKind, body: mir_body.MirBody) -> bool {
+    let is_pre = match kind {
+        case .precondition => true
+        case _ => false
+    }
+    if !is_pre {
+        return false
+    }
+    return body_has_branching(body)
+}
+
+
+function body_has_branching(body: mir_body.MirBody) -> bool {
+    let n = Vec_BasicBlock.len(body.blocks)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let bb = Vec_BasicBlock.at(body.blocks, i)
+        let branching = match bb.terminator.kind {
+            case .branch(_, _, _) => true
+            case .switch_(_, _) => true
+            case .spawn_(_, _, _, _, _, _) => true
+            case .await_(_, _, _, _) => true
+            case .call_(_, _, _, _, let unwind) => unwind_is_handler(unwind)
+            case .raise_(_, let unwind) => unwind_is_handler(unwind)
+            case .drop_(_, _, let unwind) => unwind_is_handler(unwind)
+            case _ => false
+        }
+        if branching {
+            return true
+        }
+        if block_makes_closure(bb) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function block_makes_closure(bb: mir_body.BasicBlock) -> bool {
+    let n = Vec_Statement.len(bb.statements)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let made = match Vec_Statement.at(bb.statements, i).kind {
+            case .assign(_, let value) => match value {
+                case .make_closure(_, _) => true
+                case _ => false
+            }
+            case _ => false
+        }
+        if made {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function unwind_is_handler(unwind: mir_term_mod.UnwindAction) -> bool {
+    return match unwind {
+        case .handler(_) => true
+        case _ => false
+    }
+}
+
+
+function encode_context(
+    context: Vec_Expr.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+) -> ContextResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit terms: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init terms, allocator)?
+    uninit dropped: Vec_UnsupportedFragment.Vec
+    Vec_UnsupportedFragment.new(init dropped, allocator)?
+    let n = Vec_Expr.len(context)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let pred = Vec_Expr.at(context, i)
+        match encode_mod.encode_predicate(pred, vars, ty_interner, builtins, allocator)? {
+            case .encoded(let term) => Vec_SmtTerm.push(mutable terms, take term, allocator)?
+            case .unsupported(let fragment) => {
+                if !is_hard_fragment(fragment) {
+                    return ContextResult.unsupported(fragment: fragment)
+                }
+                Vec_UnsupportedFragment.push(mutable dropped, take fragment, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return ContextResult.ok(terms: terms, dropped: dropped)
+}
+
+
+function dropped_assumption_note(
+    dropped: Vec_UnsupportedFragment.Vec,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_UnsupportedFragment.len(dropped)
+    if n == 0 {
+        return Option_String.none
+    }
+    var note = " — attempted without out-of-fragment assumption: "
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if i > 0 {
+            note = string.concat(note, ", ", allocator)?
+        }
+        let fragment = Vec_UnsupportedFragment.at(dropped, i)
+        note = string.concat(note, err_mod.fmt_unsupported_fragment(fragment), allocator)?
+        i = i + 1
+    }
+    return Option_String.some(value: note)
+}
+
+
+function append_caller(
+    predicate: String,
+    fn_name: symbol_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let name = symname_mod.extern_symbol(fn_name, interner, allocator)?
+    let p1 = string.concat(predicate, " — in `", allocator)?
+    let p2 = string.concat(p1, name, allocator)?
+    return string.concat(p2, "`", allocator)?
+}
+
+
+function append_note(
+    predicate: String,
+    note: Option_String.Option,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match note {
+        case .some(let text) => string.concat(predicate, text, allocator)?
+        case .none => predicate
+    }
+}
+
+
+function contains_udf(t: term_mod.SmtTerm) -> bool
+    with {divergence}
+{
+    return match t {
+        case .app(let op, let args) => is_udf_op(op) || args_contain_udf(args)
+        case .forall_(_, _, let body) => contains_udf(Box_SmtTerm.get(body))
+        case .exists_(_, _, let body) => contains_udf(Box_SmtTerm.get(body))
+        case _ => false
+    }
+}
+
+
+function args_contain_udf(args: Vec_SmtTerm.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if contains_udf(Vec_SmtTerm.at(args, i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function is_udf_op(op: term_mod.SmtOp) -> bool {
+    return match op {
+        case .udf(_) => true
+        case _ => false
+    }
+}
+
+
+function term_uses_var(t: term_mod.SmtTerm, name: symbol_mod.Symbol) -> bool
+    with {divergence}
+{
+    return match t {
+        case .var_(let vn, _) => vn.raw == name.raw
+        case .app(_, let args) => terms_use_var_upto(args, Vec_SmtTerm.len(args), name)
+        case .forall_(_, _, let b) => term_uses_var(Box_SmtTerm.get(b), name)
+        case .exists_(_, _, let b) => term_uses_var(Box_SmtTerm.get(b), name)
+        case _ => false
+    }
+}
+
+
+function terms_use_var_upto(terms: Vec_SmtTerm.Vec, upto: usize, name: symbol_mod.Symbol) -> bool
+    with {divergence}
+{
+    let n = Vec_SmtTerm.len(terms)
+    let bound = if upto < n { upto } else { n }
+    var i: usize = 0
+    loop
+        decreases (bound - i)
+    {
+        if i >= bound {
+            break
+        }
+        if term_uses_var(Vec_SmtTerm.at(terms, i), name) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function append_range_facts(
+    ctx_terms: mutable Vec_SmtTerm.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    ptr_width: usize,
+    anchor_sym: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nv = Vec_VariableBinding.len(vars)
+    var i: usize = 0
+    loop
+        decreases (nv - i)
+    {
+        if i >= nv {
+            break
+        }
+        let binding = Vec_VariableBinding.at(vars, i)
+        basis_mod.append_var_range(mutable ctx_terms, binding, ty_interner, ptr_width, anchor_sym, allocator)?
+        i = i + 1
+    }
+}
+
+
+function record_verdict(
+    verdict: query_mod.Verdict,
+    at: span_mod.Span,
+    goal: term_mod.SmtTerm,
+    fn_name: symbol_mod.Symbol,
+    interner: interner_mod.Interner,
+    def_raw: u32,
+    block_index: usize,
+    stmt_index: u32,
+    kind: mir_body.ObligationKind,
+    dropped_note: Option_String.Option,
+    output: mutable output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if is_builtin_trap(kind) {
+        match verdict {
+            case .unsat(_) => {
+                output_mod.record_discharged(mutable output)
+                output_mod.record_proven(mutable output, def_raw, block_index, stmt_index, kind, allocator)?
+            }
+            case _ => output_mod.record_skipped(mutable output)
+        }
+        return
+    }
+    match verdict {
+        case .unsat(let core) => {
+            output_mod.record_discharged(mutable output)
+            output_mod.record_proven(mutable output, def_raw, block_index, stmt_index, kind, allocator)?
+            if Vec_usize.len(core) == 0 {
+                let rendered = append_caller(render_mod.render_term(goal, interner, allocator)?, fn_name, interner, allocator)?
+                let predicate = append_note(rendered, dropped_note, allocator)?
+                let trivial = err_mod.RefineError.trivially_true(at: at, predicate: predicate)
+                output_mod.push_failure(mutable output, take trivial, allocator)?
+            }
+        }
+        case .unavailable => {
+            let rendered = append_caller(render_mod.render_term(goal, interner, allocator)?, fn_name, interner, allocator)?
+            let skip_note = err_mod.RefineError.skipped_undecidable(
+                at: at,
+                predicate: rendered,
+                reason: Option_String.none,
+            )
+            output_mod.push_failure(mutable output, take skip_note, allocator)?
+            output_mod.record_skipped(mutable output)
+        }
+        case .sat(let model) => {
+            let rendered = append_caller(render_mod.render_term(goal, interner, allocator)?, fn_name, interner, allocator)?
+            let predicate = append_note(rendered, dropped_note, allocator)?
+            let failure = err_mod.RefineError.failed(
+                at: at,
+                predicate: predicate,
+                counterexample: Option_String.some(value: model),
+            )
+            output_mod.push_failure(mutable output, take failure, allocator)?
+        }
+        case .unknown(let reason) => {
+            let rendered = append_caller(render_mod.render_term(goal, interner, allocator)?, fn_name, interner, allocator)?
+            let predicate = append_note(rendered, dropped_note, allocator)?
+            let failure = err_mod.RefineError.unknown(
+                at: at,
+                predicate: predicate,
+                reason: Option_String.some(value: reason),
+            )
+            output_mod.push_failure(mutable output, take failure, allocator)?
+        }
+        case .timeout => {
+            let rendered = append_caller(render_mod.render_term(goal, interner, allocator)?, fn_name, interner, allocator)?
+            let predicate = append_note(rendered, dropped_note, allocator)?
+            let failure = err_mod.RefineError.timeout(
+                at: at,
+                predicate: predicate,
+                elapsed_ms: 0 as u32,
+                configured_ms: 0 as u32,
+            )
+            output_mod.push_failure(mutable output, take failure, allocator)?
+        }
+        case .solver_error(let message) => {
+            let failure = err_mod.RefineError.solver_internal(
+                at: at,
+                message: message,
+            )
+            output_mod.push_failure(mutable output, take failure, allocator)?
+        }
+    }
+}
+
+
+function build_scope(
+    body: mir_body.MirBody,
+    allocator: Allocator,
+) -> Vec_VariableBinding.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit vars: Vec_VariableBinding.Vec
+    Vec_VariableBinding.new(init vars, allocator)?
+    let n = Vec_Local.len(body.locals)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let local = Vec_Local.at(body.locals, i)
+        match local.name {
+            case .some(let name) => {
+                let binding = ctx_mod.VariableBinding {
+                    name: name,
+                    ty: local.ty,
+                }
+                Vec_VariableBinding.push(mutable vars, take binding, allocator)?
+            }
+            case .none => {}
+        }
+        i = i + 1
+    }
+    return vars
+}

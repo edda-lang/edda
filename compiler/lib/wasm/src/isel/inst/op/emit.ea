@@ -1,0 +1,321 @@
+
+module wasm.isel.inst.op.emit
+
+import std.mem.alloc
+import std.collections.vec
+import span.loc.pos.span as span_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.tree.reg as reg_mod
+import ir.lir.tree.body as body_mod
+import ir.lir.id.vreg as vreg_mod
+import ir.lir.id.op as op_id_mod
+import local.fmt.encode as enc_mod
+import local.isel.ctx.ctx as ctx_mod
+import local.isel.valtype.valtype as vt_mod
+import local.model as model_mod
+import local.isel.wenc.wenc as common_mod
+import local.isel.inst.mem as mem_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_op(
+    code: mutable Vec_u8.Vec,
+    mctx: ctx_mod.ModuleCtx,
+    bctx: ctx_mod.BodyCtx,
+    body: body_mod.LirBody,
+    op_id: op_id_mod.LirOpId,
+    op: lir_op_mod.LirOp,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match op.kind {
+        case .mov(let src, let dst) => {
+            common_mod.emit_operand(mutable code, src, vt_mod.is_i64_vreg(body, dst), allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .copy_(let src, let dst) => {
+            common_mod.get_local(mutable code, src, allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .constant_(let c, let dst) => emit_constant(mutable code, mctx, body, c, dst, allocator)?
+        case .binary(let bop, let lhs, let rhs, let dst) => emit_binary(mutable code, body, bop, lhs, rhs, dst, allocator)?
+        case .unary(let uop, let operand, let dst) => emit_unary(mutable code, body, uop, operand, dst, allocator)?
+        case .convert_(let src, let to_width, let to_signed, let kind, let dst) => emit_convert(mutable code, body, src, to_width, to_signed, kind, dst, allocator)?
+        case .load(let addr, let dst, let width) => mem_mod.emit_load(mutable code, body, addr, dst, width, allocator)?
+        case .store(let value, let addr, let width) => mem_mod.emit_store(mutable code, body, value, addr, width, allocator)?
+        case .call_(let callee, let args, let return_) => mem_mod.emit_call(mutable code, mctx, bctx, body, op, callee, args, return_, allocator)?
+        case .call_indirect(_, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: call_indirect (fat fn-value leading-env ABI) not yet lowered for the wasm backend",
+        )
+        case .make_closure(_, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: make_closure (closure construction / fn-value env capture) not yet lowered for the wasm backend",
+        )
+        case .stack_addr(_, let dst) => mem_mod.emit_stack_addr(mutable code, body, bctx, op_id.raw, dst, allocator)?
+        case .err_flag(let dst) => {
+            common_mod.emit_int_const(mutable code, 0 as i64, vt_mod.is_i64_vreg(body, dst), allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .cmov_carry(_, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: cmov_carry (raise-carry conditional select) is not lowered for the wasm backend",
+        )
+        case .bounds_check(let index, let len) => {
+            let w64 = match index {
+                case .vreg(let id) => vt_mod.is_i64_vreg(body, id)
+                case _ => match len {
+                    case .vreg(let id) => vt_mod.is_i64_vreg(body, id)
+                    case _ => false
+                }
+            }
+            common_mod.emit_operand(mutable code, index, w64, allocator)?
+            common_mod.emit_operand(mutable code, len, w64, allocator)?
+            let ge_u: u32 = if w64 { 0x5A } else { 0x4F }
+            enc_mod.push_byte(mutable code, ge_u as u8, allocator)?
+            enc_mod.push_byte(mutable code, 0x04, allocator)?
+            enc_mod.push_byte(mutable code, 0x40, allocator)?
+            enc_mod.push_byte(mutable code, 0x00, allocator)?
+            enc_mod.push_byte(mutable code, 0x0B, allocator)?
+        }
+    }
+}
+
+
+function emit_constant(
+    code: mutable Vec_u8.Vec,
+    mctx: ctx_mod.ModuleCtx,
+    body: body_mod.LirBody,
+    c: lir_op_mod.LConstant,
+    dst: vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match c {
+        case .int_(let value, _) => {
+            common_mod.emit_int_const(mutable code, value as i64 wrapping, vt_mod.is_i64_vreg(body, dst), allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .bool_(let b) => {
+            common_mod.emit_int_const(mutable code, if b { 1 as i64 } else { 0 as i64 }, false, allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .unit_ => ()
+        case .float_(let bits, let width) => {
+            common_mod.emit_float_const(mutable code, bits, width, allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .string_(let sym) => {
+            let lo = ctx_mod.string_lo(mctx, sym.raw)
+            let len = ctx_mod.string_len(mctx, sym.raw)
+            let packed: i64 = (lo as i64) | ((len as i64) << (32 as i64))
+            enc_mod.push_byte(mutable code, 0x42, allocator)?
+            enc_mod.sleb(mutable code, packed, allocator)?
+            common_mod.set_local(mutable code, dst, allocator)?
+        }
+        case .fn_ref(let def) => {
+            match ctx_mod.resolve_func_index_raw(mctx, def.raw) {
+                case .some(let fidx) => {
+                    common_mod.emit_int_const(mutable code, fidx as i64, vt_mod.is_i64_vreg(body, dst), allocator)?
+                    common_mod.set_local(mutable code, dst, allocator)?
+                }
+                case .none => ()
+            }
+        }
+        case .runtime_fn(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: runtime_fn (i128/u128 compiler-rt helper __udivti3/__divti3/__umodti3/__modti3/__multi3) not yet lowered for the wasm backend",
+        )
+    }
+}
+
+
+function emit_binary(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    bop: lir_op_mod.LBinOp,
+    lhs: vreg_mod.LirVRegId,
+    rhs: reg_mod.Operand,
+    dst: vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let w64 = vt_mod.is_i64_vreg(body, lhs)
+    common_mod.get_local(mutable code, lhs, allocator)?
+    common_mod.emit_operand(mutable code, rhs, w64, allocator)?
+    enc_mod.push_byte(mutable code, binop_byte(bop, w64)?, allocator)?
+    common_mod.set_local(mutable code, dst, allocator)?
+}
+
+
+function binop_byte(bop: lir_op_mod.LBinOp, w64: bool) -> u8
+    with {err: lir_error_mod.LirError}
+{
+    let code: u32 = match bop {
+        case .add      => if w64 { 0x7C } else { 0x6A }
+        case .sub      => if w64 { 0x7D } else { 0x6B }
+        case .mul      => if w64 { 0x7E } else { 0x6C }
+        case .add_sat  => if w64 { 0x7C } else { 0x6A }
+        case .sub_sat  => if w64 { 0x7D } else { 0x6B }
+        case .mul_sat  => if w64 { 0x7E } else { 0x6C }
+        case .umulhi   => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: 128-bit high-multiply not supported on wasm",
+        )
+        case .smulhi   => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "wasm.isel: 128-bit high-multiply not supported on wasm",
+        )
+        case .udiv     => if w64 { 0x80 } else { 0x6E }
+        case .sdiv     => if w64 { 0x7F } else { 0x6D }
+        case .urem     => if w64 { 0x82 } else { 0x70 }
+        case .srem     => if w64 { 0x81 } else { 0x6F }
+        case .bit_and  => if w64 { 0x83 } else { 0x71 }
+        case .bit_or   => if w64 { 0x84 } else { 0x72 }
+        case .bit_xor  => if w64 { 0x85 } else { 0x73 }
+        case .shl      => if w64 { 0x86 } else { 0x74 }
+        case .lshr     => if w64 { 0x88 } else { 0x76 }
+        case .ashr     => if w64 { 0x87 } else { 0x75 }
+        case .icmp_eq  => if w64 { 0x51 } else { 0x46 }
+        case .icmp_ne  => if w64 { 0x52 } else { 0x47 }
+        case .icmp_slt => if w64 { 0x53 } else { 0x48 }
+        case .icmp_sle => if w64 { 0x57 } else { 0x4C }
+        case .icmp_sgt => if w64 { 0x55 } else { 0x4A }
+        case .icmp_sge => if w64 { 0x59 } else { 0x4E }
+        case .icmp_ult => if w64 { 0x54 } else { 0x49 }
+        case .icmp_ule => if w64 { 0x58 } else { 0x4D }
+        case .icmp_ugt => if w64 { 0x56 } else { 0x4B }
+        case .icmp_uge => if w64 { 0x5A } else { 0x4F }
+    }
+    return code as u8
+}
+
+
+function emit_unary(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    uop: lir_op_mod.LUnOp,
+    operand: vreg_mod.LirVRegId,
+    dst: vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let w64 = vt_mod.is_i64_vreg(body, dst)
+    match uop {
+        case .neg => {
+            if vt_mod.is_float_vreg(body, dst) {
+                common_mod.get_local(mutable code, operand, allocator)?
+                let fneg: u32 = match vt_mod.valtype_of_vreg(body, dst) {
+                    case .f64_ => 0x9A
+                    case _     => 0x8C
+                }
+                enc_mod.push_byte(mutable code, fneg as u8, allocator)?
+            } else {
+                common_mod.emit_int_const(mutable code, 0 as i64, w64, allocator)?
+                common_mod.get_local(mutable code, operand, allocator)?
+                let isub: u32 = if w64 { 0x7D } else { 0x6B }
+                enc_mod.push_byte(mutable code, isub as u8, allocator)?
+            }
+        }
+        case .bit_not => {
+            common_mod.get_local(mutable code, operand, allocator)?
+            common_mod.emit_int_const(mutable code, (0 as i64) - (1 as i64), w64, allocator)?
+            let ixor: u32 = if w64 { 0x85 } else { 0x73 }
+            enc_mod.push_byte(mutable code, ixor as u8, allocator)?
+        }
+        case .logical_not => {
+            common_mod.get_local(mutable code, operand, allocator)?
+            enc_mod.push_byte(mutable code, 0x45, allocator)?
+        }
+        case .fsqrt => {
+            common_mod.get_local(mutable code, operand, allocator)?
+            enc_mod.push_byte(mutable code, 0x9F as u8, allocator)?
+        }
+        case .ffloor => {
+            common_mod.get_local(mutable code, operand, allocator)?
+            enc_mod.push_byte(mutable code, 0x9C as u8, allocator)?
+        }
+        case .fceil => {
+            common_mod.get_local(mutable code, operand, allocator)?
+            enc_mod.push_byte(mutable code, 0x9B as u8, allocator)?
+        }
+        case .ftrunc => {
+            common_mod.get_local(mutable code, operand, allocator)?
+            enc_mod.push_byte(mutable code, 0x9D as u8, allocator)?
+        }
+    }
+    common_mod.set_local(mutable code, dst, allocator)?
+}
+
+
+function emit_convert(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    src: vreg_mod.LirVRegId,
+    to_width: u32,
+    to_signed: bool,
+    kind: lir_op_mod.LCastKind,
+    dst: vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let from_vt = vt_mod.valtype_of_vreg(body, src)
+    let to_vt = vt_mod.valtype_of_vreg(body, dst)
+    common_mod.get_local(mutable code, src, allocator)?
+    emit_convert_opcode(mutable code, from_vt, to_vt, to_signed, kind, allocator)?
+    common_mod.set_local(mutable code, dst, allocator)?
+}
+
+
+function emit_convert_opcode(
+    code: mutable Vec_u8.Vec,
+    from_vt: model_mod.ValType,
+    to_vt: model_mod.ValType,
+    to_signed: bool,
+    kind: lir_op_mod.LCastKind,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let from64 = common_mod.is_i64(from_vt)
+    let to64 = common_mod.is_i64(to_vt)
+    match kind {
+        case .float => {
+            if common_mod.is_f64(from_vt) && common_mod.is_f32(to_vt) { enc_mod.push_byte(mutable code, 0xB6, allocator)? }
+            if common_mod.is_f32(from_vt) && common_mod.is_f64(to_vt) { enc_mod.push_byte(mutable code, 0xBB, allocator)? }
+        }
+        case .float_to_integer => {
+            let from_is_f64 = common_mod.is_f64(from_vt)
+            let op: u32 = if to64 {
+                if from_is_f64 { if to_signed { 0xB0 } else { 0xB1 } } else { if to_signed { 0xAE } else { 0xAF } }
+            } else {
+                if from_is_f64 { if to_signed { 0xAA } else { 0xAB } } else { if to_signed { 0xA8 } else { 0xA9 } }
+            }
+            enc_mod.push_byte(mutable code, op as u8, allocator)?
+        }
+        case .integer_to_float => {
+            let to_is_f64 = common_mod.is_f64(to_vt)
+            let op: u32 = if to_is_f64 {
+                if from64 { if to_signed { 0xB9 } else { 0xBA } } else { if to_signed { 0xB7 } else { 0xB8 } }
+            } else {
+                if from64 { if to_signed { 0xB4 } else { 0xB5 } } else { if to_signed { 0xB2 } else { 0xB3 } }
+            }
+            enc_mod.push_byte(mutable code, op as u8, allocator)?
+        }
+        case _ => {
+            if from64 && !to64 { enc_mod.push_byte(mutable code, 0xA7, allocator)? }
+            if !from64 && to64 {
+                let op: u32 = if to_signed { 0xAC } else { 0xAD }
+                enc_mod.push_byte(mutable code, op as u8, allocator)?
+            }
+        }
+    }
+}

@@ -1,0 +1,61 @@
+
+module compile.setup.build
+
+import std.mem.alloc
+import std.collections.vec
+import diagnostics.emit.collection as diags_mod
+import intern.interner as interner_mod
+import mir.file.store as mir_file_mod
+import refine.discharge.output as refine_output_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+import optimize.manager as manager_mod
+import local.phase.pipeline.refine as refine_phase_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+
+
+public function optimize_mir_files(
+    mir_files: take Vec_MirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    ptr_width: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    out: init Vec_MirFile.Vec,
+) -> (usize, usize, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit acc: Vec_MirFile.Vec
+    Vec_MirFile.new(init acc, allocator)?
+    let n = Vec_MirFile.len(mir_files)
+    var discharged: usize = 0
+    var skipped: usize = 0
+    var proven: usize = 0
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n { break }
+        var optimized = Vec_MirFile.at(mir_files, i)
+        let type_out = Vec_TypeOutput.at(type_outputs, i)
+        let output = refine_phase_mod.discharge_and_emit(
+            optimized,
+            type_out,
+            ty_interner,
+            mutable interner,
+            ptr_width,
+            mutable diags,
+            allocator,
+        )?
+        discharged = discharged +| refine_output_mod.discharged_count(output)
+        skipped = skipped +| refine_output_mod.skipped_count(output)
+        proven = proven +| refine_output_mod.proven_count(output)
+        manager_mod.optimize_file(mutable optimized, output, mutable ty_interner, allocator)?
+        Vec_MirFile.push(mutable acc, take optimized, allocator)?
+        i = i + 1 as usize
+    }
+    out = acc
+    return (discharged, skipped, proven)
+}

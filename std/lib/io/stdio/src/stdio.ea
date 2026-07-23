@@ -1,0 +1,209 @@
+
+module std.io.stdio
+import std.text.string
+
+import std.os.raw
+import std.os.pages
+import std.text.utf8
+import std.io.stream
+
+
+function get_std_handle(n_std_handle: u64) -> u64
+    extern "GetStdHandle" from "kernel32.dll"
+
+function write_file(handle: u64, buf: u64, n: u64, written: u64, overlapped: u64) -> i32
+    extern "WriteFile" from "kernel32.dll"
+
+function read_file(handle: u64, buf: u64, n: u64, read_out: u64, overlapped: u64) -> i32
+    extern "ReadFile" from "kernel32.dll"
+
+function host_stdout_write(msg: String) -> i32
+    extern "__edda_host_stdout_write"
+
+function host_stderr_write(msg: String) -> i32
+    extern "__edda_host_stderr_write"
+
+
+function write_all(fd: u64, bytes: [u8]) -> () {
+    let base: u64 = raw.slice_addr(bytes)
+    let total: u64 = bytes.len() as u64
+    comptime if target_has("windows") {
+        let nstd: u64 = if fd == 2 { 0xFFFFFFF4 } else { 0xFFFFFFF5 }
+        let hout: u64 = get_std_handle(nstd)
+        handle err: pages.PageError as _e -> () {
+            let scratch: u64 = pages.map(4096)?
+            var done: u64 = 0
+            var fuel: u64 = total +% 1
+            loop
+                decreases fuel
+            {
+                if done >= total { break }
+                if fuel == 0 { break }
+                fuel = fuel - 1
+                let ok: i32 = write_file(hout, base +% done, total -% done, scratch, 0)
+                if ok == 0 { break }
+                let w_u: u64 = raw.load_u32(scratch) as u64
+                if w_u == 0 { break }
+                if w_u > total -% done { break }
+                done = done +% w_u
+            }
+            release_buffer(scratch, 4096)
+        }
+    } else {
+        var done: u64 = 0
+        var fuel: u64 = total +% 1
+        loop
+            decreases fuel
+        {
+            if done >= total { break }
+            if fuel == 0 { break }
+            fuel = fuel - 1
+            let r: i64 = raw.syscall6(1, fd, base +% done, total -% done, 0, 0, 0)
+            if r <= 0 { break }
+            let r_u: u64 = r as u64
+            if r_u > total -% done { break }
+            done = done +% r_u
+        }
+    }
+}
+
+function write_str(fd: u64, msg: String) -> () {
+    comptime if target_has("wasm32") {
+        if fd == 2 {
+            let _ = host_stderr_write(msg)
+        } else {
+            let _ = host_stdout_write(msg)
+        }
+    } else {
+        write_all(fd, msg.bytes())
+    }
+}
+
+@abi("__edda_stdout_write")
+public function stdout_write(cap: u64, msg: String) -> () {
+    write_str(1, msg)
+}
+
+@abi("__edda_stdout_write_line")
+public function stdout_write_line(cap: u64, msg: String) -> () {
+    write_str(1, msg)
+    write_str(1, "\n")
+}
+
+@abi("__edda_stderr_write")
+public function stderr_write(cap: u64, msg: String) -> () {
+    write_str(2, msg)
+}
+
+@abi("__edda_stderr_write_line")
+public function stderr_write_line(cap: u64, msg: String) -> () {
+    write_str(2, msg)
+    write_str(2, "\n")
+}
+
+function max_line_bytes() -> usize {
+    return 1048576
+}
+
+function map_buffer(byte_count: usize) -> u64
+    with {err: stream.IoError}
+{
+    return handle err: pages.PageError as _e -> (raise stream.IoError.other) {
+        pages.map(byte_count)?
+    }
+}
+
+function release_buffer(pg: u64, byte_count: usize) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, byte_count)?
+    }
+}
+
+function regrow_buffer(old_pg: u64, old_cap: usize, n: usize, new_cap: usize) -> u64
+    with {err: stream.IoError}
+{
+    let new_pg: u64 = handle err: stream.IoError as e -> {
+        release_buffer(old_pg, old_cap)
+        raise e
+    } { map_buffer(new_cap)? }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        raw.store_u8(new_pg +% (i as u64), raw.load_u8(old_pg +% (i as u64)))
+        i = i + 1
+    }
+    release_buffer(old_pg, old_cap)
+    return new_pg
+}
+
+function read_byte(fd: u64, dst: u64, scratch: u64) -> i64 {
+    comptime if target_has("windows") {
+        let ok: i32 = read_file(fd, dst, 1, scratch, 0)
+        if ok == 0 { return -1 }
+        return raw.load_u32(scratch) as i64
+    } else {
+        return raw.syscall6(0, fd, dst, 1, 0, 0, 0)
+    }
+}
+
+@abi("__edda_stdin_read_line")
+public function stdin_read_line(cap: u64) -> String
+    with {err: stream.IoError}
+{
+    var buf_cap: usize = 4096
+    var pg: u64 = map_buffer(buf_cap)?
+    let in_fd: u64 = comptime if target_has("windows") { get_std_handle(0xFFFFFFF6) } else { 0 }
+    let rscratch: u64 = comptime if target_has("windows") {
+        handle err: stream.IoError as e -> {
+            release_buffer(pg, buf_cap)
+            raise e
+        } { map_buffer(4096)? }
+    } else { 0 }
+    var n: usize = 0
+    var saw_newline: bool = false
+    loop
+        decreases max_line_bytes() - n
+    {
+        if n >= max_line_bytes() {
+            release_buffer(pg, buf_cap)
+            release_buffer(rscratch, 4096)
+            raise stream.IoError.other
+        }
+        if n == buf_cap {
+            let new_cap: usize = buf_cap *| 2
+            pg = handle err: stream.IoError as e -> {
+                release_buffer(rscratch, 4096)
+                raise e
+            } { regrow_buffer(pg, buf_cap, n, new_cap)? }
+            buf_cap = new_cap
+        }
+        let r: i64 = read_byte(in_fd, pg +% (n as u64), rscratch)
+        if r < 0 {
+            release_buffer(pg, buf_cap)
+            release_buffer(rscratch, 4096)
+            raise stream.IoError.os_error(code: r as i32 wrapping)
+        }
+        if r == 0 { break }
+        n = n + 1
+        if raw.load_u8(pg +% ((n - 1) as u64)) == 10 {
+            saw_newline = true
+            break
+        }
+    }
+    if n == 0 {
+        release_buffer(pg, buf_cap)
+        release_buffer(rscratch, 4096)
+        raise stream.IoError.unexpected_eof
+    }
+    let bytes: [u8] = raw.slice_from_raw(pg, n)
+    if !utf8.validate(bytes) {
+        release_buffer(pg, buf_cap)
+        release_buffer(rscratch, 4096)
+        raise stream.IoError.other
+    }
+    release_buffer(rscratch, 4096)
+    return string.from_owned_utf8(take bytes)
+}

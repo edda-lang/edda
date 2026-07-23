@@ -1,0 +1,68 @@
+module website.server.serve
+
+import std.io.stream
+import std.net.socket
+import std.mem.alloc
+import hermod.error
+import hermod.codec.wire.decode.decode as codec_decode
+import hermod.codec.wire.encode.encode as codec_encode
+import httpserver.frame
+import local.server.route
+import local.style.stylesheet
+
+public function run(net: Network, out: Stdout, rfs: ReadOnlyFilesystem, allocator: mutable Allocator) -> ()
+    with {net, out, rfs, allocator, divergence}
+{
+    let css = handle err: alloc.AllocError -> (return) {
+        stylesheet.build(allocator)?
+    }
+    var listener = handle err: socket.SocketError -> (return) {
+        socket.listen(net, rfs, "127.0.0.1", 8080 as u16)?
+    }
+    out.print_line("edda website listening on http://127.0.0.1:8080")
+    loop {
+        let conn = handle err: socket.SocketError -> (continue) {
+            socket.accept(mutable listener)?
+        }
+        _serve_conn(take conn, rfs, css, mutable allocator)
+    }
+}
+
+function _serve_conn(conn: take socket.Connection, rfs: ReadOnlyFilesystem, css: String, allocator: mutable Allocator) -> ()
+    with {rfs, allocator}
+{
+    handle err: socket.SocketError -> () {
+        handle err: error.CodecError -> () {
+            handle err: error.TransportError -> () {
+                handle err: alloc.AllocError -> () {
+                    _respond(mutable conn, rfs, css, mutable allocator)?
+                }
+            }
+        }
+    }
+    socket.close(take conn)
+}
+
+function _respond(conn: mutable socket.Connection, rfs: ReadOnlyFilesystem, css: String, allocator: mutable Allocator) -> ()
+    with {rfs, allocator, err: socket.SocketError, err: error.CodecError, err: error.TransportError, err: alloc.AllocError}
+{
+    let cap = frame.default_max_request_bytes()
+    let req_bytes = frame.read_full_request(mutable conn, allocator, cap)?
+    let req = codec_decode.decode_request(req_bytes, mutable allocator)?
+    let resp = route.dispatch(req, rfs, css, mutable allocator)?
+    let wire = codec_encode.encode_response(resp, mutable allocator)?
+    _write_all(mutable conn, wire)?
+}
+
+function _write_all(conn: mutable socket.Connection, data: [u8]) -> ()
+    with {err: socket.SocketError}
+{
+    var remaining: [u8] = data
+    loop decreases remaining.len() {
+        if remaining.len() == 0 as usize { break }
+        let wrote = socket.write(mutable conn, remaining)?
+        if wrote == 0 as usize { break }
+        let adv = if wrote > remaining.len() { remaining.len() } else { wrote }
+        remaining = remaining[adv..]
+    }
+}

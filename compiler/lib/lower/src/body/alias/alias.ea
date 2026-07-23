@@ -1,0 +1,91 @@
+
+module lower.body.alias.alias
+
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+import mir.layout.table as mir_layout_mod
+import types.pass.ty as ty_mod
+
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+
+import local.term.support.support as support_mod
+
+
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(u32)
+
+spec std.core.option.Option(mir_layout_mod.AggLayout)
+
+
+public function try_alias_assign(
+    env: mutable Vec_ValueId.Vec,
+    dest_local: mir_local_mod.LocalId,
+    value: mir_rvalue_mod.Rvalue,
+    body: mir_body_mod.MirBody,
+) -> bool
+    with {err: hlir_error_mod.HlirError}
+{
+    return match value {
+        case .use_(let operand) => match operand {
+            case .copy_(let place, _) => if mir_place_mod.proj_len(place) == 0 {
+                alias_place(mutable env, dest_local, place)?
+            } else {
+                false
+            }
+            case .move_(let place, _) => if mir_place_mod.proj_len(place) == 0 {
+                alias_place(mutable env, dest_local, place)?
+            } else {
+                false
+            }
+            case .constant(_) => false
+        }
+        case .discriminant(let place) => {
+            if mir_place_mod.proj_len(place) == 0 && !sum_is_payload_bearing(body, place) {
+                alias_place(mutable env, dest_local, place)?
+            } else {
+                false
+            }
+        }
+        case _ => false
+    }
+}
+
+function alias_place(
+    env: mutable Vec_ValueId.Vec,
+    dest_local: mir_local_mod.LocalId,
+    place: mir_place_mod.Place,
+) -> bool
+    with {err: hlir_error_mod.HlirError}
+{
+    let source = support_mod.place_value(env, place)?
+    support_mod.env_set(mutable env, dest_local, source)
+    return true
+}
+
+function sum_is_payload_bearing(
+    body: mir_body_mod.MirBody,
+    place: mir_place_mod.Place,
+) -> bool {
+    return ty_is_payload_bearing_sum(body, support_mod.local_ty(body, place.local))
+}
+
+public function ty_is_payload_bearing_sum(
+    body: mir_body_mod.MirBody,
+    ty: ty_mod.TyId,
+) -> bool {
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let layout) => layout_has_payload(layout)
+        case .none => false
+    }
+}
+
+function layout_has_payload(layout: mir_layout_mod.AggLayout) -> bool {
+    if Vec_u32.len(layout.field_sizes) < (2 as usize) { return false }
+    return Vec_u32.at(layout.field_sizes, 1 as usize) > (0 as u32)
+}

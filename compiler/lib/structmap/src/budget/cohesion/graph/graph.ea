@@ -1,0 +1,282 @@
+module structmap.budget.cohesion.graph.graph
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(IdxComponent)
+spec std.core.option.Option(usize)
+
+
+public function min_component_count() -> usize { return 2 as usize }
+public function min_component_size() -> usize { return 3 as usize }
+public function min_function_count() -> usize { return 8 as usize }
+public function min_residual_component_size() -> usize { return 2 as usize }
+public function scc_dominance_num() -> usize { return 3 as usize }
+public function scc_dominance_den() -> usize { return 10 as usize }
+public function scc_absolute_floor() -> usize { return 20 as usize }
+public function min_total_cluster_coverage() -> usize { return 10 as usize }
+
+
+public type Graph {
+    edge_from: Vec_usize.Vec
+    edge_to: Vec_usize.Vec
+    names: Vec_String.Vec
+}
+
+public type IdxComponent {
+    members: Vec_usize.Vec
+}
+
+
+public function new_graph(allocator: Allocator) -> Graph
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ef: Vec_usize.Vec
+    Vec_usize.new(init ef, allocator)?
+    uninit et: Vec_usize.Vec
+    Vec_usize.new(init et, allocator)?
+    uninit ns: Vec_String.Vec
+    Vec_String.new(init ns, allocator)?
+    return Graph { edge_from: ef, edge_to: et, names: ns }
+}
+
+function has_edge(g: Graph, from: usize, to: usize) -> bool {
+    let n = Vec_usize.len(g.edge_from)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        if Vec_usize.at(g.edge_from, i) == from && Vec_usize.at(g.edge_to, i) == to { return true }
+        i = i + 1
+    }
+    return false
+}
+
+public function add_edge(g: mutable Graph, from: usize, to: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if from == to { return }
+    if has_edge(g, from, to) { return }
+    Vec_usize.push(mutable g.edge_from, from, allocator)?
+    Vec_usize.push(mutable g.edge_to, to, allocator)?
+}
+
+public function out_degree(g: Graph, node: usize) -> usize {
+    let n = Vec_usize.len(g.edge_from)
+    var i: usize = 0
+    var count: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_usize.at(g.edge_from, i) == node { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+public function zeroed_bools(n: usize, allocator: Allocator) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_bool.Vec
+    Vec_bool.with_capacity(init out, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_bool.push(mutable out, false, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+public function zeroed_usizes(n: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.with_capacity(init out, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_usize.push(mutable out, 0 as usize, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function mark_component_collect(g: Graph, start: usize, visited: mutable Vec_bool.Vec, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit members: Vec_usize.Vec
+    Vec_usize.new(init members, allocator)?
+    uninit stack: Vec_usize.Vec
+    Vec_usize.new(init stack, allocator)?
+    Vec_usize.push(mutable stack, start, allocator)?
+    Vec_bool.set_at(mutable visited, start, true)
+    loop {
+        match Vec_usize.pop(mutable stack) {
+            case .some(let v) => {
+                Vec_usize.push(mutable members, v, allocator)?
+                let ne = Vec_usize.len(g.edge_from)
+                var e: usize = 0
+                loop decreases (ne - e) {
+                    if e >= ne { break }
+                    let a = Vec_usize.at(g.edge_from, e)
+                    let b = Vec_usize.at(g.edge_to, e)
+                    if a == v && !Vec_bool.at(visited, b) {
+                        Vec_bool.set_at(mutable visited, b, true)
+                        Vec_usize.push(mutable stack, b, allocator)?
+                    }
+                    if b == v && !Vec_bool.at(visited, a) {
+                        Vec_bool.set_at(mutable visited, a, true)
+                        Vec_usize.push(mutable stack, a, allocator)?
+                    }
+                    e = e + 1
+                }
+            }
+            case .none => break
+        }
+    }
+    return members
+}
+
+public function components_undirected(g: Graph, n: usize, min_size: usize, allocator: Allocator) -> Vec_IdxComponent.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var visited = zeroed_bools(n, allocator)?
+    uninit out: Vec_IdxComponent.Vec
+    Vec_IdxComponent.new(init out, allocator)?
+    var start: usize = 0
+    loop decreases (n - start) {
+        if start >= n { break }
+        if !Vec_bool.at(visited, start) {
+            let members = mark_component_collect(g, start, mutable visited, allocator)?
+            if Vec_usize.len(members) >= min_size {
+                Vec_IdxComponent.push(mutable out, IdxComponent { members: members }, allocator)?
+            }
+        }
+        start = start + 1
+    }
+    return out
+}
+
+public function directed_reach_excluding(g: Graph, start: usize, excluded: usize, visited: mutable Vec_bool.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if start == excluded { return }
+    if Vec_bool.at(visited, start) { return }
+    uninit stack: Vec_usize.Vec
+    Vec_usize.new(init stack, allocator)?
+    Vec_usize.push(mutable stack, start, allocator)?
+    Vec_bool.set_at(mutable visited, start, true)
+    loop {
+        match Vec_usize.pop(mutable stack) {
+            case .some(let v) => {
+                let ne = Vec_usize.len(g.edge_from)
+                var e: usize = 0
+                loop decreases (ne - e) {
+                    if e >= ne { break }
+                    if Vec_usize.at(g.edge_from, e) == v {
+                        let to = Vec_usize.at(g.edge_to, e)
+                        if to != excluded && !Vec_bool.at(visited, to) {
+                            Vec_bool.set_at(mutable visited, to, true)
+                            Vec_usize.push(mutable stack, to, allocator)?
+                        }
+                    }
+                    e = e + 1
+                }
+            }
+            case .none => break
+        }
+    }
+}
+
+function find_root(parent: Vec_usize.Vec, x: usize) -> usize
+    with {divergence}
+{
+    var cur = x
+    loop {
+        let p = Vec_usize.at(parent, cur)
+        if p == cur { return cur }
+        cur = p
+    }
+}
+
+function union_roots(parent: mutable Vec_usize.Vec, a: usize, b: usize) -> ()
+    with {divergence}
+{
+    let ra = find_root(parent, a)
+    let rb = find_root(parent, b)
+    if ra != rb {
+        Vec_usize.set_at(mutable parent, ra, rb)
+    }
+}
+
+public function largest_scc_size(g: Graph, n: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if n == 0 as usize { return 0 as usize }
+    uninit parent: Vec_usize.Vec
+    Vec_usize.with_capacity(init parent, n, allocator)?
+    var pi: usize = 0
+    loop decreases (n - pi) {
+        if pi >= n { break }
+        Vec_usize.push(mutable parent, pi, allocator)?
+        pi = pi + 1
+    }
+    var a: usize = 0
+    loop decreases (n - a) {
+        if a >= n { break }
+        var reach_a = zeroed_bools(n, allocator)?
+        directed_reach_excluding(g, a, n, mutable reach_a, allocator)?
+        var b: usize = a + 1
+        loop decreases (n - b) {
+            if b >= n { break }
+            if Vec_bool.at(reach_a, b) {
+                var reach_b = zeroed_bools(n, allocator)?
+                directed_reach_excluding(g, b, n, mutable reach_b, allocator)?
+                if Vec_bool.at(reach_b, a) {
+                    union_roots(mutable parent, a, b)
+                }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    var counts = zeroed_usizes(n, allocator)?
+    var c: usize = 0
+    loop decreases (n - c) {
+        if c >= n { break }
+        let r = find_root(parent, c)
+        let cur = Vec_usize.at(counts, r)
+        Vec_usize.set_at(mutable counts, r, cur + 1)
+        c = c + 1
+    }
+    var best: usize = 0
+    var d: usize = 0
+    loop decreases (n - d) {
+        if d >= n { break }
+        let v = Vec_usize.at(counts, d)
+        if v > best { best = v }
+        d = d + 1
+    }
+    return best
+}
+
+public function direct_callees(g: Graph, node: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.new(init out, allocator)?
+    let ne = Vec_usize.len(g.edge_from)
+    var e: usize = 0
+    loop decreases (ne - e) {
+        if e >= ne { break }
+        if Vec_usize.at(g.edge_from, e) == node {
+            Vec_usize.push(mutable out, Vec_usize.at(g.edge_to, e), allocator)?
+        }
+        e = e + 1
+    }
+    return out
+}

@@ -1,0 +1,372 @@
+
+module refine.solver.rational.scalar
+
+import local.solver.rational.wide as wide_mod
+
+
+derive eq, debug for Mag
+derive eq, debug for Rational
+
+
+public type Mag {
+    hi: u64
+    lo: u128
+}
+
+
+public type MagFolded {
+    ok: bool
+    value: Mag
+}
+
+
+public type Rational {
+    neg: bool
+    num: Mag
+    den: u128
+}
+
+
+public type RatResult {
+    ok: bool
+    value: Rational
+}
+
+
+function u64_max_u128() -> u128 {
+    let p32 = 4294967296 as u128
+    return p32 * p32 - (1 as u128)
+}
+
+
+function mask64() -> u128 {
+    return u64_max_u128()
+}
+
+
+public function mag_zero() -> Mag {
+    return Mag { hi: 0 as u64, lo: 0 as u128 }
+}
+
+
+public function mag_from_u128(v: u128) -> Mag {
+    return Mag { hi: 0 as u64, lo: v }
+}
+
+
+public function mag_is_zero(m: Mag) -> bool {
+    return m.hi == (0 as u64) && m.lo == (0 as u128)
+}
+
+
+public function mag_fits_u128(m: Mag) -> bool {
+    return m.hi == (0 as u64)
+}
+
+
+public function mag_cmp(a: Mag, b: Mag) -> i32 {
+    if a.hi > b.hi {
+        return 1 as i32
+    }
+    if a.hi < b.hi {
+        return -1 as i32
+    }
+    if a.lo > b.lo {
+        return 1 as i32
+    }
+    if a.lo < b.lo {
+        return -1 as i32
+    }
+    return 0 as i32
+}
+
+
+function mag_fail() -> MagFolded {
+    return MagFolded { ok: false, value: mag_zero() }
+}
+
+
+function mag_add(a: Mag, b: Mag) -> MagFolded {
+    let carry: u128 = if a.lo > wide_mod.u128_max() - b.lo { 1 as u128 } else { 0 as u128 }
+    let lo = if carry == (1 as u128) {
+        a.lo - (wide_mod.u128_max() - b.lo) - (1 as u128)
+    } else {
+        a.lo + b.lo
+    }
+    let total = (a.hi as u128) + (b.hi as u128) + carry
+    if total > u64_max_u128() {
+        return mag_fail()
+    }
+    return MagFolded { ok: true, value: Mag { hi: total as u64, lo: lo } }
+}
+
+
+function mag_sub_ge(a: Mag, b: Mag) -> Mag {
+    let borrow: u64 = if a.lo < b.lo { 1 as u64 } else { 0 as u64 }
+    let lo = if borrow == (1 as u64) {
+        a.lo + (wide_mod.u128_max() - b.lo) + (1 as u128)
+    } else {
+        a.lo - b.lo
+    }
+    return Mag { hi: a.hi - b.hi - borrow, lo: lo }
+}
+
+
+function mag_mul(a: Mag, b: Mag) -> MagFolded {
+    let m = mask64()
+    let a0 = a.lo & m
+    let a1 = a.lo >> 64
+    let a2 = a.hi as u128
+    let b0 = b.lo & m
+    let b1 = b.lo >> 64
+    let b2 = b.hi as u128
+    if a2 != (0 as u128) && (b1 != (0 as u128) || b2 != (0 as u128)) {
+        return mag_fail()
+    }
+    if b2 != (0 as u128) && a1 != (0 as u128) {
+        return mag_fail()
+    }
+    let p00 = a0 * b0
+    let p01 = a0 * b1
+    let p10 = a1 * b0
+    let p02 = a0 * b2
+    let p20 = a2 * b0
+    let p11 = a1 * b1
+    let r0 = p00 & m
+    let t1 = (p00 >> 64) + (p01 & m) + (p10 & m)
+    let r1 = t1 & m
+    let t2 = (t1 >> 64) + (p01 >> 64) + (p10 >> 64) + (p02 & m) + (p20 & m) + (p11 & m)
+    let r2 = t2 & m
+    let t3 = (t2 >> 64) + (p02 >> 64) + (p20 >> 64) + (p11 >> 64)
+    if t3 != (0 as u128) {
+        return mag_fail()
+    }
+    return MagFolded { ok: true, value: Mag { hi: r2 as u64, lo: (r1 << 64) + r0 } }
+}
+
+
+function mag_mul_u128(a: Mag, b: u128) -> MagFolded {
+    return mag_mul(a, mag_from_u128(b))
+}
+
+
+function gcd_mag(a: u128, b: u128) -> u128 {
+    var x = a
+    var y = b
+    loop
+        decreases y
+    {
+        if y == (0 as u128) {
+            break
+        }
+        let r = x % y
+        x = y
+        y = r
+    }
+    return x
+}
+
+
+function rat_fail() -> RatResult {
+    return RatResult { ok: false, value: zero() }
+}
+
+
+function make_mag(neg: bool, num: Mag, den: u128) -> RatResult {
+    if den == (0 as u128) {
+        return rat_fail()
+    }
+    if mag_is_zero(num) {
+        return RatResult { ok: true, value: zero() }
+    }
+    if !mag_fits_u128(num) {
+        return RatResult { ok: true, value: Rational { neg: neg, num: num, den: den } }
+    }
+    let g = gcd_mag(num.lo, den)
+    if g <= (1 as u128) {
+        return RatResult { ok: true, value: Rational { neg: neg, num: num, den: den } }
+    }
+    return RatResult { ok: true, value: Rational { neg: neg, num: mag_from_u128(num.lo / g), den: den / g } }
+}
+
+
+public function make(num: i128, den: i128) -> Rational
+    requires den != 0
+{
+    let neg = (num < (0 as i128)) != (den < (0 as i128))
+    let nm = wide_mod.mag_u128(num)
+    let dm = wide_mod.mag_u128(den)
+    if nm == (0 as u128) {
+        return zero()
+    }
+    let g = gcd_mag(nm, dm)
+    return Rational { neg: neg, num: mag_from_u128(nm / g), den: dm / g }
+}
+
+
+public function from_int(v: i64) -> Rational {
+    return from_i128(v as i128)
+}
+
+
+public function from_i128(v: i128) -> Rational {
+    return Rational { neg: v < (0 as i128), num: mag_from_u128(wide_mod.mag_u128(v)), den: 1 as u128 }
+}
+
+
+public function from_wide(w: wide_mod.Wide) -> Rational {
+    return Rational { neg: w.neg, num: mag_from_u128(w.mag), den: 1 as u128 }
+}
+
+
+public function zero() -> Rational {
+    return Rational { neg: false, num: mag_zero(), den: 1 as u128 }
+}
+
+
+public function one() -> Rational {
+    return Rational { neg: false, num: mag_from_u128(1 as u128), den: 1 as u128 }
+}
+
+
+public function is_zero(r: Rational) -> bool {
+    return mag_is_zero(r.num)
+}
+
+
+public function is_neg(r: Rational) -> bool {
+    return r.neg
+}
+
+
+public function is_pos(r: Rational) -> bool {
+    return !r.neg && !mag_is_zero(r.num)
+}
+
+
+public function neg(r: Rational) -> Rational {
+    return Rational {
+        neg: if mag_is_zero(r.num) { false } else { !r.neg },
+        num: r.num,
+        den: r.den,
+    }
+}
+
+
+public function neg_checked(r: Rational) -> RatResult {
+    return RatResult { ok: true, value: neg(r) }
+}
+
+
+public function add_checked(a: Rational, b: Rational) -> RatResult {
+    let n1 = mag_mul_u128(a.num, b.den)
+    let n2 = mag_mul_u128(b.num, a.den)
+    if !n1.ok || !n2.ok {
+        return rat_fail()
+    }
+    if a.den > wide_mod.u128_max() / b.den {
+        return rat_fail()
+    }
+    let d = a.den * b.den
+    if a.neg == b.neg {
+        let s = mag_add(n1.value, n2.value)
+        if !s.ok {
+            return rat_fail()
+        }
+        return make_mag(a.neg, s.value, d)
+    }
+    if mag_cmp(n1.value, n2.value) >= (0 as i32) {
+        return make_mag(a.neg, mag_sub_ge(n1.value, n2.value), d)
+    }
+    return make_mag(b.neg, mag_sub_ge(n2.value, n1.value), d)
+}
+
+
+public function sub_checked(a: Rational, b: Rational) -> RatResult {
+    return add_checked(a, neg(b))
+}
+
+
+public function mul_checked(a: Rational, b: Rational) -> RatResult {
+    let n = mag_mul(a.num, b.num)
+    if !n.ok {
+        return rat_fail()
+    }
+    if a.den > wide_mod.u128_max() / b.den {
+        return rat_fail()
+    }
+    return make_mag(a.neg != b.neg, n.value, a.den * b.den)
+}
+
+
+public function div_checked(a: Rational, b: Rational) -> RatResult {
+    if mag_is_zero(b.num) {
+        return rat_fail()
+    }
+    if !mag_fits_u128(b.num) {
+        return rat_fail()
+    }
+    let n = mag_mul_u128(a.num, b.den)
+    if !n.ok {
+        return rat_fail()
+    }
+    if a.den > wide_mod.u128_max() / b.num.lo {
+        return rat_fail()
+    }
+    return make_mag(a.neg != b.neg, n.value, a.den * b.num.lo)
+}
+
+
+public function is_integer(r: Rational) -> bool {
+    return r.den == (1 as u128)
+}
+
+
+public function floor_wide(r: Rational) -> wide_mod.WideResult {
+    if !mag_fits_u128(r.num) {
+        return wide_mod.wide_fail()
+    }
+    let q = r.num.lo / r.den
+    let rem = r.num.lo % r.den
+    if !r.neg {
+        return wide_mod.WideResult { ok: true, value: wide_mod.wide_norm(false, q) }
+    }
+    if rem == (0 as u128) {
+        return wide_mod.WideResult { ok: true, value: wide_mod.wide_norm(true, q) }
+    }
+    return wide_mod.WideResult { ok: true, value: wide_mod.wide_norm(true, q + (1 as u128)) }
+}
+
+
+public function ceil_wide(r: Rational) -> wide_mod.WideResult {
+    if !mag_fits_u128(r.num) {
+        return wide_mod.wide_fail()
+    }
+    let q = r.num.lo / r.den
+    let rem = r.num.lo % r.den
+    if r.neg {
+        return wide_mod.WideResult { ok: true, value: wide_mod.wide_norm(true, q) }
+    }
+    if rem == (0 as u128) {
+        return wide_mod.WideResult { ok: true, value: wide_mod.wide_norm(false, q) }
+    }
+    return wide_mod.WideResult { ok: true, value: wide_mod.wide_norm(false, q + (1 as u128)) }
+}
+
+
+public function floor_rat(r: Rational) -> RatResult {
+    let w = floor_wide(r)
+    if !w.ok {
+        return rat_fail()
+    }
+    return RatResult { ok: true, value: from_wide(w.value) }
+}
+
+
+public function ceil_rat(r: Rational) -> RatResult {
+    let w = ceil_wide(r)
+    if !w.ok {
+        return rat_fail()
+    }
+    return RatResult { ok: true, value: from_wide(w.value) }
+}

@@ -1,0 +1,151 @@
+module mir.lower.build.scan.pattern
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import syntax.ast.tree as ast_pat_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import local.body.model as body_mod
+import local.term as term_mod
+import local.id.local as local_mod
+import local.id.block as block_mod
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.pattern.query.query as query_mod
+import local.lower.pattern.bind as bind_mod
+import local.lower.pattern.test.test as test_mod
+
+
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(local_mod.LocalId)
+spec std.core.option.Option(body_mod.RegionId)
+
+
+public function emit_arm_match_and_bind(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    pat: ast_pat_mod.Pat,
+    bindings: Vec_HBinding.Vec,
+    matched_blk: block_mod.BlockId,
+    next_blk: block_mod.BlockId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    match pat.kind {
+        case .or_(let alts) => {
+            if query_mod.vec_pat_any_binds(alts) {
+                emit_or_alternatives(mutable builder, scrut_local, scrut_ty, bool_ty, alts, bindings, matched_blk, next_blk, types_out, ty_interner, match_node, allocator)?
+            } else {
+                emit_test_bind_generic(mutable builder, scrut_local, scrut_ty, bool_ty, pat, bindings, matched_blk, next_blk, types_out, ty_interner, match_node, allocator)?
+            }
+        }
+        case _ => emit_test_bind_generic(mutable builder, scrut_local, scrut_ty, bool_ty, pat, bindings, matched_blk, next_blk, types_out, ty_interner, match_node, allocator)?
+    }
+}
+
+function emit_test_bind_generic(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    pat: ast_pat_mod.Pat,
+    bindings: Vec_HBinding.Vec,
+    matched_blk: block_mod.BlockId,
+    next_blk: block_mod.BlockId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let bind_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+    let cond = test_mod.emit_arm_test(mutable builder, scrut_local, scrut_ty, bool_ty, pat, types_out, ty_interner, match_node, allocator)?
+    let branch_term = term_mod.Terminator {
+        origin: match_node,
+        kind: term_mod.TermKind.branch(cond: cond, true_: bind_blk, false_: next_blk),
+    }
+    builder_mod.seal_block_with(mutable builder, take branch_term, allocator)?
+    builder_mod.switch_to(mutable builder, bind_blk)
+    bind_mod.bind_arm_pattern(mutable builder, scrut_local, scrut_ty, pat, bindings, types_out, ty_interner, match_node, allocator)?
+    let goto_term = term_mod.Terminator {
+        origin: match_node,
+        kind: term_mod.TermKind.goto_(target: matched_blk),
+    }
+    builder_mod.seal_block_with(mutable builder, take goto_term, allocator)?
+}
+
+function emit_or_alternatives(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    alts: Vec_Pat.Vec,
+    bindings: Vec_HBinding.Vec,
+    matched_blk: block_mod.BlockId,
+    next_blk: block_mod.BlockId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit or_defs: Vec_DefId.Vec
+    Vec_DefId.new(init or_defs, allocator)?
+    if Vec_Pat.len(alts) > 0 {
+        bind_mod.collect_or_bound_defs(Vec_Pat.at(alts, 0), bindings, mutable or_defs, allocator)?
+    }
+    uninit canon_locals: Vec_LocalId.Vec
+    Vec_LocalId.new(init canon_locals, allocator)?
+    bind_mod.alloc_canonical_or_locals(mutable builder, or_defs, mutable canon_locals, types_out, match_node, allocator)?
+    let n = Vec_Pat.len(alts)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let alt = Vec_Pat.at(alts, i)
+        let alt_bind_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+        let is_last = (i + 1) >= n
+        let false_blk = if is_last {
+            next_blk
+        } else {
+            builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+        }
+        let cond = test_mod.emit_arm_test(mutable builder, scrut_local, scrut_ty, bool_ty, alt, types_out, ty_interner, match_node, allocator)?
+        let branch_term = term_mod.Terminator {
+            origin: match_node,
+            kind: term_mod.TermKind.branch(cond: cond, true_: alt_bind_blk, false_: false_blk),
+        }
+        builder_mod.seal_block_with(mutable builder, take branch_term, allocator)?
+        builder_mod.switch_to(mutable builder, alt_bind_blk)
+        bind_mod.bind_arm_pattern(mutable builder, scrut_local, scrut_ty, alt, bindings, types_out, ty_interner, match_node, allocator)?
+        bind_mod.funnel_or_bindings(mutable builder, or_defs, canon_locals, match_node, allocator)?
+        let goto_term = term_mod.Terminator {
+            origin: match_node,
+            kind: term_mod.TermKind.goto_(target: matched_blk),
+        }
+        builder_mod.seal_block_with(mutable builder, take goto_term, allocator)?
+        if !is_last {
+            builder_mod.switch_to(mutable builder, false_blk)
+        }
+        i = i + 1
+    }
+    bind_mod.rebind_or_canonicals(mutable builder, or_defs, canon_locals, allocator)?
+}
+

@@ -1,0 +1,108 @@
+
+module compile.instantiate.cteval
+
+import std.mem.alloc
+import std.collections.vec
+import cteval.builtin.target.reg.registry as cbi_registry_mod
+import cteval.error as cteval_error_mod
+import cteval.evaluate as cteval_evaluate_mod
+import cteval.res.output as cteval_output_mod
+import diagnostics.emit.collection as diags_mod
+import hir.build.file as hir_file_mod
+import intern.interner as sym_interner_mod
+import target.triple as triple_mod
+import types.check as types_check_mod
+import types.effect.interner as row_interner_mod
+import types.ty.interner as ty_interner_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(cteval_output_mod.ComptimeOutput)
+spec std.collections.vec.Vec(cteval_error_mod.ComptimeError)
+
+
+public function evaluate_files(
+    hir_files: Vec_HirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: row_interner_mod.Interner,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    sym_interner: mutable sym_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_ComptimeOutput.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit results: Vec_ComptimeOutput.Vec
+    Vec_ComptimeOutput.new(init results, allocator)?
+    let n = Vec_HirFile.len(hir_files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let hir = Vec_HirFile.at(hir_files, i)
+        let type_out = Vec_TypeOutput.at(type_outputs, i)
+        let cteval_out = cteval_evaluate_mod.evaluate_file(
+            hir, hir_files, type_out, ty_interner, effect_interner,
+            builtin_registry, triple, mutable sym_interner, allocator,
+        )?
+        emit_failures(mutable diags, cteval_out, allocator)?
+        Vec_ComptimeOutput.push(mutable results, take cteval_out, allocator)?
+        i = i + 1
+    }
+    return results
+}
+
+
+public function evaluate_files_bodies(
+    hir_files: Vec_HirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: row_interner_mod.Interner,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    sym_interner: mutable sym_interner_mod.Interner,
+    skip_templates: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_ComptimeOutput.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit results: Vec_ComptimeOutput.Vec
+    Vec_ComptimeOutput.new(init results, allocator)?
+    let n = Vec_HirFile.len(hir_files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let hir = Vec_HirFile.at(hir_files, i)
+        let type_out = Vec_TypeOutput.at(type_outputs, i)
+        let cteval_out = cteval_evaluate_mod.evaluate_file_bodies(
+            hir, hir_files, type_out, ty_interner, effect_interner,
+            builtin_registry, triple, mutable sym_interner, skip_templates, allocator,
+        )?
+        emit_failures(mutable diags, cteval_out, allocator)?
+        Vec_ComptimeOutput.push(mutable results, take cteval_out, allocator)?
+        i = i + 1
+    }
+    return results
+}
+
+
+function emit_failures(
+    diags: mutable diags_mod.Diagnostics,
+    output: cteval_output_mod.ComptimeOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_ComptimeError.len(output.failures)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_ComptimeError.at(output.failures, i)
+        let d = cteval_error_mod.to_diagnostic(e, allocator)?
+        diags_mod.emit(mutable diags, take d, allocator)?
+        i = i + 1
+    }
+}

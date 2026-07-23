@@ -1,0 +1,1062 @@
+
+module mir.lower.build.ctx.builder
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import hir.node as node_mod
+import hir.def as def_mod
+import hir.tree as hir_tree
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ops as ast_ops_mod
+import syntax.ast.literal as literal_mod
+import syntax.tokens.kind as int_base_mod
+import span.loc.pos.span as span_mod
+import types.pass.ty as ty_mod
+import types.effect.row as effect_facts_mod
+import target.triple as triple_mod
+import cteval.res.output as cteval_output_mod
+import cteval.state.value as comptime_value_mod
+import local.id.local as local_mod
+import local.id.block as block_mod
+import local.id.hir as hir_file_mod
+import local.place as place_mod
+import local.rvalue as rvalue_mod
+import local.body.model as body_mod
+import local.stmt as stmt_mod
+import local.term as term_mod
+import local.error.diag as mir_error_mod
+import local.lower.eqmap.targets as eqmap_mod
+import local.lower.fmt.targets as fmt_targets_mod
+
+
+spec std.collections.vec.Vec(place_mod.Projection)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(body_mod.BasicBlock)
+spec std.collections.vec.Vec(body_mod.Local)
+spec std.collections.vec.Vec(body_mod.Obligation)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_tree_mod.RefinementClause)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.collections.vec.Vec(LoopFrame)
+spec std.collections.vec.Vec(HandlerFrame)
+spec std.collections.vec.Vec(hir_tree.HClosureParam)
+spec std.collections.vec.Vec(hir_tree.HCapture)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.collections.vec.Vec(PendingClosure)
+spec std.collections.vec.Vec(mir_error_mod.UnsupportedSite)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(SpawnCaptureSet)
+spec std.collections.vec.Vec(ReturnExit)
+
+
+spec std.collections.hashmap.IntMap(u32)
+
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(local_mod.LocalId)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(body_mod.RegionId)
+spec std.core.option.Option(LoopFrame)
+spec std.core.option.Option(HandlerFrame)
+spec std.core.option.Option(PendingClosure)
+spec std.core.option.Option(comptime_value_mod.ComptimeValue)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(ty_mod.TyId)
+spec std.core.option.Option(Vec_Projection)
+spec std.core.option.Option(ast_tree_mod.Expr)
+spec std.core.option.Option(rvalue_mod.Operand)
+spec std.core.option.Option(Vec_DefId)
+spec std.core.option.Option(Box_HExpr)
+
+
+derive eq, hash, debug for LoopFrame
+derive eq, debug for HandlerFrame
+
+
+public type LoopFrame {
+    break_target: block_mod.BlockId
+    continue_target: block_mod.BlockId
+    label: Option_Symbol.Option
+    break_dest: local_mod.LocalId
+}
+
+public type HandlerFrame {
+    caught_ty: ty_mod.TyId
+    handler_block: block_mod.BlockId
+    binder_local: local_mod.LocalId
+}
+
+public type OverflowInfo {
+    found: bool
+    def_id: def_mod.DefId
+    ty: ty_mod.TyId
+    variant_idx: u32
+}
+
+public function missing_overflow_info() -> OverflowInfo {
+    return OverflowInfo {
+        found: false,
+        def_id: def_mod.DefId { raw: 0 },
+        ty: ty_mod.error(),
+        variant_idx: 0,
+    }
+}
+
+public type SpawnCaptureSet {
+    node_raw: u32
+    defs: Vec_DefId
+}
+
+public type ReturnExit {
+    value_op: rvalue_mod.Operand
+    value_expr: Option_Box_HExpr.Option
+    guards: Vec_Expr.Vec
+    opaque: bool
+}
+
+public type PendingClosure {
+    def_id: def_mod.DefId
+    name: symbol_mod.Symbol
+    params: Vec_HClosureParam
+    body: hir_tree.HBlock
+    return_ty: ty_mod.TyId
+    prepend_env: bool
+    has_capture: bool
+    capture_def: def_mod.DefId
+    capture_name: symbol_mod.Symbol
+    capture_ty: ty_mod.TyId
+    pointer_backed: bool
+    env_ty: ty_mod.TyId
+    captures: Vec_HCapture
+    spawn_result_ty: ty_mod.TyId
+}
+
+public type LowerCtx {
+    body: body_mod.MirBody
+    current_block: block_mod.BlockId
+    current_statements: Vec_Statement.Vec
+    locals_scope: IntMap_u32.IntMap
+    loop_stack: Vec_LoopFrame.Vec
+    handler_stack: Vec_HandlerFrame.Vec
+    next_region_id: u32
+    current_coherence_region: Option_RegionId.Option
+    current_exec_group: Option_LocalId.Option
+    overflow_info: OverflowInfo
+    closure_def_base: u32
+    pointer_width: usize
+    pending_closures: Vec_PendingClosure.Vec
+    comptime_values: cteval_output_mod.ComptimeOutput
+    unsupported: Vec_UnsupportedSite.Vec
+    pending_shims: Vec_DefId.Vec
+    bridge_map: IntMap_u32.IntMap
+    extern_defs: IntMap_u32.IntMap
+    err_wide_map: IntMap_u32.IntMap
+    triple: triple_mod.TargetTriple
+    closure_env_tys: IntMap_u32.IntMap
+    closure_escapes: IntMap_u32.IntMap
+    spawn_captures: Vec_SpawnCaptureSet.Vec
+    by_ref_param_tys: IntMap_u32.IntMap
+    box_elem_ty_map: IntMap_u32.IntMap
+    outcome_buf_ty: ty_mod.TyId
+    task_group_ty: ty_mod.TyId
+    effect_facts: effect_facts_mod.EffectFacts
+    fmt_targets: fmt_targets_mod.FmtTargets
+    eq_targets: eqmap_mod.EqTargets
+    own_allocator: Option_LocalId.Option
+    ensures_clauses: Vec_RefinementClause.Vec
+    return_exits: Vec_ReturnExit.Vec
+    guard_stack: Vec_Expr.Vec
+    guard_opaque_depth: u32
+}
+
+
+public function new_ctx(
+    out: init LowerCtx,
+    def_id: def_mod.DefId,
+    name: symbol_mod.Symbol,
+    origin_file: hir_file_mod.HirFileId,
+    body_node_origin: node_mod.NodeId,
+    return_ty: ty_mod.TyId,
+    function_trust: body_mod.TrustAnnotation,
+    effect_facts: effect_facts_mod.EffectFacts,
+    overflow_info: OverflowInfo,
+    closure_def_base: u32,
+    pointer_width: usize,
+    comptime_values: cteval_output_mod.ComptimeOutput,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    err_wide_map: IntMap_u32.IntMap,
+    triple: triple_mod.TargetTriple,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    outcome_buf_ty: ty_mod.TyId,
+    task_group_ty: ty_mod.TyId,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit body: body_mod.MirBody
+    body_mod.new_body(
+        init body,
+        def_id,
+        name,
+        origin_file,
+        body_node_origin,
+        return_ty,
+        function_trust,
+        effect_facts,
+        allocator,
+    )?
+
+    uninit current_statements: Vec_Statement.Vec
+    Vec_Statement.new(init current_statements, allocator)?
+
+    let locals_scope = IntMap_u32.new(allocator)?
+
+    let closure_env_tys = IntMap_u32.new(allocator)?
+
+    let closure_escapes = IntMap_u32.new(allocator)?
+
+    let by_ref_param_tys = IntMap_u32.new(allocator)?
+
+    uninit loop_stack: Vec_LoopFrame.Vec
+    Vec_LoopFrame.new(init loop_stack, allocator)?
+
+    uninit handler_stack: Vec_HandlerFrame.Vec
+    Vec_HandlerFrame.new(init handler_stack, allocator)?
+
+    uninit pending_closures: Vec_PendingClosure.Vec
+    Vec_PendingClosure.new(init pending_closures, allocator)?
+
+    uninit unsupported: Vec_UnsupportedSite.Vec
+    Vec_UnsupportedSite.new(init unsupported, allocator)?
+
+    uninit pending_shims: Vec_DefId.Vec
+    Vec_DefId.new(init pending_shims, allocator)?
+
+    uninit ensures_clauses: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init ensures_clauses, allocator)?
+
+    uninit spawn_captures: Vec_SpawnCaptureSet.Vec
+    Vec_SpawnCaptureSet.new(init spawn_captures, allocator)?
+
+    uninit return_exits: Vec_ReturnExit.Vec
+    Vec_ReturnExit.new(init return_exits, allocator)?
+
+    uninit guard_stack: Vec_Expr.Vec
+    Vec_Expr.new(init guard_stack, allocator)?
+
+    out = LowerCtx {
+        body: body,
+        current_block: block_mod.entry(),
+        current_statements: current_statements,
+        locals_scope: locals_scope,
+        loop_stack: loop_stack,
+        handler_stack: handler_stack,
+        next_region_id: 1,
+        current_coherence_region: Option_RegionId.none,
+        current_exec_group: Option_LocalId.none,
+        overflow_info: overflow_info,
+        closure_def_base: closure_def_base,
+        pointer_width: pointer_width,
+        pending_closures: pending_closures,
+        comptime_values: comptime_values,
+        unsupported: unsupported,
+        pending_shims: pending_shims,
+        bridge_map: bridge_map,
+        extern_defs: extern_defs,
+        err_wide_map: err_wide_map,
+        triple: triple,
+        closure_env_tys: closure_env_tys,
+        closure_escapes: closure_escapes,
+        spawn_captures: spawn_captures,
+        by_ref_param_tys: by_ref_param_tys,
+        box_elem_ty_map: box_elem_ty_map,
+        outcome_buf_ty: outcome_buf_ty,
+        task_group_ty: task_group_ty,
+        effect_facts: effect_facts,
+        fmt_targets: fmt_targets,
+        eq_targets: eq_targets,
+        own_allocator: Option_LocalId.none,
+        ensures_clauses: ensures_clauses,
+        return_exits: return_exits,
+        guard_stack: guard_stack,
+        guard_opaque_depth: 0,
+    }
+}
+
+
+public function push_guard_fact(
+    ctx: mutable LowerCtx,
+    fact: take ast_tree_mod.Expr,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_Expr.push(mutable ctx.guard_stack, take fact, allocator)?
+}
+
+
+public function pop_guard_fact(ctx: mutable LowerCtx) -> () {
+    let _ = Vec_Expr.pop(mutable ctx.guard_stack)
+}
+
+
+public function enter_opaque_guards(ctx: mutable LowerCtx) -> () {
+    ctx.guard_opaque_depth = ctx.guard_opaque_depth + 1
+}
+
+
+public function exit_opaque_guards(ctx: mutable LowerCtx) -> () {
+    if ctx.guard_opaque_depth > 0 {
+        ctx.guard_opaque_depth = ctx.guard_opaque_depth - 1
+    }
+}
+
+public function finish(ctx: take LowerCtx) -> body_mod.MirBody {
+    return ctx.body
+}
+
+
+public function closure_base(ctx: LowerCtx) -> u32 {
+    return ctx.closure_def_base
+}
+
+public function pointer_width(ctx: LowerCtx) -> usize {
+    return ctx.pointer_width
+}
+
+public function bridge_ordinal_of(ctx: LowerCtx, def_id: def_mod.DefId) -> Option_u32.Option {
+    return IntMap_u32.get(ctx.bridge_map, def_id.raw as i64)
+}
+
+public function is_extern_def(ctx: LowerCtx, def_id: def_mod.DefId) -> bool {
+    return match IntMap_u32.get(ctx.extern_defs, def_id.raw as i64) {
+        case .some(_) => true
+        case .none => false
+    }
+}
+
+public function err_wide_ty_of(ctx: LowerCtx, def_id: def_mod.DefId) -> Option_TyId.Option {
+    return match IntMap_u32.get(ctx.err_wide_map, def_id.raw as i64) {
+        case .some(let raw) => Option_TyId.some(value: ty_mod.TyId { raw: raw })
+        case .none => Option_TyId.none
+    }
+}
+
+public function effect_facts(ctx: LowerCtx) -> effect_facts_mod.EffectFacts {
+    return ctx.effect_facts
+}
+
+public function triple(ctx: LowerCtx) -> triple_mod.TargetTriple {
+    return ctx.triple
+}
+
+public function fmt_targets(ctx: LowerCtx) -> fmt_targets_mod.FmtTargets {
+    return ctx.fmt_targets
+}
+
+public function eq_targets(ctx: LowerCtx) -> eqmap_mod.EqTargets {
+    return ctx.eq_targets
+}
+
+public function own_allocator(ctx: LowerCtx) -> Option_LocalId.Option {
+    return ctx.own_allocator
+}
+
+public function set_own_allocator(ctx: mutable LowerCtx, local: local_mod.LocalId) -> () {
+    ctx.own_allocator = Option_LocalId.some(value: local)
+}
+
+public function box_elem_ty_of(ctx: LowerCtx, def_id: def_mod.DefId) -> Option_TyId.Option {
+    return match IntMap_u32.get(ctx.box_elem_ty_map, def_id.raw as i64) {
+        case .some(let raw) => Option_TyId.some(value: ty_mod.TyId { raw: raw })
+        case .none          => Option_TyId.none
+    }
+}
+
+public function task_group_ty_of(ctx: LowerCtx) -> ty_mod.TyId {
+    return ctx.task_group_ty
+}
+
+public function outcome_buf_ty_of(ctx: LowerCtx) -> ty_mod.TyId {
+    return ctx.outcome_buf_ty
+}
+
+public function return_value_ty(ctx: LowerCtx) -> ty_mod.TyId {
+    return if Vec_Local.len(ctx.body.locals) > 1 {
+        Vec_Local.at(ctx.body.locals, 1).ty
+    } else {
+        ty_mod.error()
+    }
+}
+
+public function local_ty(ctx: LowerCtx, id: local_mod.LocalId) -> ty_mod.TyId {
+    let idx = local_mod.index(id)
+    return if idx < Vec_Local.len(ctx.body.locals) {
+        Vec_Local.at(ctx.body.locals, idx).ty
+    } else {
+        ty_mod.error()
+    }
+}
+
+public function comptime_value_of(
+    ctx: LowerCtx,
+    node_id: node_mod.NodeId,
+) -> Option_ComptimeValue.Option
+    with {divergence}
+{
+    return cteval_output_mod.evaluated_value_of(ctx.comptime_values, node_id)
+}
+
+public function record_closure(ctx: mutable LowerCtx, pc: take PendingClosure, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_PendingClosure.push(mutable ctx.pending_closures, take pc, allocator)?
+}
+
+public function drain_pending_into(ctx: mutable LowerCtx, dst: mutable Vec_PendingClosure.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        match Vec_PendingClosure.pop(mutable ctx.pending_closures) {
+            case .some(let pc) => Vec_PendingClosure.push(mutable dst, take pc, allocator)?
+            case .none => break
+        }
+    }
+}
+
+
+public function record_shim(ctx: mutable LowerCtx, real_def: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_DefId.push(mutable ctx.pending_shims, real_def, allocator)?
+}
+
+public function drain_shims_into(ctx: mutable LowerCtx, dst: mutable Vec_DefId.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        match Vec_DefId.pop(mutable ctx.pending_shims) {
+            case .some(let real_def) => Vec_DefId.push(mutable dst, real_def, allocator)?
+            case .none => break
+        }
+    }
+}
+
+
+public function record_unlowered(ctx: mutable LowerCtx, node_id: node_mod.NodeId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let site = mir_error_mod.UnsupportedSite {
+        node_id: node_id,
+        kind: mir_error_mod.UnsupportedKind.unlowered_expr_form,
+    }
+    Vec_UnsupportedSite.push(mutable ctx.unsupported, take site, allocator)?
+}
+
+public function record_closure_escapes_without_allocator(ctx: mutable LowerCtx, node_id: node_mod.NodeId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let site = mir_error_mod.UnsupportedSite {
+        node_id: node_id,
+        kind: mir_error_mod.UnsupportedKind.closure_escapes_without_allocator,
+    }
+    Vec_UnsupportedSite.push(mutable ctx.unsupported, take site, allocator)?
+}
+
+public function record_fmt_target_unresolved(ctx: mutable LowerCtx, node_id: node_mod.NodeId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let site = mir_error_mod.UnsupportedSite {
+        node_id: node_id,
+        kind: mir_error_mod.UnsupportedKind.fmt_target_unresolved,
+    }
+    Vec_UnsupportedSite.push(mutable ctx.unsupported, take site, allocator)?
+}
+
+public function drain_unsupported_into(ctx: mutable LowerCtx, dst: mutable Vec_UnsupportedSite.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        match Vec_UnsupportedSite.pop(mutable ctx.unsupported) {
+            case .some(let site) => Vec_UnsupportedSite.push(mutable dst, take site, allocator)?
+            case .none => break
+        }
+    }
+}
+
+
+public function alloc_block(
+    ctx: mutable LowerCtx,
+    node_id_origin: node_mod.NodeId,
+    coherence_region: Option_RegionId.Option,
+    allocator: Allocator,
+) -> block_mod.BlockId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_BasicBlock.len(ctx.body.blocks) < 4294967295
+{
+    let slot = Vec_BasicBlock.len(ctx.body.blocks) as u32
+    uninit stmts: Vec_Statement.Vec
+    Vec_Statement.new(init stmts, allocator)?
+    let placeholder = body_mod.BasicBlock {
+        node_id_origin: node_id_origin,
+        statements: stmts,
+        terminator: term_mod.Terminator {
+            origin: node_id_origin,
+            kind: term_mod.TermKind.unreachable_,
+        },
+        coherence_region: coherence_region,
+    }
+    Vec_BasicBlock.push(mutable ctx.body.blocks, take placeholder, allocator)?
+    return block_mod.BlockId { raw: slot }
+}
+
+public function switch_to(
+    ctx: mutable LowerCtx,
+    target: block_mod.BlockId,
+) -> ()
+    requires block_mod.index(target) < Vec_BasicBlock.len(ctx.body.blocks)
+{
+    ctx.current_block = target
+}
+
+public function push_stmt(
+    ctx: mutable LowerCtx,
+    stmt: take stmt_mod.Statement,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires block_mod.is_error(ctx.current_block) == false
+{
+    Vec_Statement.push(mutable ctx.current_statements, take stmt, allocator)?
+}
+
+public function seal_block_with(
+    ctx: mutable LowerCtx,
+    term_value: take term_mod.Terminator,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires block_mod.is_error(ctx.current_block) == false
+    requires block_mod.index(ctx.current_block) < Vec_BasicBlock.len(ctx.body.blocks)
+{
+    let slot = block_mod.index(ctx.current_block)
+    let placeholder = Vec_BasicBlock.at(ctx.body.blocks, slot)
+
+    let buffered_stmts: Vec_Statement.Vec = ctx.current_statements
+
+    let final_block = body_mod.BasicBlock {
+        node_id_origin: placeholder.node_id_origin,
+        statements: buffered_stmts,
+        terminator: term_value,
+        coherence_region: placeholder.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable ctx.body.blocks, slot, take final_block)
+
+    uninit fresh_buffer: Vec_Statement.Vec
+    Vec_Statement.new(init fresh_buffer, allocator)?
+    ctx.current_statements = fresh_buffer
+    ctx.current_block = block_mod.error()
+}
+
+public function current_block_id(ctx: LowerCtx) -> block_mod.BlockId {
+    return ctx.current_block
+}
+
+
+public function alloc_local(
+    ctx: mutable LowerCtx,
+    ty: ty_mod.TyId,
+    mutability: body_mod.Mutability,
+    consumption: body_mod.Consumption,
+    name: Option_Symbol.Option,
+    origin: Option_NodeId.Option,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Local.len(ctx.body.locals) < 4294967295
+{
+    let slot = Vec_Local.len(ctx.body.locals) as u32
+    let local = body_mod.Local {
+        ty: ty,
+        mutability: mutability,
+        consumption: consumption,
+        name: name,
+        origin: origin,
+    }
+    Vec_Local.push(mutable ctx.body.locals, take local, allocator)?
+    return local_mod.LocalId { raw: slot }
+}
+
+
+public function push_obligation(
+    ctx: mutable LowerCtx,
+    kind: body_mod.ObligationKind,
+    predicate: take ast_tree_mod.Expr,
+    context: take Vec_Expr.Vec,
+    trust: body_mod.TrustAnnotation,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let obligation = body_mod.Obligation {
+        block: ctx.current_block,
+        stmt_index: Vec_Statement.len(ctx.current_statements) as u32,
+        kind: kind,
+        predicate: predicate,
+        context: context,
+        trust: trust,
+    }
+    Vec_Obligation.push(mutable ctx.body.obligations, take obligation, allocator)?
+}
+
+
+public function push_div_by_zero_const(
+    ctx: mutable LowerCtx,
+    divisor_bits: u128,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = nonzero_literal_predicate(divisor_bits, allocator)?
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.div_by_zero,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+public function push_div_by_zero_dynamic(
+    ctx: mutable LowerCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = int_literal_expr(0 as u128)
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.div_by_zero,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+public function push_int_overflow(
+    ctx: mutable LowerCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = int_literal_expr(0 as u128)
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.int_overflow,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+public function push_div_overflow(
+    ctx: mutable LowerCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = int_literal_expr(0 as u128)
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.div_overflow,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+public function push_index_in_bounds(
+    ctx: mutable LowerCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = int_literal_expr(0 as u128)
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.index_in_bounds,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+public function push_slice_subrange_in_bounds(
+    ctx: mutable LowerCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = int_literal_expr(0 as u128)
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.slice_subrange_in_bounds,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+public function push_narrowing_cast_range(
+    ctx: mutable LowerCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let predicate = int_literal_expr(0 as u128)
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    push_obligation(
+        mutable ctx,
+        body_mod.ObligationKind.narrowing_cast_range,
+        take predicate,
+        take context,
+        body_mod.TrustAnnotation.discharged,
+        allocator,
+    )?
+}
+
+
+function nonzero_literal_predicate(
+    bits: u128,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    let lhs_expr = int_literal_expr(bits)
+    let rhs_expr = int_literal_expr(0 as u128)
+    let lhs = Box_Expr.new(take lhs_expr, allocator)?
+    let rhs = Box_Expr.new(take rhs_expr, allocator)?
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.binary(
+            op: ast_ops_mod.BinOp.ne,
+            lhs: lhs,
+            rhs: rhs,
+        ),
+    }
+}
+
+
+function int_literal_expr(bits: u128) -> ast_tree_mod.Expr {
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.literal(
+            value: literal_mod.Literal.int(value: bits, base: int_base_mod.IntBase.dec),
+        ),
+    }
+}
+
+
+function bool_literal_expr(value: bool) -> ast_tree_mod.Expr {
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.literal(
+            value: literal_mod.Literal.bool(value: value),
+        ),
+    }
+}
+
+
+public function constant_value_expr(c: rvalue_mod.Constant) -> Option_Expr.Option {
+    return match c.kind {
+        case .int_(let bits) => Option_Expr.some(value: int_literal_expr(bits))
+        case .bool_(let value) => Option_Expr.some(value: bool_literal_expr(value))
+        case _ => Option_Expr.none
+    }
+}
+
+
+public function set_ensures_clauses(ctx: mutable LowerCtx, clauses: take Vec_RefinementClause.Vec) -> () {
+    ctx.ensures_clauses = clauses
+}
+
+
+public function bind_local(
+    ctx: mutable LowerCtx,
+    def_id: def_mod.DefId,
+    local_id: local_mod.LocalId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let raw_value: u32 = local_id.raw
+    let _ = IntMap_u32.insert(
+        mutable ctx.locals_scope,
+        def_id.raw as i64,
+        take raw_value,
+        allocator,
+    )?
+}
+
+public function lookup_local(ctx: LowerCtx, def_id: def_mod.DefId) -> Option_LocalId.Option {
+    return match IntMap_u32.get(ctx.locals_scope, def_id.raw as i64) {
+        case .some(let raw) => Option_LocalId.some(value: local_mod.LocalId { raw: raw })
+        case .none          => Option_LocalId.none
+    }
+}
+
+
+public function record_closure_env_ty(
+    ctx: mutable LowerCtx,
+    node_id: node_mod.NodeId,
+    env_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let raw_value: u32 = env_ty.raw
+    let _ = IntMap_u32.insert(
+        mutable ctx.closure_env_tys,
+        node_id.raw as i64,
+        take raw_value,
+        allocator,
+    )?
+}
+
+public function closure_env_ty_of(ctx: LowerCtx, node_id: node_mod.NodeId) -> ty_mod.TyId {
+    return match IntMap_u32.get(ctx.closure_env_tys, node_id.raw as i64) {
+        case .some(let raw) => ty_mod.TyId { raw: raw }
+        case .none          => ty_mod.error()
+    }
+}
+
+public function record_spawn_captures(
+    ctx: mutable LowerCtx,
+    node_id: node_mod.NodeId,
+    defs: take Vec_DefId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let entry = SpawnCaptureSet {
+        node_raw: node_id.raw,
+        defs: take defs,
+    }
+    Vec_SpawnCaptureSet.push(mutable ctx.spawn_captures, take entry, allocator)?
+}
+
+public function spawn_captures_of(ctx: LowerCtx, node_id: node_mod.NodeId) -> Option_Vec_DefId.Option
+    with {divergence}
+{
+    let n = Vec_SpawnCaptureSet.len(ctx.spawn_captures)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = Vec_SpawnCaptureSet.at(ctx.spawn_captures, i)
+        if entry.node_raw == node_id.raw {
+            return Option_Vec_DefId.some(value: entry.defs)
+        }
+        i = i + 1
+    }
+    return Option_Vec_DefId.none
+}
+
+public function record_closure_escapes(
+    ctx: mutable LowerCtx,
+    node_id: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let marker: u32 = 1
+    let _ = IntMap_u32.insert(
+        mutable ctx.closure_escapes,
+        node_id.raw as i64,
+        take marker,
+        allocator,
+    )?
+}
+
+public function closure_escapes_of(ctx: LowerCtx, node_id: node_mod.NodeId) -> bool {
+    return match IntMap_u32.get(ctx.closure_escapes, node_id.raw as i64) {
+        case .some(_) => true
+        case .none    => false
+    }
+}
+
+public function mark_by_ref_param(
+    ctx: mutable LowerCtx,
+    def_id: def_mod.DefId,
+    value_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let raw_value: u32 = value_ty.raw
+    let _ = IntMap_u32.insert(
+        mutable ctx.by_ref_param_tys,
+        def_id.raw as i64,
+        take raw_value,
+        allocator,
+    )?
+}
+
+public function by_ref_param_ty(ctx: LowerCtx, def_id: def_mod.DefId) -> Option_TyId.Option {
+    return match IntMap_u32.get(ctx.by_ref_param_tys, def_id.raw as i64) {
+        case .some(let raw) => Option_TyId.some(value: ty_mod.TyId { raw: raw })
+        case .none          => Option_TyId.none
+    }
+}
+
+
+public function enter_loop(
+    ctx: mutable LowerCtx,
+    frame: take LoopFrame,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_LoopFrame.push(mutable ctx.loop_stack, take frame, allocator)?
+}
+
+public function exit_loop(ctx: mutable LowerCtx) -> Option_LoopFrame.Option {
+    return Vec_LoopFrame.pop(mutable ctx.loop_stack)
+}
+
+public function innermost_loop(ctx: LowerCtx) -> Option_LoopFrame.Option {
+    return Vec_LoopFrame.last(ctx.loop_stack)
+}
+
+public function find_loop_by_label(ctx: LowerCtx, label: symbol_mod.Symbol) -> Option_LoopFrame.Option {
+    let n = Vec_LoopFrame.len(ctx.loop_stack)
+    var i: usize = n
+    loop
+        decreases i
+    {
+        if i == 0 as usize {
+            break
+        }
+        i = i - 1
+        let frame = Vec_LoopFrame.at(ctx.loop_stack, i)
+        match frame.label {
+            case .some(let l) => {
+                if l.raw == label.raw {
+                    return Option_LoopFrame.some(value: frame)
+                }
+            }
+            case .none => ()
+        }
+    }
+    return Option_LoopFrame.none
+}
+
+
+public function enter_handler(
+    ctx: mutable LowerCtx,
+    frame: take HandlerFrame,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_HandlerFrame.push(mutable ctx.handler_stack, take frame, allocator)?
+}
+
+public function exit_handler(ctx: mutable LowerCtx) -> Option_HandlerFrame.Option {
+    return Vec_HandlerFrame.pop(mutable ctx.handler_stack)
+}
+
+public function innermost_matching_handler(ctx: LowerCtx, raised_ty: ty_mod.TyId) -> Option_HandlerFrame.Option {
+    let n = Vec_HandlerFrame.len(ctx.handler_stack)
+    var i: usize = n
+    loop
+        decreases i
+    {
+        if i == 0 as usize {
+            break
+        }
+        i = i - 1
+        let frame = Vec_HandlerFrame.at(ctx.handler_stack, i)
+        if frame.caught_ty.raw == raised_ty.raw {
+            return Option_HandlerFrame.some(value: frame)
+        }
+    }
+    return Option_HandlerFrame.none
+}
+
+
+public function alloc_region(ctx: mutable LowerCtx) -> body_mod.RegionId
+    with {panic}
+{
+    let slot = ctx.next_region_id
+    let bumped = ctx.next_region_id +| 1
+    if bumped == ctx.next_region_id {
+        panic("coherence region id space exhausted")
+    }
+    ctx.next_region_id = bumped
+    return body_mod.RegionId { raw: slot }
+}
+
+public function current_region(ctx: LowerCtx) -> Option_RegionId.Option {
+    return ctx.current_coherence_region
+}
+
+public function set_coherence_region(ctx: mutable LowerCtx, region: Option_RegionId.Option) -> () {
+    ctx.current_coherence_region = region
+}
+
+public function current_exec_group(ctx: LowerCtx) -> Option_LocalId.Option {
+    return ctx.current_exec_group
+}
+
+public function set_exec_group(ctx: mutable LowerCtx, group: Option_LocalId.Option) -> () {
+    ctx.current_exec_group = group
+}
+
+
+public function local_place(local_id: local_mod.LocalId) -> place_mod.Place {
+    return place_mod.Place {
+        local: local_id,
+        projection: Option_Vec_Projection.none,
+    }
+}

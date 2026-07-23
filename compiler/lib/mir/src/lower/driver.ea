@@ -1,0 +1,482 @@
+
+module mir.lower.driver
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.text.string as string
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.interner as interner_mod
+import symname.lib as symname_mod
+import syntax.ast.item as ast_item_mod
+import types.check as check_mod
+import types.check.env.sig as sig_mod
+import types.effect.interner as effect_interner_mod
+import types.effect.row as effect_row_mod
+import types.pass.effect as effect_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import cteval.builtin.target.layout.compute.engine as engine_mod
+import target.triple as triple_mod
+import target.arch as arch_mod
+import cteval.res.output as cteval_output_mod
+import local.body.model as body_mod
+import local.file.store as file_mod
+import local.error.diag as mir_error_mod
+import local.layout.table as layout_mod
+import local.id.hir as origin_id_mod
+import local.lower.items as items
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.build.overflow.desugar as checked_mod
+import local.lower.build.scan.errscan as errscan_mod
+import local.lower.eqmap.targets as eqmap_mod
+import local.lower.fmt.targets as fmt_targets_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(body_mod.MirBody)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(builder_mod.PendingClosure)
+spec std.collections.vec.Vec(mir_error_mod.UnsupportedSite)
+spec std.collections.vec.Vec(def_mod.DefId)
+
+spec std.core.option.Option(builder_mod.PendingClosure)
+spec std.core.option.Option(span_mod.Span)
+spec std.core.option.Option(errscan_mod.DroppedNode)
+
+spec std.collections.hashmap.IntMap(u32)
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+
+
+public function lower_file(
+    hir_file: take hir_file_mod.HirFile,
+    types_out: check_mod.TypeOutput,
+    comptime_out: cteval_output_mod.ComptimeOutput,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    skip_templates: bool,
+    interner: interner_mod.Interner,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    layout_cache: mutable layout_mod.LayoutCache,
+    diags: mutable diags_mod.Diagnostics,
+    meta_alloc: Allocator,
+    allocator: Allocator,
+) -> file_mod.MirFile
+    with {meta_alloc, allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit out: file_mod.MirFile
+    file_mod.new(init out, extern_defs, allocator)?
+
+    Vec_HirFile.push(mutable out.hir_files, take hir_file, allocator)?
+    let origin_id = origin_id_mod.HirFileId { raw: 1 }
+
+    let file = Vec_HirFile.at(out.hir_files, 1)
+    let overflow_info = checked_mod.find_overflow_info(types_out, interner)
+    let closure_def_base = file.next_def_id
+    let pointer_width = arch_mod.pointer_width(triple_mod.arch(triple))
+    let outcome_buf_ty = intern_outcome_buf_ty(mutable ty_interner, types_out, meta_alloc)?
+    let task_group_ty = ty_interner_mod.intern(
+        mutable ty_interner,
+        ty_kind_mod.CTy.primitive(ty_kind_mod.PrimKind.heap_ptr),
+        meta_alloc,
+    )?
+    let err_wide_map = build_err_wide_map(types_out, effect_interner, ty_interner, triple, allocator)?
+    uninit worklist: Vec_PendingClosure.Vec
+    Vec_PendingClosure.new(init worklist, allocator)?
+    uninit unsupported: Vec_UnsupportedSite.Vec
+    Vec_UnsupportedSite.new(init unsupported, allocator)?
+    uninit shims: Vec_DefId.Vec
+    Vec_DefId.new(init shims, allocator)?
+    let n: usize = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .function_(let sig_box, let body) => {
+                let skip_generic = skip_templates && declares_generics(sig_box)
+                if !skip_generic {
+                    let dropped = if skip_templates {
+                        errscan_mod.first_error_node(body, types_out)
+                    } else {
+                        Option_DroppedNode.none
+                    }
+                    match dropped {
+                        case .some(let dn) =>
+                            emit_dropped_body_diagnostic(item, sig_box, file, dn, interner, mutable diags, meta_alloc)?
+                        case .none => {
+                            let mir_body = items.lower_function_item(
+                                item.def_id,
+                                origin_id,
+                                sig_box,
+                                body,
+                                types_out,
+                                comptime_out,
+                                mutable ty_interner,
+                                overflow_info,
+                                closure_def_base,
+                                pointer_width,
+                                bridge_map,
+                                extern_defs,
+                                err_wide_map,
+                                triple,
+                                box_elem_ty_map,
+                                outcome_buf_ty,
+                                task_group_ty,
+                                fmt_targets,
+                                eq_targets,
+                                mutable worklist,
+                                mutable unsupported,
+                                mutable shims,
+                                meta_alloc,
+                                allocator,
+                            )?
+                            let _prior = file_mod.register_body(mutable out, take mir_body, allocator)?
+                        }
+                    }
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+
+    loop {
+        match Vec_PendingClosure.pop(mutable worklist) {
+            case .some(let pc) => {
+                let lifted = items.lower_closure_body(
+                    pc,
+                    origin_id,
+                    types_out,
+                    comptime_out,
+                    mutable ty_interner,
+                    overflow_info,
+                    closure_def_base,
+                    pointer_width,
+                    bridge_map,
+                    extern_defs,
+                    err_wide_map,
+                    triple,
+                    box_elem_ty_map,
+                    outcome_buf_ty,
+                    task_group_ty,
+                    fmt_targets,
+                    eq_targets,
+                    mutable worklist,
+                    mutable unsupported,
+                    mutable shims,
+                    meta_alloc,
+                    allocator,
+                )?
+                let _lifted_prior = file_mod.register_body(mutable out, take lifted, allocator)?
+            }
+            case .none => break
+        }
+    }
+
+    uninit shim_done: Vec_DefId.Vec
+    Vec_DefId.new(init shim_done, allocator)?
+    let n_shims: usize = Vec_DefId.len(shims)
+    var si: usize = 0
+    loop
+        decreases (n_shims - si)
+    {
+        if si >= n_shims {
+            break
+        }
+        let real_def = Vec_DefId.at(shims, si)
+        if !defid_seen(shim_done, real_def) {
+            Vec_DefId.push(mutable shim_done, real_def, allocator)?
+            let shim_def = def_mod.from_raw(real_def.raw | (2147483648 as u32))
+            let real_has_by_ref = real_def_by_ref(types_out, real_def)
+            let shim_body = items.lower_shim_body(
+                real_def,
+                shim_def,
+                real_has_by_ref,
+                origin_id,
+                types_out,
+                comptime_out,
+                ty_interner,
+                overflow_info,
+                closure_def_base,
+                pointer_width,
+                bridge_map,
+                extern_defs,
+                err_wide_map,
+                triple,
+                box_elem_ty_map,
+                outcome_buf_ty,
+                task_group_ty,
+                fmt_targets,
+                eq_targets,
+                allocator,
+            )?
+            let _shim_prior = file_mod.register_body(mutable out, take shim_body, allocator)?
+        }
+        si = si + 1
+    }
+
+    layout_mod.extend_cache(mutable layout_cache, ty_interner, types_out, triple, meta_alloc)?
+    let nb = Vec_MirBody.len(out.bodies)
+    var bi: usize = 0
+    loop decreases nb - bi {
+        if bi >= nb { break }
+        let b = Vec_MirBody.at(out.bodies, bi)
+        let flag = def_err_bymem(b.def_id, types_out, err_wide_map, ty_interner, triple)
+        let layered = body_mod.set_agg_layouts(take b, layout_cache.table)
+        let updated = body_mod.set_err_bymem(take layered, flag)
+        Vec_MirBody.set_at(mutable out.bodies, bi, take updated)
+        bi += 1
+    }
+
+    emit_unsupported_diagnostics(file, unsupported, mutable diags, meta_alloc)?
+
+    return out
+}
+
+
+function emit_unsupported_diagnostics(
+    file: hir_file_mod.HirFile,
+    sites: Vec_UnsupportedSite.Vec,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_UnsupportedSite.len(sites)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let site = Vec_UnsupportedSite.at(sites, i)
+        let at = match hir_file_mod.span_of_opt(file, site.node_id) {
+            case .some(let s) => s
+            case .none => span_mod.dummy()
+        }
+        let e = match site.kind {
+            case .closure_escapes_without_allocator =>
+                mir_error_mod.MirError.closure_escapes_without_allocator(at: at)
+            case .fmt_target_unresolved =>
+                mir_error_mod.MirError.internal_lowering_invariant(at: at, message: "f-string format target resolved to def 0 — the stdlib `format_i128`/`format_u128` fmt target (or its to-String wrapper) is not in the compiled closure for this target; a call fn#0 would surface as an unresolved-symbol link error, so lowering refuses it here")
+            case _ =>
+                mir_error_mod.MirError.unsupported_expr_form(at: at, kind: site.kind)
+        }
+        let d = mir_error_mod.to_diagnostic(e, allocator)?
+        diags_mod.emit(mutable diags, take d, allocator)?
+        i = i + 1
+    }
+}
+
+
+function emit_dropped_body_diagnostic(
+    item: hir_item.HItem,
+    sig_box: Box_HFnSignature,
+    file: hir_file_mod.HirFile,
+    dropped: errscan_mod.DroppedNode,
+    interner: interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let sig = Box_HFnSignature.get(sig_box)
+    let name = symname_mod.extern_symbol(sig.name, interner, allocator)?
+    let head = string.concat("function `", name, allocator)?
+    let mid = string.concat(head, "` dropped at MIR lowering: ", allocator)?
+    let msg = string.concat(mid, errscan_mod.cause_label(dropped.cause), allocator)?
+    let at = drop_span(file, item, dropped.node_id)
+    let d = diag_mod.error_at(code_mod.codegen_error(), at, msg)
+    diags_mod.emit(mutable diags, take d, allocator)?
+}
+
+
+function drop_span(file: hir_file_mod.HirFile, item: hir_item.HItem, node_id: node_mod.NodeId) -> span_mod.Span {
+    let primary = match hir_file_mod.span_of_opt(file, node_id) {
+        case .some(let s) => s
+        case .none => span_mod.dummy()
+    }
+    if !span_mod.is_dummy(primary) {
+        return primary
+    }
+    return item.ast_item.span
+}
+
+
+function defid_seen(seen: Vec_DefId.Vec, target: def_mod.DefId) -> bool {
+    let n: usize = Vec_DefId.len(seen)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if Vec_DefId.at(seen, i).raw == target.raw {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function declares_generics(sig_box: Box_HFnSignature) -> bool {
+    let sig = Box_HFnSignature.get(sig_box)
+    return Vec_GenericParam.len(sig.outbound_generics) > 0
+        || Vec_GenericParam.len(sig.generics) > 0
+}
+
+
+function real_def_by_ref(types_out: check_mod.TypeOutput, real_def: def_mod.DefId) -> bool {
+    return match check_mod.signature_of(types_out, real_def) {
+        case .some(let s) => s.has_by_ref_param
+        case .none => false
+    }
+}
+
+
+function intern_outcome_buf_ty(
+    ty_interner: mutable ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError}
+{
+    let word_ty = types_out.builtins.usize_
+    uninit elems: Vec_TyId.Vec
+    Vec_TyId.new(init elems, allocator)?
+    Vec_TyId.push(mutable elems, word_ty, allocator)?
+    Vec_TyId.push(mutable elems, word_ty, allocator)?
+    Vec_TyId.push(mutable elems, word_ty, allocator)?
+    return ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.tuple_(elems: elems), allocator)?
+}
+
+
+function layout_size_of(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> usize
+    with {divergence}
+{
+    return match engine_mod.compute_layout(t, ty_interner, types_out, triple) {
+        case .ok(let layout) => layout.size
+        case .unsupported(_) => 0 as usize
+    }
+}
+
+
+function widest_row_err_ty(
+    row_id: effect_mod.EffectRowId,
+    effect_interner: effect_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    let row = effect_interner_mod.lookup(effect_interner, row_id)
+    var best: ty_mod.TyId = ty_mod.error()
+    var best_size: usize = 0
+    let n = Vec_CEntry.len(row.entries)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        match Vec_CEntry.at(row.entries, i) {
+            case .err_(let t) => {
+                let s = layout_size_of(t, ty_interner, types_out, triple)
+                if ty_mod.is_error(best) || s > best_size {
+                    best = t
+                    best_size = s
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return best
+}
+
+
+function build_err_wide_map(
+    types_out: check_mod.TypeOutput,
+    effect_interner: effect_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var map = IntMap_u32.new(allocator)?
+    let n = Vec_FnSig.len(types_out.fn_signatures)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let sig = Vec_FnSig.at(types_out.fn_signatures, i)
+        if sig.effect_facts.raises {
+            let wide = widest_row_err_ty(sig.effects, effect_interner, ty_interner, types_out, triple)
+            if !ty_mod.is_error(wide) {
+                let wide_raw = wide.raw
+                let _ = IntMap_u32.insert(mutable map, i as i64, take wide_raw, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return map
+}
+
+
+function def_err_bymem(
+    def_id: def_mod.DefId,
+    types_out: check_mod.TypeOutput,
+    err_wide_map: IntMap_u32.IntMap,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+) -> bool
+    with {divergence}
+{
+    let idx = (def_id.raw & (2147483647 as u32)) as usize
+    if idx >= Vec_FnSig.len(types_out.fn_signatures) { return false }
+    let sig = Vec_FnSig.at(types_out.fn_signatures, idx)
+    if !sig.effect_facts.raises { return false }
+    let result_size = layout_size_of(sig.ret, ty_interner, types_out, triple)
+    let wide_ty = match IntMap_u32.get(err_wide_map, idx as i64) {
+        case .some(let raw) => ty_mod.TyId { raw: raw }
+        case .none => sig.effect_facts.err_ty
+    }
+    let err_size = layout_size_of(wide_ty, ty_interner, types_out, triple)
+    let dest_size = if result_size > err_size { result_size } else { err_size }
+    if dest_size == (0 as usize) { return false }
+    if dest_size == (1 as usize) { return false }
+    if dest_size == (2 as usize) { return false }
+    if dest_size == (4 as usize) { return false }
+    if dest_size == (8 as usize) { return false }
+    return true
+}

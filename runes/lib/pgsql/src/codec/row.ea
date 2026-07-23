@@ -1,0 +1,197 @@
+
+module pgsql.codec.row
+
+import local.error
+import std.text.str
+import local.oid.scalar as oid
+import local.codec.binary as binary_codec
+import local.message.fe.extended as fe_extended
+import local.message.be.data.rows as be_rows
+
+
+public type DecodedValue {
+    case null_value
+    case bool_value(value: bool)
+    case int2_value(value: i16)
+    case int4_value(value: i32)
+    case int8_value(value: i64)
+    case oid_value(value: u32)
+    case char_value(value: u8)
+    case bytea_value(value: [u8])
+    case text_value(value: [u8])
+    case uuid_value(value: [u8])
+    case unsupported(oid: u32, format_code: i16, raw: [u8])
+}
+
+
+function _decode_binary(col: be_rows.DataColumn, type_oid: u32) -> DecodedValue
+    with {err: error.EncodingError, err: error.ProtocolError}
+{
+    if type_oid == oid.bool_oid() {
+        return DecodedValue.bool_value(value: binary_codec.decode_bool(col.value)?)
+    }
+    if type_oid == oid.int2_oid() {
+        return DecodedValue.int2_value(value: binary_codec.decode_int2(col.value)?)
+    }
+    if type_oid == oid.int4_oid() {
+        return DecodedValue.int4_value(value: binary_codec.decode_int4(col.value)?)
+    }
+    if type_oid == oid.int8_oid() {
+        return DecodedValue.int8_value(value: binary_codec.decode_int8(col.value)?)
+    }
+    if type_oid == oid.oid_oid() {
+        return DecodedValue.oid_value(value: binary_codec.decode_oid(col.value)?)
+    }
+    if type_oid == oid.char_oid() {
+        return DecodedValue.char_value(value: binary_codec.decode_char(col.value)?)
+    }
+    if type_oid == oid.bytea_oid() {
+        return DecodedValue.bytea_value(value: binary_codec.decode_bytea(col.value))
+    }
+    if type_oid == oid.text_oid() {
+        return DecodedValue.text_value(value: binary_codec.decode_text(col.value))
+    }
+    if type_oid == oid.varchar_oid() {
+        return DecodedValue.text_value(value: binary_codec.decode_text(col.value))
+    }
+    if type_oid == oid.bpchar_oid() {
+        return DecodedValue.text_value(value: binary_codec.decode_text(col.value))
+    }
+    if type_oid == oid.uuid_oid() {
+        return DecodedValue.uuid_value(value: binary_codec.decode_uuid(col.value)?)
+    }
+    return DecodedValue.unsupported(
+        oid: type_oid,
+        format_code: fe_extended.format_binary(),
+        raw: col.value,
+    )
+}
+
+
+function _decode_text(col: be_rows.DataColumn, type_oid: u32) -> DecodedValue
+    with {err: error.EncodingError}
+{
+    if type_oid == oid.text_oid() {
+        return DecodedValue.text_value(value: col.value)
+    }
+    if type_oid == oid.varchar_oid() {
+        return DecodedValue.text_value(value: col.value)
+    }
+    if type_oid == oid.bpchar_oid() {
+        return DecodedValue.text_value(value: col.value)
+    }
+    if type_oid == oid.bytea_oid() {
+        return DecodedValue.bytea_value(value: col.value)
+    }
+    if type_oid == oid.bool_oid() {
+        return DecodedValue.bool_value(value: _parse_bool_text(col.value, type_oid)?)
+    }
+    if type_oid == oid.int2_oid() {
+        return DecodedValue.int2_value(value: _parse_i16_text(col.value, type_oid)?)
+    }
+    if type_oid == oid.int4_oid() {
+        return DecodedValue.int4_value(value: _parse_i32_text(col.value, type_oid)?)
+    }
+    if type_oid == oid.int8_oid() {
+        return DecodedValue.int8_value(value: _parse_i64_text(col.value, type_oid)?)
+    }
+    if type_oid == oid.oid_oid() {
+        return DecodedValue.oid_value(value: _parse_u32_text(col.value, type_oid)?)
+    }
+    if type_oid == oid.char_oid() {
+        return DecodedValue.char_value(value: _parse_char_text(col.value, type_oid)?)
+    }
+    if type_oid == oid.uuid_oid() {
+        return DecodedValue.text_value(value: col.value)
+    }
+    return DecodedValue.unsupported(
+        oid: type_oid,
+        format_code: fe_extended.format_text(),
+        raw: col.value,
+    )
+}
+
+
+function _parse_bool_text(bytes: [u8], type_oid: u32) -> bool
+    with {err: error.EncodingError}
+{
+    if bytes.len() != (1 as usize) {
+        raise error.EncodingError.malformed_payload(oid: type_oid)
+    }
+    let b = bytes[0 as usize]
+    if b == (0x74 as u8) { return true }
+    if b == (0x66 as u8) { return false }
+    raise error.EncodingError.malformed_payload(oid: type_oid)
+}
+
+function _parse_char_text(bytes: [u8], type_oid: u32) -> u8
+    with {err: error.EncodingError}
+{
+    if bytes.len() != (1 as usize) {
+        raise error.EncodingError.malformed_payload(oid: type_oid)
+    }
+    return bytes[0 as usize]
+}
+
+function _parse_i64_text(bytes: [u8], type_oid: u32) -> i64
+    with {err: error.EncodingError}
+{
+    return handle err: str.ParseIntError as parse_err -> raise error.EncodingError.malformed_payload(oid: type_oid) {
+        str.parse_i64(bytes)?
+    }
+}
+
+function _parse_i32_text(bytes: [u8], type_oid: u32) -> i32
+    with {err: error.EncodingError}
+{
+    let raw = _parse_i64_text(bytes, type_oid)?
+    if raw < -2147483648 {
+        raise error.EncodingError.value_out_of_range(oid: type_oid)
+    }
+    if raw > 2147483647 {
+        raise error.EncodingError.value_out_of_range(oid: type_oid)
+    }
+    return raw as i32
+}
+
+function _parse_i16_text(bytes: [u8], type_oid: u32) -> i16
+    with {err: error.EncodingError}
+{
+    let raw = _parse_i64_text(bytes, type_oid)?
+    if raw < -32768 {
+        raise error.EncodingError.value_out_of_range(oid: type_oid)
+    }
+    if raw > 32767 {
+        raise error.EncodingError.value_out_of_range(oid: type_oid)
+    }
+    return raw as i16
+}
+
+function _parse_u32_text(bytes: [u8], type_oid: u32) -> u32
+    with {err: error.EncodingError}
+{
+    let raw = handle err: str.ParseIntError as parse_err -> raise error.EncodingError.malformed_payload(oid: type_oid) {
+        str.parse_u64(bytes)?
+    }
+    if raw > 4294967295 {
+        raise error.EncodingError.value_out_of_range(oid: type_oid)
+    }
+    return raw as u32
+}
+
+
+public function decode_column(
+    col: be_rows.DataColumn,
+    type_oid: u32,
+    format_code: i16,
+) -> DecodedValue
+    with {err: error.EncodingError, err: error.ProtocolError}
+{
+    if col.is_null {
+        return DecodedValue.null_value
+    }
+    if format_code == fe_extended.format_binary() {
+        return _decode_binary(col, type_oid)?
+    }
+    return _decode_text(col, type_oid)?
+}

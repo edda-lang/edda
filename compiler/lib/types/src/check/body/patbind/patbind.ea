@@ -1,0 +1,412 @@
+module types.check.body.patbind.patbind
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ident_mod
+import hir.tree as hir_tree
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.check.env.fields as fields_mod
+import local.check.body.defwrite.defwrite as defwrite_mod
+
+spec std.mem.alloc.Box(ast_tree.Pat)
+
+spec std.collections.vec.Vec(ast_tree.Pat)
+spec std.collections.vec.Vec(ast_tree.StructPatField)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+spec std.collections.vec.Vec(fields_mod.FieldNameMatrix)
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.core.option.Option(ast_tree.SliceRest)
+
+public function bind_arm_binders(
+    arm: hir_tree.HArm,
+    scrut_ty: ty_mod.TyId,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if ty_mod.is_error(scrut_ty) {
+        return
+    }
+    bind_pat_binders(arm.pat, arm.bindings, scrut_ty, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+}
+
+function bind_pat_binders(
+    pat: ast_tree.Pat,
+    bindings: Vec_HBinding.Vec,
+    scrut_ty: ty_mod.TyId,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let _ = bind_sub_pat(pat, scrut_ty, bindings, 0 as usize, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+}
+
+function bind_sub_pat(
+    pat: ast_tree.Pat,
+    expected_ty: ty_mod.TyId,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match pat.kind {
+        case .binding(_) => {
+            if cursor < Vec_HBinding.len(bindings) {
+                let b = Vec_HBinding.at(bindings, cursor)
+                defwrite_mod.write_at_def_id(mutable local_types, b.def_id, expected_ty, allocator)?
+                return cursor + 1 as usize
+            }
+            return cursor
+        }
+        case .tuple(let elements) => {
+            if !ty_mod.is_error(expected_ty) {
+                let scrut_cty = ty_interner_mod.lookup(ty_interner, expected_ty)
+                match scrut_cty {
+                    case .tuple_(let elem_tys) => {
+                        if Vec_Pat.len(elements) == Vec_TyId.len(elem_tys) {
+                            return bind_sub_pats(elements, elem_tys, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            return cursor + count_pat_binders(pat)
+        }
+        case .variant(let path, let payload) => {
+            let payload_ty = variant_payload_ty_of(path, expected_ty, field_tys, variant_names, ty_interner)
+            if !ty_mod.is_error(payload_ty) {
+                let pcty = ty_interner_mod.lookup(ty_interner, payload_ty)
+                match pcty {
+                    case .tuple_(let elem_tys) => {
+                        match payload {
+                            case .tuple(let elements) => {
+                                if Vec_Pat.len(elements) == Vec_TyId.len(elem_tys) {
+                                    return bind_sub_pats(elements, elem_tys, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+                                }
+                            }
+                            case .struct_(let sfields) => {
+                                match ty_interner_mod.lookup(ty_interner, expected_ty) {
+                                    case .sum_(let sdef) => {
+                                        let nseg = Vec_Ident.len(path.segments)
+                                        if nseg > 0 as usize {
+                                            let vname = Vec_Ident.at(path.segments, nseg - 1 as usize).name
+                                            match fields_mod.variant_index_in(variant_names, sdef, vname) {
+                                                case .some(let vi) => {
+                                                    return bind_struct_fields(sfields, elem_tys, sdef, vi, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+                                                }
+                                                case .none => ()
+                                            }
+                                        }
+                                    }
+                                    case _ => ()
+                                }
+                            }
+                            case _ => ()
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            return cursor + count_pat_binders(pat)
+        }
+        case .struct_(_, let fields, _) => {
+            if !ty_mod.is_error(expected_ty) {
+                match ty_interner_mod.lookup(ty_interner, expected_ty) {
+                    case .record(let rdef) => {
+                        let di = def_mod.index(rdef)
+                        if di < Vec_FieldTyList.len(field_tys) {
+                            let flist = Vec_FieldTyList.at(field_tys, di)
+                            return bind_struct_fields(fields, flist.tys, rdef, 0 as u32, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            return cursor + count_pat_binders(pat)
+        }
+        case .slice(let prefix, let rest, let suffix) => {
+            if !ty_mod.is_error(expected_ty) {
+                match ty_interner_mod.lookup(ty_interner, expected_ty) {
+                    case .slice(let elem) => {
+                        return bind_slice_pat(prefix, rest, suffix, elem, expected_ty, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+                    }
+                    case .array(let elem, _) => {
+                        return bind_slice_pat(prefix, rest, suffix, elem, expected_ty, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+                    }
+                    case _ => ()
+                }
+            }
+            return cursor + count_pat_binders(pat)
+        }
+        case .or_(let alternatives) => {
+            if Vec_Pat.len(alternatives) > 0 as usize {
+                return bind_sub_pat(Vec_Pat.at(alternatives, 0 as usize), expected_ty, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+            }
+            return cursor
+        }
+        case .at_binding(_, let sub) => {
+            let c = bind_sub_pat(Box_Pat.get(sub), expected_ty, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+            if c < Vec_HBinding.len(bindings) {
+                let b = Vec_HBinding.at(bindings, c)
+                defwrite_mod.write_at_def_id(mutable local_types, b.def_id, expected_ty, allocator)?
+                return c + 1 as usize
+            }
+            return c
+        }
+        case _ => return cursor + count_pat_binders(pat)
+    }
+}
+
+function bind_sub_pats(
+    elements: Vec_Pat.Vec,
+    elem_tys: Vec_TyId.Vec,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(elements)
+    var c: usize = cursor
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        c = bind_sub_pat(Vec_Pat.at(elements, i), Vec_TyId.at(elem_tys, i), bindings, c, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+        i = i + 1 as usize
+    }
+    return c
+}
+
+function bind_struct_fields(
+    fields: Vec_StructPatField.Vec,
+    elem_tys: Vec_TyId.Vec,
+    owner_def: def_mod.DefId,
+    row_idx: u32,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    var c: usize = cursor
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_StructPatField.at(fields, i)
+        let ety = match fields_mod.field_index_in(field_names, owner_def, row_idx, f.name.name) {
+            case .some(let idx) => {
+                let ix = idx as usize
+                if ix < Vec_TyId.len(elem_tys) {
+                    Vec_TyId.at(elem_tys, ix)
+                } else {
+                    ty_mod.error()
+                }
+            }
+            case .none => ty_mod.error()
+        }
+        c = bind_sub_pat(f.pat, ety, bindings, c, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+        i = i + 1 as usize
+    }
+    return c
+}
+
+function bind_slice_pat(
+    prefix: Vec_Pat.Vec,
+    rest: Option_SliceRest.Option,
+    suffix: Vec_Pat.Vec,
+    elem_ty: ty_mod.TyId,
+    slice_ty: ty_mod.TyId,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var c: usize = bind_same_ty_pats(prefix, elem_ty, bindings, cursor, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+    match rest {
+        case .some(let sr) => {
+            match sr.binding {
+                case .some(_) => {
+                    if c < Vec_HBinding.len(bindings) {
+                        let b = Vec_HBinding.at(bindings, c)
+                        defwrite_mod.write_at_def_id(mutable local_types, b.def_id, slice_ty, allocator)?
+                        c = c + 1 as usize
+                    }
+                }
+                case .none => ()
+            }
+        }
+        case .none => ()
+    }
+    c = bind_same_ty_pats(suffix, elem_ty, bindings, c, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+    return c
+}
+
+function bind_same_ty_pats(
+    elements: Vec_Pat.Vec,
+    elem_ty: ty_mod.TyId,
+    bindings: Vec_HBinding.Vec,
+    cursor: usize,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(elements)
+    var c: usize = cursor
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        c = bind_sub_pat(Vec_Pat.at(elements, i), elem_ty, bindings, c, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+        i = i + 1 as usize
+    }
+    return c
+}
+
+function variant_payload_ty_of(
+    path: ident_mod.Path,
+    scrut_ty: ty_mod.TyId,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    ty_interner: ty_interner_mod.Interner,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    if ty_mod.is_error(scrut_ty) {
+        return ty_mod.error()
+    }
+    let sum_def = match ty_interner_mod.lookup(ty_interner, scrut_ty) {
+        case .sum_(let d) => d
+        case _ => return ty_mod.error()
+    }
+    let nseg = Vec_Ident.len(path.segments)
+    if nseg == 0 as usize {
+        return ty_mod.error()
+    }
+    let vname = Vec_Ident.at(path.segments, nseg - 1 as usize).name
+    let di = def_mod.index(sum_def)
+    let found = match fields_mod.variant_index_in(variant_names, sum_def, vname) {
+        case .some(let vi) => vi as usize
+        case .none => return ty_mod.error()
+    }
+    if di >= Vec_FieldTyList.len(field_tys) {
+        return ty_mod.error()
+    }
+    let flist = Vec_FieldTyList.at(field_tys, di)
+    if found >= Vec_TyId.len(flist.tys) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(flist.tys, found)
+}
+
+function count_pat_binders(pat: ast_tree.Pat) -> usize
+    with {divergence}
+{
+    match pat.kind {
+        case .binding(_) => return 1 as usize
+        case .tuple(let elements) => return count_pats_binders(elements)
+        case .slice(let prefix, let rest, let suffix) => return count_pats_binders(prefix) + count_slice_rest(rest) + count_pats_binders(suffix)
+        case .struct_(_, let fields, _) => return count_struct_field_binders(fields)
+        case .variant(_, let payload) => {
+            match payload {
+                case .none => return 0 as usize
+                case .tuple(let elements) => return count_pats_binders(elements)
+                case .struct_(let fields) => return count_struct_field_binders(fields)
+            }
+        }
+        case .or_(let alternatives) => {
+            if Vec_Pat.len(alternatives) > 0 as usize {
+                return count_pat_binders(Vec_Pat.at(alternatives, 0 as usize))
+            }
+            return 0 as usize
+        }
+        case .at_binding(_, let sub) => return count_pat_binders(Box_Pat.get(sub)) + 1 as usize
+        case _ => return 0 as usize
+    }
+}
+
+function count_slice_rest(rest: Option_SliceRest.Option) -> usize
+    with {divergence}
+{
+    return match rest {
+        case .some(let sr) => match sr.binding {
+            case .some(_) => 1 as usize
+            case .none => 0 as usize
+        }
+        case .none => 0 as usize
+    }
+}
+
+function count_pats_binders(elements: Vec_Pat.Vec) -> usize
+    with {divergence}
+{
+    let n = Vec_Pat.len(elements)
+    var total: usize = 0 as usize
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        total = total + count_pat_binders(Vec_Pat.at(elements, i))
+        i = i + 1 as usize
+    }
+    return total
+}
+
+function count_struct_field_binders(fields: Vec_StructPatField.Vec) -> usize
+    with {divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    var total: usize = 0 as usize
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        total = total + count_pat_binders(Vec_StructPatField.at(fields, i).pat)
+        i = i + 1 as usize
+    }
+    return total
+}

@@ -1,0 +1,149 @@
+
+module compile.check.runes.resolve.effecthash.effecthash
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import std.archive.tar
+import cache.addr.hash as chash_mod
+import local.check.runes.util as util_mod
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(tar.Entry)
+
+
+public function compute_effect_hash(tar_bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    uninit entries: Vec_String.Vec
+    Vec_String.new(init entries, allocator)?
+    let fuel = tar.count_entries(tar_bytes)?
+    let total = tar_bytes.len()
+    var off: usize = 0
+    var i: usize = 0
+    loop decreases (fuel - i) {
+        if i >= fuel { break }
+        if off >= total { break }
+        match tar.entry_at(tar_bytes, off)? {
+            case .none => break
+            case .some(let e) => {
+                if tar.is_regular_file(e) {
+                    let nm = tar.entry_name(tar_bytes, e, allocator)?
+                    if string.starts_with(nm, "surface/") {
+                        let data = tar.entry_data(tar_bytes, e)?
+                        let text = string.bytes_slice_to_string(data, 0, data.len(), allocator)?
+                        collect_surface_effect_entries(text, mutable entries, allocator)?
+                    }
+                }
+                off = tar.next_offset(e)
+                i = i + 1
+            }
+        }
+    }
+    util_mod.sort_strings(mutable entries)
+    let canon = util_mod.join_lines(entries, allocator)?
+    let h = chash_mod.hash_bytes(canon.bytes(), allocator)?
+    let hex = chash_mod.to_hex_string(h, allocator)?
+    return string.concat("blake3:", hex, allocator)?
+}
+
+
+function collect_surface_effect_entries(
+    text: String,
+    entries: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let lines = string.split(text, "\n", allocator)?
+    let n = lines.len()
+    var in_effects: bool = false
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let line = lines[i]
+        if string.starts_with(line, "effects[") {
+            in_effects = true
+        } else {
+            if in_effects {
+                if string.starts_with(line, "  ") {
+                    collect_row_entries(line, mutable entries, allocator)?
+                } else {
+                    in_effects = false
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function collect_row_entries(
+    line: String,
+    entries: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let row = match quoted_of(line, allocator)? {
+        case .some(let r) => r
+        case .none => return
+    }
+    let parts = string.split(row, ", ", allocator)?
+    let n = parts.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = string.trim(parts[i], allocator)?
+        if !string.is_empty(entry) && !contains_str(entries, entry) {
+            let owned = string.clone(entry, allocator)?
+            Vec_String.push(mutable entries, take owned, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function quoted_of(line: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let lb = line.bytes()
+    let n = lb.len()
+    var q1: usize = 0
+    var found1: bool = false
+    loop decreases (n - q1) {
+        if q1 >= n { break }
+        if lb[q1] == 34 { found1 = true; break }
+        q1 = q1 + 1
+    }
+    if !found1 {
+        return Option_String.none
+    }
+    var q2: usize = q1 + 1
+    var found2: bool = false
+    loop decreases (n - q2) {
+        if q2 >= n { break }
+        if lb[q2] == 34 { found2 = true; break }
+        q2 = q2 + 1
+    }
+    if !found2 {
+        return Option_String.none
+    }
+    let v = string.bytes_slice_to_string(lb, q1 + 1, q2, allocator)?
+    return Option_String.some(value: v)
+}
+
+
+function contains_str(items: Vec_String.Vec, name: String) -> bool {
+    let n = Vec_String.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        if string.equals(Vec_String.at(items, i), name) {
+            return true
+        }
+        i = i + 1
+    }
+}

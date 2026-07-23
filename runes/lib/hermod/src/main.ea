@@ -1,0 +1,279 @@
+
+module hermod.main
+
+import std.io.stream
+import std.mem.alloc
+import std.core.option
+import std.text.string
+import local.error
+import local.proto.method as method_mod
+import local.proto.status as status_mod
+import local.proto.headers as headers_mod
+import local.uri.types as uri_mod
+import local.uri.parse as uri_parse_mod
+import local.message.body as body_mod
+import local.message.request as request_mod
+import local.message.response as response_mod
+import local.codec.wire.encode.encode as codec_encode
+import local.codec.wire.decode.decode as codec_decode
+import local.codec.transfer.chunked as chunked_mod
+import cookies.request as cx_request
+import cookies.parse as cx_parse
+import cookies.value as cx_value
+import cookies.error as cx_error
+import local.transport.server.server as server_mod
+import local.transport.client.client as client_mod
+
+spec option.Option(String)
+spec option.Option(i64)
+spec option.Option(cx_value.SameSite)
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function _check(out: Stdout, label: String, ok: bool) -> () with {out} {
+    if ok {
+        out.print("  [OK]  ")
+        out.print_line(label)
+    } else {
+        out.print("  FAIL  ")
+        out.print_line(label)
+    }
+}
+
+public function main(
+    out: Stdout,
+    allocator: mutable Allocator,
+) -> ()
+    with {
+        out, allocator,
+        err: alloc.AllocError,
+        err: error.CodecError,
+        err: error.TransportError,
+        err: error.UriError,
+        err: cx_error.ParseError,
+    }
+{
+    out.print_line("hermod: scaffold ready")
+    out.print_line("")
+
+    let u = uri_mod.uri_http("example.com".bytes(), 80 as u16, "/index.html".bytes())
+    var req = request_mod.request_get(u, 4 as usize, mutable allocator)?
+    headers_mod.headers_append(mutable req.headers, "Host".bytes(), "example.com".bytes())?
+    headers_mod.headers_append(mutable req.headers, "User-Agent".bytes(), "hermod/0.1".bytes())?
+    headers_mod.headers_append(mutable req.headers, "Accept".bytes(), "*/*".bytes())?
+
+    out.print_line("-- step 1 — Request constructed --")
+    _check(out, "method == GET",
+        method_mod.method_tag(request_mod.request_method(req)) == 1 as u8)
+    _check(out, "uri.target == /index.html",
+        _bytes_eq(uri_mod.uri_target(request_mod.request_uri(req)), "/index.html".bytes()))
+    _check(out, "uri.port == 80",
+        uri_mod.uri_port(request_mod.request_uri(req)) == 80 as u16)
+    _check(out, "headers.len == 3",
+        headers_mod.headers_len(request_mod.request_headers(req)) == 3 as usize)
+    _check(out, "headers has Host",
+        headers_mod.headers_has(request_mod.request_headers(req), "host".bytes()))
+    out.print_line("")
+
+    let wire = codec_encode.encode_request(req, mutable allocator)?
+    out.print_line("-- step 2 — encoded wire (text) --")
+    out.print_line(string.bytes_slice_to_string(wire, 0, wire.len(), allocator)?)
+
+    let req2 = codec_decode.decode_request(wire, mutable allocator)?
+    out.print_line("-- step 3 — round-trip decode --")
+    _check(out, "decoded method == GET",
+        method_mod.method_tag(request_mod.request_method(req2)) == 1 as u8)
+    _check(out, "decoded target == /index.html",
+        _bytes_eq(uri_mod.uri_target(request_mod.request_uri(req2)), "/index.html".bytes()))
+    _check(out, "decoded headers.len == 3",
+        headers_mod.headers_len(request_mod.request_headers(req2)) == 3 as usize)
+    _check(out, "decoded headers has User-Agent",
+        headers_mod.headers_has(request_mod.request_headers(req2), "user-agent".bytes()))
+    _check(out, "decoded body empty",
+        body_mod.body_is_empty(request_mod.request_body(req2)))
+    out.print_line("")
+
+    let body_in = body_mod.body_from_string("hello, hermod")
+    var resp = response_mod.response_ok(body_in, 4 as usize, mutable allocator)?
+    headers_mod.headers_append(mutable resp.headers, "Content-Type".bytes(), "text/plain".bytes())?
+    headers_mod.headers_append(mutable resp.headers, "Content-Length".bytes(), "13".bytes())?
+
+    let resp_wire = codec_encode.encode_response(resp, mutable allocator)?
+    out.print_line("-- step 4 — encoded response (text) --")
+    out.print_line(string.bytes_slice_to_string(resp_wire, 0, resp_wire.len(), allocator)?)
+
+    let resp2 = codec_decode.decode_response(resp_wire, mutable allocator)?
+    out.print_line("-- step 5 — response round-trip --")
+    _check(out, "decoded status code == 200",
+        status_mod.status_code(response_mod.response_status(resp2)) == 200 as u16)
+    _check(out, "decoded body bytes == \"hello, hermod\"",
+        _bytes_eq(body_mod.body_bytes(response_mod.response_body(resp2)),
+                  "hello, hermod".bytes()))
+    _check(out, "decoded headers.len == 2",
+        headers_mod.headers_len(response_mod.response_headers(resp2)) == 2 as usize)
+    out.print_line("")
+
+    let chunked_resp_wire =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n".bytes()
+    let chunked_resp = codec_decode.decode_response(chunked_resp_wire, mutable allocator)?
+    out.print_line("-- step 5b — chunked response decode --")
+    _check(out, "chunked status code == 200",
+        status_mod.status_code(response_mod.response_status(chunked_resp)) == 200 as u16)
+    _check(out, "chunked body decodes to \"Hello World\"",
+        _bytes_eq(body_mod.body_bytes(response_mod.response_body(chunked_resp)),
+                  "Hello World".bytes()))
+    out.print_line("")
+
+    let post_wire =
+        "POST /echo HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello".bytes()
+    let echo_out = server_mod.serve_one_echo(post_wire, mutable allocator)?
+    out.print_line("-- step 6 — server echo pipeline --")
+    out.print_line(string.bytes_slice_to_string(echo_out, 0, echo_out.len(), allocator)?)
+    let echo_resp = codec_decode.decode_response(echo_out, mutable allocator)?
+    _check(out, "echo status == 200",
+        status_mod.status_code(response_mod.response_status(echo_resp)) == 200 as u16)
+    _check(out, "echo body == \"hello\"",
+        _bytes_eq(body_mod.body_bytes(response_mod.response_body(echo_resp)),
+                  "hello".bytes()))
+    out.print_line("")
+
+    let c = client_mod.client_for("example.com".bytes(), 80 as u16)
+    out.print_line("-- step 7 — client stub --")
+    _check(out, "client_for built", client_mod.client_is_ready(c))
+    _check(out, "client_port == 80", client_mod.client_port(c) == 80 as u16)
+
+    let parsed = uri_parse_mod.uri_parse(
+        "https://example.com:8443/api?x=1".bytes(),
+        mutable allocator,
+    )?
+    out.print_line("-- step 9 — uri_parse --")
+    _check(out, "parsed scheme == https",
+        _bytes_eq(uri_mod.uri_scheme(parsed), "https".bytes()))
+    _check(out, "parsed host == example.com",
+        _bytes_eq(uri_mod.uri_host(parsed), "example.com".bytes()))
+    _check(out, "parsed port == 8443", uri_mod.uri_port(parsed) == 8443 as u16)
+    _check(out, "parsed target == /api?x=1",
+        _bytes_eq(uri_mod.uri_target(parsed), "/api?x=1".bytes()))
+    _check(out, "parsed is_https", uri_mod.uri_is_https(parsed))
+
+    let default_p = uri_parse_mod.uri_parse(
+        "http://example.com/".bytes(),
+        mutable allocator,
+    )?
+    _check(out, "default port resolves to 80",
+        uri_mod.uri_port(default_p) == 80 as u16)
+    out.print_line("")
+
+    let payload = "Hello, chunked body!".bytes()
+    let chunked_wire = chunked_mod.encode_chunked(payload, mutable allocator)?
+    let decoded_body = chunked_mod.decode_chunked(chunked_wire, mutable allocator)?
+    out.print_line("-- step 10 — chunked --")
+    _check(out, "encoded length sane",
+        chunked_wire.len() > payload.len())
+    _check(out, "decode round-trips",
+        _bytes_eq(decoded_body, payload))
+
+    let multi_chunk = "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n".bytes()
+    let multi_out = chunked_mod.decode_chunked(multi_chunk, mutable allocator)?
+    _check(out, "multi-chunk stitches to \"Hello World\"",
+        _bytes_eq(multi_out, "Hello World".bytes()))
+    out.print_line("")
+
+    let accept = "text/html, application/json, text/plain".bytes()
+    out.print_line("-- step 11 — csv walk --")
+    _check(out, "csv_count == 3",
+        headers_mod.csv_count(accept) == 3 as usize)
+    var csv = headers_mod.csv_advance(accept, 0 as usize)
+    _check(out, "csv[0] == text/html",
+        _bytes_eq(accept[csv.span_lo..<csv.span_hi], "text/html".bytes()))
+    csv = headers_mod.csv_advance(accept, csv.next_from)
+    _check(out, "csv[1] == application/json",
+        _bytes_eq(accept[csv.span_lo..<csv.span_hi], "application/json".bytes()))
+    csv = headers_mod.csv_advance(accept, csv.next_from)
+    _check(out, "csv[2] == text/plain",
+        _bytes_eq(accept[csv.span_lo..<csv.span_hi], "text/plain".bytes()))
+    out.print_line("")
+
+    let cookie_hdr = "session=abc123; theme=dark; lang=en".bytes()
+    out.print_line("-- step 12 — Cookie: walk --")
+    _check(out, "cookie_count == 3",
+        cx_request.cookie_count(cookie_hdr) == 3 as usize)
+    var ca = cx_request.cookie_advance(cookie_hdr, 0 as usize)
+    _check(out, "cookie[0] name=session",
+        _bytes_eq(cookie_hdr[ca.name_lo..<ca.name_hi], "session".bytes()))
+    _check(out, "cookie[0] value=abc123",
+        _bytes_eq(cookie_hdr[ca.value_lo..<ca.value_hi], "abc123".bytes()))
+    ca = cx_request.cookie_advance(cookie_hdr, ca.next_from)
+    _check(out, "cookie[1] name=theme",
+        _bytes_eq(cookie_hdr[ca.name_lo..<ca.name_hi], "theme".bytes()))
+    _check(out, "cookie[1] value=dark",
+        _bytes_eq(cookie_hdr[ca.value_lo..<ca.value_hi], "dark".bytes()))
+    out.print_line("")
+
+    let sc_hdr = "session=abc; Domain=example.com; Path=/; HttpOnly; Secure; Max-Age=3600; SameSite=Lax".bytes()
+    let sc = cx_parse.parse_set_cookie_bytes(sc_hdr, allocator)?
+    out.print_line("-- step 13 — Set-Cookie: parse --")
+    _check(out, "sc.name == session",
+        _bytes_eq(cx_value.name(sc).bytes(), "session".bytes()))
+    _check(out, "sc.value == abc",
+        _bytes_eq(cx_value.value(sc).bytes(), "abc".bytes()))
+    let domain_ok = match cx_value.domain(sc) {
+        case .some(let d) => _bytes_eq(d.bytes(), "example.com".bytes())
+        case .none        => false
+    }
+    _check(out, "sc.domain == example.com", domain_ok)
+    let path_ok = match cx_value.path(sc) {
+        case .some(let p) => _bytes_eq(p.bytes(), "/".bytes())
+        case .none        => false
+    }
+    _check(out, "sc.path == /", path_ok)
+    let same_site_ok = match cx_value.same_site(sc) {
+        case .some(let ss) => match ss {
+            case .lax => true
+            case _    => false
+        }
+        case .none => false
+    }
+    _check(out, "sc.same_site == Lax", same_site_ok)
+    let max_age_ok = match cx_value.max_age(sc) {
+        case .some(let m) => m == 3600 as i64
+        case .none        => false
+    }
+    _check(out, "sc.max_age == 3600", max_age_ok)
+    _check(out, "sc.is_secure", cx_value.secure(sc))
+    _check(out, "sc.is_http_only", cx_value.http_only(sc))
+    out.print_line("")
+
+    out.print_line("-- step 14 — multi-value lookups --")
+    _check(out, "ct fallback when absent",
+        _bytes_eq(
+            headers_mod.headers_value_or(
+                response_mod.response_headers(resp2),
+                "X-Missing".bytes(),
+                "default".bytes(),
+            ),
+            "default".bytes(),
+        ))
+    _check(out, "Content-Type direct lookup",
+        _bytes_eq(
+            headers_mod.headers_value_or(
+                response_mod.response_headers(resp2),
+                "content-type".bytes(),
+                "default".bytes(),
+            ),
+            "text/plain".bytes(),
+        ))
+    out.print_line("")
+
+    out.print_line("hermod: scaffold self-test complete")
+}

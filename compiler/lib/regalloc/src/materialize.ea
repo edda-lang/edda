@@ -1,0 +1,112 @@
+
+module regalloc.materialize
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+import target.triple as triple_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+
+import local.frame.frame as frame_mod
+import local.materialize.rewrite.subst as subst_mod
+import local.materialize.ops as ops_mod
+import local.materialize.rewrite.terms as terms_mod
+
+
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+
+
+public function materialize_spills(
+    body: mutable lir_body_mod.LirBody,
+    layout: frame_mod.FrameLayout,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let framebase = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.frame_base_preg(target), allocator)?
+    let n_blocks = Vec_LirBlock.len(body.blocks)
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        rewrite_block(mutable body, b, layout, framebase, agg_base, target, allocator)?
+        b += 1
+    }
+}
+
+
+function rewrite_block(
+    body: mutable lir_body_mod.LirBody,
+    b: usize,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if b >= Vec_LirBlock.len(body.blocks) { return }
+    let block = Vec_LirBlock.at(body.blocks, b)
+
+    uninit new_ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init new_ops, allocator)?
+
+    let n = Vec_LirOpId.len(block.ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op_id = Vec_LirOpId.at(block.ops, i)
+        rewrite_op_by_id(mutable body, mutable new_ops, op_id, layout, framebase, agg_base, target, allocator)?
+        i += 1
+    }
+
+    let new_term = terms_mod.rewrite_terminator(mutable body, mutable new_ops, block.terminator, layout, framebase, target, allocator)?
+
+    let new_block = lir_body_mod.LirBlock {
+        node_id_origin: block.node_id_origin,
+        params: block.params,
+        ops: new_ops,
+        terminator: new_term,
+        coherence_region: block.coherence_region,
+    }
+    if b >= Vec_LirBlock.len(body.blocks) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: block index out of range on write-back",
+        )
+    }
+    Vec_LirBlock.set_at(mutable body.blocks, b, take new_block)
+}
+
+
+function rewrite_op_by_id(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    op_id: lir_op_id_mod.LirOpId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let idx = op_id.raw as usize
+    if idx == 0 || idx >= Vec_LirOp.len(body.ops) {
+        Vec_LirOpId.push(mutable new_ops, op_id, allocator)?
+        return ()
+    }
+    let op = Vec_LirOp.at(body.ops, idx)
+    ops_mod.rewrite_op(mutable body, mutable new_ops, op, layout, framebase, agg_base, target, allocator)?
+}

@@ -1,0 +1,127 @@
+
+module hermod.uri.parse
+
+import std.mem.alloc
+
+import local.error
+import local.uri.types as uri_mod
+
+import uri.syntax.parse as ux_parse
+import uri.value as ux_value
+import uri.error as ux_error
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _copy_bytes(src: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let n = src.len()
+    let out = _alloc_u8_slots(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        out[i] = src[i]
+        i = i + 1 as usize
+    }
+    return out
+}
+
+function _copy_into(buf: mutable [u8], pos: usize, src: [u8]) -> usize {
+    let n = src.len()
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[pos + i] = src[i]
+        i = i + 1 as usize
+    }
+    return pos + n
+}
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _default_port(scheme_bytes: [u8]) -> u16 {
+    if _bytes_eq(scheme_bytes, "http".bytes()) {
+        return uri_mod.uri_default_port_http()
+    }
+    if _bytes_eq(scheme_bytes, "https".bytes()) {
+        return uri_mod.uri_default_port_https()
+    }
+    return 0 as u16
+}
+
+public function uri_parse(src: [u8], allocator: mutable Allocator) -> uri_mod.Uri
+    with {allocator, err: error.UriError}
+{
+    return handle err: ux_error.ParseError as pe -> match pe {
+        case .empty_input              => raise error.UriError.malformed_scheme
+        case .missing_scheme(_)        => raise error.UriError.malformed_scheme
+        case .bad_scheme_start(_)      => raise error.UriError.malformed_scheme
+        case .bad_scheme_char(_)       => raise error.UriError.malformed_scheme
+        case .bad_host(_)              => raise error.UriError.malformed_authority
+        case .empty_host(_)            => raise error.UriError.empty_host
+        case .unclosed_ip_literal(_)   => raise error.UriError.malformed_authority
+        case .bad_port(_)              => raise error.UriError.invalid_port
+        case .port_out_of_range(_)     => raise error.UriError.port_out_of_range
+        case .bad_percent_encoding(_)  => raise error.UriError.malformed_authority
+        case .allocation_failed        => raise error.UriError.out_of_memory
+    } {
+        handle err: alloc.AllocError -> { raise error.UriError.out_of_memory } {
+            let parsed = ux_parse.parse_bytes(src, allocator)?
+            let scheme_view = ux_value.scheme(parsed).bytes()
+            let host_str = match ux_value.host(parsed) {
+                case .some(let h) => h
+                case .none        => raise error.UriError.empty_host
+            }
+            let scheme_owned = _copy_bytes(scheme_view, allocator)?
+            let host_owned = _copy_bytes(host_str.bytes(), allocator)?
+            let port = match ux_value.port(parsed) {
+                case .some(let p) => p
+                case .none        => _default_port(scheme_view)
+            }
+            let path_bytes = ux_value.path(parsed).bytes()
+            let path_len = path_bytes.len()
+            let query_opt = ux_value.query(parsed)
+            let query_size = match query_opt {
+                case .some(let q) => 1 as usize + q.bytes().len()
+                case .none        => 0 as usize
+            }
+            let target_size = if path_len == 0 as usize && query_size == 0 as usize {
+                1 as usize
+            } else {
+                path_len + query_size
+            }
+            var target = _alloc_u8_slots(allocator, target_size)?
+            if path_len == 0 as usize && query_size == 0 as usize {
+                target[0 as usize] = 47 as u8
+            } else {
+                var w: usize = _copy_into(mutable target, 0 as usize, path_bytes)
+                match query_opt {
+                    case .some(let q) => {
+                        target[w] = 63 as u8
+                        w = w + 1 as usize
+                        let _end = _copy_into(mutable target, w, q.bytes())
+                    }
+                    case .none => {}
+                }
+            }
+            uri_mod.Uri {
+                scheme: scheme_owned,
+                host: host_owned,
+                port: port,
+                target: target,
+            }
+        }
+    }
+}

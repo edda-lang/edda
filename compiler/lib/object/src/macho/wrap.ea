@@ -1,0 +1,259 @@
+
+module object.macho.wrap
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.fmt.macho as macho_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(macho_mod.MachoSectionBundle)
+spec std.collections.vec.Vec(macho_mod.MachoNlist64)
+spec std.collections.vec.Vec(macho_mod.MachoRelocationInfo)
+
+
+public function wrap_function_obj(
+    out: init macho_mod.MachoFile,
+    cpu: macho_mod.MachoCpu,
+    code: take Vec_u8.Vec,
+    symbol_name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit file: macho_mod.MachoFile
+    new_object(init file, cpu, allocator)?
+    add_function(mutable file, symbol_name, take code, allocator)?
+    out = file
+}
+
+
+public function add_function(
+    file: mutable macho_mod.MachoFile,
+    symbol_name: String,
+    code: take Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit relocs: Vec_MachoRelocationInfo.Vec
+    Vec_MachoRelocationInfo.new(init relocs, allocator)?
+    add_function_relocated(mutable file, symbol_name, take code, take relocs, allocator)?
+}
+
+
+public function add_function_relocated(
+    file: mutable macho_mod.MachoFile,
+    symbol_name: String,
+    code: take Vec_u8.Vec,
+    relocations: take Vec_MachoRelocationInfo.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    add_section(mutable file, "__text", "__TEXT", text_flags(), 4 as u32, take code, take relocations, allocator)?
+    let n_sect = Vec_MachoSectionBundle.len(file.sections) as u8
+    add_symbol(mutable file, symbol_name, nlist_external_section(), n_sect, 0 as u64, allocator)?
+}
+
+
+public function text_flags() -> u32 {
+    return 0x80000400 as u32
+}
+
+public function data_flags() -> u32 {
+    return 0x00000000 as u32
+}
+
+public function nlist_external_section() -> u8 {
+    return 0x0F as u8
+}
+
+public function nlist_local_section() -> u8 {
+    return 0x0E as u8
+}
+
+public function nlist_undefined() -> u8 {
+    return 0x01 as u8
+}
+
+
+function pack_name_16(bytes: [u8]) -> macho_mod.MachoName16
+    requires bytes.len() <= 16
+{
+    let n = bytes.len()
+    var lo: u64 = 0
+    var hi: u64 = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let b: u64 = bytes[i] as u64
+        if i < 8 {
+            let shift: u64 = (i as u64) * (8 as u64)
+            lo = lo | (b << shift)
+        } else {
+            let shift: u64 = ((i - 8) as u64) * (8 as u64)
+            hi = hi | (b << shift)
+        }
+        i += 1
+    }
+    return macho_mod.MachoName16 { lo: lo, hi: hi }
+}
+
+function cpusubtype_for(cpu: macho_mod.MachoCpu) -> i32 {
+    return match cpu {
+        case .x86_64 => 3 as i32
+        case .arm64  => 0 as i32
+        case .any    => 0 as i32
+    }
+}
+
+
+public function new_object(
+    out: init macho_mod.MachoFile,
+    cpu: macho_mod.MachoCpu,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit sections: Vec_MachoSectionBundle.Vec
+    Vec_MachoSectionBundle.new(init sections, allocator)?
+    uninit symbols: Vec_MachoNlist64.Vec
+    Vec_MachoNlist64.new(init symbols, allocator)?
+    uninit string_bytes: Vec_u8.Vec
+    Vec_u8.new(init string_bytes, allocator)?
+    Vec_u8.push(mutable string_bytes, take (0 as u8), allocator)?
+
+    let header = macho_mod.MachoHeader {
+        magic: macho_mod.magic_64_native(),
+        cputype: cpu,
+        cpusubtype: cpusubtype_for(cpu),
+        filetype: macho_mod.MachoKind.object,
+        ncmds: 0 as u32,
+        sizeofcmds: 0 as u32,
+        flags: 0 as u32,
+        reserved: 0 as u32,
+    }
+
+    let segment = macho_mod.MachoSegmentCommand64 {
+        cmd: macho_mod.MachoLoadCommandKind.segment_64,
+        cmdsize: 0 as u32,
+        segname: macho_mod.MachoName16 { lo: 0 as u64, hi: 0 as u64 },
+        vmaddr: 0 as u64,
+        vmsize: 0 as u64,
+        fileoff: 0 as u64,
+        filesize: 0 as u64,
+        maxprot: 7 as i32,
+        initprot: 7 as i32,
+        nsects: 0 as u32,
+        flags: 0 as u32,
+    }
+
+    let symtab = macho_mod.MachoSymtabCommand {
+        cmd: macho_mod.MachoLoadCommandKind.symtab,
+        cmdsize: 0 as u32,
+        symoff: 0 as u32,
+        nsyms: 0 as u32,
+        stroff: 0 as u32,
+        strsize: 0 as u32,
+    }
+
+    out = macho_mod.MachoFile {
+        header: header,
+        segment: segment,
+        sections: sections,
+        symtab: symtab,
+        symbols: symbols,
+        string_table: macho_mod.MachoStringTable { bytes: string_bytes },
+    }
+}
+
+public function intern_string(
+    table: mutable macho_mod.MachoStringTable,
+    name_bytes: [u8],
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let offset = Vec_u8.len(table.bytes) as u32
+    let n = name_bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let byte_value = name_bytes[i]
+        Vec_u8.push(mutable table.bytes, take byte_value, allocator)?
+        i += 1
+    }
+    Vec_u8.push(mutable table.bytes, take (0 as u8), allocator)?
+    return offset
+}
+
+public function add_section(
+    file: mutable macho_mod.MachoFile,
+    sectname_str: String,
+    segname_str: String,
+    flags: u32,
+    align: u32,
+    data: take Vec_u8.Vec,
+    relocations: take Vec_MachoRelocationInfo.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let header = macho_mod.MachoSection64 {
+        sectname: pack_name_16(sectname_str.bytes()),
+        segname: pack_name_16(segname_str.bytes()),
+        addr: 0 as u64,
+        size: 0 as u64,
+        offset: 0 as u32,
+        align: align,
+        reloff: 0 as u32,
+        nreloc: 0 as u32,
+        flags: flags,
+        reserved1: 0 as u32,
+        reserved2: 0 as u32,
+        reserved3: 0 as u32,
+    }
+    let bundle = macho_mod.MachoSectionBundle {
+        header: header,
+        data: data,
+        relocations: relocations,
+    }
+    Vec_MachoSectionBundle.push(mutable file.sections, take bundle, allocator)?
+}
+
+public function add_symbol(
+    file: mutable macho_mod.MachoFile,
+    name_str: String,
+    n_type: u8,
+    n_sect: u8,
+    n_value: u64,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_strx = intern_string(mutable file.string_table, name_str.bytes(), allocator)?
+    let sym = macho_mod.MachoNlist64 {
+        n_strx: n_strx,
+        n_type: n_type,
+        n_sect: n_sect,
+        n_desc: 0 as u16,
+        n_value: n_value,
+    }
+    Vec_MachoNlist64.push(mutable file.symbols, take sym, allocator)?
+}
+
+public function make_relocation(
+    r_address: i32,
+    symbolnum: u32,
+    pcrel: bool,
+    length: u8,
+    extern_: bool,
+    relocation_type: u8,
+) -> macho_mod.MachoRelocationInfo {
+    return macho_mod.MachoRelocationInfo {
+        r_address: r_address,
+        r_info: macho_mod.make_relocation_info(symbolnum, pcrel, length, extern_, relocation_type),
+    }
+}

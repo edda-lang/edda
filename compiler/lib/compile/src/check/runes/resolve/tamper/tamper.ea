@@ -1,0 +1,111 @@
+
+module compile.check.runes.resolve.tamper.tamper
+
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+import local.check.runes.util as util_mod
+
+spec std.core.option.Option(String)
+
+
+public function declared_hashes_match(
+    dep_name: String,
+    hashes_opt: Option_String.Option,
+    surface_hash: String,
+    effect_hash: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let hashes_text = match hashes_opt {
+        case .none => {
+            let head = string.concat("rune '", dep_name, allocator)?
+            let msg = string.concat(head, "' rejected — hashes.toon missing from archive", allocator)?
+            emit_tamper(mutable diags, msg, allocator)?
+            return false
+        }
+        case .some(let t) => t
+    }
+    let declared_surface = declared_hash_of(hashes_text, "surface_hash", allocator)?
+    let declared_effect = declared_hash_of(hashes_text, "effect_hash", allocator)?
+    let surface_ok = match declared_surface {
+        case .none => false
+        case .some(let v) => string.equals(v, surface_hash)
+    }
+    let effect_ok = match declared_effect {
+        case .none => false
+        case .some(let v) => string.equals(v, effect_hash)
+    }
+    if !surface_ok {
+        emit_hash_mismatch(dep_name, "surface_hash", declared_surface, surface_hash, mutable diags, allocator)?
+    }
+    if !effect_ok {
+        emit_hash_mismatch(dep_name, "effect_hash", declared_effect, effect_hash, mutable diags, allocator)?
+    }
+    return surface_ok && effect_ok
+}
+
+
+function declared_hash_of(hashes_text: String, key: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let lines = string.split(hashes_text, "\n", allocator)?
+    let n = lines.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let line = string.trim(lines[i], allocator)?
+        if string.starts_with(line, key) {
+            return util_mod.extract_quoted(line, allocator)?
+        }
+        i = i + 1
+    }
+    return Option_String.none
+}
+
+
+function emit_hash_mismatch(
+    dep_name: String,
+    key: String,
+    declared: Option_String.Option,
+    recomputed: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let declared_text = match declared {
+        case .none => string.clone("(missing)", allocator)?
+        case .some(let v) => {
+            let q = string.concat("\"", v, allocator)?
+            string.concat(q, "\"", allocator)?
+        }
+    }
+    let a = string.concat("rune '", dep_name, allocator)?
+    let b = string.concat(a, "' rejected — hashes.toon ", allocator)?
+    let c = string.concat(b, key, allocator)?
+    let d = string.concat(c, " mismatch: declared ", allocator)?
+    let e = string.concat(d, declared_text, allocator)?
+    let f = string.concat(e, ", recomputed \"", allocator)?
+    let g = string.concat(f, recomputed, allocator)?
+    let msg = string.concat(g, "\"", allocator)?
+    emit_tamper(mutable diags, msg, allocator)?
+}
+
+
+function emit_tamper(
+    diags: mutable diags_mod.Diagnostics,
+    msg: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.manifest_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

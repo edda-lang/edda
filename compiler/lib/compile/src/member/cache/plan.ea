@@ -1,0 +1,361 @@
+
+module compile.member.cache.plan
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import std.time.calendar
+import std.time.iso8601 as iso8601_mod
+import cache.addr.hash as hash_mod
+import cache.addr.path.name as name_mod
+import cache.addr.path.paths as paths_mod
+import cache.error as cache_error_mod
+import cache.manifest.parse as manifest_parse_mod
+import cache.manifest.store.value as manifest_value_mod
+import cache.manifest.store.write as manifest_write_mod
+import cache.tier.tier as tier_mod
+import cache.toon.lex as lex_mod
+import source.map as source_map_mod
+import target.triple as triple_mod
+import local.member.cache.key.hash as key_mod
+import local.member.cache.store.blob as store_mod
+import local.phase.emit.link.link as link_phase_mod
+import local.phase.emit.link.selfid as selfid_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(manifest_value_mod.ArtifactEntry)
+spec std.collections.vec.Vec(manifest_value_mod.ArgumentEntry)
+spec std.core.option.Option(manifest_value_mod.ArtifactEntry)
+spec std.core.option.Option(String)
+
+
+public type CachePlan {
+    eligible: bool
+    member: String
+    hash: hash_mod.ArtifactHash
+    loc: store_mod.ExeLocation
+}
+
+
+public type MemberDeps {
+    members: Vec_String.Vec
+    packages: Vec_String.Vec
+}
+
+
+public function no_deps(allocator: Allocator) -> MemberDeps
+    with {allocator, err: alloc.AllocError}
+{
+    uninit members: Vec_String.Vec
+    Vec_String.new(init members, allocator)?
+    uninit packages: Vec_String.Vec
+    Vec_String.new(init packages, allocator)?
+    return MemberDeps { members: members, packages: packages }
+}
+
+
+public function exe_location_of(
+    output_root: String,
+    triple: triple_mod.TargetTriple,
+    program_name: String,
+    allocator: Allocator,
+) -> store_mod.ExeLocation
+    with {allocator, err: alloc.AllocError}
+{
+    let triple_str = triple_mod.to_string(triple, allocator)?
+    let bindir = link_phase_mod.bin_dir(output_root, triple_str, allocator)?
+    let exe_path = link_phase_mod.output_exe_path(bindir, triple, program_name, allocator)?
+    return store_mod.ExeLocation { dir: bindir, path: exe_path }
+}
+
+
+public function plan_for(
+    is_build: bool,
+    primary_member: Option_String.Option,
+    output_root: String,
+    stdlib_root: String,
+    triple: triple_mod.TargetTriple,
+    program_name: String,
+    map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> CachePlan
+    with {allocator, err: alloc.AllocError}
+{
+    let member_opt = if is_build { primary_member } else { Option_String.none }
+    return match member_opt {
+        case .none => CachePlan {
+            eligible: false,
+            member: "",
+            hash: hash_mod.zero(),
+            loc: store_mod.ExeLocation { dir: "", path: "" },
+        }
+        case .some(let member) => {
+            if output_root.len() == 0 {
+                CachePlan {
+                    eligible: false,
+                    member: member,
+                    hash: hash_mod.zero(),
+                    loc: store_mod.ExeLocation { dir: "", path: "" },
+                }
+            } else {
+                let hash = key_mod.source_hash_of(map, program_name, output_root, stdlib_root, allocator)?
+                let loc = exe_location_of(output_root, triple, program_name, allocator)?
+                CachePlan {
+                    eligible: true,
+                    member: member,
+                    hash: hash,
+                    loc: loc,
+                }
+            }
+        }
+    }
+}
+
+
+function find_entry(
+    entries: Vec_ArtifactEntry.Vec,
+    member: String,
+    source_hash: hash_mod.ArtifactHash,
+) -> Option_ArtifactEntry.Option
+{
+    let n = entries.len
+    for i in 0..<n {
+        let e = Vec_ArtifactEntry.at_ref(entries, i)
+        let same_hash = e.hash.w0 == source_hash.w0 && e.hash.w1 == source_hash.w1
+            && e.hash.w2 == source_hash.w2 && e.hash.w3 == source_hash.w3
+        if string.equals(e.short_name, member) && same_hash {
+            return Option_ArtifactEntry.some(value: e)
+        }
+    }
+    return Option_ArtifactEntry.none
+}
+
+
+function fallback_manifest(
+    output_root: String,
+    allocator: Allocator,
+) -> manifest_value_mod.Manifest
+    with {allocator, err: alloc.AllocError}
+{
+    let project = string.clone(output_root, allocator)?
+    return manifest_value_mod.empty_manifest(take project, calendar.epoch_unix(), allocator)?
+}
+
+
+public function load_manifest(
+    rfs: ReadOnlyFilesystem,
+    manifest_path: String,
+    output_root: String,
+    allocator: Allocator,
+) -> manifest_value_mod.Manifest
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if !fs.path_exists(rfs, manifest_path) {
+        return fallback_manifest(output_root, allocator)?
+    }
+    let text = fs.read_to_string(rfs, manifest_path, allocator)?
+    return handle err: cache_error_mod.CacheError as e -> fallback_manifest(output_root, allocator)? {
+        handle err: lex_mod.LexError as e2 -> fallback_manifest(output_root, allocator)? {
+            manifest_parse_mod.parse(text, manifest_path, allocator)?
+        }
+    }
+}
+
+
+function shard_dir_of(
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = paths_mod.codegen_cache_root(output_root, allocator)?
+    let shard = paths_mod.shard_string(source_hash, allocator)?
+    let with_slash = string.concat(root, "/", allocator)?
+    return string.concat(with_slash, shard, allocator)?
+}
+
+
+public function try_restore(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    loc: store_mod.ExeLocation,
+    member: String,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if selfid_mod.is_self_image_path(loc.path, allocator)? {
+        return false
+    }
+    if try_restore_local(rfs, wfs, output_root, source_hash, loc, member, allocator)? {
+        return true
+    }
+    return handle err: fs.FsError as e -> false {
+        store_mod.try_restore_global(rfs, wfs, source_hash, loc, member, allocator)?
+    }
+}
+
+
+function try_restore_local(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    loc: store_mod.ExeLocation,
+    member: String,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let manifest_path = paths_mod.codegen_manifest_path(output_root, allocator)?
+    if !fs.path_exists(rfs, manifest_path) {
+        return false
+    }
+    let manifest = load_manifest(rfs, manifest_path, output_root, allocator)?
+    let found = find_entry(manifest.artifacts, member, source_hash)
+    return match found {
+        case .none => false
+        case .some(let entry) => store_mod.restore_from_blob_path(rfs, wfs, entry.path, source_hash, loc, allocator)?
+    }
+}
+
+
+function inputs_for(
+    member: String,
+    deps: MemberDeps,
+    allocator: Allocator,
+) -> manifest_value_mod.ArtifactInputs
+    with {allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_ArgumentEntry.Vec
+    Vec_ArgumentEntry.new(init args, allocator)?
+    uninit nested: Vec_String.Vec
+    Vec_String.new(init nested, allocator)?
+    let pn = Vec_String.len(deps.packages)
+    for i in 0..<pn {
+        Vec_String.push(mutable nested, string.clone(Vec_String.at(deps.packages, i), allocator)?, allocator)?
+    }
+    let name_owned = string.clone(member, allocator)?
+    return manifest_value_mod.ArtifactInputs {
+        body_version: hash_mod.current_body_version(),
+        spec_qualified_name: name_owned,
+        argument_tuple: args,
+        nested_deps: nested,
+    }
+}
+
+
+function reachable_for(
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    member: String,
+    deps: MemberDeps,
+    allocator: Allocator,
+) -> manifest_value_mod.ReachableFrom
+    with {allocator, err: alloc.AllocError}
+{
+    uninit sources: Vec_String.Vec
+    Vec_String.new(init sources, allocator)?
+    uninit artifacts: Vec_String.Vec
+    Vec_String.new(init artifacts, allocator)?
+    let n = Vec_String.len(deps.members)
+    for i in 0..<n {
+        let dep = Vec_String.at(deps.members, i)
+        Vec_String.push(mutable sources, string.clone(dep, allocator)?, allocator)?
+        if !string.equals(dep, member) {
+            let dep_owned = string.clone(dep, allocator)?
+            match name_mod.new(take dep_owned, source_hash) {
+                case .none => ()
+                case .some(let dep_name) => {
+                    let dep_path = paths_mod.cache_tier_path(output_root, source_hash, dep_name, allocator)?
+                    Vec_String.push(mutable artifacts, take dep_path, allocator)?
+                }
+            }
+        }
+    }
+    return manifest_value_mod.ReachableFrom {
+        sources: sources,
+        artifacts: artifacts,
+    }
+}
+
+
+function write_cache_entry(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    exe_bytes: [u8],
+    name: name_mod.ArtifactName,
+    member: String,
+    deps: MemberDeps,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    let blob_path = paths_mod.cache_tier_path(output_root, source_hash, name, allocator)?
+    let shard_dir = shard_dir_of(output_root, source_hash, allocator)?
+    fs.create_dir_all(wfs, shard_dir)?
+
+    let blob_bytes = store_mod.build_exe_blob(source_hash, exe_bytes, allocator)?
+    fs.write_bytes(wfs, blob_path, blob_bytes)?
+
+    let manifest_path = paths_mod.codegen_manifest_path(output_root, allocator)?
+    var manifest = load_manifest(rfs, manifest_path, output_root, allocator)?
+    let entry = manifest_value_mod.ArtifactEntry {
+        path: blob_path,
+        hash: source_hash,
+        short_name: member,
+        tier: tier_mod.Tier.cache,
+        inputs: inputs_for(member, deps, allocator)?,
+        reachable_from: reachable_for(output_root, source_hash, member, deps, allocator)?,
+        generated_at: calendar.epoch_unix(),
+    }
+    Vec_ArtifactEntry.push(mutable manifest.artifacts, take entry, allocator)?
+    let text_opt = handle err: iso8601_mod.Iso8601Error as e -> Option_String.none {
+        Option_String.some(value: manifest_write_mod.to_text(manifest, allocator)?)
+    }
+    match text_opt {
+        case .none => ()
+        case .some(let text) => {
+            fs.create_dir_all(wfs, paths_mod.codegen_cache_root(output_root, allocator)?)?
+            fs.write_bytes(wfs, manifest_path, text.bytes())?
+        }
+    }
+}
+
+
+public function try_store(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    loc: store_mod.ExeLocation,
+    member: String,
+    deps: MemberDeps,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    if !fs.path_exists(rfs, loc.path) {
+        return
+    }
+    let exe_bytes = fs.read_bytes(rfs, loc.path, allocator)?
+    let short_owned = string.clone(member, allocator)?
+    let name_opt = name_mod.new(take short_owned, source_hash)
+    match name_opt {
+        case .none => ()
+        case .some(let name) => {
+            write_cache_entry(rfs, wfs, output_root, source_hash, exe_bytes, name, member, deps, allocator)?
+            handle err: fs.FsError as e -> () {
+                store_mod.publish_global(rfs, wfs, output_root, source_hash, exe_bytes, name, allocator)?
+            }
+        }
+    }
+}

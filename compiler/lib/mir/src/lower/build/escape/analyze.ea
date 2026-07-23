@@ -1,0 +1,432 @@
+
+module mir.lower.build.escape.analyze
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.def as def_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HCapture)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+
+
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+
+
+public function local_escapes(fn_body: hir_tree.HBlock, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return escapes_block(fn_body, local, false)
+}
+
+
+public function local_is_body_local(fn_body: hir_tree.HBlock, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return binds_block(fn_body, local)
+}
+
+
+function is_use_of(e: hir_tree.HExpr, local: def_mod.DefId) -> bool {
+    return match e.kind {
+        case .use_(let d) => def_eq(d, local)
+        case _ => false
+    }
+}
+
+
+function def_eq(a: def_mod.DefId, b: def_mod.DefId) -> bool {
+    return def_mod.index(a) == def_mod.index(b)
+}
+
+
+function escapes_block(block: hir_tree.HBlock, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if escapes_stmt(Vec_HStmt.at(block.stmts, i), local, strict) {
+            return true
+        }
+        i = i + 1
+    }
+    return match block.trailing {
+        case .some(let box) => escapes_box(box, local, strict)
+        case .none => false
+    }
+}
+
+
+function escapes_stmt(stmt: hir_tree.HStmt, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, _, _, let init_) => escapes_expr(init_, local, strict)
+        case .uninit_(_, _, _) => false
+        case .assign(let target, _, let rhs) => {
+            let tgt = if is_use_of(target, local) { false } else { escapes_expr(target, local, strict) }
+            tgt || escapes_expr(rhs, local, strict)
+        }
+    }
+}
+
+
+function escapes_expr(expr: hir_tree.HExpr, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    return match expr.kind {
+        case .literal(_) => false
+        case .use_(let d) => def_eq(d, local)
+        case .ident_literal(_) => false
+        case .binary(_, let lhs, let rhs) => escapes_box(lhs, local, strict) || escapes_box(rhs, local, strict)
+        case .unary(_, let e) => escapes_box(e, local, strict)
+        case .call(_, let args) => escapes_args(args, local, strict)
+        case .variant_ctor(_, _, let args) => escapes_args(args, local, strict)
+        case .dyn_call(let callee, let args) => {
+            let inner = Box_HExpr.get(callee)
+            let callee_esc = if strict {
+                escapes_expr(inner, local, strict)
+            } else {
+                if is_use_of(inner, local) { false } else { escapes_expr(inner, local, false) }
+            }
+            callee_esc || escapes_args(args, local, strict)
+        }
+        case .field(let receiver, _) => escapes_box(receiver, local, strict)
+        case .positional(let receiver, let idx) => escapes_box(receiver, local, strict) || escapes_box(idx, local, strict)
+        case .index(let receiver, let idx) => escapes_box(receiver, local, strict) || escapes_box(idx, local, strict)
+        case .subrange(let receiver, let lo, let hi, _) => escapes_box(receiver, local, strict) || escapes_opt(lo, local, strict) || escapes_opt(hi, local, strict)
+        case .range(let lo, let hi, _) => escapes_box(lo, local, strict) || escapes_box(hi, local, strict)
+        case .if_(let cond, let then_block, let else_block) => {
+            let else_esc = match else_block {
+                case .some(let b) => escapes_block(b, local, strict)
+                case .none => false
+            }
+            escapes_box(cond, local, strict) || escapes_block(then_block, local, strict) || else_esc
+        }
+        case .match_(let scrutinee, let arms) => escapes_box(scrutinee, local, strict) || escapes_arms(arms, local, strict)
+        case .block_(let body) => escapes_block(body, local, strict)
+        case .loop_(let body, _, let decreases_) => escapes_block(body, local, strict) || escapes_opt(decreases_, local, strict)
+        case .cast(let e, _, _) => escapes_box(e, local, strict)
+        case .tuple(let elements) => escapes_exprs(elements, local, strict)
+        case .struct_lit(_, let fields) => escapes_args(fields, local, strict)
+        case .raise_(let e) => escapes_box(e, local, strict)
+        case .panic_(let e) => escapes_box(e, local, strict)
+        case .return_(let value) => escapes_opt(value, local, strict)
+        case .break_(_, let value) => escapes_opt(value, local, strict)
+        case .continue_(_) => false
+        case .comptime_(let e) => escapes_box(e, local, strict)
+        case .comptime_block(let body) => escapes_block(body, local, strict)
+        case .comptime_for(_, let lo, let hi, _, let body) => escapes_box(lo, local, strict) || escapes_box(hi, local, strict) || escapes_block(body, local, strict)
+        case .scope_(_, _, let body) => escapes_block(body, local, strict)
+        case .handle_(_, _, let recovery, let body) => escapes_box(recovery, local, strict) || escapes_block(body, local, strict)
+        case .closure(let box) => closure_captures(box, local)
+        case .spawn_(let inner) => escapes_spawn(Box_HSpawn.get(inner), local)
+        case .forall_(_, let iter, let body) => escapes_box(iter, local, strict) || escapes_box(body, local, strict)
+        case .exists_(_, let iter, let body) => escapes_box(iter, local, strict) || escapes_box(body, local, strict)
+        case .method_call(_, let args) => escapes_args(args, local, strict)
+        case .error => false
+    }
+}
+
+
+function escapes_box(box: Box_HExpr, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    return escapes_expr(Box_HExpr.get(box), local, strict)
+}
+
+
+function escapes_opt(o: Option_Box_HExpr.Option, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    return match o {
+        case .some(let box) => escapes_box(box, local, strict)
+        case .none => false
+    }
+}
+
+
+function escapes_args(args: Vec_HArg.Vec, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if escapes_expr(Vec_HArg.at(args, i).expr, local, strict) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function escapes_exprs(exprs: Vec_HExpr.Vec, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if escapes_expr(Vec_HExpr.at(exprs, i), local, strict) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function escapes_arms(arms: Vec_HArm.Vec, local: def_mod.DefId, strict: bool) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        let guard_esc = match arm.guard {
+            case .some(let g) => escapes_expr(g, local, strict)
+            case .none => false
+        }
+        if guard_esc {
+            return true
+        }
+        if escapes_expr(arm.body, local, strict) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function escapes_spawn(sp: hir_tree.HSpawn, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HSpawnArg.len(sp.args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if escapes_expr(Vec_HSpawnArg.at(sp.args, i).init_, local, true) {
+            return true
+        }
+        i = i + 1
+    }
+    return escapes_block(sp.body, local, true)
+}
+
+
+function closure_captures(box: Box_HClosure, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let c = Box_HClosure.get(box)
+    let n = Vec_HCapture.len(c.captures)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if def_eq(Vec_HCapture.at(c.captures, i).def_id, local) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function binds_block(block: hir_tree.HBlock, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if binds_stmt(Vec_HStmt.at(block.stmts, i), local) {
+            return true
+        }
+        i = i + 1
+    }
+    return match block.trailing {
+        case .some(let box) => binds_box(box, local)
+        case .none => false
+    }
+}
+
+
+function binds_stmt(stmt: hir_tree.HStmt, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, let bindings, _, let init_) => bindings_contain(bindings, local) || binds_expr(init_, local)
+        case .uninit_(_, let bindings, _) => bindings_contain(bindings, local)
+        case .assign(let target, _, let rhs) => binds_expr(target, local) || binds_expr(rhs, local)
+    }
+}
+
+
+function bindings_contain(bindings: Vec_HBinding.Vec, local: def_mod.DefId) -> bool {
+    let n = Vec_HBinding.len(bindings)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if def_eq(Vec_HBinding.at(bindings, i).def_id, local) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function binds_expr(expr: hir_tree.HExpr, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match expr.kind {
+        case .literal(_) => false
+        case .use_(_) => false
+        case .ident_literal(_) => false
+        case .binary(_, let lhs, let rhs) => binds_box(lhs, local) || binds_box(rhs, local)
+        case .unary(_, let e) => binds_box(e, local)
+        case .call(_, let args) => binds_args(args, local)
+        case .variant_ctor(_, _, let args) => binds_args(args, local)
+        case .dyn_call(let callee, let args) => binds_box(callee, local) || binds_args(args, local)
+        case .field(let receiver, _) => binds_box(receiver, local)
+        case .positional(let receiver, let idx) => binds_box(receiver, local) || binds_box(idx, local)
+        case .index(let receiver, let idx) => binds_box(receiver, local) || binds_box(idx, local)
+        case .subrange(let receiver, let lo, let hi, _) => binds_box(receiver, local) || binds_opt(lo, local) || binds_opt(hi, local)
+        case .range(let lo, let hi, _) => binds_box(lo, local) || binds_box(hi, local)
+        case .if_(let cond, let then_block, let else_block) => {
+            let else_esc = match else_block {
+                case .some(let b) => binds_block(b, local)
+                case .none => false
+            }
+            binds_box(cond, local) || binds_block(then_block, local) || else_esc
+        }
+        case .match_(let scrutinee, let arms) => binds_box(scrutinee, local) || binds_arms(arms, local)
+        case .block_(let body) => binds_block(body, local)
+        case .loop_(let body, _, let decreases_) => binds_block(body, local) || binds_opt(decreases_, local)
+        case .cast(let e, _, _) => binds_box(e, local)
+        case .tuple(let elements) => binds_exprs(elements, local)
+        case .struct_lit(_, let fields) => binds_args(fields, local)
+        case .raise_(let e) => binds_box(e, local)
+        case .panic_(let e) => binds_box(e, local)
+        case .return_(let value) => binds_opt(value, local)
+        case .break_(_, let value) => binds_opt(value, local)
+        case .continue_(_) => false
+        case .comptime_(let e) => binds_box(e, local)
+        case .comptime_block(let body) => binds_block(body, local)
+        case .comptime_for(_, let lo, let hi, _, let body) => binds_box(lo, local) || binds_box(hi, local) || binds_block(body, local)
+        case .scope_(_, _, let body) => binds_block(body, local)
+        case .handle_(_, _, let recovery, let body) => binds_box(recovery, local) || binds_block(body, local)
+        case .closure(_) => false
+        case .spawn_(let inner) => binds_spawn(Box_HSpawn.get(inner), local)
+        case .forall_(_, let iter, let body) => binds_box(iter, local) || binds_box(body, local)
+        case .exists_(_, let iter, let body) => binds_box(iter, local) || binds_box(body, local)
+        case .method_call(_, let args) => binds_args(args, local)
+        case .error => false
+    }
+}
+
+
+function binds_box(box: Box_HExpr, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return binds_expr(Box_HExpr.get(box), local)
+}
+
+
+function binds_opt(o: Option_Box_HExpr.Option, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    return match o {
+        case .some(let box) => binds_box(box, local)
+        case .none => false
+    }
+}
+
+
+function binds_args(args: Vec_HArg.Vec, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if binds_expr(Vec_HArg.at(args, i).expr, local) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function binds_exprs(exprs: Vec_HExpr.Vec, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if binds_expr(Vec_HExpr.at(exprs, i), local) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function binds_arms(arms: Vec_HArm.Vec, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        let guard_esc = match arm.guard {
+            case .some(let g) => binds_expr(g, local)
+            case .none => false
+        }
+        if guard_esc {
+            return true
+        }
+        if binds_expr(arm.body, local) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function binds_spawn(sp: hir_tree.HSpawn, local: def_mod.DefId) -> bool
+    with {divergence}
+{
+    let n = Vec_HSpawnArg.len(sp.args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if binds_expr(Vec_HSpawnArg.at(sp.args, i).init_, local) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}

@@ -1,0 +1,394 @@
+
+module egraph.sat.extract
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import local.eclass as eclass_mod
+import local.graph.enode as enode_mod
+import local.graph.graph as graph_mod
+import local.key as key_mod
+import local.sat.parents.parents as parents_mod
+import ir.hlir.op as hlir_op_mod
+
+
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(eclass_mod.EClassId)
+spec std.collections.vec.Vec(graph_mod.EClass)
+spec std.collections.vec.Vec(enode_mod.ENode)
+spec std.core.option.Option(enode_mod.ENode)
+
+
+derive eq, hash, debug for Extraction
+
+
+public type Extraction {
+    cost: Vec_u64.Vec
+    best: Vec_usize.Vec
+}
+
+
+function infinity() -> u64 {
+    return 18446744073709551615
+}
+
+
+public function node_cost(node: enode_mod.ENode) -> u64 {
+    return match node.kind {
+        case .literal(let c) => literal_cost(c)
+        case .binary(let op, _, _) => binary_cost(op)
+        case .unary(_, _) => 1
+        case .cast(_, _, _, _) => 1
+        case .call_(_, _) => 8
+        case .field(_, _) => 1
+        case .index(_, _) => 2
+        case .len(_) => 1
+        case .discriminant(_) => 1
+        case .aggregate(_, _) => 2
+        case .ref_(_, _) => 1
+    }
+}
+
+
+function literal_cost(c: hlir_op_mod.HConstant) -> u64 {
+    return match c {
+        case .fn_ref(_) => 1
+        case _ => 0
+    }
+}
+
+
+function binary_cost(op: hlir_op_mod.HBinOp) -> u64 {
+    return match op {
+        case .div => 6
+        case .rem => 6
+        case .mul => 3
+        case .mul_wrap => 3
+        case .mul_sat => 3
+        case _ => 1
+    }
+}
+
+
+public function extract(graph: mutable graph_mod.EGraph, allocator: Allocator) -> Extraction
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let total = Vec_EClass.len(graph.classes)
+    uninit cost: Vec_u64.Vec
+    Vec_u64.new(init cost, allocator)?
+    uninit best: Vec_usize.Vec
+    Vec_usize.new(init best, allocator)?
+    var k: usize = 0
+    loop
+        decreases total - k
+    {
+        if k >= total { break }
+        Vec_u64.push(mutable cost, infinity(), allocator)?
+        Vec_usize.push(mutable best, 0 as usize, allocator)?
+        k = k + 1
+    }
+    let assembled = Extraction { cost: cost, best: best }
+    let parents = parents_mod.build_parent_map(mutable graph, total, allocator)?
+    return relax_to_fixpoint(mutable graph, take assembled, total, parents, allocator)?
+}
+
+
+function relax_to_fixpoint(
+    graph: mutable graph_mod.EGraph,
+    ext: take Extraction,
+    total: usize,
+    parents: parents_mod.ParentMap,
+    allocator: Allocator,
+) -> Extraction
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit cur: Vec_usize.Vec
+    Vec_usize.new(init cur, allocator)?
+    uninit nxt: Vec_usize.Vec
+    Vec_usize.new(init nxt, allocator)?
+    uninit in_nxt: Vec_usize.Vec
+    Vec_usize.new(init in_nxt, allocator)?
+    var z: usize = 0
+    loop
+        decreases total - z
+    {
+        if z >= total { break }
+        Vec_usize.push(mutable in_nxt, 0 as usize, allocator)?
+        Vec_usize.push(mutable cur, z, allocator)?
+        z = z + 1
+    }
+    var rounds: usize = 0
+    loop
+        decreases total - rounds
+    {
+        if rounds >= total { break }
+        Vec_usize.clear(mutable nxt)
+        let changed = relax_round(mutable graph, mutable ext, cur, mutable nxt, mutable in_nxt, parents, total, allocator)?
+        if !changed { break }
+        Vec_usize.clear(mutable cur)
+        let m = Vec_usize.len(nxt)
+        var t: usize = 0
+        loop
+            decreases m - t
+        {
+            if t >= m { break }
+            let idx = Vec_usize.at(nxt, t)
+            if idx < Vec_usize.len(in_nxt) {
+                Vec_usize.set_at(mutable in_nxt, idx, 0 as usize)
+            }
+            Vec_usize.push(mutable cur, idx, allocator)?
+            t = t + 1
+        }
+        rounds = rounds + 1
+    }
+    return ext
+}
+
+
+function relax_round(
+    graph: mutable graph_mod.EGraph,
+    ext: mutable Extraction,
+    cur: Vec_usize.Vec,
+    nxt: mutable Vec_usize.Vec,
+    in_nxt: mutable Vec_usize.Vec,
+    parents: parents_mod.ParentMap,
+    total: usize,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var changed: bool = false
+    let count = Vec_usize.len(cur)
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        let k = Vec_usize.at(cur, i)
+        if relax_class(mutable graph, mutable ext, k, total) {
+            changed = true
+            enqueue_parents(parents, mutable nxt, mutable in_nxt, k, total, allocator)?
+        }
+        i = i + 1
+    }
+    return changed
+}
+
+
+function enqueue_parents(
+    parents: parents_mod.ParentMap,
+    nxt: mutable Vec_usize.Vec,
+    in_nxt: mutable Vec_usize.Vec,
+    k: usize,
+    total: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if k + 1 >= Vec_usize.len(parents.off) { return }
+    let lo = Vec_usize.at(parents.off, k)
+    let hi = Vec_usize.at(parents.off, k + 1)
+    if hi <= lo { return }
+    let span = hi - lo
+    var p: usize = 0
+    loop
+        decreases span - p
+    {
+        if p >= span { break }
+        let slot = lo + p
+        if slot < Vec_usize.len(parents.ids) {
+            let par = Vec_usize.at(parents.ids, slot)
+            if par < total {
+                if par < Vec_usize.len(in_nxt) {
+                    if Vec_usize.at(in_nxt, par) == 0 {
+                        Vec_usize.set_at(mutable in_nxt, par, 1 as usize)
+                        Vec_usize.push(mutable nxt, par, allocator)?
+                    }
+                }
+            }
+        }
+        p = p + 1
+    }
+}
+
+
+function relax_class(
+    graph: mutable graph_mod.EGraph,
+    ext: mutable Extraction,
+    k: usize,
+    total: usize,
+) -> bool
+    with {panic}
+{
+    if k >= Vec_EClass.len(graph.classes) { return false }
+    let cls = Vec_EClass.at(graph.classes, k)
+    let node_total = Vec_ENode.len(cls.nodes)
+    var best_cost: u64 = infinity()
+    var best_idx: usize = 0
+    var j: usize = 0
+    loop
+        decreases node_total - j
+    {
+        if j >= node_total { break }
+        let candidate = node_total_cost(mutable graph, ext, Vec_ENode.at(cls.nodes, j), total)
+        if candidate < best_cost {
+            best_cost = candidate
+            best_idx = j
+        }
+        j = j + 1
+    }
+    return commit_class(mutable ext, k, best_cost, best_idx)
+}
+
+
+function commit_class(
+    ext: mutable Extraction,
+    k: usize,
+    best_cost: u64,
+    best_idx: usize,
+) -> bool
+{
+    if k >= Vec_u64.len(ext.cost) { return false }
+    let prior = Vec_u64.at(ext.cost, k)
+    if best_cost >= prior { return false }
+    if k >= Vec_usize.len(ext.best) { return false }
+    Vec_usize.set_at(mutable ext.best, k, best_idx)
+    Vec_u64.set_at(mutable ext.cost, k, best_cost)
+    return true
+}
+
+
+function node_total_cost(
+    graph: mutable graph_mod.EGraph,
+    ext: Extraction,
+    node: enode_mod.ENode,
+    total: usize,
+) -> u64
+    with {panic}
+{
+    let base = node_cost(node)
+    return match node.kind {
+        case .literal(_) => base
+        case .binary(_, let lhs, let rhs) =>
+            add_costs(base, child_pair(mutable graph, ext, lhs, rhs, total))
+        case .unary(_, let operand) =>
+            add_costs(base, child_cost(mutable graph, ext, operand, total))
+        case .cast(let value, _, _, _) =>
+            add_costs(base, child_cost(mutable graph, ext, value, total))
+        case .call_(let callee, let args) =>
+            add_costs(add_costs(base, child_cost(mutable graph, ext, callee, total)),
+                children_cost(mutable graph, ext, args, total))
+        case .field(let operand, _) =>
+            add_costs(base, child_cost(mutable graph, ext, operand, total))
+        case .index(let operand, let index_v) =>
+            add_costs(base, child_pair(mutable graph, ext, operand, index_v, total))
+        case .len(let operand) =>
+            add_costs(base, child_cost(mutable graph, ext, operand, total))
+        case .discriminant(let operand) =>
+            add_costs(base, child_cost(mutable graph, ext, operand, total))
+        case .aggregate(_, let elems) =>
+            add_costs(base, children_cost(mutable graph, ext, elems, total))
+        case .ref_(_, let operand) =>
+            add_costs(base, child_cost(mutable graph, ext, operand, total))
+    }
+}
+
+
+function add_costs(a: u64, b: u64) -> u64 {
+    if a == infinity() { return infinity() }
+    if b == infinity() { return infinity() }
+    return a +| b
+}
+
+
+function child_pair(
+    graph: mutable graph_mod.EGraph,
+    ext: Extraction,
+    a: eclass_mod.EClassId,
+    b: eclass_mod.EClassId,
+    total: usize,
+) -> u64
+    with {panic}
+{
+    return add_costs(
+        child_cost(mutable graph, ext, a, total),
+        child_cost(mutable graph, ext, b, total),
+    )
+}
+
+
+function child_cost(
+    graph: mutable graph_mod.EGraph,
+    ext: Extraction,
+    c: eclass_mod.EClassId,
+    total: usize,
+) -> u64
+    with {panic}
+{
+    let root = key_mod.canon_child(mutable graph.uf, c)
+    let idx = root.raw as usize
+    if idx >= total { return infinity() }
+    if idx >= Vec_u64.len(ext.cost) { return infinity() }
+    return Vec_u64.at(ext.cost, idx)
+}
+
+
+function children_cost(
+    graph: mutable graph_mod.EGraph,
+    ext: Extraction,
+    kids: Vec_EClassId.Vec,
+    total: usize,
+) -> u64
+    with {panic}
+{
+    let n = Vec_EClassId.len(kids)
+    var acc: u64 = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        acc = add_costs(acc, child_cost(mutable graph, ext, Vec_EClassId.at(kids, i), total))
+        i = i + 1
+    }
+    return acc
+}
+
+
+public function class_cost(ext: Extraction, c: eclass_mod.EClassId) -> u64 {
+    let idx = c.raw as usize
+    if idx >= Vec_u64.len(ext.cost) {
+        return infinity()
+    }
+    return Vec_u64.at(ext.cost, idx)
+}
+
+
+public function is_extractable(ext: Extraction, c: eclass_mod.EClassId) -> bool {
+    return class_cost(ext, c) != infinity()
+}
+
+
+public function best_node(
+    graph: mutable graph_mod.EGraph,
+    ext: Extraction,
+    c: eclass_mod.EClassId,
+) -> Option_ENode.Option
+    with {panic}
+{
+    let root = key_mod.canon_child(mutable graph.uf, c)
+    let idx = root.raw as usize
+    if idx >= Vec_usize.len(ext.best) {
+        return Option_ENode.none
+    }
+    if idx >= Vec_EClass.len(graph.classes) {
+        return Option_ENode.none
+    }
+    if class_cost(ext, root) == infinity() {
+        return Option_ENode.none
+    }
+    let chosen = Vec_usize.at(ext.best, idx)
+    let cls = Vec_EClass.at(graph.classes, idx)
+    return Vec_ENode.get(cls.nodes, chosen)
+}

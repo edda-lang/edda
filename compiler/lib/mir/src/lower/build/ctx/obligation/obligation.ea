@@ -1,0 +1,548 @@
+
+module mir.lower.build.ctx.obligation.obligation
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.def as def_mod
+import hir.tree as hir_tree
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.ops as ast_ops_mod
+import syntax.ast.literal as literal_mod
+import span.loc.pos.span as span_mod
+import types.check as check_mod
+import types.ty.interner as ty_interner_mod
+import local.id.local as local_mod
+import local.place as place_mod
+import local.rvalue as rvalue_mod
+import local.stmt as stmt_mod
+import local.body.model as body_mod
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.build.ctx.subst.subst as subst_mod
+import local.lower.build.ctx.clauses.clauses as clauses_mod
+import local.lower.build.ctx.postcond.postcond as postcond_mod
+
+
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_tree_mod.RefinementClause)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.collections.vec.Vec(subst_mod.SubEntry)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.core.option.Option(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(body_mod.Local)
+spec std.core.option.Option(rvalue_mod.Operand)
+spec std.core.option.Option(Box_HExpr)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(builder_mod.ReturnExit)
+
+
+function is_param_local(ctx: builder_mod.LowerCtx, idx: usize) -> bool {
+    let first_param = 2 as usize
+    let last_param = first_param + (ctx.body.n_params as usize)
+    return idx >= first_param && idx < last_param
+}
+
+
+function base_local_expr(
+    ctx: builder_mod.LowerCtx,
+    local_id: local_mod.LocalId,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let idx = local_mod.index(local_id)
+    if !is_param_local(ctx, idx) {
+        return Option_Expr.none
+    }
+    if idx >= Vec_Local.len(ctx.body.locals) {
+        return Option_Expr.none
+    }
+    let local = Vec_Local.at(ctx.body.locals, idx)
+    return match local.name {
+        case .some(let name) => Option_Expr.some(value: subst_mod.named_ident_expr(name, allocator)?)
+        case .none => Option_Expr.none
+    }
+}
+
+
+function named_place_expr(
+    ctx: builder_mod.LowerCtx,
+    p: place_mod.Place,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    refinement_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = place_mod.proj_len(p)
+    if n == 0 as usize {
+        return base_local_expr(ctx, p.local, allocator)?
+    }
+    if !all_field_projections(p, n) {
+        return Option_Expr.none
+    }
+    let idx = local_mod.index(p.local)
+    if idx >= Vec_Local.len(ctx.body.locals) {
+        return Option_Expr.none
+    }
+    var receiver = base_local_expr(ctx, p.local, allocator)?
+    var owner_ty = Vec_Local.at(ctx.body.locals, idx).ty
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        match receiver {
+            case .none => return Option_Expr.none
+            case .some(let recv_expr) => {
+                let proj = place_mod.proj_at(p, i)
+                let field_idx = field_projection_index(proj.kind)
+                let owner_def = clauses_mod.record_def_of_ty(ty_interner, owner_ty)
+                let field_name = check_mod.field_name_at(types_out, owner_def, 0 as u32, field_idx as usize)
+                match field_name {
+                    case .none => return Option_Expr.none
+                    case .some(let name) => {
+                        clauses_mod.fold_field_refinement(
+                            mutable refinement_facts,
+                            owner_def,
+                            field_idx,
+                            recv_expr,
+                            types_out,
+                            allocator,
+                        )?
+                        let recv_box = Box_Expr.new(take recv_expr, allocator)?
+                        let field_expr = ast_tree_mod.Expr {
+                            span: span_mod.dummy(),
+                            kind: ast_tree_mod.ExprKind.field(
+                                receiver: recv_box,
+                                name: ident_mod.Ident { name: name, span: span_mod.dummy() },
+                            ),
+                        }
+                        receiver = Option_Expr.some(value: field_expr)
+                    }
+                }
+                owner_ty = proj.result_ty
+            }
+        }
+        i = i + 1
+    }
+    return receiver
+}
+
+
+function all_field_projections(p: place_mod.Place, n: usize) -> bool {
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        match place_mod.proj_at(p, i).kind {
+            case .field(_) => {}
+            case _ => return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+
+function field_projection_index(kind: place_mod.ProjectionKind) -> u32 {
+    return match kind {
+        case .field(let idx) => idx
+        case _ => 0
+    }
+}
+
+
+function return_value_expr(
+    ctx: builder_mod.LowerCtx,
+    value_op: rvalue_mod.Operand,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    refinement_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match value_op {
+        case .constant(let c) => builder_mod.constant_value_expr(c)
+        case .copy_(let p, _) => named_place_expr(ctx, p, types_out, ty_interner, mutable refinement_facts, allocator)?
+        case .move_(let p, _) => named_place_expr(ctx, p, types_out, ty_interner, mutable refinement_facts, allocator)?
+    }
+}
+
+
+function is_dead_placeholder_operand(value_op: rvalue_mod.Operand) -> bool {
+    return match value_op {
+        case .constant(let c) => match c.kind {
+            case .zero_init => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+
+public function record_return_exit(
+    ctx: mutable builder_mod.LowerCtx,
+    value_op: rvalue_mod.Operand,
+    value_expr: Option_Box_HExpr.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if is_dead_placeholder_operand(value_op) {
+        return
+    }
+    uninit guards: Vec_Expr.Vec
+    Vec_Expr.new(init guards, allocator)?
+    append_exprs(mutable guards, ctx.guard_stack, allocator)?
+    let exit_rec = builder_mod.ReturnExit {
+        value_op: value_op,
+        value_expr: value_expr,
+        guards: take guards,
+        opaque: ctx.guard_opaque_depth > 0,
+    }
+    Vec_ReturnExit.push(mutable ctx.return_exits, take exit_rec, allocator)?
+}
+
+
+function exit_result_fact(
+    ctx: builder_mod.LowerCtx,
+    exit_rec: builder_mod.ReturnExit,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    field_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let direct = return_value_expr(ctx, exit_rec.value_op, types_out, ty_interner, mutable field_facts, allocator)?
+    match direct {
+        case .some(let value_expr) => return Option_Expr.some(value: value_expr)
+        case .none => {}
+    }
+    return match exit_rec.value_expr {
+        case .some(let boxed) => harg_to_ast_expr(ctx, Box_HExpr.get(boxed), types_out, ty_interner, mutable field_facts, allocator)?
+        case .none => Option_Expr.none
+    }
+}
+
+
+public function finish_return_postconditions(
+    ctx: mutable builder_mod.LowerCtx,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    let n = Vec_RefinementClause.len(ctx.ensures_clauses)
+    if n == 0 as usize {
+        return
+    }
+    let n_exits = Vec_ReturnExit.len(ctx.return_exits)
+    var ei: usize = 0
+    loop
+        decreases (n_exits - ei)
+    {
+        if ei >= n_exits {
+            break
+        }
+        let exit_rec = Vec_ReturnExit.at(ctx.return_exits, ei)
+        if !exit_rec.opaque {
+            emit_exit_postconditions(mutable ctx, exit_rec, types_out, ty_interner, allocator)?
+        }
+        ei = ei + 1
+    }
+}
+
+
+function emit_exit_postconditions(
+    ctx: mutable builder_mod.LowerCtx,
+    exit_rec: builder_mod.ReturnExit,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    uninit field_facts: Vec_Expr.Vec
+    Vec_Expr.new(init field_facts, allocator)?
+    let result_fact = exit_result_fact(ctx, exit_rec, types_out, ty_interner, mutable field_facts, allocator)?
+    let has_result_fact = match result_fact {
+        case .some(_) => true
+        case .none => false
+    }
+    let n = Vec_RefinementClause.len(ctx.ensures_clauses)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let clause = Vec_RefinementClause.at(ctx.ensures_clauses, i)
+        match clause.kind {
+            case .ensures_ => {
+                if has_result_fact || !postcond_mod.mentions_result(clause.pred) {
+                    var context = clauses_mod.collect_requires_clauses(ctx.ensures_clauses, allocator)?
+                    append_exprs(mutable context, field_facts, allocator)?
+                    append_exprs(mutable context, exit_rec.guards, allocator)?
+                    match result_fact {
+                        case .some(let value_expr) => {
+                            let fact = postcond_mod.result_equals_expr(take value_expr, allocator)?
+                            Vec_Expr.push(mutable context, take fact, allocator)?
+                        }
+                        case .none => {}
+                    }
+                    builder_mod.push_obligation(
+                        mutable ctx,
+                        body_mod.ObligationKind.postcondition,
+                        take clause.pred,
+                        take context,
+                        body_mod.TrustAnnotation.discharged,
+                        allocator,
+                    )?
+                }
+            }
+            case _ => {}
+        }
+        i = i + 1
+    }
+}
+
+
+function append_exprs(
+    out: mutable Vec_Expr.Vec,
+    src: Vec_Expr.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Expr.len(src)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        Vec_Expr.push(mutable out, take Vec_Expr.at(src, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+public function emit_precondition_obligations(
+    ctx: mutable builder_mod.LowerCtx,
+    param_names: Vec_Symbol.Vec,
+    refinements: Vec_RefinementClause.Vec,
+    args: Vec_HArg.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires Vec_Statement.len(ctx.current_statements) < 4294967295
+{
+    if !has_requires(refinements) {
+        return
+    }
+    uninit subs: Vec_SubEntry.Vec
+    Vec_SubEntry.new(init subs, allocator)?
+    uninit field_facts: Vec_Expr.Vec
+    Vec_Expr.new(init field_facts, allocator)?
+    let np = Vec_Symbol.len(param_names)
+    let na = Vec_HArg.len(args)
+    var i: usize = 0
+    loop
+        decreases (np - i)
+    {
+        if i >= np {
+            break
+        }
+        if i >= na {
+            break
+        }
+        let harg = Vec_HArg.at(args, i)
+        match harg_to_ast_expr(ctx, harg.expr, types_out, ty_interner, mutable field_facts, allocator)? {
+            case .some(let ae) => {
+                let entry = subst_mod.SubEntry { name: Vec_Symbol.at(param_names, i), expr: ae }
+                Vec_SubEntry.push(mutable subs, take entry, allocator)?
+            }
+            case .none => {}
+        }
+        i = i + 1
+    }
+    let nc = Vec_RefinementClause.len(refinements)
+    var k: usize = 0
+    loop
+        decreases (nc - k)
+    {
+        if k >= nc {
+            break
+        }
+        let clause = Vec_RefinementClause.at(refinements, k)
+        match clause.kind {
+            case .requires_ => {
+                let new_pred = subst_mod.subst_expr(clause.pred, subs, allocator)?
+                var context = clauses_mod.collect_requires_clauses(ctx.ensures_clauses, allocator)?
+                append_exprs(mutable context, field_facts, allocator)?
+                builder_mod.push_obligation(
+                    mutable ctx,
+                    body_mod.ObligationKind.precondition,
+                    take new_pred,
+                    take context,
+                    body_mod.TrustAnnotation.discharged,
+                    allocator,
+                )?
+            }
+            case _ => {}
+        }
+        k = k + 1
+    }
+}
+
+
+function has_requires(refinements: Vec_RefinementClause.Vec) -> bool {
+    let n = Vec_RefinementClause.len(refinements)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        match Vec_RefinementClause.at(refinements, i).kind {
+            case .requires_ => return true
+            case _ => {}
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+public function harg_to_ast_expr(
+    ctx: builder_mod.LowerCtx,
+    e: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    refinement_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match e.kind {
+        case .literal(let hlit) => Option_Expr.some(
+            value: ast_tree_mod.Expr {
+                span: span_mod.dummy(),
+                kind: ast_tree_mod.ExprKind.literal(value: hlit_to_lit(hlit)),
+            },
+        )
+        case .use_(let def) => local_ref_expr(ctx, def, types_out, ty_interner, mutable refinement_facts, allocator)?
+        case .unary(let op, let inner_box) => harg_unary(ctx, op, inner_box, types_out, ty_interner, mutable refinement_facts, allocator)?
+        case .binary(let op, let lbox, let rbox) => harg_binary(ctx, op, lbox, rbox, types_out, ty_interner, mutable refinement_facts, allocator)?
+        case _ => Option_Expr.none
+    }
+}
+
+
+function harg_unary(
+    ctx: builder_mod.LowerCtx,
+    op: ast_ops_mod.UnOp,
+    inner_box: Box_HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    refinement_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_HExpr.get(inner_box)
+    return match harg_to_ast_expr(ctx, inner, types_out, ty_interner, mutable refinement_facts, allocator)? {
+        case .some(let iae) => {
+            let ib = Box_Expr.new(take iae, allocator)?
+            Option_Expr.some(
+                value: ast_tree_mod.Expr {
+                    span: span_mod.dummy(),
+                    kind: ast_tree_mod.ExprKind.unary(op: op, expr: ib),
+                },
+            )
+        }
+        case .none => Option_Expr.none
+    }
+}
+
+
+function harg_binary(
+    ctx: builder_mod.LowerCtx,
+    op: ast_ops_mod.BinOp,
+    lbox: Box_HExpr,
+    rbox: Box_HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    refinement_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let lh = Box_HExpr.get(lbox)
+    let rh = Box_HExpr.get(rbox)
+    return match harg_to_ast_expr(ctx, lh, types_out, ty_interner, mutable refinement_facts, allocator)? {
+        case .some(let lae) => match harg_to_ast_expr(ctx, rh, types_out, ty_interner, mutable refinement_facts, allocator)? {
+            case .some(let rae) => {
+                let lb = Box_Expr.new(take lae, allocator)?
+                let rb = Box_Expr.new(take rae, allocator)?
+                Option_Expr.some(
+                    value: ast_tree_mod.Expr {
+                        span: span_mod.dummy(),
+                        kind: ast_tree_mod.ExprKind.binary(op: op, lhs: lb, rhs: rb),
+                    },
+                )
+            }
+            case .none => Option_Expr.none
+        }
+        case .none => Option_Expr.none
+    }
+}
+
+
+function hlit_to_lit(h: hir_tree.HLiteral) -> literal_mod.Literal {
+    return match h {
+        case .int(let value, let base) => literal_mod.Literal.int(value: value, base: base)
+        case .bool(let value) => literal_mod.Literal.bool(value: value)
+        case .float(let sym, _) => literal_mod.Literal.float(sym: sym)
+        case .str(let sym) => literal_mod.Literal.str(sym: sym)
+        case .unit => literal_mod.Literal.unit
+    }
+}
+
+
+function local_ref_expr(
+    ctx: builder_mod.LowerCtx,
+    def_id: def_mod.DefId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    refinement_facts: mutable Vec_Expr.Vec,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match builder_mod.lookup_local(ctx, def_id) {
+        case .some(let lid) => named_place_expr(ctx, builder_mod.local_place(lid), types_out, ty_interner, mutable refinement_facts, allocator)?
+        case .none => Option_Expr.none
+    }
+}

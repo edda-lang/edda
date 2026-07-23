@@ -1,0 +1,190 @@
+module tinysql.parse.cursor
+
+import std.mem.alloc
+import std.text.string
+import tinysql.model.error
+import tinysql.model.value
+import tinysql.parse.lex
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public type Parser {
+    toks: [lex.Token]
+    n: usize
+    src: [u8]
+    pos: usize
+}
+
+function _lower(c: u8) -> u8 {
+    return if c >= 65 as u8 && c <= 90 as u8 { c + 32 as u8 } else { c }
+}
+
+public function kw_eq_at(src: [u8], start: usize, end: usize, kw: String) -> bool {
+    let kb = kw.bytes()
+    let m = kb.len()
+    if end - start != m { return false }
+    var i: usize = 0
+    loop decreases m - i + 1 as usize {
+        if i >= m { break }
+        if _lower(src[start + i]) != _lower(kb[i]) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+public function offset(t: lex.Token) -> usize {
+    return match t {
+        case .ident(let s, _)      => s
+        case .string_lit(let s, _) => s
+        case .number(let s, _)     => s
+        case .lparen(let a)        => a
+        case .rparen(let a)        => a
+        case .comma(let a)         => a
+        case .star(let a)          => a
+        case .semicolon(let a)     => a
+        case .eq(let a)            => a
+        case .ne(let a)            => a
+        case .lt(let a)            => a
+        case .le(let a)            => a
+        case .gt(let a)            => a
+        case .ge(let a)            => a
+        case .eof(let a)           => a
+    }
+}
+
+public function cur(p: Parser) -> lex.Token {
+    return p.toks[p.pos]
+}
+
+public function bump(p: mutable Parser) -> () {
+    p.pos = p.pos + 1 as usize
+}
+
+public function at_end(p: Parser) -> bool {
+    return match cur(p) {
+        case .eof(_) => true
+        case _       => false
+    }
+}
+
+public function is_kw(p: Parser, kw: String) -> bool {
+    return match cur(p) {
+        case .ident(let s, let e) => kw_eq_at(p.src, s, e, kw)
+        case _                    => false
+    }
+}
+
+public function is_comma(p: Parser) -> bool {
+    return match cur(p) { case .comma(_) => true  case _ => false }
+}
+
+public function is_lparen(p: Parser) -> bool {
+    return match cur(p) { case .lparen(_) => true  case _ => false }
+}
+
+public function is_star(p: Parser) -> bool {
+    return match cur(p) { case .star(_) => true  case _ => false }
+}
+
+public function is_semicolon(p: Parser) -> bool {
+    return match cur(p) { case .semicolon(_) => true  case _ => false }
+}
+
+public function decode_string(src: [u8], start: usize, end: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let cap = end - start
+    let buf = _alloc_bytes(allocator, cap + 1 as usize)?
+    var w: usize = 0
+    var r: usize = start
+    loop decreases end - r + 1 as usize {
+        if r >= end { break }
+        let c = src[r]
+        buf[w] = c
+        w = w + 1 as usize
+        if c == 39 as u8 && r + 1 as usize < end && src[r + 1 as usize] == 39 as u8 {
+            r = r + 2 as usize
+        } else {
+            r = r + 1 as usize
+        }
+    }
+    return string.bytes_slice_to_string(buf, 0 as usize, w, allocator)?
+}
+
+public function expect_ident(p: mutable Parser, allocator: Allocator) -> String
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let t = cur(p)
+    return match t {
+        case .ident(let s, let e) => {
+            bump(mutable p)
+            string.bytes_slice_to_string(p.src, s, e, allocator)?
+        }
+        case _ => raise error.SqlError.expected_identifier(at: offset(t))
+    }
+}
+
+public function expect_kw(p: mutable Parser, kw: String) -> ()
+    with {err: error.SqlError}
+{
+    if is_kw(p, kw) {
+        bump(mutable p)
+        return ()
+    }
+    raise error.SqlError.expected_keyword(at: offset(cur(p)))
+}
+
+public function expect_lparen(p: mutable Parser) -> ()
+    with {err: error.SqlError}
+{
+    let t = cur(p)
+    return match t {
+        case .lparen(_) => { bump(mutable p); () }
+        case _          => raise error.SqlError.unexpected_token(at: offset(t))
+    }
+}
+
+public function expect_rparen(p: mutable Parser) -> ()
+    with {err: error.SqlError}
+{
+    let t = cur(p)
+    return match t {
+        case .rparen(_) => { bump(mutable p); () }
+        case _          => raise error.SqlError.unexpected_token(at: offset(t))
+    }
+}
+
+public function expect_eq(p: mutable Parser) -> ()
+    with {err: error.SqlError}
+{
+    let t = cur(p)
+    return match t {
+        case .eq(_) => { bump(mutable p); () }
+        case _      => raise error.SqlError.unexpected_token(at: offset(t))
+    }
+}
+
+public function parse_coltype(p: mutable Parser) -> value.ColumnType
+    with {err: error.SqlError}
+{
+    let t = cur(p)
+    return match t {
+        case .ident(let s, let e) => {
+            if kw_eq_at(p.src, s, e, "int") || kw_eq_at(p.src, s, e, "integer") {
+                bump(mutable p)
+                value.ColumnType.int_type
+            } else if kw_eq_at(p.src, s, e, "text") || kw_eq_at(p.src, s, e, "varchar") {
+                bump(mutable p)
+                value.ColumnType.text_type
+            } else if kw_eq_at(p.src, s, e, "bool") || kw_eq_at(p.src, s, e, "boolean") {
+                bump(mutable p)
+                value.ColumnType.bool_type
+            } else {
+                raise error.SqlError.unknown_type(at: s)
+            }
+        }
+        case _ => raise error.SqlError.unknown_type(at: offset(t))
+    }
+}

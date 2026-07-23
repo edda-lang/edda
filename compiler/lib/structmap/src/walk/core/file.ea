@@ -1,0 +1,380 @@
+
+module structmap.walk.core.file
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import source.map as source_map_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import local.data.model as model
+import local.walk.emit.item as walkitem
+import local.walk.count.children as children_mod
+import local.walk.count.subcounts as subcounts_mod
+
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.StringMap(u32)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(model.ChildIndex)
+spec std.collections.vec.Vec(model.ModuleEntry)
+spec std.collections.vec.Vec(model.TypeEntry)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(model.InvariantEntry)
+spec std.collections.vec.Vec(model.PatternEntry)
+spec std.collections.vec.Vec(model.DocEntry)
+spec std.collections.vec.Vec(model.TrustEntry)
+
+
+public function build_tree(
+    tree: mutable model.Tree,
+    package_root: String,
+    hir_files: [hir_file_mod.HirFile],
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let _ = seed_root(mutable tree, package_root, allocator)?
+    let n: usize = hir_files.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        walk_one_file(
+            mutable tree,
+            package_root,
+            hir_files[i],
+            i,
+            interner,
+            source_map,
+            type_outputs,
+            effect_interner,
+            allocator,
+        )?
+        i += 1
+    }
+    fill_children(mutable tree, package_root, allocator)?
+}
+
+
+function walk_one_file(
+    tree: mutable model.Tree,
+    package_root: String,
+    hf: hir_file_mod.HirFile,
+    file_idx: usize,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let file_id = hf.source.span.file
+    if (file_id.raw as usize) >= source_map_mod.file_count(source_map) { return }
+    let file_path = source_map_mod.file_name_of(source_map, file_id)
+    if !starts_with_str(file_path, package_root) { return }
+    if is_under_build_cache(file_path) { return }
+    let dir_opt = parent_dir(file_path, allocator)?
+    match dir_opt {
+        case .none => ()
+        case .some(let dir_path) => {
+            let dir_idx = find_or_add_dir(mutable tree, dir_path, allocator)?
+            ensure_ancestors(mutable tree, dir_path, package_root, allocator)?
+            let file_rel = relative_basename(file_path, dir_path, allocator)?
+            walkitem.push_module(
+                mutable tree,
+                dir_idx,
+                hf.source,
+                hf.items,
+                file_rel,
+                file_id,
+                interner,
+                source_map,
+                type_outputs,
+                file_idx,
+                effect_interner,
+                allocator,
+            )?
+        }
+    }
+}
+
+
+function seed_root(
+    tree: mutable model.Tree,
+    package_root: String,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return find_or_add_dir(mutable tree, package_root, allocator)?
+}
+
+function find_or_add_dir(
+    tree: mutable model.Tree,
+    dir_path: String,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let existing = StringMap_u32.get(tree.by_path, dir_path)
+    match existing {
+        case .some(let idx) => return idx as usize
+        case .none => ()
+    }
+    let new_raw: u32 = Vec_String.len(tree.paths) as u32
+    let copied = clone_str(dir_path, allocator)?
+    Vec_String.push(mutable tree.paths, copied, allocator)?
+    let inserted_copy = clone_str(dir_path, allocator)?
+    let _ = StringMap_u32.insert(mutable tree.by_path, inserted_copy, new_raw, allocator)?
+    return new_raw as usize
+}
+
+function ensure_ancestors(
+    tree: mutable model.Tree,
+    dir_path: String,
+    package_root: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if string_equals(dir_path, package_root) { return }
+    let cur_opt = parent_dir(dir_path, allocator)?
+    match cur_opt {
+        case .none => ()
+        case .some(let parent) => {
+            if !starts_with_str(parent, package_root) { return }
+            let _ = find_or_add_dir(mutable tree, parent, allocator)?
+            ensure_ancestors(mutable tree, parent, package_root, allocator)?
+        }
+    }
+}
+
+function fill_children(
+    tree: mutable model.Tree,
+    package_root: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let child_path = Vec_String.at(tree.paths, i)
+        if !string_equals(child_path, package_root) {
+            let parent_opt = parent_dir(child_path, allocator)?
+            match parent_opt {
+                case .none => ()
+                case .some(let parent_path) => {
+                    let parent_lookup = StringMap_u32.get(tree.by_path, parent_path)
+                    match parent_lookup {
+                        case .some(let parent_raw) => {
+                            let parent_idx: usize = parent_raw as usize
+                            let rel = relative_from_parent(parent_path, child_path, allocator)?
+                            let totals = subcounts_mod.own_totals(tree, i)
+                            let headline = subcounts_mod.public_headline(tree, i, allocator)?
+                            Vec_ChildIndex.push(
+                                mutable tree.children,
+                                model.ChildIndex {
+                                    dir_idx: parent_idx,
+                                    path: rel,
+                                    types: totals.0,
+                                    functions: totals.1,
+                                    public_names: headline,
+                                },
+                                allocator,
+                            )?
+                        }
+                        case .none => ()
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    children_mod.sort_children(mutable tree.children)
+}
+
+
+function starts_with_str(s: String, prefix: String) -> bool {
+    let sb = s.bytes()
+    let pb = prefix.bytes()
+    let sn: usize = sb.len()
+    let pn: usize = pb.len()
+    if pn > sn { return false }
+    var i: usize = 0
+    loop
+        decreases pn - i
+    {
+        if i >= pn { break }
+        if sb[i] != pb[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function string_equals(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    if an != bn { return false }
+    var i: usize = 0
+    loop
+        decreases an - i
+    {
+        if i >= an { break }
+        if ab[i] != bb[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function clone_str(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function is_under_build_cache(path: String) -> bool {
+    let bytes = path.bytes()
+    let n: usize = bytes.len()
+    if n < 5 { return false }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if is_segment_start(bytes, i) && bytes_match_at(bytes, i, ".edda") {
+            let end: usize = i + 5
+            if end == n { return true }
+            if end < n && (bytes[end] == 0x2F || bytes[end] == 0x5C) { return true }
+        }
+        i += 1
+    }
+    return false
+}
+
+function bytes_match_at(bytes: [u8], i: usize, pat: String) -> bool {
+    let pb = pat.bytes()
+    let pn: usize = pb.len()
+    let bn: usize = bytes.len()
+    if i + pn > bn { return false }
+    var k: usize = 0
+    loop
+        decreases pn - k
+    {
+        if k >= pn { break }
+        if bytes[i + k] != pb[k] { return false }
+        k += 1
+    }
+    return true
+}
+
+function is_segment_start(bytes: [u8], i: usize) -> bool {
+    if i == 0 { return true }
+    let b = bytes[i - 1]
+    return b == 0x2F || b == 0x5C
+}
+
+function parent_dir(path: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = path.bytes()
+    let n: usize = bytes.len()
+    if n == 0 { return Option_String.none() }
+    var i: usize = n
+    loop
+        decreases i
+    {
+        if i == 0 { break }
+        i -= 1
+        if bytes[i] == 0x2F || bytes[i] == 0x5C {
+            let buf: [u8] = allocator.alloc_array(u8, i)?
+            var k: usize = 0
+            loop
+                decreases i - k
+            {
+                if k >= i { break }
+                buf[k] = bytes[k]
+                k += 1
+            }
+            return Option_String.some(value: string.from_owned_utf8(take buf))
+        }
+    }
+    return Option_String.none()
+}
+
+function relative_basename(
+    file_path: String,
+    dir_path: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let fb = file_path.bytes()
+    let db = dir_path.bytes()
+    let fn: usize = fb.len()
+    let dn: usize = db.len()
+    if dn >= fn { return clone_str(file_path, allocator)? }
+    if !starts_with_str(file_path, dir_path) { return clone_str(file_path, allocator)? }
+    var start: usize = dn
+    if start < fn && (fb[start] == 0x2F || fb[start] == 0x5C) {
+        start += 1
+    }
+    let rest_len: usize = fn - start
+    let buf: [u8] = allocator.alloc_array(u8, rest_len)?
+    var i: usize = 0
+    loop
+        decreases rest_len - i
+    {
+        if i >= rest_len { break }
+        let b = fb[start + i]
+        if b == 0x5C {
+            buf[i] = 0x2F
+        } else {
+            buf[i] = b
+        }
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function relative_from_parent(
+    parent: String,
+    child: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return relative_basename(child, parent, allocator)?
+}

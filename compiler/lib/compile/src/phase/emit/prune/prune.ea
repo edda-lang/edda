@@ -1,0 +1,234 @@
+
+module compile.phase.emit.prune.prune
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import intern.interner as interner_mod
+import source.map as source_map_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as body_mod
+import local.phase.emit.reach.reach as reach_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(body_mod.MirBody)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.StringMap(bool)
+
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(reach_mod.FileRefs)
+
+
+public function prune_unreachable(
+    optimized: take Vec_MirFile.Vec,
+    source_paths: [String],
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_MirFile.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_set = reach_mod.build_path_set(source_paths, allocator)?
+    let marks = reach_mod.mark_reachable(optimized, path_set, map, interner, allocator)?
+    uninit out: Vec_MirFile.Vec
+    Vec_MirFile.new(init out, allocator)?
+    loop decreases (Vec_MirFile.len(optimized) + 1) as usize {
+        if Vec_MirFile.is_empty(optimized) { break }
+        let mf = Vec_MirFile.remove(mutable optimized, 0 as usize)
+        if reach_mod.file_is_package_own(mf, path_set, map) {
+            Vec_MirFile.push(mutable out, take mf, allocator)?
+        } else {
+            match filter_file(mf, marks.visited, marks.referenced_externs, allocator)? {
+                case .some(let f) => Vec_MirFile.push(mutable out, take f, allocator)?
+                case .none => ()
+            }
+        }
+    }
+    return out
+}
+
+
+public function prune_unreachable_bodies(
+    optimized: take Vec_MirFile.Vec,
+    source_paths: [String],
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_MirFile.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_set = reach_mod.build_path_set(source_paths, allocator)?
+    let marks = reach_mod.mark_reachable(optimized, path_set, map, interner, allocator)?
+    uninit out: Vec_MirFile.Vec
+    Vec_MirFile.new(init out, allocator)?
+    loop decreases (Vec_MirFile.len(optimized) + 1) as usize {
+        if Vec_MirFile.is_empty(optimized) { break }
+        let mf = Vec_MirFile.remove(mutable optimized, 0 as usize)
+        if reach_mod.file_is_package_own(mf, path_set, map) {
+            Vec_MirFile.push(mutable out, take mf, allocator)?
+        } else {
+            let filtered = filter_bodies(mf, marks.visited, allocator)?
+            Vec_MirFile.push(mutable out, take filtered, allocator)?
+        }
+    }
+    return out
+}
+
+
+public function compute_marks_with_extra(
+    files: Vec_MirFile.Vec,
+    extra: Vec_FileRefs.Vec,
+    source_paths: [String],
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> reach_mod.ReachMarks
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_set = reach_mod.build_path_set(source_paths, allocator)?
+    return reach_mod.mark_reachable_full(files, extra, path_set, map, interner, allocator)?
+}
+
+
+public function filter_bodies_with_marks(
+    optimized: take Vec_MirFile.Vec,
+    marks: reach_mod.ReachMarks,
+    source_paths: [String],
+    map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> Vec_MirFile.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_set = reach_mod.build_path_set(source_paths, allocator)?
+    uninit out: Vec_MirFile.Vec
+    Vec_MirFile.new(init out, allocator)?
+    loop decreases (Vec_MirFile.len(optimized) + 1) as usize {
+        if Vec_MirFile.is_empty(optimized) { break }
+        let mf = Vec_MirFile.remove(mutable optimized, 0 as usize)
+        if reach_mod.file_is_package_own(mf, path_set, map) {
+            Vec_MirFile.push(mutable out, take mf, allocator)?
+        } else {
+            let filtered = filter_bodies(mf, marks.visited, allocator)?
+            Vec_MirFile.push(mutable out, take filtered, allocator)?
+        }
+    }
+    return out
+}
+
+
+public function prune_one_file(
+    mf: take mir_file_mod.MirFile,
+    marks: reach_mod.ReachMarks,
+    path_set: StringMap_bool.StringMap,
+    map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> Option_MirFile.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if reach_mod.file_is_package_own(mf, path_set, map) {
+        return Option_MirFile.some(value: mf)
+    }
+    return filter_file(mf, marks.visited, marks.referenced_externs, allocator)?
+}
+
+
+public function body_count(files: Vec_MirFile.Vec) -> usize {
+    let n = Vec_MirFile.len(files)
+    var total: usize = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let mf = Vec_MirFile.at(files, i)
+        total = total +| Vec_MirBody.len(mf.bodies)
+        i = i + 1 as usize
+    }
+    return total
+}
+
+
+function filter_file(
+    mf: mir_file_mod.MirFile,
+    kept: IntMap_u32.IntMap,
+    referenced_externs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> Option_MirFile.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nf = filter_bodies(mf, kept, allocator)?
+    if Vec_MirBody.len(nf.bodies) == 0 as usize {
+        if !file_declares_referenced_extern(mf, referenced_externs) {
+            return Option_MirFile.none
+        }
+    }
+    return Option_MirFile.some(value: nf)
+}
+
+
+function filter_bodies(
+    mf: mir_file_mod.MirFile,
+    kept: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> mir_file_mod.MirFile
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit bodies: Vec_MirBody.Vec
+    Vec_MirBody.new(init bodies, allocator)?
+    var index = IntMap_u32.new(allocator)?
+    let nb = Vec_MirBody.len(mf.bodies)
+    var bi: usize = 0
+    var slot: u32 = 0
+    loop decreases nb - bi {
+        if bi >= nb { break }
+        let b = Vec_MirBody.at(mf.bodies, bi)
+        let draw = b.def_id.raw
+        if reach_mod.is_marked(kept, draw) {
+            let _i = IntMap_u32.insert(mutable index, draw as i64, slot, allocator)?
+            Vec_MirBody.push(mutable bodies, take b, allocator)?
+            slot = slot + 1 as u32
+        }
+        bi = bi + 1 as usize
+    }
+    return mir_file_mod.MirFile {
+        hir_files: mf.hir_files,
+        bodies: bodies,
+        body_index_by_def: index,
+        extern_defs: mf.extern_defs,
+    }
+}
+
+
+function file_declares_referenced_extern(mf: mir_file_mod.MirFile, referenced_externs: IntMap_u32.IntMap) -> bool {
+    let nf = Vec_HirFile.len(mf.hir_files)
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        let hf = Vec_HirFile.at(mf.hir_files, i)
+        let ni = Vec_HItem.len(hf.items)
+        var j: usize = 0
+        loop decreases ni - j {
+            if j >= ni { break }
+            let item = Vec_HItem.at(hf.items, j)
+            match item.kind {
+                case .function_extern(_, _, _, _) => {
+                    if reach_mod.is_marked(referenced_externs, item.def_id.raw) {
+                        return true
+                    }
+                }
+                case _ => ()
+            }
+            j = j + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+    return false
+}

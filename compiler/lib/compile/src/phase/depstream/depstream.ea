@@ -1,0 +1,175 @@
+
+module compile.phase.depstream.depstream
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import intern.interner as interner_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import cteval.builtin.target.reg.registry as cbi_registry_mod
+import cteval.res.output as cteval_output_mod
+import diagnostics.emit.collection as diags_mod
+import hir.build.file as hir_file_mod
+import mir.file.store as mir_file_mod
+import mir.layout.table as mir_layout_mod
+import mir.lower.entry.caps as entry_mod
+import mir.lower.eqmap.targets as eqmap_mod
+import mir.lower.fmt.targets as fmt_targets_mod
+import resolve.ctx as resolve_ctx_mod
+import target.triple as triple_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import types.ty.interner as ty_interner_mod
+import optimize.manager as manager_mod
+import refine.discharge.output as refine_output_mod
+import local.instantiate.cteval as cteval_phase_mod
+import local.member.filter as filter_mod
+import local.phase.depjit.depjit as depjit_mod
+import local.phase.emit.prune.prune as prune_mod
+import local.phase.emit.reach.reach as reach_mod
+import local.phase.pipeline.mir as mir_phase_mod
+import local.phase.pipeline.refine as refine_phase_mod
+import local.trace.trace as trace_mod
+
+
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(cteval_output_mod.ComptimeOutput)
+spec std.collections.vec.Vec(reach_mod.FileRefs)
+
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.StringMap(bool)
+
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(mir_file_mod.MirFile)
+
+
+public type DepStream {
+    dep_ast: Vec_File.Vec
+    dep_refs: Vec_FileRefs.Vec
+    dep_types: Vec_TypeOutput.Vec
+    dep_decl_types: Vec_TypeOutput.Vec
+    dep_def_base: u32
+    output: resolve_ctx_mod.ResolveOutput
+    builtin_registry: cbi_registry_mod.BuiltinRegistry
+    bridge_map: IntMap_u32.IntMap
+    extern_defs: IntMap_u32.IntMap
+    box_elem_ty_map: IntMap_u32.IntMap
+    fmt_targets: fmt_targets_mod.FmtTargets
+    eq_targets: eqmap_mod.EqTargets
+    layout_cache: mir_layout_mod.LayoutCache
+}
+
+
+public type DepEmit {
+    files: Vec_MirFile.Vec
+    has_entry: bool
+    discharged: usize
+    skipped: usize
+    proven: usize
+}
+
+
+public function lower_optimize_dep(
+    stream: take DepStream,
+    marks: reach_mod.ReachMarks,
+    entry_filter: Option_String.Option,
+    source_paths: [String],
+    triple: triple_mod.TargetTriple,
+    ptr_width: usize,
+    trace: trace_mod.TraceConfig,
+    clock: MonotonicClock,
+    errout: Stderr,
+    map: source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    dep_fork: Allocator,
+    allocator: Allocator,
+) -> DepEmit
+    with {clock, errout, dep_fork, allocator, divergence, err: alloc.AllocError, panic}
+{
+    let path_set = reach_mod.build_path_set(source_paths, allocator)?
+    var layout_cache = stream.layout_cache
+    var dep_ast = stream.dep_ast
+    uninit out: Vec_MirFile.Vec
+    Vec_MirFile.new(init out, allocator)?
+    var has_entry = false
+    var discharged: usize = 0
+    var skipped: usize = 0
+    var proven: usize = 0
+    let s_low = trace_mod.phase_begin(trace, clock, errout, "mir2.lower-opt", allocator)?
+    var i: usize = 0
+    loop decreases (Vec_File.len(dep_ast) + 1) as usize {
+        if Vec_File.is_empty(dep_ast) { break }
+        let ast = Vec_File.remove(mutable dep_ast, 0 as usize)
+        let file_fork = alloc.fork(allocator)
+        let decl_t = Vec_TypeOutput.at(stream.dep_decl_types, i)
+        let hir = depjit_mod.relower_one_dep_hir(
+            take ast, stream.output, stream.dep_def_base, take decl_t,
+            ty_interner, effect_interner, stream.builtin_registry, triple,
+            mutable interner, allocator, file_fork,
+        )?
+        uninit one_hir: Vec_HirFile.Vec
+        Vec_HirFile.new(init one_hir, file_fork)?
+        Vec_HirFile.push(mutable one_hir, take hir, file_fork)?
+        uninit one_types: Vec_TypeOutput.Vec
+        Vec_TypeOutput.new(init one_types, file_fork)?
+        let types_ct = Vec_TypeOutput.at(stream.dep_types, i)
+        Vec_TypeOutput.push(mutable one_types, take types_ct, file_fork)?
+        let file_cteval = cteval_phase_mod.evaluate_files_bodies(
+            one_hir, one_types, ty_interner, effect_interner,
+            stream.builtin_registry, triple, mutable interner, true, mutable diags, allocator,
+        )?
+        let comptime_out = Vec_ComptimeOutput.at(file_cteval, 0 as usize)
+        let hir_one = Vec_HirFile.remove(mutable one_hir, 0 as usize)
+        let types_out = Vec_TypeOutput.at(stream.dep_types, i)
+        let mf = mir_phase_mod.lower_one_to_mir(
+            take hir_one, types_out, comptime_out, mutable ty_interner, effect_interner, triple, true,
+            interner, stream.bridge_map, stream.extern_defs, stream.box_elem_ty_map,
+            stream.fmt_targets, stream.eq_targets, mutable layout_cache, mutable diags, allocator, dep_fork,
+        )?
+        uninit one: Vec_MirFile.Vec
+        Vec_MirFile.new(init one, allocator)?
+        Vec_MirFile.push(mutable one, take mf, allocator)?
+        depjit_mod.distill_mir_hir(mutable one, dep_fork)?
+        match entry_filter {
+            case .some(let prefix) => filter_mod.demote_foreign_mains(mutable one, prefix, map, interner, allocator)?
+            case .none => ()
+        }
+        let he = entry_mod.materialize_entries(mutable one, mutable ty_interner, interner, allocator)?
+        has_entry = has_entry || he
+        let staged = Vec_MirFile.remove(mutable one, 0 as usize)
+        match prune_mod.prune_one_file(take staged, marks, path_set, map, dep_fork)? {
+            case .some(let kept) => {
+                var live = kept
+                let output = refine_phase_mod.discharge_and_emit(
+                    live, types_out, ty_interner, mutable interner, ptr_width, mutable diags, allocator,
+                )?
+                discharged = discharged +| refine_output_mod.discharged_count(output)
+                skipped = skipped +| refine_output_mod.skipped_count(output)
+                proven = proven +| refine_output_mod.proven_count(output)
+                manager_mod.optimize_file(mutable live, output, mutable ty_interner, allocator)?
+                Vec_MirFile.push(mutable out, take live, allocator)?
+            }
+            case .none => ()
+        }
+        alloc.close(take file_fork)
+        i = i + 1 as usize
+    }
+    trace_mod.phase_end_n(s_low, clock, errout, Vec_MirFile.len(out), "files", allocator)?
+    return DepEmit {
+        files: take out,
+        has_entry: has_entry,
+        discharged: discharged,
+        skipped: skipped,
+        proven: proven,
+    }
+}

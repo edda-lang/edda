@@ -1,0 +1,234 @@
+module optimize.alias_mem.store.flow.dead
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.store.flow.suffix as suffix_mod
+import local.alias_mem.store.flow.reads as reads_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+
+public function assign_dead_flags(
+    block: mir_body_mod.BasicBlock,
+    read_flags: Vec_bool.Vec,
+    info: escape_mod.EscapeInfo,
+    body: mir_body_mod.MirBody,
+    sweep: mutable suffix_mod.SuffixEvents,
+    allocator: Allocator,
+) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    suffix_mod.begin_block(mutable sweep)
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+    uninit flags: Vec_bool.Vec
+    Vec_bool.with_capacity(init flags, n_stmts, allocator)?
+    var fi: usize = 0
+    loop decreases n_stmts - fi {
+        if fi >= n_stmts { break }
+        Vec_bool.push(mutable flags, false, allocator)?
+        fi += 1
+    }
+
+    var si: usize = n_stmts
+    loop decreases si {
+        if si == 0 { break }
+        si -= 1
+        let stmt = Vec_Statement.at(block.statements, si)
+        match stmt.kind {
+            case .assign(let dest, let value) => {
+                if assign_is_dead(dest, value, read_flags, info, body, sweep, si) {
+                    Vec_bool.set_at(mutable flags, si, true)
+                }
+            }
+            case _ => ()
+        }
+        suffix_mod.fold_statement(mutable sweep, stmt, si)
+    }
+    return flags
+}
+
+
+public function stmt_is_removable(
+    stmt: mir_stmt_mod.Statement,
+    flags: Vec_bool.Vec,
+    index_in_block: usize,
+    read_flags: Vec_bool.Vec,
+    info: escape_mod.EscapeInfo,
+    body: mir_body_mod.MirBody,
+    unrem: Vec_bool.Vec,
+) -> bool {
+    return match stmt.kind {
+        case .assign(_, _) =>
+            index_in_block < Vec_bool.len(flags) && Vec_bool.at(flags, index_in_block)
+        case .storage_live(let local) =>
+            storage_marker_is_dead(local, read_flags, info, body, unrem)
+        case .storage_dead(let local) =>
+            storage_marker_is_dead(local, read_flags, info, body, unrem)
+        case .nop_ => false
+    }
+}
+
+
+function assign_is_dead(
+    dest: mir_place_mod.Place,
+    value: mir_rvalue_mod.Rvalue,
+    read_flags: Vec_bool.Vec,
+    info: escape_mod.EscapeInfo,
+    body: mir_body_mod.MirBody,
+    sweep: suffix_mod.SuffixEvents,
+    index_in_block: usize,
+) -> bool {
+    if escape_mod.is_bare(dest) == false {
+        return false
+    }
+    let base: mir_local_mod.LocalId = escape_mod.base_local(dest)
+    if escape_mod.escapes(info, base) {
+        return false
+    }
+    if escape_mod.rvalue_is_trap_free(value) == false {
+        return false
+    }
+    if mir_local_mod.index(base) < escape_mod.first_temp_index(body) {
+        return false
+    }
+    if reads_mod.read_anywhere(read_flags, base) == false {
+        return true
+    }
+    return suffix_mod.first_is_overwrite(sweep, base, index_in_block)
+}
+
+
+function storage_marker_is_dead(
+    local: mir_local_mod.LocalId,
+    read_flags: Vec_bool.Vec,
+    info: escape_mod.EscapeInfo,
+    body: mir_body_mod.MirBody,
+    unrem: Vec_bool.Vec,
+) -> bool {
+    if escape_mod.escapes(info, local) {
+        return false
+    }
+    if mir_local_mod.index(local) < escape_mod.first_temp_index(body) {
+        return false
+    }
+    if reads_mod.read_anywhere(read_flags, local) {
+        return false
+    }
+    return writes_all_removable(unrem, local)
+}
+
+
+function writes_all_removable(unrem: Vec_bool.Vec, local: mir_local_mod.LocalId) -> bool {
+    let idx: usize = mir_local_mod.index(local)
+    if idx < Vec_bool.len(unrem) {
+        return Vec_bool.at(unrem, idx) == false
+    }
+    return true
+}
+
+
+public function compute_unremovable_writes(
+    body: mir_body_mod.MirBody,
+    read_flags: Vec_bool.Vec,
+    info: escape_mod.EscapeInfo,
+    allocator: Allocator,
+) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n_locals: usize = Vec_Local.len(body.locals)
+    uninit unrem: Vec_bool.Vec
+    Vec_bool.with_capacity(init unrem, n_locals, allocator)?
+    var li: usize = 0
+    loop decreases n_locals - li {
+        if li >= n_locals { break }
+        Vec_bool.push(mutable unrem, false, allocator)?
+        li += 1
+    }
+
+    uninit sweep: suffix_mod.SuffixEvents
+    suffix_mod.new_events(init sweep, n_locals, allocator)?
+
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        let flags = assign_dead_flags(block, read_flags, info, body, mutable sweep, allocator)?
+        scan_block_writes(mutable unrem, block, flags, bi)
+        bi += 1
+    }
+    return unrem
+}
+
+
+function scan_block_writes(
+    unrem: mutable Vec_bool.Vec,
+    block: mir_body_mod.BasicBlock,
+    flags: Vec_bool.Vec,
+    block_slot: usize,
+) -> () {
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(block.statements, si)
+        match stmt.kind {
+            case .assign(let dest, _) => {
+                let base: mir_local_mod.LocalId = escape_mod.base_local(dest)
+                let removable = escape_mod.is_bare(dest)
+                    && block_slot >= 1
+                    && si < Vec_bool.len(flags)
+                    && Vec_bool.at(flags, si)
+                if removable == false {
+                    set_unrem(mutable unrem, base)
+                }
+            }
+            case _ => ()
+        }
+        si += 1
+    }
+    mark_term_write(mutable unrem, block.terminator)
+}
+
+
+function set_unrem(unrem: mutable Vec_bool.Vec, l: mir_local_mod.LocalId) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_bool.len(unrem) {
+        Vec_bool.set_at(mutable unrem, idx, true)
+    }
+}
+
+
+function mark_term_write(unrem: mutable Vec_bool.Vec, term: mir_term_mod.Terminator) -> () {
+    match term.kind {
+        case .call_(_, _, let dest, _, _) => {
+            if escape_mod.is_bare(dest) {
+                set_unrem(mutable unrem, escape_mod.base_local(dest))
+            }
+        }
+        case .spawn_(_, _, _, let handle_dest, _, _) => {
+            if escape_mod.is_bare(handle_dest) {
+                set_unrem(mutable unrem, escape_mod.base_local(handle_dest))
+            }
+        }
+        case .await_(_, let dest, _, _) => {
+            if escape_mod.is_bare(dest) {
+                set_unrem(mutable unrem, escape_mod.base_local(dest))
+            }
+        }
+        case _ => ()
+    }
+}

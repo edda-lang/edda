@@ -1,0 +1,314 @@
+
+module object.coff.serialize
+
+import std.mem.alloc
+import std.collections.vec
+import local.bytes as bytes_mod
+import local.coff as coff_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(coff_mod.CoffSymbol)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+
+public function serialize_header(
+    out: mutable Vec_u8.Vec,
+    h: coff_mod.CoffHeader,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u16_le(mutable out, coff_mod.to_u16(h.machine), allocator)?
+    bytes_mod.push_u16_le(mutable out, h.number_of_sections, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.time_date_stamp, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.pointer_to_symbol_table, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.number_of_symbols, allocator)?
+    bytes_mod.push_u16_le(mutable out, h.size_of_optional_header, allocator)?
+    bytes_mod.push_u16_le(mutable out, h.characteristics, allocator)?
+}
+
+
+public function serialize_section_name(
+    out: mutable Vec_u8.Vec,
+    name: coff_mod.CoffSectionName,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match name {
+        case .inline_(let packed) => {
+            bytes_mod.push_u64_le(mutable out, packed, allocator)?
+        }
+        case .string_table_ref(let offset) => {
+            if offset > 9999999 {
+                bytes_mod.push_u8(mutable out, 0x2F as u8, allocator)?
+                bytes_mod.push_u8(mutable out, 0x2F as u8, allocator)?
+                var div: u32 = 1073741824
+                var i: usize = 0
+                loop decreases (6 - i) {
+                    if i >= 6 { break }
+                    let digit = (offset / div) % 64
+                    bytes_mod.push_u8(mutable out, base64_coff_digit(digit), allocator)?
+                    div = div / 64
+                    i = i + 1
+                }
+            } else {
+                bytes_mod.push_u8(mutable out, 0x2F as u8, allocator)?
+                var div: u32 = 1000000
+                var i: usize = 0
+                loop decreases (7 - i) {
+                    if i >= 7 { break }
+                    let digit = ((offset / div) % 10) as u8
+                    bytes_mod.push_u8(mutable out, (digit + 0x30) as u8, allocator)?
+                    div = div / 10
+                    i = i + 1
+                }
+            }
+        }
+    }
+}
+
+function base64_coff_digit(d: u32) -> u8
+    requires d < 64
+{
+    if d < 26 {
+        return (d + 0x41) as u8
+    }
+    if d < 52 {
+        return (d - 26 + 0x61) as u8
+    }
+    if d < 62 {
+        return (d - 52 + 0x30) as u8
+    }
+    if d < 63 {
+        return 0x2B as u8
+    }
+    return 0x2F as u8
+}
+
+
+public function serialize_section_header(
+    out: mutable Vec_u8.Vec,
+    h: coff_mod.CoffSectionHeader,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    serialize_section_name(mutable out, h.name, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.virtual_size, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.virtual_address, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.size_of_raw_data, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.pointer_to_raw_data, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.pointer_to_relocations, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.pointer_to_linenumbers, allocator)?
+    bytes_mod.push_u16_le(mutable out, h.number_of_relocations, allocator)?
+    bytes_mod.push_u16_le(mutable out, h.number_of_linenumbers, allocator)?
+    bytes_mod.push_u32_le(mutable out, h.characteristics, allocator)?
+}
+
+
+public function serialize_symbol_name(
+    out: mutable Vec_u8.Vec,
+    name: coff_mod.CoffSymbolName,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match name {
+        case .inline_(let packed) => {
+            bytes_mod.push_u64_le(mutable out, packed, allocator)?
+        }
+        case .string_table_ref(let offset) => {
+            bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+            bytes_mod.push_u32_le(mutable out, offset, allocator)?
+        }
+    }
+}
+
+public function serialize_symbol(
+    out: mutable Vec_u8.Vec,
+    s: coff_mod.CoffSymbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    serialize_symbol_name(mutable out, s.name, allocator)?
+    bytes_mod.push_u32_le(mutable out, s.value, allocator)?
+    bytes_mod.push_i16_le(mutable out, s.section_number, allocator)?
+    bytes_mod.push_u16_le(mutable out, s.type_, allocator)?
+    bytes_mod.push_u8(mutable out, s.storage_class, allocator)?
+    bytes_mod.push_u8(mutable out, s.number_of_aux_symbols, allocator)?
+}
+
+
+public function serialize_relocation(
+    out: mutable Vec_u8.Vec,
+    r: coff_mod.CoffRelocation,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u32_le(mutable out, r.virtual_address, allocator)?
+    bytes_mod.push_u32_le(mutable out, r.symbol_table_index, allocator)?
+    bytes_mod.push_u16_le(mutable out, r.type_, allocator)?
+}
+
+
+function image_scn_lnk_nreloc_ovfl() -> u32 {
+    return 0x01000000 as u32
+}
+
+function reloc_disk_count(reloc_len: u32) -> u32 {
+    return if reloc_len >= 0xFFFF {
+        reloc_len +| 1
+    } else {
+        reloc_len
+    }
+}
+
+function serialize_section_relocations(
+    out: mutable Vec_u8.Vec,
+    relocations: Vec_CoffRelocation.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_CoffRelocation.len(relocations)
+    let reloc_len: u32 = n as u32
+    if reloc_len >= 0xFFFF {
+        let counter = coff_mod.CoffRelocation {
+            virtual_address: reloc_disk_count(reloc_len),
+            symbol_table_index: 0 as u32,
+            type_: 0 as u16,
+        }
+        serialize_relocation(mutable out, counter, allocator)?
+    }
+    var r: usize = 0
+    loop decreases (n - r) {
+        if r >= n { break }
+        let reloc = Vec_CoffRelocation.at(relocations, r)
+        serialize_relocation(mutable out, reloc, allocator)?
+        r = r + 1
+    }
+}
+
+
+public function serialize_string_table(
+    out: mutable Vec_u8.Vec,
+    t: coff_mod.CoffStringTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let size = (Vec_u8.len(t.bytes) as u32) + 4
+    bytes_mod.push_u32_le(mutable out, size, allocator)?
+    Vec_u8.extend_from_slice(mutable out, Vec_u8.as_slice(t.bytes), allocator)?
+}
+
+
+public function serialize_file(
+    out: mutable Vec_u8.Vec,
+    f: coff_mod.CoffFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_sections = Vec_CoffSection.len(f.sections)
+    let n_symbols = Vec_CoffSymbol.len(f.symbols)
+    let header_size: u32 = 20
+    let section_header_size: u32 = 40
+    let symbol_size: u32 = 18
+    let relocation_size: u32 = 10
+
+    uninit data_offsets: Vec_u32.Vec
+    Vec_u32.new(init data_offsets, allocator)?
+    uninit reloc_offsets: Vec_u32.Vec
+    Vec_u32.new(init reloc_offsets, allocator)?
+
+    var offset: u32 = header_size + section_header_size * (n_sections as u32)
+    var i: usize = 0
+    loop decreases (n_sections - i) {
+        if i >= n_sections { break }
+        let section = Vec_CoffSection.at(f.sections, i)
+        let data_len = Vec_u8.len(section.data) as u32
+        let reloc_len = Vec_CoffRelocation.len(section.relocations) as u32
+        let data_off: u32 = offset
+        Vec_u32.push(mutable data_offsets, take data_off, allocator)?
+        offset = offset + data_len
+        let reloc_off: u32 = offset
+        Vec_u32.push(mutable reloc_offsets, take reloc_off, allocator)?
+        offset = offset + reloc_disk_count(reloc_len) * relocation_size
+        i = i + 1
+    }
+    let symtab_offset: u32 = offset
+
+    let strtab_size: u32 = 4 +| (Vec_u8.len(f.string_table.bytes) as u32)
+    let total_size: u32 = symtab_offset +| (n_symbols as u32) *| symbol_size +| strtab_size
+    Vec_u8.reserve(mutable out, Vec_u8.len(out) +| (total_size as usize), allocator)?
+
+    let header_fixed = coff_mod.CoffHeader {
+        machine: f.header.machine,
+        number_of_sections: n_sections as u16,
+        time_date_stamp: f.header.time_date_stamp,
+        pointer_to_symbol_table: symtab_offset,
+        number_of_symbols: n_symbols as u32,
+        size_of_optional_header: f.header.size_of_optional_header,
+        characteristics: f.header.characteristics,
+    }
+    serialize_header(mutable out, header_fixed, allocator)?
+
+    var j: usize = 0
+    loop decreases (n_sections - j) {
+        if j >= n_sections { break }
+        let section = Vec_CoffSection.at(f.sections, j)
+        let data_len = Vec_u8.len(section.data) as u32
+        let reloc_len = Vec_CoffRelocation.len(section.relocations) as u32
+        let overflow: bool = reloc_len >= 0xFFFF
+        let nrelocs: u16 = if overflow {
+            0xFFFF as u16
+        } else {
+            reloc_len as u16
+        }
+        let characteristics: u32 = if overflow {
+            section.header.characteristics | image_scn_lnk_nreloc_ovfl()
+        } else {
+            section.header.characteristics
+        }
+        let header_fixed_section = coff_mod.CoffSectionHeader {
+            name: section.header.name,
+            virtual_size: section.header.virtual_size,
+            virtual_address: section.header.virtual_address,
+            size_of_raw_data: data_len,
+            pointer_to_raw_data: Vec_u32.at(data_offsets, j),
+            pointer_to_relocations: Vec_u32.at(reloc_offsets, j),
+            pointer_to_linenumbers: 0 as u32,
+            number_of_relocations: nrelocs,
+            number_of_linenumbers: 0 as u16,
+            characteristics: characteristics,
+        }
+        serialize_section_header(mutable out, header_fixed_section, allocator)?
+        j = j + 1
+    }
+
+    var k: usize = 0
+    loop decreases (n_sections - k) {
+        if k >= n_sections { break }
+        let section = Vec_CoffSection.at(f.sections, k)
+        Vec_u8.extend_from_slice(mutable out, Vec_u8.as_slice(section.data), allocator)?
+        serialize_section_relocations(mutable out, section.relocations, allocator)?
+        k = k + 1
+    }
+
+    var s: usize = 0
+    loop decreases (n_symbols - s) {
+        if s >= n_symbols { break }
+        let symbol = Vec_CoffSymbol.at(f.symbols, s)
+        serialize_symbol(mutable out, symbol, allocator)?
+        s = s + 1
+    }
+
+    serialize_string_table(mutable out, f.string_table, allocator)?
+}

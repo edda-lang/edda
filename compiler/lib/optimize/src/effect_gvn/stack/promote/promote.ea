@@ -1,0 +1,325 @@
+
+module optimize.effect_gvn.stack.promote.promote
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.def as def_mod
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.op as op_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.tree.node.file as file_mod
+import ir.hlir.attrs as attrs_mod
+import resolve.build.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+import local.effect_gvn.stack.escape.escape as escape_mod
+import local.effect_gvn.stack.promote.size as size_mod
+
+
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBody)
+spec std.collections.vec.Vec(AllocPromotion)
+spec std.collections.vec.Vec(AllocCandidate)
+spec std.core.option.Option(u32)
+
+
+public type AllocPromotion {
+    op: op_mod.OpId
+    bytes: u32
+}
+
+
+public type AllocCandidate {
+    op: op_mod.OpId
+    callee: def_mod.DefId
+    has_bound: bool
+    bytes_bound: u128
+}
+
+
+public type AllocPromotePlan {
+    promotions: Vec_AllocPromotion.Vec
+    candidates: Vec_AllocCandidate.Vec
+    bound_unreachable: bool
+}
+
+
+public function analyze(
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    built: mutable mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> AllocPromotePlan
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit promotions: Vec_AllocPromotion.Vec
+    Vec_AllocPromotion.new(init promotions, allocator)?
+    uninit candidates: Vec_AllocCandidate.Vec
+    Vec_AllocCandidate.new(init candidates, allocator)?
+    collect_candidates(mutable candidates, body, file, ty_interner, allocator)?
+    let escaped = escape_mod.compute(body, allocator)?
+    build_promotions(mutable promotions, candidates, escaped, body, allocator)?
+    return AllocPromotePlan {
+        promotions: promotions,
+        candidates: candidates,
+        bound_unreachable: any_candidate_unbounded(candidates),
+    }
+}
+
+
+function build_promotions(
+    promotions: mutable Vec_AllocPromotion.Vec,
+    candidates: Vec_AllocCandidate.Vec,
+    escaped: escape_mod.EscapeSet,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_AllocCandidate.len(candidates)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let c = Vec_AllocCandidate.at(candidates, i)
+        let res = result_value_of(c.op, body)
+        if c.has_bound && c.bytes_bound <= (256 as u128) && !value_mod.is_error(res) && !escape_mod.escapes(escaped, res) {
+            let promo = AllocPromotion { op: c.op, bytes: c.bytes_bound as u32 }
+            Vec_AllocPromotion.push(mutable promotions, take promo, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function result_value_of(
+    op_id: op_mod.OpId,
+    body: hlir_body_mod.HlirBody,
+) -> value_mod.ValueId
+    with {panic}
+{
+    if op_mod.is_error(op_id) { return value_mod.error() }
+    let idx = op_mod.index(op_id)
+    if idx >= Vec_HlirOp.len(body.ops) { return value_mod.error() }
+    return Vec_HlirOp.at(body.ops, idx).result_
+}
+
+
+function any_candidate_unbounded(candidates: Vec_AllocCandidate.Vec) -> bool {
+    let n = Vec_AllocCandidate.len(candidates)
+    var i: usize = 0
+    var unbounded: bool = false
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_AllocCandidate.at(candidates, i)
+        if !c.has_bound {
+            unbounded = true
+            break
+        }
+        i = i + 1
+    }
+    return unbounded
+}
+
+
+function collect_candidates(
+    candidates: mutable Vec_AllocCandidate.Vec,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        consider_op(mutable candidates, op, body, file, ty_interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function consider_op(
+    candidates: mutable Vec_AllocCandidate.Vec,
+    op: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if op.result_.raw == 0 { return () }
+    match op.kind {
+        case .call_(let callee_v, let args) =>
+            consider_call(mutable candidates, op, callee_v, args, body, file, ty_interner, allocator)?
+        case _ => ()
+    }
+}
+
+
+function consider_call(
+    candidates: mutable Vec_AllocCandidate.Vec,
+    op: hlir_op_mod.HlirOp,
+    callee_v: value_mod.ValueId,
+    args: Vec_ValueId.Vec,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let resolved = resolve_callee(callee_v, body, file)
+    if !resolved.known { return () }
+    if resolved.def.raw != builtins_mod.alloc_array_reserved().raw { return () }
+    let op_id = result_op_id(op, body)
+    let bytes = size_mod.alloc_const_bytes(op, args, body, ty_interner)
+    let candidate = AllocCandidate {
+        op: op_id,
+        callee: resolved.def,
+        has_bound: bytes.known,
+        bytes_bound: bytes.value,
+    }
+    Vec_AllocCandidate.push(mutable candidates, take candidate, allocator)?
+}
+
+
+function result_op_id(
+    op: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+) -> op_mod.OpId
+    with {panic}
+{
+    let raw = op.result_.raw
+    if raw == 0 { return op_mod.error() }
+    if (raw as usize) >= Vec_HlirValue.len(body.values) { return op_mod.error() }
+    let value = Vec_HlirValue.at(body.values, raw as usize)
+    return match value.def {
+        case .op_result(let op_id) => op_id
+        case .block_param(let blk, let pos) => op_mod.error()
+    }
+}
+
+
+type ResolvedCallee {
+    def: def_mod.DefId
+    attrs: attrs_mod.HlirFnAttrs
+    known: bool
+}
+
+
+function resolve_callee(
+    callee_v: value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+) -> ResolvedCallee
+    with {panic}
+{
+    let callee_raw = callee_v.raw
+    if callee_raw == 0 { return unknown_callee() }
+    if (callee_raw as usize) >= Vec_HlirValue.len(body.values) {
+        return unknown_callee()
+    }
+    let value = Vec_HlirValue.at(body.values, callee_raw as usize)
+    let def_op = match value.def {
+        case .op_result(let op_id) => op_id
+        case .block_param(let blk, let pos) => return unknown_callee()
+    }
+    if (def_op.raw as usize) >= Vec_HlirOp.len(body.ops) {
+        return unknown_callee()
+    }
+    let defining = Vec_HlirOp.at(body.ops, def_op.raw as usize)
+    return match defining.kind {
+        case .literal(let c) => resolve_const(c, file)
+        case _ => unknown_callee()
+    }
+}
+
+
+function resolve_const(
+    c: hlir_op_mod.HConstant,
+    file: file_mod.HlirFile,
+) -> ResolvedCallee {
+    return match c {
+        case .fn_ref(let def) =>
+            if def.raw == builtins_mod.alloc_array_reserved().raw {
+                ResolvedCallee { def: def, attrs: attrs_mod.empty(), known: true }
+            } else {
+                lookup_callee(def, file)
+            }
+        case _ => unknown_callee()
+    }
+}
+
+
+function lookup_callee(
+    def: def_mod.DefId,
+    file: file_mod.HlirFile,
+) -> ResolvedCallee {
+    return match file_mod.lookup_body_index(file, def) {
+        case .some(let slot) => callee_at_slot(def, slot, file)
+        case .none => unknown_callee()
+    }
+}
+
+
+function callee_at_slot(
+    def: def_mod.DefId,
+    slot: u32,
+    file: file_mod.HlirFile,
+) -> ResolvedCallee {
+    if (slot as usize) >= Vec_HlirBody.len(file.bodies) {
+        return unknown_callee()
+    }
+    let callee_body = Vec_HlirBody.at(file.bodies, slot as usize)
+    return ResolvedCallee {
+        def: def,
+        attrs: callee_body.fn_attrs,
+        known: true,
+    }
+}
+
+
+function unknown_callee() -> ResolvedCallee {
+    return ResolvedCallee {
+        def: def_mod.error(),
+        attrs: attrs_mod.empty(),
+        known: false,
+    }
+}
+
+
+public function promotion_count(plan: AllocPromotePlan) -> usize {
+    return Vec_AllocPromotion.len(plan.promotions)
+}
+
+
+public function candidate_count(plan: AllocPromotePlan) -> usize {
+    return Vec_AllocCandidate.len(plan.candidates)
+}
+
+
+public function candidate_at(plan: AllocPromotePlan, i: usize) -> AllocCandidate
+    requires i < Vec_AllocCandidate.len(plan.candidates)
+{
+    return Vec_AllocCandidate.at(plan.candidates, i)
+}
+
+
+public function promotion_at(plan: AllocPromotePlan, i: usize) -> AllocPromotion
+    requires i < Vec_AllocPromotion.len(plan.promotions)
+{
+    return Vec_AllocPromotion.at(plan.promotions, i)
+}

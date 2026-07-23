@@ -1,0 +1,160 @@
+module optimize.linear_reuse.dataflow.live.genkill
+
+import std.collections.vec
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+import local.linear_reuse.dataflow.bitset as bitset_mod
+
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(u64)
+
+public function build_block_use_def(
+    use_set: mutable Vec_u64.Vec,
+    def_set: mutable Vec_u64.Vec,
+    bb: mir_body_mod.BasicBlock,
+    base: usize,
+    n_locals: usize,
+) -> () {
+    let ns = Vec_Statement.len(bb.statements)
+    var i: usize = 0
+    loop decreases ns - i {
+        if i >= ns { break }
+        fold_statement(mutable use_set, mutable def_set, Vec_Statement.at(bb.statements, i), base, n_locals)
+        i += 1
+    }
+    fold_terminator(mutable use_set, mutable def_set, bb.terminator, base, n_locals)
+}
+
+function note_read(use_set: mutable Vec_u64.Vec, def_set: Vec_u64.Vec, base: usize, idx: usize, n_locals: usize) -> () {
+    if idx >= n_locals { return }
+    if bitset_mod.bit_at(def_set, base, idx) { return }
+    bitset_mod.bit_set(mutable use_set, base, idx)
+}
+
+function note_kill(def_set: mutable Vec_u64.Vec, base: usize, idx: usize, n_locals: usize) -> () {
+    if idx >= n_locals { return }
+    bitset_mod.bit_set(mutable def_set, base, idx)
+}
+
+function fold_statement(use_set: mutable Vec_u64.Vec, def_set: mutable Vec_u64.Vec, s: mir_stmt_mod.Statement, base: usize, n_locals: usize) -> () {
+    match s.kind {
+        case .assign(let dest, let value) => {
+            if mir_place_mod.proj_len(dest) == 0 {
+                fold_rvalue(mutable use_set, def_set, value, base, n_locals)
+                note_kill(mutable def_set, base, mir_local_mod.index(dest.local), n_locals)
+            } else {
+                note_read(mutable use_set, def_set, base, mir_local_mod.index(dest.local), n_locals)
+                fold_projection(mutable use_set, def_set, dest, base, n_locals)
+                fold_rvalue(mutable use_set, def_set, value, base, n_locals)
+            }
+        }
+        case .storage_live(let l) => note_kill(mutable def_set, base, mir_local_mod.index(l), n_locals)
+        case .storage_dead(_) => ()
+        case .nop_ => ()
+    }
+}
+
+function fold_terminator(use_set: mutable Vec_u64.Vec, def_set: mutable Vec_u64.Vec, term: mir_term_mod.Terminator, base: usize, n_locals: usize) -> () {
+    match term.kind {
+        case .branch(let cond, _, _) => fold_operand(mutable use_set, def_set, cond, base, n_locals)
+        case .switch_(let discr, _) => fold_operand(mutable use_set, def_set, discr, base, n_locals)
+        case .raise_(let value, _) => fold_operand(mutable use_set, def_set, value, base, n_locals)
+        case .panic_(let message) => fold_operand(mutable use_set, def_set, message, base, n_locals)
+        case .call_(let callee, let args, let dest, _, _) => {
+            fold_operand(mutable use_set, def_set, callee, base, n_locals)
+            fold_operands(mutable use_set, def_set, args, base, n_locals)
+            fold_dest(mutable use_set, mutable def_set, dest, base, n_locals)
+        }
+        case .drop_(let place, _, _) => fold_place(mutable use_set, def_set, place, base, n_locals)
+        case .spawn_(_, let args, let group_local, let handle_dest, _, _) => {
+            note_read(mutable use_set, def_set, base, mir_local_mod.index(group_local), n_locals)
+            fold_operands(mutable use_set, def_set, args, base, n_locals)
+            fold_dest(mutable use_set, mutable def_set, handle_dest, base, n_locals)
+        }
+        case .await_(let handle, let dest, _, _) => {
+            fold_operand(mutable use_set, def_set, handle, base, n_locals)
+            fold_dest(mutable use_set, mutable def_set, dest, base, n_locals)
+        }
+        case .goto_(_) => ()
+        case .return_ => ()
+        case .unreachable_ => ()
+        case .coherence_enter(_, _) => ()
+        case .coherence_exit(_) => ()
+    }
+}
+
+function fold_dest(use_set: mutable Vec_u64.Vec, def_set: mutable Vec_u64.Vec, dest: mir_place_mod.Place, base: usize, n_locals: usize) -> () {
+    if mir_place_mod.proj_len(dest) == 0 {
+        note_kill(mutable def_set, base, mir_local_mod.index(dest.local), n_locals)
+    } else {
+        note_read(mutable use_set, def_set, base, mir_local_mod.index(dest.local), n_locals)
+        fold_projection(mutable use_set, def_set, dest, base, n_locals)
+    }
+}
+
+function fold_rvalue(use_set: mutable Vec_u64.Vec, def_set: Vec_u64.Vec, value: mir_rvalue_mod.Rvalue, base: usize, n_locals: usize) -> () {
+    match value {
+        case .use_(let operand) => fold_operand(mutable use_set, def_set, operand, base, n_locals)
+        case .binary(_, let lhs, let rhs) => {
+            fold_operand(mutable use_set, def_set, lhs, base, n_locals)
+            fold_operand(mutable use_set, def_set, rhs, base, n_locals)
+        }
+        case .unary(_, let operand) => fold_operand(mutable use_set, def_set, operand, base, n_locals)
+        case .cast(let operand, _, _, _) => fold_operand(mutable use_set, def_set, operand, base, n_locals)
+        case .aggregate(_, let elems, _) => fold_operands(mutable use_set, def_set, elems, base, n_locals)
+        case .ref_(_, let place) => fold_place(mutable use_set, def_set, place, base, n_locals)
+        case .len(let place) => fold_place(mutable use_set, def_set, place, base, n_locals)
+        case .discriminant(let place) => fold_place(mutable use_set, def_set, place, base, n_locals)
+        case .make_closure(_, let env) => fold_operand(mutable use_set, def_set, env, base, n_locals)
+    }
+}
+
+function fold_operands(use_set: mutable Vec_u64.Vec, def_set: Vec_u64.Vec, ops: Vec_Operand.Vec, base: usize, n_locals: usize) -> () {
+    let n = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        fold_operand(mutable use_set, def_set, Vec_Operand.at(ops, i), base, n_locals)
+        i += 1
+    }
+}
+
+function fold_operand(use_set: mutable Vec_u64.Vec, def_set: Vec_u64.Vec, op: mir_rvalue_mod.Operand, base: usize, n_locals: usize) -> () {
+    match op {
+        case .copy_(let place, _) => fold_place(mutable use_set, def_set, place, base, n_locals)
+        case .move_(let place, _) => fold_place(mutable use_set, def_set, place, base, n_locals)
+        case .constant(_) => ()
+    }
+}
+
+function fold_place(use_set: mutable Vec_u64.Vec, def_set: Vec_u64.Vec, place: mir_place_mod.Place, base: usize, n_locals: usize) -> () {
+    note_read(mutable use_set, def_set, base, mir_local_mod.index(place.local), n_locals)
+    fold_projection(mutable use_set, def_set, place, base, n_locals)
+}
+
+function fold_projection(use_set: mutable Vec_u64.Vec, def_set: Vec_u64.Vec, place: mir_place_mod.Place, base: usize, n_locals: usize) -> () {
+    let n = mir_place_mod.proj_len(place)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let p = mir_place_mod.proj_at(place, i)
+        match p.kind {
+            case .index(let idx_local, _) => note_read(mutable use_set, def_set, base, mir_local_mod.index(idx_local), n_locals)
+            case .slice_subrange(let lo_local, let hi_local, _) => {
+                note_read(mutable use_set, def_set, base, mir_local_mod.index(lo_local), n_locals)
+                note_read(mutable use_set, def_set, base, mir_local_mod.index(hi_local), n_locals)
+            }
+            case .field(_) => ()
+            case .deref_ => ()
+            case .variant_payload(_) => ()
+        }
+        i += 1
+    }
+}

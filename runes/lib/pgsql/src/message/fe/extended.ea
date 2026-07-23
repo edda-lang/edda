@@ -1,0 +1,217 @@
+
+module pgsql.message.fe.extended
+
+import std.mem.alloc
+import local.error
+import local.link.wire
+import local.message.tag
+import local.message.framing
+
+
+public function format_text() -> i16 { return 0 as i16 }
+
+public function format_binary() -> i16 { return 1 as i16 }
+
+
+public function target_statement() -> u8 { return 83 as u8 }
+
+public function target_portal() -> u8 { return 80 as u8 }
+
+
+public type BindParam {
+    is_null: bool
+    value: [u8]
+}
+
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+function _parse_size(stmt_name: [u8], sql: [u8], param_types: [u32]) -> usize {
+    return (9 as usize) + stmt_name.len() + sql.len()
+        + (2 as usize) + (4 as usize) * param_types.len()
+}
+
+public function encode_parse(
+    stmt_name: [u8],
+    sql: [u8],
+    param_types: [u32],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let size = _parse_size(stmt_name, sql, param_types)
+    var buf = _alloc_u8_slots(allocator, size)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_parse())?
+    var p = wire.write_cstring(mutable buf, body_start, stmt_name)?
+    p = wire.write_cstring(mutable buf, p, sql)?
+    let n = param_types.len()
+    p = wire.write_i16_be(mutable buf, p, n as i16)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        p = wire.write_i32_be(mutable buf, p, param_types[i] as i32)?
+        i = i + (1 as usize)
+    }
+    let _ = framing.close_message(mutable buf, 0 as usize, p)?
+    return buf
+}
+
+
+function _bind_params_size(params: [BindParam]) -> usize {
+    var size = (0 as usize)
+    let n = params.len()
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        size = size + (4 as usize)
+        if !params[i].is_null {
+            size = size + params[i].value.len()
+        }
+        i = i + (1 as usize)
+    }
+    return size
+}
+
+function _bind_size(
+    portal_name: [u8],
+    stmt_name: [u8],
+    param_formats: [i16],
+    params: [BindParam],
+    result_formats: [i16],
+) -> usize {
+    return (7 as usize) + portal_name.len() + stmt_name.len()
+        + (2 as usize) + (2 as usize) * param_formats.len()
+        + (2 as usize) + _bind_params_size(params)
+        + (2 as usize) + (2 as usize) * result_formats.len()
+}
+
+public function encode_bind(
+    portal_name: [u8],
+    stmt_name: [u8],
+    param_formats: [i16],
+    params: [BindParam],
+    result_formats: [i16],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let size = _bind_size(portal_name, stmt_name, param_formats, params, result_formats)
+    var buf = _alloc_u8_slots(allocator, size)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_bind())?
+    var p = wire.write_cstring(mutable buf, body_start, portal_name)?
+    p = wire.write_cstring(mutable buf, p, stmt_name)?
+
+    let npf = param_formats.len()
+    p = wire.write_i16_be(mutable buf, p, npf as i16)?
+    var i: usize = 0 as usize
+    loop decreases npf - i {
+        if i >= npf { break }
+        p = wire.write_i16_be(mutable buf, p, param_formats[i])?
+        i = i + (1 as usize)
+    }
+
+    let np = params.len()
+    p = wire.write_i16_be(mutable buf, p, np as i16)?
+    var j: usize = 0 as usize
+    loop decreases np - j {
+        if j >= np { break }
+        if params[j].is_null {
+            p = wire.write_i32_be(mutable buf, p, -1 as i32)?
+        } else {
+            let vlen = params[j].value.len()
+            p = wire.write_i32_be(mutable buf, p, vlen as i32)?
+            p = wire.write_bytes(mutable buf, p, params[j].value)?
+        }
+        j = j + (1 as usize)
+    }
+
+    let nrf = result_formats.len()
+    p = wire.write_i16_be(mutable buf, p, nrf as i16)?
+    var k: usize = 0 as usize
+    loop decreases nrf - k {
+        if k >= nrf { break }
+        p = wire.write_i16_be(mutable buf, p, result_formats[k])?
+        k = k + (1 as usize)
+    }
+
+    let _ = framing.close_message(mutable buf, 0 as usize, p)?
+    return buf
+}
+
+
+public function encode_describe(
+    target_kind: u8,
+    name: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let size = (7 as usize) + name.len()
+    var buf = _alloc_u8_slots(allocator, size)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_describe())?
+    var p = wire.write_u8(mutable buf, body_start, target_kind)?
+    p = wire.write_cstring(mutable buf, p, name)?
+    let _ = framing.close_message(mutable buf, 0 as usize, p)?
+    return buf
+}
+
+
+public function encode_execute(
+    portal_name: [u8],
+    max_rows: i32,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let size = (10 as usize) + portal_name.len()
+    var buf = _alloc_u8_slots(allocator, size)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_execute())?
+    var p = wire.write_cstring(mutable buf, body_start, portal_name)?
+    p = wire.write_i32_be(mutable buf, p, max_rows)?
+    let _ = framing.close_message(mutable buf, 0 as usize, p)?
+    return buf
+}
+
+
+public function encode_close(
+    target_kind: u8,
+    name: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let size = (7 as usize) + name.len()
+    var buf = _alloc_u8_slots(allocator, size)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_close())?
+    var p = wire.write_u8(mutable buf, body_start, target_kind)?
+    p = wire.write_cstring(mutable buf, p, name)?
+    let _ = framing.close_message(mutable buf, 0 as usize, p)?
+    return buf
+}
+
+
+public function encode_sync(
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    var buf = _alloc_u8_slots(allocator, 5 as usize)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_sync())?
+    let _ = framing.close_message(mutable buf, 0 as usize, body_start)?
+    return buf
+}
+
+
+public function encode_flush(
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    var buf = _alloc_u8_slots(allocator, 5 as usize)?
+    let body_start = framing.open_message(mutable buf, 0 as usize, tag.fe_flush())?
+    let _ = framing.close_message(mutable buf, 0 as usize, body_start)?
+    return buf
+}

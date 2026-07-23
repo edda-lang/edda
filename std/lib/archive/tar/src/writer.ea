@@ -1,0 +1,122 @@
+
+module std.archive.tar.writer
+
+import std.mem.alloc
+import std.collections.vec
+import std.archive.tar
+
+spec std.mem.alloc.Array(u8)
+spec std.collections.vec.Vec(u8)
+
+
+public function write_entry(
+    out: mutable Vec_u8.Vec,
+    name: String,
+    data: [u8],
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    let nb: [u8] = name.bytes()
+    if nb.len() > 100 { raise tar.TarError.name_too_long }
+    var hdr: [u8] = Array_u8.alloc(allocator, 512)?
+    var z: usize = 0
+    loop
+        decreases 512 - z
+    {
+        if z >= 512 { break }
+        hdr[z] = 0x00
+        z += 1
+    }
+    put_bytes(mutable hdr, 0, nb)
+    put_octal(mutable hdr, 100, 8, 420)
+    put_octal(mutable hdr, 108, 8, 0)
+    put_octal(mutable hdr, 116, 8, 0)
+    put_octal(mutable hdr, 124, 12, data.len())
+    put_octal(mutable hdr, 136, 12, 0)
+    hdr[156] = 0x30
+    put_bytes(mutable hdr, 257, "ustar".bytes())
+    hdr[263] = 0x30
+    hdr[264] = 0x30
+    let sum: usize = header_checksum(hdr)
+    put_octal(mutable hdr, 148, 7, sum)
+    hdr[155] = 0x20
+    Vec_u8.extend_from_slice(mutable out, hdr, allocator)?
+    Vec_u8.extend_from_slice(mutable out, data, allocator)?
+    let rem: usize = data.len() % 512
+    if rem != 0 {
+        var p: usize = rem
+        loop
+            decreases 512 - p
+        {
+            if p >= 512 { break }
+            Vec_u8.push(mutable out, 0x00, allocator)?
+            p += 1
+        }
+    }
+}
+
+public function write_end(out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var i: usize = 0
+    loop
+        decreases 1024 - i
+    {
+        if i >= 1024 { break }
+        Vec_u8.push(mutable out, 0x00, allocator)?
+        i += 1
+    }
+}
+
+function put_bytes(
+    buf: mutable [u8],
+    off: usize,
+    src: [u8] where off + src.len() <= buf.len(),
+) -> () {
+    var i: usize = 0
+    loop
+        decreases src.len() - i
+    {
+        if i >= src.len() { break }
+        buf[off + i] = src[i]
+        i += 1
+    }
+}
+
+function put_octal(
+    buf: mutable [u8],
+    off: usize,
+    width: usize where width >= 1 && off + width <= buf.len(),
+    value: usize,
+) -> () {
+    var v: usize = value
+    let digits: usize = width - 1
+    var i: usize = 0
+    loop
+        decreases digits - i
+    {
+        if i >= digits { break }
+        let pos: usize = off + digits - 1 - i
+        buf[pos] = ((0x30 as usize) + (v & 0x7)) as u8 wrapping
+        v = v >> 3
+        i += 1
+    }
+}
+
+function header_checksum(buf: [u8] where buf.len() >= 512) -> usize {
+    var sum: usize = 0
+    var i: usize = 0
+    loop
+        decreases 512 - i
+    {
+        if i >= 512 { break }
+        if i >= 148 && i < 156 {
+            sum = sum +% 0x20
+        } else {
+            sum = sum +% (buf[i] as usize)
+        }
+        i += 1
+    }
+    return sum
+}

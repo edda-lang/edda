@@ -1,0 +1,93 @@
+
+module cache.blob.mir.ast.literal
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import syntax.ast.literal as literal_mod
+import syntax.tokens.kind as kind_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function write_int_base(b: kind_mod.IntBase, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let tag: u8 = match b {
+        case .dec => 0
+        case .hex => 1
+        case .bin => 2
+        case .oct => 3
+    }
+    prim_mod.push_u8(mutable out, tag, allocator)?
+}
+
+public function read_int_base(bytes: [u8], cur: mutable prim_mod.Reader) -> kind_mod.IntBase
+    with {err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => kind_mod.IntBase.dec
+        case 1 => kind_mod.IntBase.hex
+        case 2 => kind_mod.IntBase.bin
+        case 3 => kind_mod.IntBase.oct
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown IntBase tag")
+    }
+}
+
+public function write_literal(
+    it: interner_mod.Interner,
+    lit: literal_mod.Literal,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match lit {
+        case .int(let value, let base) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            prim_mod.push_u128_le(mutable out, value, allocator)?
+            write_int_base(base, mutable out, allocator)?
+        }
+        case .float(let sym) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            symbol_codec_mod.write_symbol(it, sym, mutable out, allocator)?
+        }
+        case .str(let sym) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            symbol_codec_mod.write_symbol(it, sym, mutable out, allocator)?
+        }
+        case .bool(let value) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            prim_mod.push_bool(mutable out, value, allocator)?
+        }
+        case .unit => prim_mod.push_u8(mutable out, 4, allocator)?
+    }
+}
+
+public function read_literal(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> literal_mod.Literal
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => {
+            let value = prim_mod.read_u128_le(bytes, mutable cur)?
+            let base = read_int_base(bytes, mutable cur)?
+            literal_mod.Literal.int(value: value, base: base)
+        }
+        case 1 => literal_mod.Literal.float(sym: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+        case 2 => literal_mod.Literal.str(sym: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+        case 3 => literal_mod.Literal.bool(value: prim_mod.read_bool(bytes, mutable cur)?)
+        case 4 => literal_mod.Literal.unit
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown Literal tag")
+    }
+}

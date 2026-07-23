@@ -1,0 +1,322 @@
+
+module specs.gen.build.debug.synth
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import hir.def as def_mod
+import intern.interner as sym_interner_mod
+import intern.symbol as sym_mod
+import manifest.lex.toml.val.values as values_mod
+import std.core.fmt as fmt_mod
+import span.file as file_mod
+import syntax.ast.file as file_ast_mod
+import syntax.ast.item as item_mod
+import syntax.parse.parser as parser_mod
+import types.check as types_check_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.name as ty_name_mod
+
+
+spec std.mem.alloc.Box(item_mod.Spec)
+
+spec std.collections.vec.Vec(item_mod.Item)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+public function synthesize_debug_body(
+    target_ty: ty_mod.TyId,
+    type_output: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit empty: Vec_Item.Vec
+    Vec_Item.new(init empty, allocator)?
+    if ty_mod.is_error(target_ty) {
+        return empty
+    }
+
+    var body_src: String = ""
+    match ty_interner_mod.lookup(ty_interner, target_ty) {
+        case .record(let def) => {
+            let type_name = ty_name_mod.name_of(target_ty, ty_interner, allocator)?
+            body_src = record_body_source(type_output, def, type_name, sym_interner, allocator)?
+        }
+        case .sum_(let def) => { body_src = sum_body_source(type_output, def, ty_interner, sym_interner, allocator)? }
+        case _ => ()
+    }
+    if body_src.len() == 0 {
+        return empty
+    }
+
+    let full_src = build_spec_source(body_src, allocator)?
+    return parse_format_items(full_src, mutable sym_interner, allocator)?
+}
+
+
+function record_body_source(
+    out: types_check_mod.TypeOutput,
+    def: def_mod.DefId,
+    type_name: String,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = types_check_mod.field_ty_count(out, def)
+    if n == 0 {
+        let empty_text = string.concat(type_name, " { }", allocator)?
+        let lit = quote_src(empty_text, allocator)?
+        return string.concat("return ", lit, allocator)?
+    }
+
+    var acc: String = ""
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n { break }
+        let field_name = match types_check_mod.field_name_at(out, def, 0 as u32, i) {
+            case .some(let sym) => render_symbol(sym, sym_interner, allocator)?
+            case .none => ""
+        }
+        if field_name.len() == 0 {
+            return ""
+        }
+        let piece_text = if i == 0 {
+            let head = string.concat(type_name, " { ", allocator)?
+            string.concat(head, field_name, allocator)?
+        } else {
+            string.concat(", ", field_name, allocator)?
+        }
+        let header_text = string.concat(piece_text, ": ", allocator)?
+        let header_lit = quote_src(header_text, allocator)?
+        acc = accumulate(acc, header_lit, allocator)?
+        let field_access = string.concat("v.", field_name, allocator)?
+        let slot = slot_fstring_src(field_access, allocator)?
+        acc = accumulate(acc, slot, allocator)?
+        i = i + 1
+    }
+    let tail = quote_src(" }", allocator)?
+    acc = accumulate(acc, tail, allocator)?
+    return string.concat("return ", acc, allocator)?
+}
+
+
+function sum_body_source(
+    out: types_check_mod.TypeOutput,
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = types_check_mod.variant_count_of(out, def)
+    if n == 0 {
+        let lit = quote_src("", allocator)?
+        return string.concat("return ", lit, allocator)?
+    }
+
+    var arms: String = ""
+    var v: usize = 0
+    loop
+        decreases (n - v)
+    {
+        if v >= n { break }
+        let variant_name = match types_check_mod.variant_name_at(out, def, v) {
+            case .some(let sym) => render_symbol(sym, sym_interner, allocator)?
+            case .none => ""
+        }
+        if variant_name.len() == 0 {
+            return ""
+        }
+        let arity = variant_payload_arity(out, def, v as u32, ty_interner)
+        let pat = variant_pattern_src(variant_name, arity, allocator)?
+        let value = variant_value_src(variant_name, arity, allocator)?
+        let arm_head = string.concat("case ", pat, allocator)?
+        let arm_mid = string.concat(arm_head, " => ", allocator)?
+        let arm_full = string.concat(arm_mid, value, allocator)?
+        let arm = string.concat(arm_full, "\n", allocator)?
+        arms = string.concat(arms, arm, allocator)?
+        v = v + 1
+    }
+    let head = string.concat("return match v {\n", arms, allocator)?
+    return string.concat(head, "}", allocator)?
+}
+
+
+function variant_payload_arity(
+    out: types_check_mod.TypeOutput,
+    def: def_mod.DefId,
+    variant_idx: u32,
+    ty_interner: ty_interner_mod.Interner,
+) -> usize
+{
+    let pty = types_check_mod.variant_payload_ty(out, def, variant_idx)
+    if ty_mod.is_error(pty) {
+        return 0
+    }
+    if ty_mod.index(pty) >= ty_interner_mod.slot_count(ty_interner) {
+        return 0
+    }
+    return match ty_interner_mod.lookup(ty_interner, pty) {
+        case .primitive(let p) => match p {
+            case .unit_ => 0
+            case _ => 1
+        }
+        case .tuple_(let elems) => Vec_TyId.len(elems)
+        case _ => 1
+    }
+}
+
+
+function variant_pattern_src(name: String, arity: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let head = string.concat(".", name, allocator)?
+    if arity == 0 {
+        return head
+    }
+    var binders: String = ""
+    var i: usize = 0
+    loop
+        decreases (arity - i)
+    {
+        if i >= arity { break }
+        let binder = string.concat("let a", fmt_mod.usize_to_string(i, allocator)?, allocator)?
+        binders = if i == 0 {
+            binder
+        } else {
+            let sep = string.concat(binders, ", ", allocator)?
+            string.concat(sep, binder, allocator)?
+        }
+        i = i + 1
+    }
+    let opened = string.concat(head, "(", allocator)?
+    let with_binders = string.concat(opened, binders, allocator)?
+    return string.concat(with_binders, ")", allocator)?
+}
+
+
+function variant_value_src(name: String, arity: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if arity == 0 {
+        let text = string.concat(".", name, allocator)?
+        return quote_src(text, allocator)?
+    }
+    let head_text = string.concat(".", name, allocator)?
+    let head_open = string.concat(head_text, "(", allocator)?
+    var acc = quote_src(head_open, allocator)?
+    var i: usize = 0
+    loop
+        decreases (arity - i)
+    {
+        if i >= arity { break }
+        if i > 0 {
+            let sep = quote_src(", ", allocator)?
+            acc = accumulate(acc, sep, allocator)?
+        }
+        let slot_expr = string.concat("a", fmt_mod.usize_to_string(i, allocator)?, allocator)?
+        let slot = slot_fstring_src(slot_expr, allocator)?
+        acc = accumulate(acc, slot, allocator)?
+        i = i + 1
+    }
+    let close = quote_src(")", allocator)?
+    return accumulate(acc, close, allocator)?
+}
+
+
+function accumulate(acc: String, piece: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if acc.len() == 0 {
+        return piece
+    }
+    let head = string.concat("string_concat(", acc, allocator)?
+    let mid = string.concat(head, ", ", allocator)?
+    let full = string.concat(mid, piece, allocator)?
+    return string.concat(full, ")", allocator)?
+}
+
+
+function quote_src(text: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = string.concat("\"", text, allocator)?
+    return string.concat(a, "\"", allocator)?
+}
+
+
+function slot_fstring_src(expr_text: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = string.concat("f\"{", expr_text, allocator)?
+    return string.concat(a, "}\"", allocator)?
+}
+
+
+function render_symbol(sym: sym_mod.Symbol, sym_interner: sym_interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = sym_interner_mod.lookup(sym_interner, sym)
+    return values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+
+function build_spec_source(body_src: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("public spec debug(comptime T: Type) {\npublic function format(v: T) -> String {\n", body_src, allocator)?
+    return string.concat(head, "\n}\n}\n", allocator)?
+}
+
+
+function parse_format_items(
+    src: String,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit empty: Vec_Item.Vec
+    Vec_Item.new(init empty, allocator)?
+
+    uninit sd: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init sd, allocator)?
+    let bytes = src.bytes()
+    uninit parsed: file_ast_mod.File
+    parser_mod.parse_file_from_bytes(bytes, file_mod.unknown(), mutable sym_interner, mutable sd, init parsed, allocator)?
+    if diags_mod.has_errors(sd) {
+        return empty
+    }
+    return extract_spec_body(parsed, allocator)?
+}
+
+
+function extract_spec_body(parsed: file_ast_mod.File, allocator: Allocator) -> Vec_Item.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit empty: Vec_Item.Vec
+    Vec_Item.new(init empty, allocator)?
+    let n = Vec_Item.len(parsed.items)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n { break }
+        let it = Vec_Item.at(parsed.items, i)
+        match it.kind {
+            case .spec_(let b) => return Box_Spec.get(b).body
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return empty
+}

@@ -1,0 +1,149 @@
+
+module hermod.fetch.polite.get
+
+import std.mem.alloc
+import std.os.time
+import std.text.string
+
+import local.error
+import local.message.response as response_mod
+import local.fetch.redirect as redirect_mod
+import local.fetch.response as fetch_resp_mod
+import local.uri.parse as uri_parse_mod
+import local.uri.types as uri_mod
+import local.fetch.polite.policy.schedule as sched_mod
+import local.fetch.polite.policy.robots as robots_mod
+
+public type PoliteError {
+    case disallowed_by_robots
+}
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _copy_into(dst: mutable [u8], at: usize, src: [u8]) -> usize {
+    var w = at
+    var i: usize = 0 as usize
+    loop decreases src.len() - i {
+        if i >= src.len() { break }
+        if w >= dst.len() { break }
+        dst[w] = src[i]
+        w = w + 1 as usize
+        i = i + 1 as usize
+    }
+    return w
+}
+
+function _robots_url(
+    scheme: [u8],
+    host: [u8],
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let sep = "://".bytes()
+    let tail = "/robots.txt".bytes()
+    let total = scheme.len() +| sep.len() +| host.len() +| tail.len()
+    var buf = _alloc_bytes(allocator, total)?
+    var w: usize = 0 as usize
+    w = _copy_into(mutable buf, w, scheme)
+    w = _copy_into(mutable buf, w, sep)
+    w = _copy_into(mutable buf, w, host)
+    w = _copy_into(mutable buf, w, tail)
+    return string.from_owned_utf8(take buf)
+}
+
+function _fetch_robots(
+    rurl: String,
+    ua: [u8],
+    max_redirects: usize,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    allocator: mutable Allocator,
+) -> robots_mod.RobotsRules
+    with {
+        net,
+        fs,
+        allocator,
+        err: error.UriError,
+        err: alloc.AllocError,
+        err: error.TransportError,
+        err: error.RedirectError,
+        err: error.CodecError,
+    }
+{
+    let resp = redirect_mod.fetch_get_follow(rurl, max_redirects, net, fs, mutable allocator)?
+    if !fetch_resp_mod.is_success(resp) {
+        return robots_mod.robots_empty_alloc(allocator)?
+    }
+    let body = fetch_resp_mod.body_bytes(resp)
+    return robots_mod.parse_robots(body, ua, mutable allocator)?
+}
+
+public function polite_get(
+    c: mutable sched_mod.PoliteClient,
+    url: String,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    clock: MonotonicClock,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {
+        net,
+        fs,
+        clock,
+        allocator,
+        time(ops <= 4),
+        err: error.UriError,
+        err: alloc.AllocError,
+        err: error.TransportError,
+        err: error.RedirectError,
+        err: error.CodecError,
+        err: PoliteError,
+    }
+{
+    let u = uri_parse_mod.uri_parse(url.bytes(), mutable allocator)?
+    let host = uri_mod.uri_host(u)
+    let path = uri_mod.uri_target(u)
+    let scheme = uri_mod.uri_scheme(u)
+    let max_redirects = sched_mod.politeclient_max_redirects(c)
+    let max_retries = sched_mod.politeclient_max_retries(c)
+    let ua = sched_mod.politeclient_user_agent(c)
+
+    let idx = sched_mod.politeclient_touch_host(mutable c, host)?
+    if !sched_mod.politeclient_has_robots(c, idx) {
+        let rurl = _robots_url(scheme, host, allocator)?
+        let rules = _fetch_robots(rurl, ua, max_redirects, net, fs, mutable allocator)?
+        sched_mod.politeclient_set_robots(mutable c, idx, rules)
+    }
+    if !sched_mod.politeclient_path_allowed(c, idx, path) {
+        raise PoliteError.disallowed_by_robots
+    }
+
+    var attempt: usize = 0 as usize
+    loop decreases max_retries - attempt + 1 as usize {
+        let now = time.monotonic_now(clock)
+        let wait = sched_mod.politeclient_required_wait(c, idx, now)
+        if time.compare(wait, time.zero()) > 0 {
+            time.sleep(clock, wait)
+        }
+        let after = time.monotonic_now(clock)
+        sched_mod.politeclient_mark_request(mutable c, idx, after)
+
+        let resp = redirect_mod.fetch_get_follow(url, max_redirects, net, fs, mutable allocator)?
+        let code = fetch_resp_mod.status_code(resp)
+        if code != 429 as u16 && code != 503 as u16 {
+            return resp
+        }
+        if attempt >= max_retries {
+            return resp
+        }
+        let ra_bytes = fetch_resp_mod.header_bytes_or(resp, "Retry-After".bytes(), "".bytes())
+        let ra = sched_mod.parse_retry_after_seconds(ra_bytes)
+        let back = sched_mod.backoff_delay(c, attempt, ra)
+        time.sleep(clock, back)
+        attempt = attempt + 1 as usize
+    }
+    raise error.TransportError.timed_out
+}

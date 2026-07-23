@@ -1,0 +1,150 @@
+
+module optimize.refine_elim.narrow.plan.plan
+
+import std.core.option
+import std.collections.vec
+import std.mem.alloc as alloc
+
+import local.refine_elim.range.range as range_mod
+import local.refine_elim.narrow.util.util as util_mod
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+
+spec std.core.option.Option(range_mod.IntType)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(range_mod.IntType)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+derive debug for NarrowPlan
+
+public type NarrowPlan {
+    has: Vec_bool.Vec
+    targets: Vec_IntType.Vec
+    narrowed_tys: Vec_TyId.Vec
+}
+
+public function narrows_at(plan: NarrowPlan, idx: usize) -> bool {
+    if idx >= Vec_bool.len(plan.has) {
+        return false
+    }
+    return Vec_bool.at(plan.has, idx)
+}
+
+public function target_at(plan: NarrowPlan, idx: usize) -> range_mod.IntType {
+    if idx >= Vec_IntType.len(plan.targets) {
+        return filler()
+    }
+    return Vec_IntType.at(plan.targets, idx)
+}
+
+public function narrowed_ty_at(plan: NarrowPlan, idx: usize) -> ty_mod.TyId {
+    if idx >= Vec_TyId.len(plan.narrowed_tys) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(plan.narrowed_tys, idx)
+}
+
+public function prim_of_int_type(it: range_mod.IntType) -> ty_kind_mod.PrimKind {
+    return match it.bits {
+        case 8 => if it.signed { ty_kind_mod.PrimKind.i8_ } else { ty_kind_mod.PrimKind.u8_ }
+        case 16 => if it.signed { ty_kind_mod.PrimKind.i16_ } else { ty_kind_mod.PrimKind.u16_ }
+        case 32 => if it.signed { ty_kind_mod.PrimKind.i32_ } else { ty_kind_mod.PrimKind.u32_ }
+        case _ => if it.signed { ty_kind_mod.PrimKind.i64_ } else { ty_kind_mod.PrimKind.u64_ }
+    }
+}
+
+function intern_narrowed(
+    it: range_mod.IntType,
+    it_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError}
+{
+    return ty_interner_mod.intern(mutable it_interner, take ty_kind_mod.CTy.primitive(prim_of_int_type(it)), allocator)?
+}
+
+public function filler() -> range_mod.IntType {
+    return range_mod.IntType {
+        signed: false,
+        bits: (0 as u32),
+        lo: (0 as i128),
+        hi: (0 as i128),
+    }
+}
+
+public function build_plan(
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    n: usize,
+    it_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> NarrowPlan
+    with {allocator, err: alloc.AllocError}
+{
+    uninit has: Vec_bool.Vec
+    Vec_bool.new(init has, allocator)?
+    uninit targets: Vec_IntType.Vec
+    Vec_IntType.new(init targets, allocator)?
+    uninit narrowed_tys: Vec_TyId.Vec
+    Vec_TyId.new(init narrowed_tys, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match verdict_at(cur, defined, declared, pinned, i) {
+            case .some(let t) => {
+                let tyid = intern_narrowed(t, mutable it_interner, allocator)?
+                Vec_bool.push(mutable has, take true, allocator)?
+                Vec_IntType.push(mutable targets, take t, allocator)?
+                Vec_TyId.push(mutable narrowed_tys, take tyid, allocator)?
+            }
+            case .none => {
+                Vec_bool.push(mutable has, take false, allocator)?
+                Vec_IntType.push(mutable targets, take filler(), allocator)?
+                Vec_TyId.push(mutable narrowed_tys, take ty_mod.error(), allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return NarrowPlan { has: has, targets: targets, narrowed_tys: narrowed_tys }
+}
+
+function verdict_at(
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    idx: usize,
+) -> Option_IntType.Option {
+    if util_mod.pinned_at(pinned, idx) {
+        return Option_IntType.none
+    }
+    if idx >= Vec_bool.len(defined) || !Vec_bool.at(defined, idx) {
+        return Option_IntType.none
+    }
+    let decl = range_mod.get_at(declared, idx)
+    if !decl.known {
+        return Option_IntType.none
+    }
+    let r = range_mod.get_at(cur, idx)
+    if !r.known {
+        return Option_IntType.none
+    }
+    let decl_t = match range_mod.narrowest_int_type(decl) {
+        case .some(let v) => v
+        case .none => return Option_IntType.none
+    }
+    return match range_mod.narrowest_int_type(r) {
+        case .none => Option_IntType.none
+        case .some(let rt) => {
+            if rt.bits < decl_t.bits {
+                Option_IntType.some(value: rt)
+            } else {
+                Option_IntType.none
+            }
+        }
+    }
+}

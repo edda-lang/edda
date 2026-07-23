@@ -1,0 +1,83 @@
+module multipart.params
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+import local.scan as scan
+
+spec std.core.option.Option(String)
+
+
+function _b_eq() -> u8     { return 61 as u8 }
+function _b_semi() -> u8   { return 59 as u8 }
+function _b_quote() -> u8  { return 34 as u8 }
+function _b_sp() -> u8     { return 32 as u8 }
+function _b_tab() -> u8    { return 9 as u8 }
+
+function _to_lower(b: u8) -> u8 {
+    if b >= 0x41 as u8 && b <= 0x5A as u8 {
+        return b + 0x20 as u8
+    }
+    return b
+}
+
+public function name_eq_ci(src: [u8], at: usize, name: [u8]) -> bool {
+    let n = name.len()
+    if at + n > src.len() { return false }
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if _to_lower(src[at + i]) != _to_lower(name[i]) { return false }
+        i += 1
+    }
+    return true
+}
+
+function _is_token_boundary(src: [u8], at: usize) -> bool {
+    if at == 0 as usize { return true }
+    let prev = src[at - (1 as usize)]
+    return prev == _b_semi() || prev == _b_sp() || prev == _b_tab()
+}
+
+function _find_param(src: [u8], lo: usize, hi: usize, name: [u8]) -> usize {
+    let nn = name.len()
+    if nn == 0 as usize { return hi }
+    var i: usize = lo
+    loop decreases hi + (1 as usize) - i {
+        if i >= hi { break }
+        if name_eq_ci(src, i, name)
+            && _is_token_boundary(src, i)
+            && i + nn < src.len()
+            && src[i + nn] == _b_eq() {
+            return i + nn + (1 as usize)
+        }
+        i += 1
+    }
+    return hi
+}
+
+public function extract(
+    src: [u8],
+    lo: usize,
+    hi: usize where lo <= hi && hi <= src.len(),
+    name: [u8],
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+{
+    let value_start = _find_param(src, lo, hi, name)
+    if value_start >= hi {
+        return Option_String.none
+    }
+    if src[value_start] == _b_quote() {
+        let inner_lo = value_start + (1 as usize)
+        let close = scan.index_of(src, inner_lo, hi, _b_quote())
+        let safe_hi = if close <= src.len() { close } else { src.len() }
+        let copied = scan.slice_copy(src, inner_lo, safe_hi, allocator)?
+        return Option_String.some(value: string.from_owned_utf8(take copied))
+    }
+    let unq_hi = scan.index_of(src, value_start, hi, _b_semi())
+    let trimmed_hi = scan.trim_ows_right(src, value_start, unq_hi)
+    let copied = scan.slice_copy(src, value_start, trimmed_hi, allocator)?
+    return Option_String.some(value: string.from_owned_utf8(take copied))
+}

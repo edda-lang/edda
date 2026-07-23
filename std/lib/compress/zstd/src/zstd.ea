@@ -1,0 +1,292 @@
+
+module std.compress.zstd
+
+import std.mem.alloc
+import std.collections.vec
+import local.block
+import local.sequences
+import local.fault
+
+spec std.collections.vec.Vec(u8)
+
+
+public type ZstdError {
+    case truncated
+    case bad_magic
+    case unsupported_dictionary
+    case reserved_bit
+    case window_too_large
+    case bad_block
+    case bad_literals
+    case bad_distribution
+    case bad_huffman
+    case bad_sequences
+    case output_mismatch
+}
+
+
+public function decompress(data: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: ZstdError}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    var pos: usize = 0
+    loop
+        decreases data.len() - pos
+    {
+        if pos >= data.len() { break }
+        if pos +| 4 > data.len() { raise ZstdError.truncated }
+        let magic: usize = read_u32_le(data, pos)
+        pos = pos + 4
+        if magic >= 0x184D2A50 && magic <= 0x184D2A5F {
+            if pos +| 4 > data.len() { raise ZstdError.truncated }
+            let skip: usize = read_u32_le(data, pos)
+            pos = pos + 4
+            if pos +| skip > data.len() { raise ZstdError.truncated }
+            pos = pos + skip
+            continue
+        }
+        if magic != 0xFD2FB528 { raise ZstdError.bad_magic }
+        pos = decode_frame(data, pos, mutable out, allocator)?
+    }
+    return Vec_u8.into_array(take out, allocator)?
+}
+
+public function compress(data: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    Vec_u8.push(mutable out, 0x28, allocator)?
+    Vec_u8.push(mutable out, 0xB5, allocator)?
+    Vec_u8.push(mutable out, 0x2F, allocator)?
+    Vec_u8.push(mutable out, 0xFD, allocator)?
+    Vec_u8.push(mutable out, 0xE0, allocator)?
+    write_int_le(mutable out, data.len(), 8, allocator)?
+    let total: usize = data.len()
+    if total == 0 {
+        write_int_le(mutable out, 1, 3, allocator)?
+        return Vec_u8.into_array(take out, allocator)?
+    }
+    var pos: usize = 0
+    loop
+        decreases total - pos
+    {
+        if pos >= total { break }
+        var chunk: usize = total - pos
+        if chunk > 131072 { chunk = 131072 }
+        let last: bool = pos + chunk >= total
+        var header: usize = chunk << 3
+        if last { header = header | 1 }
+        write_int_le(mutable out, header, 3, allocator)?
+        Vec_u8.extend_from_slice(mutable out, data[pos ..< pos + chunk], allocator)?
+        pos = pos + chunk
+    }
+    return Vec_u8.into_array(take out, allocator)?
+}
+
+function write_int_le(
+    out: mutable Vec_u8.Vec,
+    value: usize,
+    width: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var i: usize = 0
+    loop
+        decreases width - i
+    {
+        if i >= width { break }
+        let b: u8 = ((value >> (8 * i)) & 0xFF) as u8 wrapping
+        Vec_u8.push(mutable out, b, allocator)?
+        i += 1
+    }
+}
+
+function decode_frame(
+    data: [u8],
+    start: usize,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, err: ZstdError}
+{
+    var pos: usize = start
+    if pos >= data.len() { raise ZstdError.truncated }
+    let desc: u8 = data[pos]
+    pos = pos + 1
+    if (desc & 0x08) != 0 { raise ZstdError.reserved_bit }
+    let single_segment: bool = (desc & 0x20) != 0
+    let has_checksum: bool = (desc & 0x04) != 0
+    let dict_flag: usize = (desc & 0x03) as usize
+    let fcs_flag: usize = ((desc >> 6) & 0x03) as usize
+    if !single_segment {
+        if pos >= data.len() { raise ZstdError.truncated }
+        let wd: usize = data[pos] as usize
+        pos = pos + 1
+        let exponent: usize = wd >> 3
+        if exponent > 21 { raise ZstdError.window_too_large }
+    }
+    let dict_bytes: usize = dict_field_width(dict_flag)
+    if pos +| dict_bytes > data.len() { raise ZstdError.truncated }
+    if dict_bytes > 0 {
+        if read_int_le(data, pos, dict_bytes) != 0 { raise ZstdError.unsupported_dictionary }
+        pos = pos + dict_bytes
+    }
+    var fcs_bytes: usize = 0
+    if fcs_flag == 0 {
+        if single_segment { fcs_bytes = 1 }
+    } else if fcs_flag == 1 {
+        fcs_bytes = 2
+    } else if fcs_flag == 2 {
+        fcs_bytes = 4
+    } else {
+        fcs_bytes = 8
+    }
+    if pos +| fcs_bytes > data.len() { raise ZstdError.truncated }
+    var content_size: usize = 0
+    var content_known: bool = false
+    if fcs_bytes > 0 {
+        content_size = read_int_le(data, pos, fcs_bytes)
+        if fcs_bytes == 2 { content_size = content_size + 256 }
+        content_known = true
+        pos = pos + fcs_bytes
+    }
+    let out_start: usize = Vec_u8.len(out)
+    if content_known {
+        Vec_u8.reserve(mutable out, out_start +| content_size, allocator)?
+    }
+    var ctx: block.Ctx = block.new_ctx(allocator)?
+    pos = decode_blocks(data, pos, mutable ctx, out_start, mutable out, allocator)?
+    if has_checksum {
+        if pos +| 4 > data.len() { raise ZstdError.truncated }
+        pos = pos + 4
+    }
+    if content_known {
+        if Vec_u8.len(out) - out_start != content_size { raise ZstdError.output_mismatch }
+    }
+    return pos
+}
+
+function decode_blocks(
+    data: [u8],
+    start: usize,
+    ctx: mutable block.Ctx,
+    frame_base: usize,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, err: ZstdError}
+{
+    var pos: usize = start
+    loop
+        decreases data.len() - pos
+    {
+        if pos +| 3 > data.len() { raise ZstdError.truncated }
+        let b0: usize = data[pos] as usize
+        let b1: usize = data[pos + 1] as usize
+        let b2: usize = data[pos + 2] as usize
+        pos = pos + 3
+        let header: usize = b0 | (b1 << 8) | (b2 << 16)
+        let last: bool = (header & 1) != 0
+        let btype: usize = (header >> 1) & 3
+        let bsize: usize = header >> 3
+        if btype == 0 {
+            if pos +| bsize > data.len() { raise ZstdError.truncated }
+            Vec_u8.extend_from_slice(mutable out, data[pos ..< pos + bsize], allocator)?
+            pos = pos + bsize
+        } else if btype == 1 {
+            if pos >= data.len() { raise ZstdError.truncated }
+            let fill: u8 = data[pos]
+            pos = pos + 1
+            push_repeated(mutable out, fill, bsize, allocator)?
+        } else if btype == 2 {
+            if pos +| bsize > data.len() { raise ZstdError.truncated }
+            decode_compressed_block(data[pos ..< pos + bsize], mutable ctx, frame_base, mutable out, allocator)?
+            pos = pos + bsize
+        } else {
+            raise ZstdError.bad_block
+        }
+        if last { break }
+        if pos >= data.len() { raise ZstdError.truncated }
+    }
+    return pos
+}
+
+function push_repeated(
+    out: mutable Vec_u8.Vec,
+    fill: u8,
+    count: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        Vec_u8.push(mutable out, fill, allocator)?
+        i += 1
+    }
+}
+
+function decode_compressed_block(
+    blk: [u8],
+    ctx: mutable block.Ctx,
+    frame_base: usize,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: ZstdError}
+{
+    handle err: fault.Fault as e -> raise translate(e) {
+        let lits: block.Lits = block.decode_literals(blk, mutable ctx, allocator)?
+        if lits.consumed > blk.len() { raise ZstdError.bad_block }
+        sequences.execute(blk[lits.consumed ..], mutable ctx, lits, mutable out, frame_base, allocator)?
+    }
+}
+
+function translate(e: fault.Fault) -> ZstdError {
+    return match e {
+        case .truncated => ZstdError.truncated
+        case .bad_block => ZstdError.bad_block
+        case .bad_literals => ZstdError.bad_literals
+        case .bad_distribution => ZstdError.bad_distribution
+        case .bad_huffman => ZstdError.bad_huffman
+        case .bad_sequences => ZstdError.bad_sequences
+    }
+}
+
+function dict_field_width(flag: usize) -> usize {
+    if flag == 0 { return 0 }
+    if flag == 1 { return 1 }
+    if flag == 2 { return 2 }
+    return 4
+}
+
+function read_u32_le(data: [u8], off: usize where off + 4 <= data.len()) -> usize {
+    let b0: usize = data[off] as usize
+    let b1: usize = data[off + 1] as usize
+    let b2: usize = data[off + 2] as usize
+    let b3: usize = data[off + 3] as usize
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+function read_int_le(
+    data: [u8],
+    off: usize,
+    width: usize where width <= 8 && off + width <= data.len(),
+) -> usize {
+    var v: usize = 0
+    var i: usize = 0
+    loop
+        decreases width - i
+    {
+        if i >= width { break }
+        v = v | ((data[off + i] as usize) << (8 * i))
+        i += 1
+    }
+    return v
+}

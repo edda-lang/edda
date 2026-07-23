@@ -1,0 +1,187 @@
+
+module regalloc.live.defuse.defuse
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import local.scan.step.walk as walk_mod
+import local.live.defuse.bits as bits_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+
+
+spec std.core.option.Option(u32)
+
+
+public function compute(
+    def_set: mutable Vec_u64.Vec,
+    use_set: mutable Vec_u64.Vec,
+    body: lir_body_mod.LirBody,
+    n_blocks: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit seen_def: Vec_bool.Vec
+    bits_mod.new_bools(init seen_def, n_vregs, allocator)?
+    uninit scratch: Vec_u32.Vec
+    Vec_u32.new(init scratch, allocator)?
+    uninit touched: Vec_u32.Vec
+    Vec_u32.new(init touched, allocator)?
+
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        block_def_use(mutable def_set, mutable use_set, mutable seen_def, mutable scratch, mutable touched, body, b, n_vregs, allocator)?
+        b += 1
+    }
+}
+
+
+function block_def_use(
+    def_set: mutable Vec_u64.Vec,
+    use_set: mutable Vec_u64.Vec,
+    seen_def: mutable Vec_bool.Vec,
+    scratch: mutable Vec_u32.Vec,
+    touched: mutable Vec_u32.Vec,
+    body: lir_body_mod.LirBody,
+    b: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let block = Vec_LirBlock.at(body.blocks, b)
+    mark_params_def(mutable def_set, mutable seen_def, mutable touched, block.params, b, n_vregs, allocator)?
+
+    let ops = block.ops
+    let n = Vec_LirOpId.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op_id = Vec_LirOpId.at(ops, i)
+        let oidx = op_id.raw as usize
+        if oidx != 0 {
+            if oidx < Vec_LirOp.len(body.ops) {
+                let op = Vec_LirOp.at(body.ops, oidx)
+                Vec_u32.clear(mutable scratch)
+                walk_mod.collect_op_uses(op, mutable scratch, allocator)?
+                mark_uses(mutable use_set, seen_def, scratch, b, n_vregs)
+                mark_def(mutable def_set, mutable seen_def, mutable touched, op, b, n_vregs, allocator)?
+            }
+        }
+        i += 1
+    }
+
+    Vec_u32.clear(mutable scratch)
+    walk_mod.collect_term_uses(block.terminator, mutable scratch, allocator)?
+    mark_uses(mutable use_set, seen_def, scratch, b, n_vregs)
+
+    reset_seen(mutable seen_def, touched)
+    Vec_u32.clear(mutable touched)
+}
+
+
+function reset_seen(seen_def: mutable Vec_bool.Vec, touched: Vec_u32.Vec) -> () {
+    let cap = Vec_bool.len(seen_def)
+    let n = Vec_u32.len(touched)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let v = Vec_u32.at(touched, i) as usize
+        if v < cap {
+            Vec_bool.set_at(mutable seen_def, v, false)
+        }
+        i += 1
+    }
+}
+
+
+function mark_params_def(
+    def_set: mutable Vec_u64.Vec,
+    seen_def: mutable Vec_bool.Vec,
+    touched: mutable Vec_u32.Vec,
+    params: Vec_LirVRegId.Vec,
+    b: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LirVRegId.len(params)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let id = Vec_LirVRegId.at(params, i)
+        let v = id.raw as usize
+        if v < n_vregs {
+            bits_mod.bset_true(mutable def_set, b, v, n_vregs)
+            Vec_bool.set_at(mutable seen_def, v, true)
+            Vec_u32.push(mutable touched, id.raw, allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function mark_uses(
+    use_set: mutable Vec_u64.Vec,
+    seen_def: Vec_bool.Vec,
+    uses: Vec_u32.Vec,
+    b: usize,
+    n_vregs: usize,
+) -> ()
+{
+    let n = Vec_u32.len(uses)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let v = Vec_u32.at(uses, i) as usize
+        if v < n_vregs {
+            if !Vec_bool.at(seen_def, v) {
+                bits_mod.bset_true(mutable use_set, b, v, n_vregs)
+            }
+        }
+        i += 1
+    }
+}
+
+
+function mark_def(
+    def_set: mutable Vec_u64.Vec,
+    seen_def: mutable Vec_bool.Vec,
+    touched: mutable Vec_u32.Vec,
+    op: lir_op_mod.LirOp,
+    b: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match walk_mod.op_def(op) {
+        case .some(let raw) => {
+            let v = raw as usize
+            if v < n_vregs {
+                bits_mod.bset_true(mutable def_set, b, v, n_vregs)
+                Vec_bool.set_at(mutable seen_def, v, true)
+                Vec_u32.push(mutable touched, raw, allocator)?
+            }
+        }
+        case .none => ()
+    }
+}

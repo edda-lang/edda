@@ -1,0 +1,165 @@
+
+module wasm.isel.inst.term.emit
+
+import std.mem.alloc
+import std.collections.vec
+import ir.lir.term as term_mod
+import ir.lir.tree.body as body_mod
+import ir.lir.id.vreg as vreg_mod
+import ir.lir.id.block as block_id_mod
+import local.fmt.encode as enc_mod
+import local.isel.ctx.ctx as ctx_mod
+import local.isel.valtype.valtype as vt_mod
+import local.isel.wenc.wenc as common_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(term_mod.LirSwitchCase)
+spec std.collections.vec.Vec(body_mod.LirBlock)
+
+
+public function emit_terminator(
+    code: mutable Vec_u8.Vec,
+    bctx: ctx_mod.BodyCtx,
+    body: body_mod.LirBody,
+    block_index: u32,
+    term: term_mod.LirTerminator,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match term.kind {
+        case .jump(let target, let args) => emit_edge(mutable code, body, bctx, target, args, block_index, allocator)?
+        case .branch_if(let cond, let t, let targs, let f, let fargs) => {
+            common_mod.get_local(mutable code, cond, allocator)?
+            enc_mod.push_byte(mutable code, 0x04, allocator)?
+            enc_mod.push_byte(mutable code, 0x40, allocator)?
+            emit_edge(mutable code, body, bctx, t, targs, block_index + (1 as u32), allocator)?
+            enc_mod.push_byte(mutable code, 0x05, allocator)?
+            emit_edge(mutable code, body, bctx, f, fargs, block_index + (1 as u32), allocator)?
+            enc_mod.push_byte(mutable code, 0x0B, allocator)?
+            enc_mod.push_byte(mutable code, 0x00, allocator)?
+        }
+        case .switch_(let discr, let targets) => emit_switch(mutable code, body, bctx, discr, targets, block_index, allocator)?
+        case .return_(let values) => emit_return(mutable code, bctx, values, allocator)?
+        case .unreachable_ => enc_mod.push_byte(mutable code, 0x00, allocator)?
+        case .raise_(_, _) => enc_mod.push_byte(mutable code, 0x00, allocator)?
+        case .panic_(_) => enc_mod.push_byte(mutable code, 0x00, allocator)?
+        case .coherence_enter(let body_entry, _) => emit_goto(mutable code, bctx, body_entry, block_index, allocator)?
+        case .coherence_exit(let target) => emit_goto(mutable code, bctx, target, block_index, allocator)?
+    }
+}
+
+
+function emit_edge(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    bctx: ctx_mod.BodyCtx,
+    target: block_id_mod.LirBlockId,
+    args: Vec_LirVRegId.Vec,
+    depth: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let tgt = block_params_of(body, target)
+    let np: usize = Vec_LirVRegId.len(tgt)
+    let na: usize = Vec_LirVRegId.len(args)
+    let n: usize = if np < na { np } else { na }
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        common_mod.get_local(mutable code, Vec_LirVRegId.at(args, i), allocator)?
+        common_mod.set_local(mutable code, Vec_LirVRegId.at(tgt, i), allocator)?
+        i += 1
+    }
+    enc_mod.push_byte(mutable code, 0x41, allocator)?
+    enc_mod.sleb(mutable code, target.raw as i64, allocator)?
+    enc_mod.push_byte(mutable code, 0x21, allocator)?
+    enc_mod.uleb(mutable code, bctx.state_local as u64, allocator)?
+    enc_mod.push_byte(mutable code, 0x0C, allocator)?
+    enc_mod.uleb(mutable code, depth as u64, allocator)?
+}
+
+
+function block_params_of(body: body_mod.LirBody, target: block_id_mod.LirBlockId) -> Vec_LirVRegId.Vec {
+    return Vec_LirBlock.at(body.blocks, target.raw as usize).params
+}
+
+
+function emit_goto(
+    code: mutable Vec_u8.Vec,
+    bctx: ctx_mod.BodyCtx,
+    target: block_id_mod.LirBlockId,
+    depth: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x41, allocator)?
+    enc_mod.sleb(mutable code, target.raw as i64, allocator)?
+    enc_mod.push_byte(mutable code, 0x21, allocator)?
+    enc_mod.uleb(mutable code, bctx.state_local as u64, allocator)?
+    enc_mod.push_byte(mutable code, 0x0C, allocator)?
+    enc_mod.uleb(mutable code, depth as u64, allocator)?
+}
+
+
+function emit_switch(
+    code: mutable Vec_u8.Vec,
+    body: body_mod.LirBody,
+    bctx: ctx_mod.BodyCtx,
+    discr: vreg_mod.LirVRegId,
+    targets: term_mod.LirSwitchTargets,
+    block_index: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let w64 = vt_mod.is_i64_vreg(body, discr)
+    let n: usize = Vec_LirSwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_LirSwitchCase.at(targets.cases, i)
+        common_mod.get_local(mutable code, discr, allocator)?
+        common_mod.emit_int_const(mutable code, c.value as i64 wrapping, w64, allocator)?
+        let eqop: u32 = if w64 { 0x51 } else { 0x46 }
+        enc_mod.push_byte(mutable code, eqop as u8, allocator)?
+        enc_mod.push_byte(mutable code, 0x04, allocator)?
+        enc_mod.push_byte(mutable code, 0x40, allocator)?
+        emit_edge(mutable code, body, bctx, c.target, c.args, block_index + (1 as u32), allocator)?
+        enc_mod.push_byte(mutable code, 0x0B, allocator)?
+        i += 1
+    }
+    emit_edge(mutable code, body, bctx, targets.default, targets.default_args, block_index, allocator)?
+}
+
+
+function emit_return(
+    code: mutable Vec_u8.Vec,
+    bctx: ctx_mod.BodyCtx,
+    values: Vec_LirVRegId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if bctx.frame_size != 0 {
+        enc_mod.push_byte(mutable code, 0x23, allocator)?
+        enc_mod.uleb(mutable code, 0 as u64, allocator)?
+        enc_mod.push_byte(mutable code, 0x41, allocator)?
+        enc_mod.sleb(mutable code, bctx.frame_size as i64, allocator)?
+        enc_mod.push_byte(mutable code, 0x6A, allocator)?
+        enc_mod.push_byte(mutable code, 0x24, allocator)?
+        enc_mod.uleb(mutable code, 0 as u64, allocator)?
+    }
+    let n: usize = Vec_LirVRegId.len(values)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        common_mod.get_local(mutable code, Vec_LirVRegId.at(values, i), allocator)?
+        i += 1
+    }
+    enc_mod.push_byte(mutable code, 0x0F, allocator)?
+}

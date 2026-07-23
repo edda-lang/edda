@@ -1,0 +1,97 @@
+
+module tls.crypto.aead
+
+import std.crypto.aead.aes.gcm as aes_gcm
+import std.crypto.aead.chacha20.poly1305 as chacha20_poly1305
+import local.error
+
+unstable public type AeadCipher {
+    case aes_128_gcm
+    case chacha20_poly1305
+}
+
+public function cipher_key_len(c: AeadCipher) -> usize {
+    return match c {
+        case .aes_128_gcm        => 16 as usize
+        case .chacha20_poly1305  => 32 as usize
+    }
+}
+
+public function cipher_iv_len(c: AeadCipher) -> usize {
+    let _ = c
+    return 12 as usize
+}
+
+public function cipher_tag_len(c: AeadCipher) -> usize {
+    let _ = c
+    return 16 as usize
+}
+
+public function compute_nonce(
+    iv: [u8] where iv.len() == 12,
+    seq: u64,
+    nonce_out: mutable [u8] where nonce_out.len() == 12,
+) -> () {
+    nonce_out[0 as usize] = iv[0 as usize]
+    nonce_out[1 as usize] = iv[1 as usize]
+    nonce_out[2 as usize] = iv[2 as usize]
+    nonce_out[3 as usize] = iv[3 as usize]
+    nonce_out[4 as usize]  = iv[4 as usize]  ^ ((seq >> 56) as u8)
+    nonce_out[5 as usize]  = iv[5 as usize]  ^ ((seq >> 48) as u8)
+    nonce_out[6 as usize]  = iv[6 as usize]  ^ ((seq >> 40) as u8)
+    nonce_out[7 as usize]  = iv[7 as usize]  ^ ((seq >> 32) as u8)
+    nonce_out[8 as usize]  = iv[8 as usize]  ^ ((seq >> 24) as u8)
+    nonce_out[9 as usize]  = iv[9 as usize]  ^ ((seq >> 16) as u8)
+    nonce_out[10 as usize] = iv[10 as usize] ^ ((seq >> 8) as u8)
+    nonce_out[11 as usize] = iv[11 as usize] ^ (seq as u8)
+}
+
+public function seal(
+    c: AeadCipher,
+    key: [u8],
+    nonce: [u8] where nonce.len() == 12,
+    plaintext: [u8],
+    aad: [u8],
+    ciphertext: mutable [u8] where ciphertext.len() == plaintext.len(),
+    tag: mutable [u8] where tag.len() == 16,
+) -> ()
+    with {err: error.TlsError}
+{
+    match c {
+        case .aes_128_gcm => {
+            if key.len() != (16 as usize) { raise error.TlsError.key_exchange_failed }
+            aes_gcm.encrypt_128(key, nonce, plaintext, aad, mutable ciphertext, mutable tag)
+        }
+        case .chacha20_poly1305 => {
+            if key.len() != (32 as usize) { raise error.TlsError.key_exchange_failed }
+            chacha20_poly1305.encrypt(key, nonce, plaintext, aad, mutable ciphertext, mutable tag)
+        }
+    }
+}
+
+public function open(
+    c: AeadCipher,
+    key: [u8],
+    nonce: [u8] where nonce.len() == 12,
+    ciphertext: [u8],
+    aad: [u8],
+    tag: [u8] where tag.len() == 16,
+    plaintext: mutable [u8] where plaintext.len() == ciphertext.len(),
+) -> ()
+    with {err: error.TlsError}
+{
+    match c {
+        case .aes_128_gcm => {
+            if key.len() != (16 as usize) { raise error.TlsError.key_exchange_failed }
+            handle err: aes_gcm.AeadError -> (raise error.TlsError.bad_record_mac) {
+                aes_gcm.decrypt_128(key, nonce, ciphertext, aad, tag, mutable plaintext)?
+            }
+        }
+        case .chacha20_poly1305 => {
+            if key.len() != (32 as usize) { raise error.TlsError.key_exchange_failed }
+            handle err: chacha20_poly1305.AeadError -> (raise error.TlsError.bad_record_mac) {
+                chacha20_poly1305.decrypt(key, nonce, ciphertext, aad, tag, mutable plaintext)?
+            }
+        }
+    }
+}

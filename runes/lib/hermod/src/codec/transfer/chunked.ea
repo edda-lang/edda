@@ -1,0 +1,243 @@
+
+module hermod.codec.transfer.chunked
+
+import std.mem.alloc
+import local.error
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _b_cr() -> u8     { return 13 as u8 }
+function _b_lf() -> u8     { return 10 as u8 }
+function _b_zero() -> u8   { return 48 as u8 }
+function _b_nine() -> u8   { return 57 as u8 }
+function _b_a_l() -> u8    { return 97 as u8 }
+function _b_f_l() -> u8    { return 102 as u8 }
+function _b_a_u() -> u8    { return 65 as u8 }
+function _b_f_u() -> u8    { return 70 as u8 }
+
+function _write_byte(buf: mutable [u8], pos: usize, b: u8) -> usize
+    with {err: error.CodecError}
+{
+    if pos >= buf.len() { raise error.CodecError.buffer_overflow }
+    buf[pos] = b
+    return pos + 1 as usize
+}
+
+function _write_bytes(buf: mutable [u8], pos: usize, src: [u8]) -> usize
+    with {err: error.CodecError}
+{
+    let n = src.len()
+    var i: usize = 0
+    var p: usize = pos
+    loop decreases n - i {
+        if i >= n { break }
+        p = _write_byte(mutable buf, p, src[i])?
+        i += 1
+    }
+    return p
+}
+
+function _write_crlf(buf: mutable [u8], pos: usize) -> usize
+    with {err: error.CodecError}
+{
+    let p1 = _write_byte(mutable buf, pos, _b_cr())?
+    return _write_byte(mutable buf, p1, _b_lf())?
+}
+
+function _hex_digits(n: usize) -> usize {
+    if n == 0 as usize { return 1 as usize }
+    var work: usize = n
+    var k: usize = 0
+    loop decreases work + (1 as usize) {
+        if work == 0 as usize { break }
+        work = work / (16 as usize)
+        k += 1
+    }
+    return k
+}
+
+function _hex_char(d: u8) -> u8 {
+    if d < 10 as u8 { return _b_zero() + d }
+    return _b_a_l() + (d - 10 as u8)
+}
+
+function _write_hex_usize(buf: mutable [u8], pos: usize, n: usize) -> usize
+    with {err: error.CodecError}
+{
+    let k = _hex_digits(n)
+    var remaining: usize = n
+    var i: usize = k
+    var p: usize = pos
+    var written: usize = 0
+    loop decreases k - written {
+        if written >= k { break }
+        p = _write_byte(mutable buf, p, _b_zero())?
+        written += 1
+    }
+    var q: usize = p
+    loop decreases i + (1 as usize) {
+        if i == 0 as usize { break }
+        i = i - (1 as usize)
+        q = q - (1 as usize)
+        let d = (remaining % (16 as usize)) as u8
+        buf[q] = _hex_char(d)
+        remaining = remaining / (16 as usize)
+    }
+    return p
+}
+
+function _hex_val(b: u8) -> u8
+    with {err: error.CodecError}
+{
+    if b >= _b_zero() && b <= _b_nine() { return b - _b_zero() }
+    if b >= _b_a_l()  && b <= _b_f_l()  { return (b - _b_a_l()) + (10 as u8) }
+    if b >= _b_a_u()  && b <= _b_f_u()  { return (b - _b_a_u()) + (10 as u8) }
+    raise error.CodecError.malformed_header_line
+}
+
+function _find_lf(src: [u8], lo: usize, hi: usize) -> usize {
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if src[i] == _b_lf() { return i }
+        i += 1
+    }
+    return hi
+}
+
+function _consume_eol(src: [u8], pos: usize) -> usize
+    with {err: error.CodecError}
+{
+    if pos >= src.len() { raise error.CodecError.missing_crlf }
+    if src[pos] == _b_cr() {
+        if pos + (1 as usize) >= src.len() {
+            raise error.CodecError.missing_crlf
+        }
+        if src[pos + (1 as usize)] != _b_lf() {
+            raise error.CodecError.missing_crlf
+        }
+        return pos + (2 as usize)
+    }
+    if src[pos] == _b_lf() { return pos + (1 as usize) }
+    raise error.CodecError.missing_crlf
+}
+
+function _parse_chunk_size(src: [u8], lo: usize, hi: usize) -> usize
+    with {err: error.CodecError}
+{
+    if lo >= hi { raise error.CodecError.malformed_header_line }
+    var stop: usize = hi
+    var j: usize = lo
+    loop decreases hi - j {
+        if j >= stop { break }
+        if src[j] == (59 as u8) {
+            stop = j
+            break
+        }
+        j += 1
+    }
+    if stop == lo { raise error.CodecError.malformed_header_line }
+    var acc: usize = 0 as usize
+    var i: usize = lo
+    loop decreases stop - i {
+        if i >= stop { break }
+        let nib = _hex_val(src[i])?
+        acc = acc * (16 as usize) + (nib as usize)
+        i += 1
+    }
+    return acc
+}
+
+function _slab_size_for(body_len: usize) -> usize {
+    return body_len
+        + (16 as usize)
+        + (2 as usize)
+        + (2 as usize)
+        + (1 as usize)
+        + (2 as usize)
+        + (2 as usize)
+}
+
+public function encode_chunked(body: [u8], allocator: mutable Allocator) -> [u8]
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        var buf = _alloc_u8_slots(allocator, _slab_size_for(body.len()))?
+        var p: usize = 0 as usize
+        p = _write_hex_usize(mutable buf, p, body.len())?
+        p = _write_crlf(mutable buf, p)?
+        p = _write_bytes(mutable buf, p, body)?
+        p = _write_crlf(mutable buf, p)?
+        p = _write_byte(mutable buf, p, _b_zero())?
+        p = _write_crlf(mutable buf, p)?
+        p = _write_crlf(mutable buf, p)?
+        buf[0 as usize..<p]
+    }
+}
+
+public function decode_chunked(src: [u8], allocator: mutable Allocator) -> [u8]
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        let total = _scan_chunk_total(src)?
+        var out = _alloc_u8_slots(allocator, total)?
+        _decode_into(src, mutable out)?
+        out
+    }
+}
+
+function _scan_chunk_total(src: [u8]) -> usize
+    with {err: error.CodecError}
+{
+    let n = src.len()
+    var p: usize = 0 as usize
+    var total: usize = 0 as usize
+    loop decreases n + (1 as usize) - p {
+        if p >= n { raise error.CodecError.unexpected_eof }
+        let eol = _find_lf(src, p, n)
+        if eol >= n { raise error.CodecError.missing_crlf }
+        var size_hi: usize = eol
+        if eol > p && src[eol - (1 as usize)] == _b_cr() {
+            size_hi = eol - (1 as usize)
+        }
+        let sz = _parse_chunk_size(src, p, size_hi)?
+        p = _consume_eol(src, eol)?
+        if sz == 0 as usize { break }
+        if p + sz > n { raise error.CodecError.unexpected_eof }
+        total += sz
+        p = p + sz
+        p = _consume_eol(src, p)?
+    }
+    return total
+}
+
+function _decode_into(src: [u8], out: mutable [u8]) -> ()
+    with {err: error.CodecError}
+{
+    let n = src.len()
+    var p: usize = 0 as usize
+    var w: usize = 0 as usize
+    loop decreases n + (1 as usize) - p {
+        if p >= n { raise error.CodecError.unexpected_eof }
+        let eol = _find_lf(src, p, n)
+        if eol >= n { raise error.CodecError.missing_crlf }
+        var size_hi: usize = eol
+        if eol > p && src[eol - (1 as usize)] == _b_cr() {
+            size_hi = eol - (1 as usize)
+        }
+        let sz = _parse_chunk_size(src, p, size_hi)?
+        p = _consume_eol(src, eol)?
+        if sz == 0 as usize { break }
+        var k: usize = 0 as usize
+        loop decreases sz - k {
+            if k >= sz { break }
+            out[w + k] = src[p + k]
+            k += 1
+        }
+        w += sz
+        p += sz
+        p = _consume_eol(src, p)?
+    }
+}

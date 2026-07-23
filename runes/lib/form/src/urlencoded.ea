@@ -1,0 +1,137 @@
+module form.urlencoded
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import std.encoding.percent
+import std.text.str
+
+spec std.collections.vec.Vec(Field)
+
+
+public type Field {
+    name: String
+    value: String
+}
+
+public type FieldError {
+    case missing(name: String)
+}
+
+public type Lookup {
+    case found(value: String)
+    case missing
+}
+
+function _to_string(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _find_eq(bytes: [u8]) -> usize
+    ensures result <= bytes.len()
+{
+    let n = bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if bytes[i] == 61 as u8 { return i }
+        i += 1
+    }
+    return n
+}
+
+function _split_kv(pair: String, allocator: Allocator) -> Field
+    with {allocator, err: alloc.AllocError, err: percent.PercentError}
+{
+    let pb = pair.bytes()
+    let n = pb.len()
+    let eq = _find_eq(pb)
+    let key_str = _to_string(pb[0 as usize..<eq], allocator)?
+    let key = percent.decode(key_str, true, allocator)?
+    if eq >= n {
+        return Field { name: key, value: "" }
+    }
+    let value_str = _to_string(pb[eq + 1 as usize..<n], allocator)?
+    let value = percent.decode(value_str, true, allocator)?
+    return Field { name: key, value: value }
+}
+
+public function parse(body: [u8], allocator: Allocator) -> [Field]
+    with {allocator, err: alloc.AllocError, err: percent.PercentError}
+{
+    let body_str = _to_string(body, allocator)?
+    let pairs = string.split(body_str, "&", allocator)?
+    uninit fields: Vec_Field.Vec
+    Vec_Field.new(init fields, allocator)?
+    let n = pairs.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let pair = pairs[i]
+        if !string.is_empty(pair) {
+            let f = _split_kv(pair, allocator)?
+            Vec_Field.push(mutable fields, take f, allocator)?
+        }
+        i += 1
+    }
+    return Vec_Field.into_array(take fields, allocator)?
+}
+
+public function opt_field(fields: [Field], name: String, allocator: Allocator) -> Lookup
+    with {allocator, err: alloc.AllocError}
+{
+    let n = fields.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = fields[i]
+        if string.equals(f.name, name) {
+            return Lookup.found(value: string.clone(f.value, allocator)?)
+        }
+        i += 1
+    }
+    return Lookup.missing
+}
+
+public function string_field(fields: [Field], name: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: FieldError}
+{
+    let n = fields.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = fields[i]
+        if string.equals(f.name, name) {
+            return string.clone(f.value, allocator)?
+        }
+        i += 1
+    }
+    raise FieldError.missing(name: string.clone(name, allocator)?)
+}
+
+public function usize_field(fields: [Field], name: String, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, err: FieldError, err: str.ParseIntError}
+{
+    let n = fields.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = fields[i]
+        if string.equals(f.name, name) {
+            let v = str.parse_u64(f.value.bytes())?
+            return v as usize
+        }
+        i += 1
+    }
+    raise FieldError.missing(name: string.clone(name, allocator)?)
+}

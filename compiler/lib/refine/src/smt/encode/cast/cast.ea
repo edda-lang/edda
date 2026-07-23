@@ -1,0 +1,96 @@
+
+module refine.smt.encode.cast.cast
+
+import std.collections.vec
+import std.mem.alloc
+import syntax.ast.ops as ops_mod
+import syntax.ast.tree as ast_tree
+import types.check.env.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.term as term_mod
+import local.smt.encode.encres as result_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.mem.alloc.Box(ast_tree.Ty)
+
+
+public function encode_cast(
+    expr_box: Box_Expr,
+    ty_box: Box_Ty,
+    mode: ops_mod.CastMode,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner_expr = Box_Expr.get(expr_box)
+    let inner_result = encode_fn(inner_expr, vars, ty_interner, builtins, allocator)?
+    return match inner_result {
+        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+        case .encoded(let inner_term) => match sort_of_term(inner_term) {
+            case .int_ => result_mod.EncodeResult.encoded(term: inner_term)
+            case .bool_ => unsupported_cross_sort()
+            case .array_(_) => unsupported_cross_sort()
+            case .uninterp(_) => unsupported_cross_sort()
+        }
+    }
+}
+
+
+function unsupported_cross_sort() -> result_mod.EncodeResult {
+    return result_mod.EncodeResult.unsupported(
+        fragment: err_mod.UnsupportedFragment.other(
+            message: "cast crosses SMT sorts (no int/bool coercion in the decidable fragment)",
+        ),
+    )
+}
+
+
+function sort_of_term(term: term_mod.SmtTerm) -> term_mod.SmtSort {
+    return match term {
+        case .true_ => term_mod.SmtSort.bool_
+        case .false_ => term_mod.SmtSort.bool_
+        case .numeral(_) => term_mod.SmtSort.int_
+        case .var_(_, let sort) => sort
+        case .app(let op, _) => sort_of_op(op)
+        case .forall_(_, _, _) => term_mod.SmtSort.bool_
+        case .exists_(_, _, _) => term_mod.SmtSort.bool_
+    }
+}
+
+
+function sort_of_op(op: term_mod.SmtOp) -> term_mod.SmtSort {
+    return match op {
+        case .and_ => term_mod.SmtSort.bool_
+        case .or_ => term_mod.SmtSort.bool_
+        case .not_ => term_mod.SmtSort.bool_
+        case .implies_ => term_mod.SmtSort.bool_
+        case .eq_ => term_mod.SmtSort.bool_
+        case .distinct_ => term_mod.SmtSort.bool_
+
+        case .add => term_mod.SmtSort.int_
+        case .sub => term_mod.SmtSort.int_
+        case .mul => term_mod.SmtSort.int_
+        case .neg => term_mod.SmtSort.int_
+        case .div_ => term_mod.SmtSort.int_
+        case .mod_ => term_mod.SmtSort.int_
+
+        case .lt => term_mod.SmtSort.bool_
+        case .le => term_mod.SmtSort.bool_
+        case .gt => term_mod.SmtSort.bool_
+        case .ge => term_mod.SmtSort.bool_
+
+        case .ite => term_mod.SmtSort.int_
+        case .select_ => term_mod.SmtSort.int_
+        case .store_ => term_mod.SmtSort.int_
+        case .udf(_) => term_mod.SmtSort.int_
+    }
+}

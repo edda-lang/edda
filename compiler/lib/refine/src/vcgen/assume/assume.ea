@@ -1,0 +1,239 @@
+
+module refine.vcgen.assume.assume
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import mir.body.model as mir_body
+import mir.id.block as block_mod
+import mir.id.local as local_mod
+import mir.rvalue as rvalue_mod
+import mir.stmt as stmt_mod
+import mir.place as place_mod
+import local.smt.term as term_mod
+import local.vcgen.term.term as vterm_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+
+
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtOp)
+
+
+type PredLookup {
+    count: usize
+    last: usize
+}
+
+
+public function append_guard_context(
+    ctx: mutable Vec_SmtTerm.Vec,
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    trap_block: block_mod.BlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var cur: usize = block_mod.index(trap_block)
+    var steps: usize = 0
+    loop
+        decreases (nb - steps)
+    {
+        if steps >= nb {
+            break
+        }
+        steps = steps + 1
+        if cur >= nb {
+            break
+        }
+        let pl = unique_pred(idx, cur)
+        if pl.count != 1 {
+            break
+        }
+        if pl.last >= nb {
+            break
+        }
+        let pbb = Vec_BasicBlock.at(body.blocks, pl.last)
+        match pbb.terminator.kind {
+            case .branch(let cond, let true_, let false_) => {
+                let it = block_mod.index(true_)
+                let if_ = block_mod.index(false_)
+                if it == cur && if_ != cur {
+                    append_cond(mutable ctx, body, idx, cond, true, allocator)?
+                } else {
+                    if if_ == cur && it != cur {
+                        append_cond(mutable ctx, body, idx, cond, false, allocator)?
+                    }
+                }
+            }
+            case _ => {}
+        }
+        cur = pl.last
+    }
+}
+
+
+function append_cond(
+    ctx: mutable Vec_SmtTerm.Vec,
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    cond: rvalue_mod.Operand,
+    positive: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match encode_cond(body, idx, cond, positive, allocator)? {
+        case .some(let t) => Vec_SmtTerm.push(mutable ctx, take t, allocator)?
+        case .none => {}
+    }
+}
+
+
+function unique_pred(idx: bodyidx_mod.BodyIndex, cur: usize) -> PredLookup {
+    return PredLookup {
+        count: bodyidx_mod.pred_lookup_count(idx, cur),
+        last: bodyidx_mod.pred_lookup_last(idx, cur),
+    }
+}
+
+
+function encode_cond(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    cond: rvalue_mod.Operand,
+    positive: bool,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match cond {
+        case .copy_(let place, _) => resolve_bool_place(body, idx, place, positive, allocator)?
+        case .move_(let place, _) => resolve_bool_place(body, idx, place, positive, allocator)?
+        case .constant(_) => Option_SmtTerm.none
+    }
+}
+
+
+function resolve_bool_place(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    place: place_mod.Place,
+    positive: bool,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    if place_mod.proj_len(place) != 0 {
+        return Option_SmtTerm.none
+    }
+    return scan_bool_def(body, idx, place.local, positive, allocator)?
+}
+
+
+function scan_bool_def(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    local_id: local_mod.LocalId,
+    positive: bool,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let ds = bodyidx_mod.def_site(idx, local_id)
+    if !ds.found {
+        return Option_SmtTerm.none
+    }
+    if ds.block >= Vec_BasicBlock.len(body.blocks) {
+        return Option_SmtTerm.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, ds.block)
+    if ds.stmt >= Vec_Statement.len(bb.statements) {
+        return Option_SmtTerm.none
+    }
+    return match Vec_Statement.at(bb.statements, ds.stmt).kind {
+        case .assign(let dest, let value) => {
+            if place_mod.proj_len(dest) == 0 && local_mod.index(dest.local) == local_mod.index(local_id) {
+                encode_compare(body, idx, value, positive, allocator)?
+            } else {
+                Option_SmtTerm.none
+            }
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function encode_compare(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    value: rvalue_mod.Rvalue,
+    positive: bool,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match value {
+        case .binary(let op, let lhs, let rhs) => {
+            match cmp_smt_op(op) {
+                case .some(let sop) => build_compare(body, idx, sop, lhs, rhs, positive, allocator)?
+                case .none => Option_SmtTerm.none
+            }
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function cmp_smt_op(op: rvalue_mod.MBinOp) -> Option_SmtOp.Option {
+    return match op {
+        case .eq => Option_SmtOp.some(value: term_mod.SmtOp.eq_)
+        case .ne => Option_SmtOp.some(value: term_mod.SmtOp.distinct_)
+        case .lt => Option_SmtOp.some(value: term_mod.SmtOp.lt)
+        case .le => Option_SmtOp.some(value: term_mod.SmtOp.le)
+        case .gt => Option_SmtOp.some(value: term_mod.SmtOp.gt)
+        case .ge => Option_SmtOp.some(value: term_mod.SmtOp.ge)
+        case _ => Option_SmtOp.none
+    }
+}
+
+
+function build_compare(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    sop: term_mod.SmtOp,
+    lhs: rvalue_mod.Operand,
+    rhs: rvalue_mod.Operand,
+    positive: bool,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match vterm_mod.operand_to_int_term(body, idx, lhs) {
+        case .none => Option_SmtTerm.none
+        case .some(let lt) => match vterm_mod.operand_to_int_term(body, idx, rhs) {
+            case .none => Option_SmtTerm.none
+            case .some(let rt) => {
+                let eff = if positive { sop } else { negate_cmp_op(sop) }
+                Option_SmtTerm.some(value: vterm_mod.mk_bin(eff, take lt, take rt, allocator)?)
+            }
+        }
+    }
+}
+
+
+function negate_cmp_op(op: term_mod.SmtOp) -> term_mod.SmtOp {
+    return match op {
+        case .eq_ => term_mod.SmtOp.distinct_
+        case .distinct_ => term_mod.SmtOp.eq_
+        case .lt => term_mod.SmtOp.ge
+        case .le => term_mod.SmtOp.gt
+        case .gt => term_mod.SmtOp.le
+        case .ge => term_mod.SmtOp.lt
+        case _ => op
+    }
+}

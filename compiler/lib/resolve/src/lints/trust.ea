@@ -1,0 +1,79 @@
+
+module resolve.lints.trust
+
+import std.collections.vec
+import std.collections.slice
+import std.mem.alloc
+import intern.interner as interner_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.attr as attr_mod
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import local.ctx as ctx_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+
+
+public function check_trust_hatch_density(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_file(mutable ctx, interner, Vec_File.at(files, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function check_file(ctx: mutable ctx_mod.ResolveCtx, interner: interner_mod.Interner, file: ast_file.File, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(file.items)
+    var total: usize = 0
+    var hatched: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .function_(_) => {
+                total = total + 1
+                if is_hatched(item.attributes, interner) {
+                    hatched = hatched + 1
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    if total == 0 {
+        return
+    }
+    if hatched * 10 < total {
+        return
+    }
+    let pct = (hatched * 100) / total
+    let msg = f"file has high trust-hatch density: {hatched}/{total} functions ({pct}%) carry `@unverified` or `@trust`"
+    let d = diag_mod.warn_at(diag_code_mod.trust_hatch_too_dense(), file.span, msg)
+    ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+}
+
+
+function is_hatched(attrs: Vec_Attribute.Vec, interner: interner_mod.Interner) -> bool {
+    let n = Vec_Attribute.len(attrs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        let a = Vec_Attribute.at(attrs, i)
+        let bytes = interner_mod.lookup(interner, a.name.name)
+        if slice.eq_u8(bytes, "trust".bytes()) { return true }
+        if slice.eq_u8(bytes, "unverified".bytes()) { return true }
+        i = i + 1
+    }
+    return false
+}

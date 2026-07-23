@@ -1,0 +1,134 @@
+
+module refine.discharge.output
+
+import std.collections.vec
+import std.mem.alloc
+import mir.body.model as mir_body_mod
+import local.discharge.error as err_mod
+
+
+spec std.collections.vec.Vec(err_mod.RefineError)
+spec std.collections.vec.Vec(ProvenVerdict)
+
+
+derive eq, debug for RefineOutput
+derive eq, hash, debug for ProvenVerdict
+
+
+public type ProvenVerdict {
+    def_raw: u32
+    block_index: usize
+    stmt_index: u32
+    kind: mir_body_mod.ObligationKind
+}
+
+
+public type RefineOutput {
+    discharged: u32
+    skipped: u32
+    failures: Vec_RefineError.Vec
+    proven: Vec_ProvenVerdict.Vec
+}
+
+
+public function new(out: init RefineOutput, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit fs: Vec_RefineError.Vec
+    Vec_RefineError.new(init fs, allocator)?
+    uninit pv: Vec_ProvenVerdict.Vec
+    Vec_ProvenVerdict.new(init pv, allocator)?
+    out = RefineOutput {
+        discharged: 0 as u32,
+        skipped: 0 as u32,
+        failures: fs,
+        proven: pv,
+    }
+}
+
+
+public function record_proven(
+    out: mutable RefineOutput,
+    def_raw: u32,
+    block_index: usize,
+    stmt_index: u32,
+    kind: mir_body_mod.ObligationKind,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let v = ProvenVerdict {
+        def_raw: def_raw,
+        block_index: block_index,
+        stmt_index: stmt_index,
+        kind: kind,
+    }
+    Vec_ProvenVerdict.push(mutable out.proven, take v, allocator)?
+}
+
+
+public function proven_count(out: RefineOutput) -> usize {
+    return Vec_ProvenVerdict.len(out.proven)
+}
+
+
+public function discharged_count(out: RefineOutput) -> usize {
+    return out.discharged as usize
+}
+
+public function skipped_count(out: RefineOutput) -> usize {
+    return out.skipped as usize
+}
+
+
+public function proven_at(out: RefineOutput, i: usize) -> ProvenVerdict
+    requires i < Vec_ProvenVerdict.len(out.proven)
+{
+    return Vec_ProvenVerdict.at(out.proven, i)
+}
+
+
+public function record_discharged(out: mutable RefineOutput) -> ()
+    requires out.discharged < 4294967295
+{
+    out.discharged = out.discharged + 1 as u32
+}
+
+public function record_skipped(out: mutable RefineOutput) -> ()
+    requires out.skipped < 4294967295
+{
+    out.skipped = out.skipped + 1 as u32
+}
+
+public function push_failure(
+    out: mutable RefineOutput,
+    failure: take err_mod.RefineError,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_RefineError.push(mutable out.failures, take failure, allocator)?
+}
+
+
+public stable function total(out: RefineOutput) -> usize
+    requires (out.discharged as usize) + (out.skipped as usize) + Vec_RefineError.len(out.failures) <= 18446744073709551615
+{
+    return (out.discharged as usize) + (out.skipped as usize) + Vec_RefineError.len(out.failures)
+}
+
+public stable function ok(out: RefineOutput) -> bool {
+    return Vec_RefineError.len(out.failures) == 0
+}
+
+public stable function should_short_circuit(out: RefineOutput) -> bool {
+    let n = Vec_RefineError.len(out.failures)
+    if n == 0 {
+        return false
+    }
+    let last = Vec_RefineError.at(out.failures, n - 1)
+    return match last {
+        case .solver_internal(_, _) => true
+        case _ => false
+    }
+}

@@ -1,0 +1,158 @@
+
+module pgsql.message.be.reply.response
+
+import std.mem.alloc
+import local.error
+import local.link.wire
+
+
+public function field_severity() -> u8 { return 83 as u8 }
+
+public function field_severity_nonlocalised() -> u8 { return 86 as u8 }
+
+public function field_sqlstate() -> u8 { return 67 as u8 }
+
+public function field_message() -> u8 { return 77 as u8 }
+
+public function field_detail() -> u8 { return 68 as u8 }
+
+public function field_hint() -> u8 { return 72 as u8 }
+
+public function field_position() -> u8 { return 80 as u8 }
+
+public function field_internal_position() -> u8 { return 112 as u8 }
+
+public function field_internal_query() -> u8 { return 113 as u8 }
+
+public function field_where() -> u8 { return 87 as u8 }
+
+public function field_schema() -> u8 { return 115 as u8 }
+
+public function field_table() -> u8 { return 116 as u8 }
+
+public function field_column() -> u8 { return 99 as u8 }
+
+public function field_data_type() -> u8 { return 100 as u8 }
+
+public function field_constraint() -> u8 { return 110 as u8 }
+
+public function field_file() -> u8 { return 70 as u8 }
+
+public function field_line() -> u8 { return 76 as u8 }
+
+public function field_routine() -> u8 { return 82 as u8 }
+
+
+function _alloc_response_field_slots(
+    allocator: Allocator,
+    n: usize,
+) -> [ResponseField]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+public type ResponseField {
+    code: u8
+    value: [u8]
+}
+
+public type ErrorResponse {
+    fields: [ResponseField]
+}
+
+public type NoticeResponse {
+    fields: [ResponseField]
+}
+
+
+function _count_fields(body: [u8]) -> usize
+    with {err: error.ProtocolError}
+{
+    var pos: usize = 0 as usize
+    var n: usize = 0 as usize
+    let blen = body.len()
+    loop decreases blen - pos {
+        if pos >= blen {
+            raise error.ProtocolError.truncated_message
+        }
+        let code = body[pos]
+        pos = pos + (1 as usize)
+        if code == (0 as u8) { break }
+        let cs = wire.read_cstring(body, pos)?
+        pos = cs.next_pos
+        n = n + (1 as usize)
+    }
+    return n
+}
+
+function _decode_response_fields(
+    body: [u8],
+    allocator: Allocator,
+) -> [ResponseField]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let n = _count_fields(body)?
+    let fields = _alloc_response_field_slots(allocator, n)?
+    var pos: usize = 0 as usize
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        let code = body[pos]
+        pos = pos + (1 as usize)
+        let cs = wire.read_cstring(body, pos)?
+        fields[i] = ResponseField {
+            code: code,
+            value: body[cs.bytes_lo..<cs.bytes_hi],
+        }
+        pos = cs.next_pos
+        i = i + (1 as usize)
+    }
+    return fields
+}
+
+public function decode_error_response(
+    body: [u8],
+    allocator: Allocator,
+) -> ErrorResponse
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let fields = _decode_response_fields(body, allocator)?
+    return ErrorResponse { fields: fields }
+}
+
+public function decode_notice_response(
+    body: [u8],
+    allocator: Allocator,
+) -> NoticeResponse
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let fields = _decode_response_fields(body, allocator)?
+    return NoticeResponse { fields: fields }
+}
+
+
+public function field_value_or(
+    fields: [ResponseField],
+    code: u8,
+    fallback: [u8],
+) -> [u8] {
+    let n = fields.len()
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        if fields[i].code == code { return fields[i].value }
+        i = i + (1 as usize)
+    }
+    return fallback
+}
+
+public function field_present(fields: [ResponseField], code: u8) -> bool {
+    let n = fields.len()
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        if fields[i].code == code { return true }
+        i = i + (1 as usize)
+    }
+    return false
+}

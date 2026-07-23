@@ -1,0 +1,487 @@
+
+module toml.parse.decode.walk
+
+import std.mem.alloc
+import std.text.string
+import toml.error
+import toml.value
+import toml.parse.token.lex
+import toml.parse.decode.scalar
+
+function _alloc_string_slots(allocator: Allocator, n: usize) -> [String]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_pathseg_slots(allocator: Allocator, n: usize) -> [PathSeg]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_flat_binding_slots(allocator: Allocator, n: usize) -> [FlatBinding]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_array_counter_slots(allocator: Allocator, n: usize) -> [ArrayCounter]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+public type PathSeg {
+    case key(String)
+    case index(usize)
+}
+
+public type FlatBinding {
+    path: [PathSeg]
+    at: usize
+    val: value.Value
+}
+
+public type ArrayCounter {
+    path: [PathSeg]
+    count: usize
+}
+
+function _seg_eq(a: PathSeg, b: PathSeg) -> bool {
+    return match a {
+        case .key(let sa) => match b {
+            case .key(let sb)  => _bytes_eq(sa.bytes(), sb.bytes())
+            case .index(_)     => false
+        }
+        case .index(let ia) => match b {
+            case .key(_)        => false
+            case .index(let ib) => ia == ib
+        }
+    }
+}
+
+function _path_eq(a: [PathSeg], b: [PathSeg]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if !_seg_eq(a[i], b[i]) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _find_counter(
+    counters: [ArrayCounter],
+    n_counters: usize,
+    path: [PathSeg],
+) -> (usize, bool) {
+    var i: usize = 0
+    loop decreases n_counters - i + 1 as usize {
+        if i >= n_counters { break }
+        if _path_eq(counters[i].path, path) { return (i, true) }
+        i = i + 1 as usize
+    }
+    return (0 as usize, false)
+}
+
+function _append_seg(p: [PathSeg], seg: PathSeg, allocator: Allocator) -> [PathSeg]
+    with {allocator, err: alloc.AllocError}
+{
+    let n = p.len()
+    let slots = _alloc_pathseg_slots(allocator, n + 1 as usize)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        slots[i] = p[i]
+        i = i + 1 as usize
+    }
+    slots[n] = seg
+    return slots
+}
+
+function _resolve(
+    counters: [ArrayCounter],
+    n_counters: usize,
+    keys: [PathSeg],
+    upto: usize,
+    allocator: Allocator,
+) -> [PathSeg]
+    with {allocator, err: alloc.AllocError}
+{
+    let slots = _alloc_pathseg_slots(allocator, upto * 2 as usize)?
+    var out_n: usize = 0
+    var s: usize = 0
+    loop decreases upto - s + 1 as usize {
+        if s >= upto { break }
+        slots[out_n] = keys[s]
+        out_n = out_n + 1 as usize
+        let (idx, found) = _find_counter(counters, n_counters, slots[0 as usize..<out_n])
+        if found {
+            slots[out_n] = PathSeg.index(counters[idx].count - 1 as usize)
+            out_n = out_n + 1 as usize
+        }
+        s = s + 1 as usize
+    }
+    return slots[0 as usize..<out_n]
+}
+
+public function tok_offset(t: lex.Token) -> usize {
+    return match t {
+        case .lbracket(let a)         => a
+        case .rbracket(let a)         => a
+        case .double_lbracket(let a)  => a
+        case .double_rbracket(let a)  => a
+        case .equals(let a)           => a
+        case .dot(let a)              => a
+        case .comma(let a)            => a
+        case .newline(let a)          => a
+        case .bare_key(let s, _)      => s
+        case .str_lit(let s, _)       => s
+        case .int_lit(let s, _)       => s
+        case .float_lit(let s, _)     => s
+        case .eof(let a)              => a
+    }
+}
+
+function _parse_dotted_key(
+    toks: [lex.Token],
+    n_toks: usize,
+    cursor: usize,
+    src: [u8],
+    allocator: Allocator,
+) -> ([PathSeg], usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    var seg_count: usize = 0
+    var c: usize = cursor
+    var expecting_key: bool = true
+    loop decreases n_toks - c + 1 as usize {
+        if c >= n_toks { break }
+        let t = toks[c]
+        if expecting_key {
+            let is_key = match t {
+                case .bare_key(_, _) => true
+                case .str_lit(_, _)  => true
+                case _               => false
+            }
+            if !is_key { break }
+            seg_count = seg_count + 1 as usize
+            c = c + 1 as usize
+            expecting_key = false
+        } else {
+            let is_dot = match t {
+                case .dot(_) => true
+                case _       => false
+            }
+            if !is_dot { break }
+            c = c + 1 as usize
+            expecting_key = true
+        }
+    }
+    if seg_count == 0 as usize {
+        let at = if cursor < n_toks { tok_offset(toks[cursor]) } else { src.len() }
+        raise error.ParseError.bad_key(at: at)
+    }
+    if expecting_key {
+        let at = if c < n_toks { tok_offset(toks[c]) } else { src.len() }
+        raise error.ParseError.bad_key(at: at)
+    }
+
+    let slots = _alloc_pathseg_slots(allocator, seg_count)?
+    var n: usize = 0
+    var c2: usize = cursor
+    var fill_expecting_key: bool = true
+    loop decreases n_toks - c2 + 1 as usize {
+        if c2 >= n_toks { break }
+        if n >= seg_count { break }
+        let t = toks[c2]
+        if fill_expecting_key {
+            let segment = match t {
+                case .bare_key(let s, let e) => string.bytes_slice_to_string(src, s, e, allocator)?
+                case .str_lit(let s, let e)  => scalar.parse_string_body(src, s, e, allocator)?
+                case _                       => raise error.ParseError.bad_key(at: tok_offset(t))
+            }
+            slots[n] = PathSeg.key(segment)
+            n = n + 1 as usize
+            c2 = c2 + 1 as usize
+            fill_expecting_key = false
+        } else {
+            let is_dot = match t {
+                case .dot(_) => true
+                case _       => false
+            }
+            if !is_dot { break }
+            c2 = c2 + 1 as usize
+            fill_expecting_key = true
+        }
+    }
+    return (slots, c2)
+}
+
+function _parse_value(
+    toks: [lex.Token],
+    n_toks: usize,
+    cursor: usize,
+    src: [u8],
+    allocator: Allocator,
+) -> (value.Value, usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    if cursor >= n_toks {
+        raise error.ParseError.unexpected_eof(at: src.len())
+    }
+    let t = toks[cursor]
+    return match t {
+        case .str_lit(let s, let e) => {
+            let body = scalar.parse_string_body(src, s, e, allocator)?
+            (value.Value.string(body), cursor + 1 as usize)
+        }
+        case .int_lit(let s, let e) => {
+            let n = scalar.parse_i64(src, s, e)?
+            (value.Value.integer(n), cursor + 1 as usize)
+        }
+        case .float_lit(let s, let e) => {
+            let n = scalar.parse_f64(src, s, e)?
+            (value.Value.float(n), cursor + 1 as usize)
+        }
+        case .bare_key(let s, let e) => {
+            let body = src[s..<e]
+            if _bytes_eq(body, "true".bytes()) {
+                (value.Value.boolean(true), cursor + 1 as usize)
+            } else if _bytes_eq(body, "false".bytes()) {
+                (value.Value.boolean(false), cursor + 1 as usize)
+            } else {
+                raise error.ParseError.reserved_in_subset(at: s)
+            }
+        }
+        case .lbracket(_) => _parse_string_array(toks, n_toks, cursor + 1 as usize, src, allocator)?
+        case _ => raise error.ParseError.unexpected_token(at: tok_offset(t))
+    }
+}
+
+function _parse_string_array(
+    toks: [lex.Token],
+    n_toks: usize,
+    cursor: usize,
+    src: [u8],
+    allocator: Allocator,
+) -> (value.Value, usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let slots = _alloc_string_slots(allocator, n_toks - cursor + 1 as usize)?
+    var n: usize = 0
+    var c: usize = cursor
+    var expecting_value: bool = true
+    loop decreases n_toks - c + 1 as usize {
+        if c >= n_toks {
+            raise error.ParseError.unexpected_eof(at: src.len())
+        }
+        let t = toks[c]
+        let is_newline = match t {
+            case .newline(_) => true
+            case _           => false
+        }
+        if is_newline {
+            c = c + 1 as usize
+        } else {
+            let is_close = match t {
+                case .rbracket(_) => true
+                case _            => false
+            }
+            if is_close {
+                let arr = value.StringArray { items: slots[0 as usize..<n] }
+                return (value.Value.string_array(arr), c + 1 as usize)
+            }
+            if expecting_value {
+                let body = match t {
+                    case .str_lit(let s, let e) => scalar.parse_string_body(src, s, e, allocator)?
+                    case _ => raise error.ParseError.mixed_array(at: tok_offset(t))
+                }
+                slots[n] = body
+                n = n + 1 as usize
+                c = c + 1 as usize
+                expecting_value = false
+            } else {
+                let is_comma = match t {
+                    case .comma(_) => true
+                    case _         => false
+                }
+                if !is_comma {
+                    raise error.ParseError.unexpected_token(at: tok_offset(t))
+                }
+                c = c + 1 as usize
+                expecting_value = true
+            }
+        }
+    }
+    raise error.ParseError.unexpected_eof(at: src.len())
+}
+
+function _concat_paths(
+    a: [PathSeg], b: [PathSeg],
+    allocator: Allocator,
+) -> [PathSeg]
+    with {allocator, err: alloc.AllocError}
+{
+    let n_a = a.len()
+    let n_b = b.len()
+    let slots = _alloc_pathseg_slots(allocator, n_a + n_b)?
+    var i: usize = 0
+    loop decreases n_a - i + 1 as usize {
+        if i >= n_a { break }
+        slots[i] = a[i]
+        i = i + 1 as usize
+    }
+    var j: usize = 0
+    loop decreases n_b - j + 1 as usize {
+        if j >= n_b { break }
+        slots[n_a + j] = b[j]
+        j = j + 1 as usize
+    }
+    return slots
+}
+
+public function walk(
+    toks: [lex.Token],
+    n_toks: usize,
+    src: [u8],
+    allocator: Allocator,
+) -> ([FlatBinding], usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let bindings = _alloc_flat_binding_slots(allocator, n_toks)?
+    var n_bindings: usize = 0
+    let counters = _alloc_array_counter_slots(allocator, n_toks)?
+    var n_counters: usize = 0
+    var section_path: [PathSeg] = _alloc_pathseg_slots(allocator, 0 as usize)?
+    var c: usize = 0
+    loop decreases n_toks - c + 1 as usize {
+        if c >= n_toks { break }
+        let t = toks[c]
+        let is_eof = match t {
+            case .eof(_) => true
+            case _       => false
+        }
+        if is_eof { break }
+        let is_newline = match t {
+            case .newline(_) => true
+            case _           => false
+        }
+        if is_newline {
+            c = c + 1 as usize
+        } else {
+            let is_double_lbracket = match t {
+                case .double_lbracket(_) => true
+                case _                   => false
+            }
+            let is_lbracket = match t {
+                case .lbracket(_) => true
+                case _            => false
+            }
+            if is_double_lbracket {
+                let (keys, c2) = _parse_dotted_key(toks, n_toks, c + 1 as usize, src, allocator)?
+                if c2 >= n_toks {
+                    raise error.ParseError.unexpected_eof(at: src.len())
+                }
+                let close = match toks[c2] {
+                    case .double_rbracket(_) => true
+                    case _                   => false
+                }
+                if !close {
+                    raise error.ParseError.missing_bracket(at: tok_offset(toks[c2]))
+                }
+                let m = keys.len()
+                let prefix = _resolve(counters, n_counters, keys, m - 1 as usize, allocator)?
+                let target = _append_seg(prefix, keys[m - 1 as usize], allocator)?
+                let (idx, found) = _find_counter(counters, n_counters, target)
+                var elem_index: usize = 0
+                if found {
+                    elem_index = counters[idx].count
+                    counters[idx] = ArrayCounter {
+                        path: counters[idx].path,
+                        count: elem_index + 1 as usize,
+                    }
+                } else {
+                    counters[n_counters] = ArrayCounter { path: target, count: 1 as usize }
+                    n_counters = n_counters + 1 as usize
+                }
+                section_path = _append_seg(target, PathSeg.index(elem_index), allocator)?
+                c = c2 + 1 as usize
+                if c < n_toks {
+                    let nl = match toks[c] {
+                        case .newline(_) => true
+                        case .eof(_)     => true
+                        case _           => false
+                    }
+                    if !nl {
+                        raise error.ParseError.missing_newline(at: tok_offset(toks[c]))
+                    }
+                }
+            } else if is_lbracket {
+                let (new_keys, c2) = _parse_dotted_key(toks, n_toks, c + 1 as usize, src, allocator)?
+                if c2 >= n_toks {
+                    raise error.ParseError.unexpected_eof(at: src.len())
+                }
+                let close = match toks[c2] {
+                    case .rbracket(_) => true
+                    case _            => false
+                }
+                if !close {
+                    raise error.ParseError.missing_bracket(at: tok_offset(toks[c2]))
+                }
+                section_path = _resolve(counters, n_counters, new_keys, new_keys.len(), allocator)?
+                c = c2 + 1 as usize
+                if c < n_toks {
+                    let nl = match toks[c] {
+                        case .newline(_) => true
+                        case .eof(_)     => true
+                        case _           => false
+                    }
+                    if !nl {
+                        raise error.ParseError.missing_newline(at: tok_offset(toks[c]))
+                    }
+                }
+            } else {
+                let at = tok_offset(t)
+                let (key_path, c2) = _parse_dotted_key(toks, n_toks, c, src, allocator)?
+                if c2 >= n_toks {
+                    raise error.ParseError.unexpected_eof(at: src.len())
+                }
+                let eq = match toks[c2] {
+                    case .equals(_) => true
+                    case _          => false
+                }
+                if !eq {
+                    raise error.ParseError.missing_equals(at: tok_offset(toks[c2]))
+                }
+                let (v, c3) = _parse_value(toks, n_toks, c2 + 1 as usize, src, allocator)?
+                let full_path = _concat_paths(section_path, key_path, allocator)?
+                bindings[n_bindings] = FlatBinding {
+                    path: full_path,
+                    at: at,
+                    val: v,
+                }
+                n_bindings = n_bindings + 1 as usize
+                c = c3
+                if c < n_toks {
+                    let nl = match toks[c] {
+                        case .newline(_) => true
+                        case .eof(_)     => true
+                        case _           => false
+                    }
+                    if !nl {
+                        raise error.ParseError.missing_newline(at: tok_offset(toks[c]))
+                    }
+                }
+            }
+        }
+    }
+    return (bindings, n_bindings)
+}

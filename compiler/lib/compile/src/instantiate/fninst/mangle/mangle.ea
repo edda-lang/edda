@@ -1,0 +1,197 @@
+module compile.instantiate.fninst.mangle.mangle
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.core.fmt as fmt_mod
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import specs.gen.monomorphise.address.address as addr_mod
+import specs.gen.typaths as typaths_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import local.instantiate.fninst.table.table as table_mod
+import local.instantiate.fninst.discover.discover as discover_mod
+
+
+spec std.collections.hashmap.IntMap(bool)
+spec std.core.option.Option(String)
+spec std.core.option.Option(sym_mod.Symbol)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(discover_mod.TemplateCall)
+spec std.collections.vec.Vec(table_mod.TemplateEntry)
+spec std.collections.vec.Vec(FnInstNeed)
+
+
+public type FnInstNeed {
+    entry_idx: u32
+    bound: Vec_TyId.Vec
+    mangled: sym_mod.Symbol
+}
+
+
+public function mangle(
+    entry: table_mod.TemplateEntry,
+    bound: Vec_TyId.Vec,
+    ty_paths: typaths_mod.TyPathMap,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Symbol.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let base = addr_mod.render_symbol_string(entry.name, interner, allocator)?
+    var s = string.concat("fni_", base, allocator)?
+    var k: usize = 0
+    loop
+        decreases Vec_TyId.len(bound) - k
+    {
+        if k >= Vec_TyId.len(bound) { break }
+        match render_ty(Vec_TyId.at(bound, k), ty_paths, ty_interner, interner, allocator, 16 as usize)? {
+            case .some(let r) => {
+                let s2 = string.concat(s, "_", allocator)?
+                s = string.concat(s2, r, allocator)?
+            }
+            case .none => return Option_Symbol.none
+        }
+        k += 1
+    }
+    return Option_Symbol.some(value: interner_mod.intern(mutable interner, s, allocator)?)
+}
+
+
+function render_ty(
+    t: ty_mod.TyId,
+    ty_paths: typaths_mod.TyPathMap,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+    fuel: usize,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError, divergence}
+    decreases fuel
+{
+    if fuel == 0 as usize { return Option_String.none }
+    if ty_mod.is_error(t) { return Option_String.none }
+    if ty_mod.index(t) >= ty_interner_mod.slot_count(ty_interner) { return Option_String.none }
+    match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let p) => return prim_name(p)
+        case .string_ => return Option_String.some(value: "String")
+        case .record(_) => return render_nominal(t, ty_paths, interner, allocator)?
+        case .sum_(_) => return render_nominal(t, ty_paths, interner, allocator)?
+        case .tuple_(let elems) => {
+            let count = fmt_mod.u64_to_string(Vec_TyId.len(elems) as u64, allocator)?
+            var s = string.concat("Tuple", count, allocator)?
+            var k: usize = 0
+            loop
+                decreases Vec_TyId.len(elems) - k
+            {
+                if k >= Vec_TyId.len(elems) { break }
+                match render_ty(Vec_TyId.at(elems, k), ty_paths, ty_interner, interner, allocator, fuel - 1)? {
+                    case .some(let r) => {
+                        let s2 = string.concat(s, "_", allocator)?
+                        s = string.concat(s2, r, allocator)?
+                    }
+                    case .none => return Option_String.none
+                }
+                k += 1
+            }
+            return Option_String.some(value: s)
+        }
+        case _ => return Option_String.none
+    }
+}
+
+
+function render_nominal(
+    t: ty_mod.TyId,
+    ty_paths: typaths_mod.TyPathMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match typaths_mod.ty_path_of(ty_paths, t) {
+        case .some(let tp) => {
+            var s = ""
+            var k: usize = 0
+            loop
+                decreases Vec_Symbol.len(tp.segs) - k
+            {
+                if k >= Vec_Symbol.len(tp.segs) { break }
+                let part = addr_mod.render_symbol_string(Vec_Symbol.at(tp.segs, k), interner, allocator)?
+                if k > 0 {
+                    s = string.concat(s, "_", allocator)?
+                }
+                s = string.concat(s, part, allocator)?
+                k += 1
+            }
+            return Option_String.some(value: s)
+        }
+        case .none => return Option_String.none
+    }
+}
+
+
+function prim_name(p: ty_kind_mod.PrimKind) -> Option_String.Option {
+    return match p {
+        case .i8_ => Option_String.some(value: "i8")
+        case .i16_ => Option_String.some(value: "i16")
+        case .i32_ => Option_String.some(value: "i32")
+        case .i64_ => Option_String.some(value: "i64")
+        case .i128_ => Option_String.some(value: "i128")
+        case .u8_ => Option_String.some(value: "u8")
+        case .u16_ => Option_String.some(value: "u16")
+        case .u32_ => Option_String.some(value: "u32")
+        case .u64_ => Option_String.some(value: "u64")
+        case .u128_ => Option_String.some(value: "u128")
+        case .isize_ => Option_String.some(value: "isize")
+        case .usize_ => Option_String.some(value: "usize")
+        case .f32_ => Option_String.some(value: "f32")
+        case .f64_ => Option_String.some(value: "f64")
+        case .bool_ => Option_String.some(value: "bool")
+        case .codepoint_ => Option_String.some(value: "Codepoint")
+        case .unit_ => Option_String.some(value: "unit")
+        case _ => Option_String.none
+    }
+}
+
+public function needs_from_calls(
+    calls: Vec_TemplateCall.Vec,
+    t: table_mod.TemplateTable,
+    ty_paths: typaths_mod.TyPathMap,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    seen: mutable IntMap_bool.IntMap,
+    needs: mutable Vec_FnInstNeed.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var i: usize = 0
+    loop
+        decreases Vec_TemplateCall.len(calls) - i
+    {
+        if i >= Vec_TemplateCall.len(calls) { break }
+        let c = Vec_TemplateCall.at(calls, i)
+        let entry = Vec_TemplateEntry.at(t.entries, c.entry_idx as usize)
+        match mangle(entry, c.bound, ty_paths, ty_interner, mutable interner, allocator)? {
+            case .some(let mname) => {
+                if !IntMap_bool.contains(seen, mname.raw as i64) {
+                    let _ = IntMap_bool.insert(mutable seen, mname.raw as i64, true, allocator)?
+                    Vec_FnInstNeed.push(mutable needs, FnInstNeed {
+                        entry_idx: c.entry_idx,
+                        bound: c.bound,
+                        mangled: mname,
+                    }, allocator)?
+                }
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+}

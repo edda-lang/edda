@@ -1,0 +1,127 @@
+module jwt.base64url
+
+import std.mem.alloc
+import std.text.string
+
+
+public type Base64UrlError {
+    case invalid_length
+    case invalid_char
+}
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _encoded_length(byte_count: usize) -> usize {
+    let full = byte_count / 3 as usize
+    let rem = byte_count - full * 3 as usize
+    let base = full * 4 as usize
+    if rem == 0 as usize {
+        return base
+    }
+    return base + rem + 1 as usize
+}
+
+function _b64url_char(v: u8) -> u8 {
+    let idx = v & 0x3F as u8
+    if idx < 26 as u8 { return 0x41 as u8 +% idx }
+    if idx < 52 as u8 { return 0x61 as u8 +% (idx -% 26 as u8) }
+    if idx < 62 as u8 { return 0x30 as u8 +% (idx -% 52 as u8) }
+    if idx == 62 as u8 { return 0x2D as u8 }
+    return 0x5F as u8
+}
+
+public function encode(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    let out_len = _encoded_length(n)
+    var out = _alloc_byte_slab(allocator, out_len)?
+    let full = n / 3 as usize
+    var k: usize = 0
+    loop decreases full - k {
+        if k >= full { break }
+        let b0 = bytes[3 as usize * k]
+        let b1 = bytes[3 as usize * k + 1 as usize]
+        let b2 = bytes[3 as usize * k + 2 as usize]
+        out[4 as usize * k] = _b64url_char(b0 >> 2 as u8)
+        out[4 as usize * k + 1 as usize] = _b64url_char(((b0 & 0x03 as u8) << 4 as u8) | (b1 >> 4 as u8))
+        out[4 as usize * k + 2 as usize] = _b64url_char(((b1 & 0x0F as u8) << 2 as u8) | (b2 >> 6 as u8))
+        out[4 as usize * k + 3 as usize] = _b64url_char(b2 & 0x3F as u8)
+        k = k + 1 as usize
+    }
+    let rem = n - full * 3 as usize
+    if rem != 0 as usize {
+        let o = 4 as usize * full
+        let b0 = bytes[3 as usize * full]
+        out[o] = _b64url_char(b0 >> 2 as u8)
+        if rem == 1 as usize {
+            out[o + 1 as usize] = _b64url_char((b0 & 0x03 as u8) << 4 as u8)
+        } else {
+            let b1 = bytes[3 as usize * full + 1 as usize]
+            out[o + 1 as usize] = _b64url_char(((b0 & 0x03 as u8) << 4 as u8) | (b1 >> 4 as u8))
+            out[o + 2 as usize] = _b64url_char((b1 & 0x0F as u8) << 2 as u8)
+        }
+    }
+    return string.from_owned_utf8(take out)
+}
+
+function _b64url_val(c: u8) -> u8
+    with {err: Base64UrlError}
+{
+    if c >= 0x41 as u8 && c <= 0x5A as u8 { return c -% 0x41 as u8 }
+    if c >= 0x61 as u8 && c <= 0x7A as u8 { return c -% 0x61 as u8 +% 26 as u8 }
+    if c >= 0x30 as u8 && c <= 0x39 as u8 { return c -% 0x30 as u8 +% 52 as u8 }
+    if c == 0x2D as u8 { return 62 as u8 }
+    if c == 0x5F as u8 { return 63 as u8 }
+    raise Base64UrlError.invalid_char
+}
+
+function _decoded_length(string_len: usize) -> usize
+    with {err: Base64UrlError}
+{
+    let quads = string_len / 4 as usize
+    let rem = string_len - quads * 4 as usize
+    if rem == 1 as usize { raise Base64UrlError.invalid_length }
+    let base = quads * 3 as usize
+    if rem == 0 as usize { return base }
+    return base + rem - 1 as usize
+}
+
+public function decode(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: Base64UrlError}
+{
+    let src = s.bytes()
+    let sn = src.len()
+    let out_len = _decoded_length(sn)?
+    var out = _alloc_byte_slab(allocator, out_len)?
+    let full = sn / 4 as usize
+    var k: usize = 0
+    var w: usize = 0
+    loop decreases full - k {
+        if k >= full { break }
+        let v0 = _b64url_val(src[4 as usize * k])?
+        let v1 = _b64url_val(src[4 as usize * k + 1 as usize])?
+        let v2 = _b64url_val(src[4 as usize * k + 2 as usize])?
+        let v3 = _b64url_val(src[4 as usize * k + 3 as usize])?
+        out[w] = (v0 << 2 as u8) | (v1 >> 4 as u8)
+        out[w + 1 as usize] = (v1 << 4 as u8) | (v2 >> 2 as u8)
+        out[w + 2 as usize] = (v2 << 6 as u8) | v3
+        k = k + 1 as usize
+        w = w + 3 as usize
+    }
+    let rem = sn - full * 4 as usize
+    if rem >= 2 as usize {
+        let base = 4 as usize * full
+        let v0 = _b64url_val(src[base])?
+        let v1 = _b64url_val(src[base + 1 as usize])?
+        out[w] = (v0 << 2 as u8) | (v1 >> 4 as u8)
+        w = w + 1 as usize
+        if rem == 3 as usize {
+            let v2 = _b64url_val(src[base + 2 as usize])?
+            out[w] = (v1 << 4 as u8) | (v2 >> 2 as u8)
+        }
+    }
+    return out
+}

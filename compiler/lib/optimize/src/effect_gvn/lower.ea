@@ -1,0 +1,279 @@
+
+module optimize.effect_gvn.lower
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import types.pass.ty as ty_mod
+import egraph.eclass as eclass_mod
+import egraph.graph.enode as enode_mod
+import egraph.graph.graph as graph_mod
+import ir.hlir.id.value as value_mod
+import ir.hlir.op as hlir_op_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+
+
+spec std.collections.vec.Vec(eclass_mod.EClassId)
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.hashmap.IntMap(eclass_mod.EClassId)
+spec std.core.option.Option(eclass_mod.EClassId)
+
+
+public function fresh_opaque(
+    built: mutable mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> eclass_mod.EClassId
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let marker = built.fresh_counter
+    built.fresh_counter = built.fresh_counter + 1
+    let node = enode_mod.ENode {
+        kind: enode_mod.EnodeKind.literal(c: hlir_op_mod.HConstant.int_(value: marker, ty: ty_mod.error())),
+        flags: default_flags(),
+    }
+    return graph_mod.add_class(mutable built.graph, take node, allocator)?
+}
+
+
+function default_flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+
+public function operand_class(
+    built: mutable mapping_mod.BuildResult,
+    v: value_mod.ValueId,
+    allocator: Allocator,
+) -> eclass_mod.EClassId
+    with {allocator, err: alloc.AllocError, panic}
+{
+    return match IntMap_EClassId.get(built.value_to_class, v.raw as i64) {
+        case .some(let class_) => class_
+        case .none => fresh_opaque(mutable built, allocator)?
+    }
+}
+
+
+public function lower_op_node(
+    built: mutable mapping_mod.BuildResult,
+    op: hlir_op_mod.HlirOp,
+    allocator: Allocator,
+) -> enode_mod.ENode
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let kind = lower_op_kind(mutable built, op.kind, allocator)?
+    return enode_mod.ENode {
+        kind: kind,
+        flags: op.flags,
+    }
+}
+
+
+function lower_op_kind(
+    built: mutable mapping_mod.BuildResult,
+    kind: hlir_op_mod.HlirOpKind,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    return match kind {
+        case .literal(let c) => enode_mod.EnodeKind.literal(c: c)
+        case .binary(let bop, let lhs, let rhs) => lower_binary(mutable built, bop, lhs, rhs, allocator)?
+        case .unary(let uop, let operand) => lower_unary(mutable built, uop, operand, allocator)?
+        case .cast(let value, let from, let to, let ck) => lower_cast(mutable built, value, from, to, ck, allocator)?
+        case .call_(let callee_v, let args) => lower_call(mutable built, callee_v, args, allocator)?
+        case .field(let operand, let index) => lower_field(mutable built, operand, index, allocator)?
+        case .index(let operand, let index_v) => lower_index(mutable built, operand, index_v, allocator)?
+        case .slice_subrange(let operand, let lo_v, let hi_v) => fresh_marker(mutable built)
+        case .len(let operand) => lower_len(mutable built, operand, allocator)?
+        case .discriminant(let operand) => lower_discriminant(mutable built, operand, allocator)?
+        case .aggregate(let akind, let elems) => lower_aggregate(mutable built, akind, elems, allocator)?
+        case .ref_(let bkind, let operand) => lower_ref(mutable built, bkind, operand, allocator)?
+        case .deref_(let operand) => fresh_marker(mutable built)
+        case .field_addr(_, _) => fresh_marker(mutable built)
+        case .index_addr(_, _) => fresh_marker(mutable built)
+        case .subrange_addr(_, _, _) => fresh_marker(mutable built)
+        case .deref_addr(_) => fresh_marker(mutable built)
+        case .store_(_, _) => fresh_marker(mutable built)
+        case .stack_alloc(_) => fresh_marker(mutable built)
+        case .call_indirect(let callee_v, let args) => fresh_marker(mutable built)
+        case .make_closure(let code, let env) => fresh_marker(mutable built)
+        case .err_flag => fresh_marker(mutable built)
+    }
+}
+
+
+function fresh_marker(built: mutable mapping_mod.BuildResult) -> enode_mod.EnodeKind {
+    let marker = built.fresh_counter
+    built.fresh_counter = built.fresh_counter + 1
+    return enode_mod.EnodeKind.literal(c: hlir_op_mod.HConstant.int_(value: marker, ty: ty_mod.error()))
+}
+
+
+function lower_binary(
+    built: mutable mapping_mod.BuildResult,
+    bop: hlir_op_mod.HBinOp,
+    lhs: value_mod.ValueId,
+    rhs: value_mod.ValueId,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let lc = operand_class(mutable built, lhs, allocator)?
+    let rc = operand_class(mutable built, rhs, allocator)?
+    return enode_mod.EnodeKind.binary(op: bop, lhs: lc, rhs: rc)
+}
+
+
+function lower_unary(
+    built: mutable mapping_mod.BuildResult,
+    uop: hlir_op_mod.HUnOp,
+    operand: value_mod.ValueId,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let oc = operand_class(mutable built, operand, allocator)?
+    return enode_mod.EnodeKind.unary(op: uop, operand: oc)
+}
+
+
+function lower_cast(
+    built: mutable mapping_mod.BuildResult,
+    value: value_mod.ValueId,
+    from: ty_mod.TyId,
+    to: ty_mod.TyId,
+    ck: hlir_op_mod.HCastKind,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let vc = operand_class(mutable built, value, allocator)?
+    return enode_mod.EnodeKind.cast(value: vc, from: from, to: to, kind: ck)
+}
+
+
+function lower_call(
+    built: mutable mapping_mod.BuildResult,
+    callee_v: value_mod.ValueId,
+    args: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let cc = operand_class(mutable built, callee_v, allocator)?
+    let arg_classes = lower_value_vec(mutable built, args, allocator)?
+    return enode_mod.EnodeKind.call_(callee: cc, args: arg_classes)
+}
+
+
+function lower_field(
+    built: mutable mapping_mod.BuildResult,
+    operand: value_mod.ValueId,
+    index: u32,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let oc = operand_class(mutable built, operand, allocator)?
+    return enode_mod.EnodeKind.field(operand: oc, index: index)
+}
+
+
+function lower_index(
+    built: mutable mapping_mod.BuildResult,
+    operand: value_mod.ValueId,
+    index_v: value_mod.ValueId,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let oc = operand_class(mutable built, operand, allocator)?
+    let ic = operand_class(mutable built, index_v, allocator)?
+    return enode_mod.EnodeKind.index(operand: oc, index_v: ic)
+}
+
+
+function lower_len(
+    built: mutable mapping_mod.BuildResult,
+    operand: value_mod.ValueId,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let oc = operand_class(mutable built, operand, allocator)?
+    return enode_mod.EnodeKind.len(operand: oc)
+}
+
+
+function lower_discriminant(
+    built: mutable mapping_mod.BuildResult,
+    operand: value_mod.ValueId,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let oc = operand_class(mutable built, operand, allocator)?
+    return enode_mod.EnodeKind.discriminant(operand: oc)
+}
+
+
+function lower_aggregate(
+    built: mutable mapping_mod.BuildResult,
+    akind: hlir_op_mod.HAggregateKind,
+    elems: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let elem_classes = lower_value_vec(mutable built, elems, allocator)?
+    return enode_mod.EnodeKind.aggregate(kind: akind, elems: elem_classes)
+}
+
+
+function lower_ref(
+    built: mutable mapping_mod.BuildResult,
+    bkind: hlir_op_mod.HBorrowKind,
+    operand: value_mod.ValueId,
+    allocator: Allocator,
+) -> enode_mod.EnodeKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let oc = operand_class(mutable built, operand, allocator)?
+    return enode_mod.EnodeKind.ref_(kind: bkind, operand: oc)
+}
+
+
+function lower_value_vec(
+    built: mutable mapping_mod.BuildResult,
+    values: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> Vec_EClassId.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit out: Vec_EClassId.Vec
+    Vec_EClassId.new(init out, allocator)?
+    let n = Vec_ValueId.len(values)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let v = Vec_ValueId.at(values, i)
+        let class_ = operand_class(mutable built, v, allocator)?
+        Vec_EClassId.push(mutable out, class_, allocator)?
+        i = i + 1
+    }
+    return out
+}

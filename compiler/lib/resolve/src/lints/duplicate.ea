@@ -1,0 +1,217 @@
+
+module resolve.lints.duplicate
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.ident as ast_ident
+import syntax.ast.tree as ast_tree
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import manifest.lex.toml.val.values as values_mod
+import local.ctx as ctx_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.core.option.Option(Vec_Ident)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.mem.alloc.Box(ast_item.SpecInvocation)
+spec std.collections.vec.Vec(ast_tree.Expr)
+
+
+public function check_duplicate_imports(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_duplicate_imports_in_file(mutable ctx, interner, Vec_File.at(files, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function check_duplicate_imports_in_file(ctx: mutable ctx_mod.ResolveCtx, interner: interner_mod.Interner, file: ast_file.File, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit seen: Vec_Symbol.Vec
+    Vec_Symbol.new(init seen, allocator)?
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .import_(let imp) => check_import_names(mutable ctx, mutable seen, interner, imp, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function check_import_names(ctx: mutable ctx_mod.ResolveCtx, seen: mutable Vec_Symbol.Vec, interner: interner_mod.Interner, imp: ast_item.Import, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match imp.selection {
+        case .some(let names) => {
+            let n = Vec_Ident.len(names)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let nm = Vec_Ident.at(names, i)
+                check_and_record(mutable ctx, mutable seen, interner, nm.name, nm.span, allocator)?
+                i = i + 1
+            }
+        }
+        case .none => {
+            let bound = match imp.alias {
+                case .some(let a) => a
+                case .none => last_ident(imp.path)
+            }
+            check_and_record(mutable ctx, mutable seen, interner, bound.name, bound.span, allocator)?
+        }
+    }
+}
+
+
+function last_ident(path: ast_ident.Path) -> ast_ident.Ident {
+    let n = Vec_Ident.len(path.segments)
+    return Vec_Ident.at(path.segments, n - 1)
+}
+
+
+function contains_symbol(list: Vec_Symbol.Vec, name: symbol.Symbol) -> bool {
+    let n = Vec_Symbol.len(list)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_Symbol.at(list, i).raw == name.raw { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function check_and_record(ctx: mutable ctx_mod.ResolveCtx, seen: mutable Vec_Symbol.Vec, interner: interner_mod.Interner, name: symbol.Symbol, at: span_mod.Span, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if contains_symbol(seen, name) {
+        let bytes = interner_mod.lookup(interner, name)
+        let name_str = values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+        let msg = f"duplicate import of `{name_str}`"
+        let d = diag_mod.warn_at(diag_code_mod.duplicate_import(), at, msg)
+        ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+    }
+    Vec_Symbol.push(mutable seen, name, allocator)?
+}
+
+
+public function check_duplicate_spec_invocations(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_duplicate_spec_invocations_in_file(mutable ctx, Vec_File.at(files, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function check_duplicate_spec_invocations_in_file(ctx: mutable ctx_mod.ResolveCtx, file: ast_file.File, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_spec_invocation_against_earlier(mutable ctx, file.items, i, allocator)?
+        i = i + 1
+    }
+}
+
+
+function check_spec_invocation_against_earlier(ctx: mutable ctx_mod.ResolveCtx, items: Vec_Item.Vec, i: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let item = Vec_Item.at(items, i)
+    let inv = match item.kind {
+        case .spec_invocation(let boxed) => Box_SpecInvocation.get(boxed)
+        case _ => return
+    }
+    var j: usize = 0
+    loop decreases (i - j) {
+        if j >= i { break }
+        let earlier = Vec_Item.at(items, j)
+        match earlier.kind {
+            case .spec_invocation(let eboxed) => {
+                if spec_invocations_equal(inv, Box_SpecInvocation.get(eboxed)) {
+                    let d = diag_mod.warn_at(diag_code_mod.duplicate_spec_invocation(), inv.span, "duplicate spec invocation — same module path and arguments as an earlier invocation in this file")
+                    ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+                    return
+                }
+            }
+            case _ => ()
+        }
+        j = j + 1
+    }
+}
+
+
+function spec_invocations_equal(a: ast_item.SpecInvocation, b: ast_item.SpecInvocation) -> bool {
+    if !spec_paths_equal(a.path, b.path) { return false }
+    return spec_args_equal(a.args, b.args)
+}
+
+
+function spec_paths_equal(a: ast_ident.Path, b: ast_ident.Path) -> bool {
+    let na = Vec_Ident.len(a.segments)
+    let nb = Vec_Ident.len(b.segments)
+    if na != nb { return false }
+    var i: usize = 0
+    loop decreases (na - i) {
+        if i >= na { break }
+        if Vec_Ident.at(a.segments, i).name.raw != Vec_Ident.at(b.segments, i).name.raw { return false }
+        i = i + 1
+    }
+    return true
+}
+
+
+function spec_args_equal(a: Vec_Expr.Vec, b: Vec_Expr.Vec) -> bool {
+    let na = Vec_Expr.len(a)
+    let nb = Vec_Expr.len(b)
+    if na != nb { return false }
+    var i: usize = 0
+    loop decreases (na - i) {
+        if i >= na { break }
+        if !spec_arg_expr_equal(Vec_Expr.at(a, i), Vec_Expr.at(b, i)) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+
+function spec_arg_expr_equal(a: ast_tree.Expr, b: ast_tree.Expr) -> bool {
+    return match a.kind {
+        case .path(let pa) => match b.kind {
+            case .path(let pb) => spec_paths_equal(pa, pb)
+            case _ => false
+        }
+        case .literal(let la) => match b.kind {
+            case .literal(let lb) => la == lb
+            case _ => false
+        }
+        case _ => false
+    }
+}

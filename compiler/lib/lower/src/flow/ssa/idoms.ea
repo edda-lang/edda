@@ -1,0 +1,143 @@
+
+module lower.flow.ssa.idoms
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.flow.cfg.cfg as cfg_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+
+
+public function compute_idoms(
+    out: init Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    pred_offsets: Vec_usize.Vec,
+    pred_pool: Vec_u32.Vec,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit idom: Vec_u32.Vec
+    Vec_u32.new(init idom, allocator)?
+    var i: usize = 0
+    loop decreases n_blocks - i {
+        if i >= n_blocks { break }
+        Vec_u32.push(mutable idom, 0 as u32, allocator)?
+        i += 1
+    }
+    if n_blocks >= 2 {
+        Vec_u32.set_at(mutable idom, 1, 1 as u32)
+    }
+    var fuel: usize = n_blocks + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        if !idom_round(mutable idom, cfg, pred_offsets, pred_pool, n_blocks) { break }
+    }
+    out = idom
+}
+
+
+function idom_round(
+    idom: mutable Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    pred_offsets: Vec_usize.Vec,
+    pred_pool: Vec_u32.Vec,
+    n_blocks: usize,
+) -> bool {
+    var changed = false
+    let m = Vec_u32.len(cfg.rpo_order)
+    var k: usize = 0
+    loop decreases m - k {
+        if k >= m { break }
+        let b = Vec_u32.at(cfg.rpo_order, k)
+        if b != (1 as u32) {
+            if (b as usize) < n_blocks {
+                let new_idom = recompute_idom(idom, cfg, pred_offsets, pred_pool, b as usize)
+                if new_idom != (0 as u32) {
+                    if Vec_u32.at(idom, b as usize) != new_idom {
+                        Vec_u32.set_at(mutable idom, b as usize, new_idom)
+                        changed = true
+                    }
+                }
+            }
+        }
+        k += 1
+    }
+    return changed
+}
+
+
+function recompute_idom(
+    idom: Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    pred_offsets: Vec_usize.Vec,
+    pred_pool: Vec_u32.Vec,
+    b: usize,
+) -> u32 {
+    if b + 1 >= Vec_usize.len(pred_offsets) { return 0 }
+    var i = Vec_usize.at(pred_offsets, b)
+    let end = Vec_usize.at(pred_offsets, b + 1)
+    var new_idom: u32 = 0
+    loop decreases end - i {
+        if i >= end { break }
+        if i < Vec_u32.len(pred_pool) {
+            let p = Vec_u32.at(pred_pool, i)
+            if (p as usize) < Vec_u32.len(idom) {
+                if Vec_u32.at(idom, p as usize) != (0 as u32) || p == (1 as u32) {
+                    if new_idom == (0 as u32) {
+                        new_idom = p
+                    } else {
+                        new_idom = intersect_rpo(idom, cfg.rpo_pos, new_idom, p)
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    return new_idom
+}
+
+
+function intersect_rpo(
+    idom: Vec_u32.Vec,
+    rpo_pos: Vec_u32.Vec,
+    a: u32,
+    b: u32,
+) -> u32 {
+    if a == (0 as u32) { return b }
+    if b == (0 as u32) { return a }
+    let budget = Vec_u32.len(idom) + Vec_u32.len(idom) + 4
+    var x = a
+    var y = b
+    var steps: usize = 0
+    loop decreases budget - steps {
+        if steps >= budget { break }
+        if x == y { return x }
+        if (x as usize) >= Vec_u32.len(rpo_pos) { break }
+        if (y as usize) >= Vec_u32.len(rpo_pos) { break }
+        let rx = Vec_u32.at(rpo_pos, x as usize)
+        let ry = Vec_u32.at(rpo_pos, y as usize)
+        if rx == (0 as u32) { break }
+        if ry == (0 as u32) { break }
+        if rx > ry {
+            if (x as usize) >= Vec_u32.len(idom) { break }
+            let px = Vec_u32.at(idom, x as usize)
+            if px == (0 as u32) { break }
+            if px == x { break }
+            x = px
+        } else {
+            if (y as usize) >= Vec_u32.len(idom) { break }
+            let py = Vec_u32.at(idom, y as usize)
+            if py == (0 as u32) { break }
+            if py == y { break }
+            y = py
+        }
+        steps += 1
+    }
+    return 1 as u32
+}

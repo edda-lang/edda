@@ -1,0 +1,285 @@
+
+module refine.solver.cdcl.core.core
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.cdcl.core.trail as trail_mod
+import local.solver.cdcl.prop.clause as clause_mod
+import local.solver.theory.theory as theory_mod
+import local.solver.cdcl.core.state as state_mod
+import local.solver.cdcl.prop.propagate as propagate_mod
+import local.solver.cdcl.analyze as analyze_mod
+
+
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(usize)
+spec std.core.option.Option(lit_mod.Lit)
+spec std.core.option.Option(usize)
+
+
+public function add_clause_lits(
+    s: mutable state_mod.Solver,
+    lits: take Vec_Lit.Vec,
+    origin: take Vec_usize.Vec,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Lit.len(lits)
+    if n == 0 {
+        s.ok = false
+        s.ok_conflict_origin = origin
+        return false
+    }
+    let ci = clause_mod.add_clause(mutable s.db, take lits, false, take origin, allocator)?
+    state_mod.attach_watches(mutable s, ci, allocator)?
+    if clause_mod.clause_len(s.db, ci) == 1 {
+        let l0 = clause_mod.clause_lit(s.db, ci, 0)
+        if state_mod.lit_false(s, l0) {
+            s.ok = false
+            uninit combined: Vec_usize.Vec
+            Vec_usize.new(init combined, allocator)?
+            clause_mod.union_origin_into(mutable combined, s.db, ci, allocator)?
+            match trail_mod.var_reason(s.trail, lit_mod.lit_var(l0)) {
+                case .propagated(let earlier_ci) => {
+                    clause_mod.union_origin_into(mutable combined, s.db, earlier_ci, allocator)?
+                }
+                case .decision => {}
+            }
+            s.ok_conflict_origin = combined
+            return false
+        }
+        if !state_mod.lit_true(s, l0) {
+            trail_mod.assign(mutable s.trail, l0, trail_mod.Reason.propagated(clause: ci), allocator)?
+        }
+    }
+    return true
+}
+
+
+function origin_of_lits(s: state_mod.Solver, lits: Vec_Lit.Vec, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit acc: Vec_usize.Vec
+    Vec_usize.new(init acc, allocator)?
+    let n = Vec_Lit.len(lits)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let l = Vec_Lit.at(lits, i)
+        match trail_mod.var_reason(s.trail, lit_mod.lit_var(l)) {
+            case .propagated(let ci) => {
+                clause_mod.union_origin_into(mutable acc, s.db, ci, allocator)?
+            }
+            case .decision => {}
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+
+function pick_branch(s: state_mod.Solver) -> Option_Lit.Option {
+    var v: usize = 0
+    loop
+        decreases (s.n_vars - v)
+    {
+        if v >= s.n_vars {
+            break
+        }
+        match trail_mod.var_value(s.trail, v) {
+            case .lundef => return Option_Lit.some(value: lit_mod.make_lit(v, false))
+            case _ => {}
+        }
+        v = v + 1
+    }
+    return Option_Lit.none
+}
+
+
+function collect_clause(s: state_mod.Solver, ci: usize, allocator: Allocator) -> Vec_Lit.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Lit.Vec
+    Vec_Lit.new(init out, allocator)?
+    let n = clause_mod.clause_len(s.db, ci)
+    var k: usize = 0
+    loop
+        decreases (n - k)
+    {
+        if k >= n {
+            break
+        }
+        let l = clause_mod.clause_lit(s.db, ci, k)
+        Vec_Lit.push(mutable out, take l, allocator)?
+        k = k + 1
+    }
+    return out
+}
+
+
+function install_learned(s: mutable state_mod.Solver, learned: analyze_mod.Learned, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let lits = learned.lits
+    let origin = learned.core
+    let count = Vec_Lit.len(lits)
+    let asserting = if count > 0 {
+        Vec_Lit.at(lits, 0)
+    } else {
+        lit_mod.make_lit(0, false)
+    }
+    let ci = clause_mod.add_clause(mutable s.db, take lits, true, take origin, allocator)?
+    state_mod.attach_watches(mutable s, ci, allocator)?
+    if count > 0 {
+        trail_mod.assign(mutable s.trail, asserting, trail_mod.Reason.propagated(clause: ci), allocator)?
+    }
+}
+
+
+function install_explanation(s: mutable state_mod.Solver, expl: Vec_Lit.Vec, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Lit.len(expl)
+    if n == 0 {
+        return false
+    }
+    let blocking_origin = origin_of_lits(s, expl, allocator)?
+    uninit blocking: Vec_Lit.Vec
+    Vec_Lit.new(init blocking, allocator)?
+    var max_level: u32 = 0
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let l = Vec_Lit.at(expl, i)
+        let lv = trail_mod.var_level(s.trail, lit_mod.lit_var(l))
+        if lv > max_level {
+            max_level = lv
+        }
+        let nl = lit_mod.lit_negate(l)
+        Vec_Lit.push(mutable blocking, take nl, allocator)?
+        i = i + 1
+    }
+    if max_level == 0 as u32 {
+        return false
+    }
+    let ci = clause_mod.add_clause(mutable s.db, take blocking, true, take blocking_origin, allocator)?
+    state_mod.attach_watches(mutable s, ci, allocator)?
+    if trail_mod.decision_level(s.trail) > max_level {
+        trail_mod.backjump_to(mutable s.trail, max_level)
+        s.qhead = trail_mod.stack_len(s.trail)
+    }
+    let learned = analyze_mod.run(s, ci, allocator)?
+    trail_mod.backjump_to(mutable s.trail, learned.bt_level)
+    s.qhead = trail_mod.stack_len(s.trail)
+    install_learned(mutable s, learned, allocator)?
+    return true
+}
+
+
+function theory_consult(s: mutable state_mod.Solver, allocator: Allocator) -> theory_mod.TheoryVerdict
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    theory_mod.begin_consult(mutable s.theory)
+    var v: usize = 0
+    loop
+        decreases (s.n_vars - v)
+    {
+        if v >= s.n_vars {
+            break
+        }
+        match trail_mod.var_value(s.trail, v) {
+            case .ltrue => {
+                let lit = lit_mod.make_lit(v, false)
+                theory_mod.assert_recipe(mutable s.theory, v, true, lit, allocator)?
+            }
+            case .lfalse => {
+                let lit = lit_mod.make_lit(v, true)
+                theory_mod.assert_recipe(mutable s.theory, v, false, lit, allocator)?
+            }
+            case .lundef => {}
+        }
+        v = v + 1
+    }
+    return theory_mod.check(mutable s.theory, allocator)?
+}
+
+
+function conflict_budget() -> usize {
+    return 20000
+}
+
+
+public function solve(s: mutable state_mod.Solver, allocator: Allocator) -> state_mod.SolveResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if !s.ok {
+        uninit core: Vec_Lit.Vec
+        Vec_Lit.new(init core, allocator)?
+        uninit premise_core: Vec_usize.Vec
+        Vec_usize.new(init premise_core, allocator)?
+        Vec_usize.extend_from_slice(mutable premise_core, Vec_usize.as_slice(s.ok_conflict_origin), allocator)?
+        return state_mod.SolveResult.unsat(core: core, premise_core: premise_core)
+    }
+    var fuel: usize = conflict_budget()
+    loop {
+        let confl = propagate_mod.run(mutable s, allocator)?
+        match confl {
+            case .some(let ci) => {
+                if trail_mod.decision_level(s.trail) == 0 as u32 {
+                    let core = collect_clause(s, ci, allocator)?
+                    uninit premise_core: Vec_usize.Vec
+                    Vec_usize.new(init premise_core, allocator)?
+                    clause_mod.union_origin_into(mutable premise_core, s.db, ci, allocator)?
+                    return state_mod.SolveResult.unsat(core: core, premise_core: premise_core)
+                }
+                if fuel == 0 {
+                    return state_mod.SolveResult.unknown
+                }
+                fuel = fuel - 1
+                let learned = analyze_mod.run(s, ci, allocator)?
+                trail_mod.backjump_to(mutable s.trail, learned.bt_level)
+                s.qhead = trail_mod.stack_len(s.trail)
+                install_learned(mutable s, learned, allocator)?
+            }
+            case .none => {
+                match pick_branch(s) {
+                    case .some(let l) => {
+                        trail_mod.new_level(mutable s.trail, allocator)?
+                        trail_mod.assign(mutable s.trail, l, trail_mod.Reason.decision, allocator)?
+                    }
+                    case .none => {
+                        match theory_consult(mutable s, allocator)? {
+                            case .consistent => return state_mod.SolveResult.sat
+                            case .conflict(let expl) => {
+                                if trail_mod.decision_level(s.trail) == 0 as u32 {
+                                    let premise_core = origin_of_lits(s, expl, allocator)?
+                                    return state_mod.SolveResult.unsat(core: expl, premise_core: premise_core)
+                                }
+                                if fuel == 0 {
+                                    return state_mod.SolveResult.unknown
+                                }
+                                fuel = fuel - 1
+                                let cont = install_explanation(mutable s, expl, allocator)?
+                                if !cont {
+                                    let premise_core = origin_of_lits(s, expl, allocator)?
+                                    return state_mod.SolveResult.unsat(core: expl, premise_core: premise_core)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

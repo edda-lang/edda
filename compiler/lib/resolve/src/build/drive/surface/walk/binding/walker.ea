@@ -1,0 +1,383 @@
+
+module resolve.build.drive.surface.walk.binding.walker
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import intern.interner as intern_mod
+import intern.symbol
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.ident as ast_ident
+import hir.def as def_mod
+import local.bind.bindings as bindings_mod
+import local.build.builtins as builtins_mod
+import local.ctx as ctx_mod
+import local.map.error as error_mod
+import local.paths.modules as mt_mod
+import local.build.drive.surface.walk.binding.claim as claim_mod
+import local.build.drive.surface.walk.binding.rules as rules_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.core.option.Option(def_mod.DefId)
+spec std.mem.alloc.Box(ast_item.FnDecl)
+spec std.mem.alloc.Box(ast_item.TypeDecl)
+spec std.mem.alloc.Box(ast_item.Spec)
+spec std.mem.alloc.Box(ast_item.LetDecl)
+spec std.mem.alloc.Box(ast_item.Derive)
+
+
+public type DeriveWhitelist {
+    eq: symbol.Symbol
+    ord: symbol.Symbol
+    hash: symbol.Symbol
+    debug: symbol.Symbol
+    clone: symbol.Symbol
+    properties: symbol.Symbol
+    serialize: symbol.Symbol
+    deserialize: symbol.Symbol
+}
+
+public function new_derive_whitelist(interner: mutable intern_mod.Interner, allocator: Allocator) -> DeriveWhitelist
+    with {allocator, err: alloc.AllocError}
+{
+    let s_eq = intern_mod.intern(mutable interner, "eq", allocator)?
+    let s_ord = intern_mod.intern(mutable interner, "ord", allocator)?
+    let s_hash = intern_mod.intern(mutable interner, "hash", allocator)?
+    let s_debug = intern_mod.intern(mutable interner, "debug", allocator)?
+    let s_clone = intern_mod.intern(mutable interner, "clone", allocator)?
+    let s_properties = intern_mod.intern(mutable interner, "properties", allocator)?
+    let s_serialize = intern_mod.intern(mutable interner, "serialize", allocator)?
+    let s_deserialize = intern_mod.intern(mutable interner, "deserialize", allocator)?
+    return DeriveWhitelist {
+        eq: s_eq,
+        ord: s_ord,
+        hash: s_hash,
+        debug: s_debug,
+        clone: s_clone,
+        properties: s_properties,
+        serialize: s_serialize,
+        deserialize: s_deserialize,
+    }
+}
+
+function is_admitted(wl: DeriveWhitelist, name: symbol.Symbol) -> bool {
+    if name.raw == wl.eq.raw { return true }
+    if name.raw == wl.ord.raw { return true }
+    if name.raw == wl.hash.raw { return true }
+    if name.raw == wl.debug.raw { return true }
+    if name.raw == wl.clone.raw { return true }
+    if name.raw == wl.properties.raw { return true }
+    if name.raw == wl.serialize.raw { return true }
+    if name.raw == wl.deserialize.raw { return true }
+    return false
+}
+
+
+public function walk_file(
+    ctx: mutable ctx_mod.ResolveCtx,
+    file: ast_file.File,
+    wl: DeriveWhitelist,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> mt_mod.ModuleId
+    with {allocator, err: alloc.AllocError}
+{
+    let mod_id = ctx_mod.alloc_module_id(mutable ctx)
+    uninit table: bindings_mod.SymbolTable
+    table = bindings_mod.new_table(allocator)?
+    register_module_path_from_items(mutable ctx, file.items, mod_id, allocator)?
+    let in_task_mod = claim_mod.module_path_is_std_task(file.items, interner)
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        register_item(mutable ctx, mutable table, item, wl, in_task_mod, interner, allocator)?
+        i = i + 1
+    }
+    ctx_mod.register_module(mutable ctx, mod_id, table, allocator)?
+    rules_mod.check_derive_rules(mutable ctx, file.items, wl.eq, wl.ord, interner, allocator)?
+    return mod_id
+}
+
+public function walk_package(
+    ctx: mutable ctx_mod.ResolveCtx,
+    files: Vec_File.Vec,
+    wl: DeriveWhitelist,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_File.at(files, i)
+        let _ = walk_file(mutable ctx, file, wl, interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function register_module_path_from_items(
+    ctx: mutable ctx_mod.ResolveCtx,
+    items: Vec_Item.Vec,
+    mod_id: mt_mod.ModuleId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .module_(let decl) => {
+                let segs = build_path_segments(decl.path, allocator)?
+                ctx_mod.register_module_path(mutable ctx, take segs, mod_id, allocator)?
+                break
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+function build_path_segments(path: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    let n = Vec_Ident.len(path.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(path.segments, i)
+        Vec_Symbol.push(mutable segs, id.name, allocator)?
+        i = i + 1
+    }
+    return segs
+}
+
+
+function register_item(
+    ctx: mutable ctx_mod.ResolveCtx,
+    table: mutable bindings_mod.SymbolTable,
+    item: ast_item.Item,
+    wl: DeriveWhitelist,
+    in_task_mod: bool,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match item.kind {
+        case .function_(let decl) => {
+            let fnd = Box_FnDecl.get(decl)
+            match intrinsic_extern_def(fnd.body, interner) {
+                case .some(let def) => register_named_with_def(mutable ctx, mutable table, fnd.name, def, interner, allocator)?
+                case .none => {
+                    match claim_mod.reserved_task_body_def(fnd.name, in_task_mod, interner) {
+                        case .some(let def) => register_named_with_def(mutable ctx, mutable table, fnd.name, def, interner, allocator)?
+                        case .none => register_named(mutable ctx, mutable table, fnd.name, interner, allocator)?
+                    }
+                }
+            }
+        }
+        case .type_decl(let decl) => register_named(mutable ctx, mutable table, Box_TypeDecl.get(decl).name, interner, allocator)?
+        case .spec_(let decl) => register_named(mutable ctx, mutable table, Box_Spec.get(decl).name, interner, allocator)?
+        case .let_(let decl) => register_named(mutable ctx, mutable table, Box_LetDecl.get(decl).name, interner, allocator)?
+        case .derive_(let decl) => check_derive_items(mutable ctx, Box_Derive.get(decl).items, wl, interner, allocator)?
+        case _ => ()
+    }
+}
+
+function register_named(
+    ctx: mutable ctx_mod.ResolveCtx,
+    table: mutable bindings_mod.SymbolTable,
+    name: ast_ident.Ident,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let def = ctx_mod.alloc_def(mutable ctx)
+    ctx_mod.record_use(mutable ctx, name.span, def, allocator)?
+    let prior = bindings_mod.insert(mutable table, name.name, def, allocator)?
+    match prior {
+        case .some(let prev) => emit_duplicate(mutable ctx, name.span, name.name, prev, interner, allocator)?
+        case .none => ()
+    }
+}
+
+function intrinsic_extern_def(body: ast_item.FnBody, interner: intern_mod.Interner) -> Option_DefId.Option {
+    return match body {
+        case .extern_(_, _, let name, _) => intrinsic_def_for_symbol(intern_mod.lookup(interner, name))
+        case _ => Option_DefId.none
+    }
+}
+
+function intrinsic_def_for_symbol(bytes: [u8]) -> Option_DefId.Option {
+    if slice.eq_u8(bytes, "__edda_syscall".bytes()) {
+        return Option_DefId.some(value: builtins_mod.syscall6_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_slice_addr".bytes()) {
+        return Option_DefId.some(value: builtins_mod.slice_addr_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_slice_from_raw".bytes()) {
+        return Option_DefId.some(value: builtins_mod.slice_from_raw_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_slice_from_raw_string".bytes()) {
+        return Option_DefId.some(value: builtins_mod.slice_from_raw_string_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_load_u8".bytes()) {
+        return Option_DefId.some(value: builtins_mod.load_u8_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_load_u16".bytes()) {
+        return Option_DefId.some(value: builtins_mod.load_u16_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_load_u32".bytes()) {
+        return Option_DefId.some(value: builtins_mod.load_u32_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_load_u64".bytes()) {
+        return Option_DefId.some(value: builtins_mod.load_u64_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_load_usize".bytes()) {
+        return Option_DefId.some(value: builtins_mod.load_usize_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_store_u8".bytes()) {
+        return Option_DefId.some(value: builtins_mod.store_u8_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_store_u16".bytes()) {
+        return Option_DefId.some(value: builtins_mod.store_u16_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_store_u32".bytes()) {
+        return Option_DefId.some(value: builtins_mod.store_u32_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_store_u64".bytes()) {
+        return Option_DefId.some(value: builtins_mod.store_u64_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_store_usize".bytes()) {
+        return Option_DefId.some(value: builtins_mod.store_usize_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_sqrt_f64".bytes()) {
+        return Option_DefId.some(value: builtins_mod.sqrt_f64_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_floor_f64".bytes()) {
+        return Option_DefId.some(value: builtins_mod.floor_f64_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_ceil_f64".bytes()) {
+        return Option_DefId.some(value: builtins_mod.ceil_f64_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_trunc_f64".bytes()) {
+        return Option_DefId.some(value: builtins_mod.trunc_f64_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_alloc_array".bytes()) {
+        return Option_DefId.some(value: builtins_mod.alloc_array_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_string_from_raw".bytes()) {
+        return Option_DefId.some(value: builtins_mod.string_from_raw_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_f64_to_bits".bytes()) {
+        return Option_DefId.some(value: builtins_mod.f64_to_bits_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_f64_from_bits".bytes()) {
+        return Option_DefId.some(value: builtins_mod.f64_from_bits_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_f32_to_bits".bytes()) {
+        return Option_DefId.some(value: builtins_mod.f32_to_bits_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_f32_from_bits".bytes()) {
+        return Option_DefId.some(value: builtins_mod.f32_from_bits_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_codepoint_to_u32".bytes()) {
+        return Option_DefId.some(value: builtins_mod.codepoint_to_u32_reserved())
+    }
+    if slice.eq_u8(bytes, "__edda_codepoint_from_u32".bytes()) {
+        return Option_DefId.some(value: builtins_mod.codepoint_from_u32_reserved())
+    }
+    return Option_DefId.none
+}
+
+function register_named_with_def(
+    ctx: mutable ctx_mod.ResolveCtx,
+    table: mutable bindings_mod.SymbolTable,
+    name: ast_ident.Ident,
+    def: def_mod.DefId,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    ctx_mod.record_use(mutable ctx, name.span, def, allocator)?
+    let prior = bindings_mod.insert(mutable table, name.name, def, allocator)?
+    match prior {
+        case .some(let prev) => emit_duplicate(mutable ctx, name.span, name.name, prev, interner, allocator)?
+        case .none => ()
+    }
+}
+
+function check_derive_items(
+    ctx: mutable ctx_mod.ResolveCtx,
+    items: Vec_Ident.Vec,
+    wl: DeriveWhitelist,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Ident.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(items, i)
+        if !is_admitted(wl, id.name) {
+            emit_derive_unknown(mutable ctx, id.span, id.name, interner, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function emit_duplicate(
+    ctx: mutable ctx_mod.ResolveCtx,
+    at: span_mod.Span,
+    name: symbol.Symbol,
+    prior: def_mod.DefId,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let err = error_mod.ResolveError {
+        at: at,
+        kind: error_mod.ResolveErrorKind.duplicate_item(name: name, prior: prior),
+    }
+    let d = error_mod.to_diagnostic(err, interner, allocator)?
+    ctx_mod.emit_diagnostic(mutable ctx, d, allocator)?
+}
+
+function emit_derive_unknown(
+    ctx: mutable ctx_mod.ResolveCtx,
+    at: span_mod.Span,
+    name: symbol.Symbol,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let err = error_mod.ResolveError {
+        at: at,
+        kind: error_mod.ResolveErrorKind.derive_unknown(name: name),
+    }
+    let d = error_mod.to_diagnostic(err, interner, allocator)?
+    ctx_mod.emit_diagnostic(mutable ctx, d, allocator)?
+}

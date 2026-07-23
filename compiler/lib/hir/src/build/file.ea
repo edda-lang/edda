@@ -1,0 +1,228 @@
+
+module hir.build.file
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file
+import intern.symbol as sym_mod
+import local.def as def_mod
+import local.node as node_mod
+import local.item as hir_item
+
+
+spec std.collections.vec.Vec(span_mod.Span)
+spec std.collections.vec.Vec(NodeKind)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HDeclItem)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(u32)
+spec std.core.option.Option(span_mod.Span)
+
+
+derive eq, hash, ord, clone, debug for NodeKind
+derive eq, clone, debug for HirFile
+derive eq, clone, debug for HirFileDecl
+
+
+public type NodeKind {
+    case expr
+    case stmt
+    case block
+    case arm
+    case item
+    case param
+}
+
+
+public type HirFile {
+    source: ast_file.File
+    items: Vec_HItem
+    node_spans: Vec_Span
+    node_kinds: Vec_NodeKind
+    node_method_names: Vec_Symbol
+    node_method_recv: Vec_u32
+    node_for_hint: Vec_u32
+    node_is_try: Vec_u32
+    next_node_id: u32
+    next_def_id: u32
+    saw_comptime: bool
+}
+
+
+public type HirFileDecl {
+    source: ast_file.File
+    items: Vec_HDeclItem
+    node_spans: Vec_Span
+    node_kinds: Vec_NodeKind
+    node_method_names: Vec_Symbol
+    node_method_recv: Vec_u32
+    next_node_id: u32
+    next_def_id: u32
+    saw_comptime: bool
+}
+
+
+public function new_hir_file(out: init HirFile, source: take ast_file.File, start_def_id: u32, item_count_hint: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let node_cap = item_count_hint *| 8
+    uninit items: Vec_HItem.Vec
+    Vec_HItem.with_capacity(init items, item_count_hint, allocator)?
+    uninit node_spans: Vec_Span.Vec
+    Vec_Span.with_capacity(init node_spans, node_cap, allocator)?
+    uninit node_kinds: Vec_NodeKind.Vec
+    Vec_NodeKind.with_capacity(init node_kinds, node_cap, allocator)?
+    uninit node_method_names: Vec_Symbol.Vec
+    Vec_Symbol.with_capacity(init node_method_names, node_cap, allocator)?
+    uninit node_method_recv: Vec_u32.Vec
+    Vec_u32.with_capacity(init node_method_recv, node_cap, allocator)?
+    uninit node_for_hint: Vec_u32.Vec
+    Vec_u32.with_capacity(init node_for_hint, node_cap, allocator)?
+    uninit node_is_try: Vec_u32.Vec
+    Vec_u32.with_capacity(init node_is_try, node_cap, allocator)?
+    out = HirFile {
+        source: source,
+        items: items,
+        node_spans: node_spans,
+        node_kinds: node_kinds,
+        node_method_names: node_method_names,
+        node_method_recv: node_method_recv,
+        node_for_hint: node_for_hint,
+        node_is_try: node_is_try,
+        next_node_id: 1 as u32,
+        next_def_id: start_def_id,
+        saw_comptime: false,
+    }
+    Vec_Span.push(mutable out.node_spans, span_mod.dummy(), allocator)?
+    Vec_NodeKind.push(mutable out.node_kinds, NodeKind.expr, allocator)?
+    Vec_Symbol.push(mutable out.node_method_names, sym_mod.empty(), allocator)?
+    Vec_u32.push(mutable out.node_method_recv, 0 as u32, allocator)?
+    Vec_u32.push(mutable out.node_for_hint, 0 as u32, allocator)?
+    Vec_u32.push(mutable out.node_is_try, 0 as u32, allocator)?
+}
+
+
+public function alloc_node(file: mutable HirFile, span: span_mod.Span, kind: NodeKind, allocator: Allocator) -> node_mod.NodeId
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let raw = file.next_node_id
+    let provenanced = if span_mod.is_dummy(span) {
+        span
+    } else {
+        span_mod.Span { file: file.source.span.file, start: span.start, end: span.end }
+    }
+    Vec_Span.push(mutable file.node_spans, provenanced, allocator)?
+    Vec_NodeKind.push(mutable file.node_kinds, kind, allocator)?
+    Vec_Symbol.push(mutable file.node_method_names, sym_mod.empty(), allocator)?
+    Vec_u32.push(mutable file.node_method_recv, 0 as u32, allocator)?
+    Vec_u32.push(mutable file.node_for_hint, 0 as u32, allocator)?
+    Vec_u32.push(mutable file.node_is_try, 0 as u32, allocator)?
+    file.next_node_id = raw + 1 as u32
+    return node_mod.NodeId { raw: raw }
+}
+
+
+public function alloc_def_id(file: mutable HirFile) -> def_mod.DefId
+    requires file.next_def_id < 4294967295
+{
+    let raw = file.next_def_id
+    file.next_def_id = raw + 1 as u32
+    return def_mod.DefId { raw: raw }
+}
+
+
+public function span_of(file: HirFile, n: node_mod.NodeId) -> span_mod.Span
+    requires (n.raw as usize) < Vec_Span.len(file.node_spans)
+{
+    return Vec_Span.at(file.node_spans, n.raw as usize)
+}
+
+public function span_of_opt(file: HirFile, n: node_mod.NodeId) -> Option_Span.Option {
+    let i = n.raw as usize
+    if i >= Vec_Span.len(file.node_spans) {
+        return Option_Span.none
+    }
+    return Option_Span.some(value: Vec_Span.at(file.node_spans, i))
+}
+
+public function kind_of(file: HirFile, n: node_mod.NodeId) -> NodeKind
+    requires (n.raw as usize) < Vec_NodeKind.len(file.node_kinds)
+{
+    return Vec_NodeKind.at(file.node_kinds, n.raw as usize)
+}
+
+public function set_method_name(file: mutable HirFile, call_node: u32, method: sym_mod.Symbol, recv: u32) -> () {
+    let i = call_node as usize
+    if i >= Vec_Symbol.len(file.node_method_names) {
+        return
+    }
+    Vec_Symbol.set_at(mutable file.node_method_names, i, method)
+    if i >= Vec_u32.len(file.node_method_recv) {
+        return
+    }
+    Vec_u32.set_at(mutable file.node_method_recv, i, recv)
+}
+
+public function method_name_at(file: HirFile, n: node_mod.NodeId) -> sym_mod.Symbol {
+    let i = n.raw as usize
+    if i >= Vec_Symbol.len(file.node_method_names) {
+        return sym_mod.empty()
+    }
+    return Vec_Symbol.at(file.node_method_names, i)
+}
+
+public function method_recv_at(file: HirFile, n: node_mod.NodeId) -> u32 {
+    let i = n.raw as usize
+    if i >= Vec_u32.len(file.node_method_recv) {
+        return 0 as u32
+    }
+    return Vec_u32.at(file.node_method_recv, i)
+}
+
+public function is_method_call(file: HirFile, n: node_mod.NodeId) -> bool {
+    return sym_mod.is_empty(method_name_at(file, n)) == false
+}
+
+public function set_for_hint(file: mutable HirFile, stmt_node: u32, peer_def: u32) -> () {
+    let i = stmt_node as usize
+    if i >= Vec_u32.len(file.node_for_hint) {
+        return
+    }
+    Vec_u32.set_at(mutable file.node_for_hint, i, peer_def)
+}
+
+public function set_try_flag(file: mutable HirFile, node: u32) -> () {
+    let i = node as usize
+    if i >= Vec_u32.len(file.node_is_try) {
+        return
+    }
+    Vec_u32.set_at(mutable file.node_is_try, i, 1 as u32)
+}
+
+public function is_try_at(file: HirFile, n: node_mod.NodeId) -> bool {
+    let i = n.raw as usize
+    if i >= Vec_u32.len(file.node_is_try) {
+        return false
+    }
+    return Vec_u32.at(file.node_is_try, i) == 1 as u32
+}
+
+
+public function to_decl_file(file: HirFile, allocator: Allocator) -> HirFileDecl
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return HirFileDecl {
+        source: file.source,
+        items: hir_item.to_decl_items(file.items, allocator)?,
+        node_spans: file.node_spans,
+        node_kinds: file.node_kinds,
+        node_method_names: file.node_method_names,
+        node_method_recv: file.node_method_recv,
+        next_node_id: file.next_node_id,
+        next_def_id: file.next_def_id,
+        saw_comptime: file.saw_comptime,
+    }
+}

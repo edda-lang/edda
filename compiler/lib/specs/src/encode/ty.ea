@@ -1,0 +1,172 @@
+
+module specs.encode.ty
+
+import std.mem.alloc
+import std.collections.vec
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import target.capability as cap_mod
+import span.loc.pos.span as span_mod
+import intern.symbol as sym_mod
+import intern.interner as sym_interner_mod
+import local.error as err_mod
+import local.encode.bytes as bytes_mod
+import local.encode.prim as prim_mod
+import local.gen.typaths as typaths_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+
+
+public function kind_type() -> u8 { return 0x01 as u8 }
+
+
+public function encode_type(
+    buf: mutable Vec_u8.Vec,
+    ty: ty_mod.TyId,
+    at: span_mod.Span,
+    ty_interner: ty_interner_mod.Interner,
+    ty_paths: typaths_mod.TyPathMap,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    bytes_mod.put_u8(mutable buf, kind_type(), allocator)?
+    let canonical = ty_interner_mod.lookup(ty_interner, ty)
+    match canonical {
+        case .primitive(let pk) =>
+            bytes_mod.put_u8(mutable buf, prim_mod.prim_subtag(pk), allocator)?
+        case .string_ =>
+            bytes_mod.put_u8(mutable buf, prim_mod.prim_subtag_string(), allocator)?
+        case .slice(_) =>
+            raise composite_type_error(at, "slice")
+        case .array(_, _) =>
+            raise composite_type_error(at, "array")
+        case .tuple_(_) =>
+            raise composite_type_error(at, "tuple")
+        case .record(_) => {
+            bytes_mod.put_u8(mutable buf, 0x40 as u8, allocator)?
+            encode_nominal_path(mutable buf, ty, at, ty_paths, sym_interner, "record", allocator)?
+        }
+        case .sum_(_) => {
+            bytes_mod.put_u8(mutable buf, 0x40 as u8, allocator)?
+            encode_nominal_path(mutable buf, ty, at, ty_paths, sym_interner, "sum", allocator)?
+        }
+        case .fn_(_, _, _) =>
+            raise composite_type_error(at, "function")
+        case .spec_instance(_, _) =>
+            raise composite_type_error(at, "spec_instance")
+        case .refined(_, _) =>
+            raise composite_type_error(at, "refined")
+        case .capability(let cap) => {
+            bytes_mod.put_u8(mutable buf, 0x50 as u8, allocator)?
+            bytes_mod.put_u8(mutable buf, cap_subtag(cap), allocator)?
+        }
+        case .opaque(_) =>
+            raise composite_type_error(at, "opaque")
+        case .error_ =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "error_type",
+                message: "type-meta arg resolves to the typecheck error sentinel; an upstream diagnostic was already emitted",
+            )
+    }
+}
+
+public function encode_type_defid(
+    buf: mutable Vec_u8.Vec,
+    ty: ty_mod.TyId,
+    at: span_mod.Span,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    bytes_mod.put_u8(mutable buf, kind_type(), allocator)?
+    let canonical = ty_interner_mod.lookup(ty_interner, ty)
+    match canonical {
+        case .primitive(let pk) =>
+            bytes_mod.put_u8(mutable buf, prim_mod.prim_subtag(pk), allocator)?
+        case .string_ =>
+            bytes_mod.put_u8(mutable buf, prim_mod.prim_subtag_string(), allocator)?
+        case .slice(_) =>
+            raise composite_type_error(at, "slice")
+        case .array(_, _) =>
+            raise composite_type_error(at, "array")
+        case .tuple_(_) =>
+            raise composite_type_error(at, "tuple")
+        case .record(let def) => {
+            bytes_mod.put_u8(mutable buf, 0x40 as u8, allocator)?
+            bytes_mod.put_u32_le(mutable buf, def.raw, allocator)?
+        }
+        case .sum_(let def) => {
+            bytes_mod.put_u8(mutable buf, 0x41 as u8, allocator)?
+            bytes_mod.put_u32_le(mutable buf, def.raw, allocator)?
+        }
+        case .fn_(_, _, _) =>
+            raise composite_type_error(at, "function")
+        case .spec_instance(_, _) =>
+            raise composite_type_error(at, "spec_instance")
+        case .refined(_, _) =>
+            raise composite_type_error(at, "refined")
+        case .capability(let cap) => {
+            bytes_mod.put_u8(mutable buf, 0x50 as u8, allocator)?
+            bytes_mod.put_u8(mutable buf, cap_subtag(cap), allocator)?
+        }
+        case .opaque(_) =>
+            raise composite_type_error(at, "opaque")
+        case .error_ =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "error_type",
+                message: "type-meta arg resolves to the typecheck error sentinel; an upstream diagnostic was already emitted",
+            )
+    }
+}
+
+function encode_nominal_path(
+    buf: mutable Vec_u8.Vec,
+    ty: ty_mod.TyId,
+    at: span_mod.Span,
+    ty_paths: typaths_mod.TyPathMap,
+    sym_interner: sym_interner_mod.Interner,
+    kind: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    match typaths_mod.ty_path_of(ty_paths, ty) {
+        case .some(let tp) => {
+            let n = Vec_Symbol.len(tp.segs)
+            bytes_mod.put_u32_le(mutable buf, n as u32, allocator)?
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let bytes = sym_interner_mod.lookup(sym_interner, Vec_Symbol.at(tp.segs, i))
+                bytes_mod.put_u32_le(mutable buf, bytes.len() as u32, allocator)?
+                bytes_mod.put_bytes(mutable buf, bytes, allocator)?
+                i = i + 1
+            }
+        }
+        case .none =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: kind,
+                message: "nominal type-meta arg has no canonical qualified path in the TyPathMap; the position-dependent DefId is not an admitted SpecHash input",
+            )
+    }
+}
+
+function cap_subtag(cap: cap_mod.Capability) -> u8 {
+    return cap_mod.ordinal(cap) as u8
+}
+
+function composite_type_error(at: span_mod.Span, kind: String) -> err_mod.SpecError {
+    return err_mod.SpecError.encoding_failed(
+        at: at,
+        kind: kind,
+        message: "composite type encoding is deferred to the spec walker phase; only primitive types and String are accepted as type-meta args in Phase 1",
+    )
+}

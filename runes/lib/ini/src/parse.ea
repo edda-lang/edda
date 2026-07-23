@@ -1,0 +1,160 @@
+module ini.parse
+
+import std.mem.alloc
+import std.text.lines
+import std.text.string
+import std.collections.vec
+import ini.value
+
+spec std.collections.vec.Vec(value.Pair)
+spec std.collections.vec.Vec(value.Section)
+
+
+function _is_ws(b: u8) -> bool {
+    return b == 0x20 as u8 || (b >= 0x09 as u8 && b <= 0x0D as u8)
+}
+
+function _trim_lo(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if !_is_ws(bytes[i]) { break }
+        i = i + 1 as usize
+    }
+    return i
+}
+
+function _trim_hi(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    var j: usize = hi
+    loop decreases j - lo {
+        if j <= lo { break }
+        if !_is_ws(bytes[j - 1 as usize]) { break }
+        j = j - 1 as usize
+    }
+    return j
+}
+
+function _slice_to_string(
+    bytes: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let n = hi - lo
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[lo + i]
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _find_eq(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if bytes[i] == 0x3D as u8 { return i }
+        i = i + 1 as usize
+    }
+    return hi
+}
+
+function _finish_section(
+    name: String,
+    pairs: take Vec_Pair.Vec,
+    sinks: mutable Vec_Section.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let items = Vec_Pair.into_array(take pairs, allocator)?
+    let sec = value.Section { name: name, pairs: items }
+    Vec_Section.push(mutable sinks, take sec, allocator)?
+}
+
+function _handle_line(
+    bytes: [u8],
+    start: usize,
+    end: usize,
+    cur_name: mutable String,
+    cur_pairs: mutable Vec_Pair.Vec,
+    sinks: mutable Vec_Section.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires start <= end
+    requires end <= bytes.len()
+{
+    let lo = _trim_lo(bytes, start, end)
+    let hi = _trim_hi(bytes, lo, end)
+    if lo >= hi { return }
+    let first = bytes[lo]
+    if first == 0x3B as u8 || first == 0x23 as u8 { return }
+    if first == 0x5B as u8 && bytes[hi - 1 as usize] == 0x5D as u8 {
+        let name_lo = _trim_lo(bytes, lo + 1 as usize, hi - 1 as usize)
+        let name_hi = _trim_hi(bytes, name_lo, hi - 1 as usize)
+        let name = _slice_to_string(bytes, name_lo, name_hi, allocator)?
+        uninit fresh: Vec_Pair.Vec
+        Vec_Pair.new(init fresh, allocator)?
+        let prev = cur_pairs
+        cur_pairs = fresh
+        let prev_name = cur_name
+        cur_name = name
+        _finish_section(prev_name, take prev, mutable sinks, allocator)?
+        return
+    }
+    let eq = _find_eq(bytes, lo, hi)
+    let key_hi = _trim_hi(bytes, lo, eq)
+    let key = _slice_to_string(bytes, lo, key_hi, allocator)?
+    let val_lo = if eq < hi { _trim_lo(bytes, eq + 1 as usize, hi) } else { hi }
+    let val = _slice_to_string(bytes, val_lo, hi, allocator)?
+    let pair = value.Pair { key: key, value: val }
+    Vec_Pair.push(mutable cur_pairs, take pair, allocator)?
+}
+
+public function parse(content: String, allocator: Allocator) -> value.Ini
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = content.bytes()
+    let n = bytes.len()
+    uninit secs: Vec_Section.Vec
+    Vec_Section.new(init secs, allocator)?
+    uninit cur_pairs: Vec_Pair.Vec
+    Vec_Pair.new(init cur_pairs, allocator)?
+    var cur_name: String = ""
+    var pos: usize = 0
+    loop decreases n + 1 as usize - pos {
+        if pos > n { break }
+        match lines.next_line(bytes, pos) {
+            case .some(let entry) => {
+                _handle_line(bytes, entry.start, entry.end, mutable cur_name, mutable cur_pairs, mutable secs, allocator)?
+                pos = entry.resume
+            }
+            case .none => break
+        }
+    }
+    _finish_section(cur_name, take cur_pairs, mutable secs, allocator)?
+    let out = Vec_Section.into_array(take secs, allocator)?
+    return value.Ini { sections: out }
+}

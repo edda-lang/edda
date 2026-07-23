@@ -1,0 +1,765 @@
+
+module lower.body.transcribe
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import types.ty.interner as ty_interner_mod
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import types.pass.ty as ty_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+import mir.layout.table as mir_layout_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as hlir_term_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.id.op as hlir_op_id_mod
+import ir.hlir.id.block as hlir_block_mod
+import ir.hlir.id.region as hlir_region_mod
+import ir.lir.tree.reg as lir_reg_mod
+
+import local.body.alias.alias as alias_mod
+import local.sel.convert as convert_mod
+import local.term.support.support as support_mod
+import local.term.support.place as place_mod
+import local.term.support.flags as flags_mod
+import local.term.terminator.terminator as terminator_mod
+import local.flow.cfg.cfg as cfg_mod
+import local.flow.live.live as live_mod
+import local.flow.plan.plan as plan_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(u32)
+
+spec std.core.option.Option(hlir_region_mod.RegionId)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(mir_local_mod.LocalId)
+spec std.core.option.Option(mir_layout_mod.AggLayout)
+
+
+public function transcribe_blocks(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let n = Vec_BasicBlock.len(body.blocks)
+    if n < 2 { return }
+    let n_locals = Vec_Local.len(body.locals)
+
+    uninit cfg: cfg_mod.Cfg
+    cfg_mod.build(init cfg, body, allocator)?
+    uninit liv: live_mod.Liveness
+    live_mod.compute(init liv, body, cfg, allocator)?
+    uninit plan: plan_mod.MergePlan
+    plan_mod.build(init plan, body, cfg, liv, allocator)?
+
+    mint_merge_params(mutable out, mutable plan, body, n, allocator)?
+
+    var p: usize = Vec_HlirBlock.len(out.blocks)
+    loop decreases n - p {
+        if p >= n { break }
+        let filler = placeholder_block(allocator)?
+        let _ = hlir_body_mod.push_block(mutable out, take filler, allocator)?
+        p += 1
+    }
+
+    uninit out_envs: Vec_ValueId.Vec
+    Vec_ValueId.new(init out_envs, allocator)?
+    let grid = n * n_locals
+    var g: usize = 0
+    loop decreases grid - g {
+        if g >= grid { break }
+        Vec_ValueId.push(mutable out_envs, take hlir_value_mod.error(), allocator)?
+        g += 1
+    }
+
+    let n_rpo = Vec_u32.len(cfg.rpo_order)
+    var i: usize = 0
+    loop decreases n_rpo - i {
+        if i >= n_rpo { break }
+        let b = Vec_u32.at(cfg.rpo_order, i) as usize
+        if b >= 1 {
+            if b < n {
+                uninit working: Vec_ValueId.Vec
+                seed_block_env(init working, env, out_envs, cfg, plan, b, n_locals, allocator)?
+                let mblock = Vec_BasicBlock.at(body.blocks, b)
+                let hblock = lower_block(
+                    mutable out,
+                    mutable working,
+                    mblock,
+                    body,
+                    b,
+                    plan,
+                    ty_interner,
+                    extern_defs,
+                    allocator,
+                )?
+                var l: usize = 0
+                loop decreases n_locals - l {
+                    if l >= n_locals { break }
+                    let idx = b * n_locals + l
+                    if idx < Vec_ValueId.len(out_envs) {
+                        if l < Vec_ValueId.len(working) {
+                            let v = Vec_ValueId.at(working, l)
+                            Vec_ValueId.set_at(mutable out_envs, idx, take v)
+                        }
+                    }
+                    l += 1
+                }
+                Vec_HlirBlock.set_at(mutable out.blocks, b, take hblock)
+            }
+        }
+        i += 1
+    }
+}
+
+
+function mint_merge_params(
+    out: mutable hlir_body_mod.HlirBody,
+    plan: mutable plan_mod.MergePlan,
+    body: mir_body_mod.MirBody,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var b: usize = 0
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        let start = plan_mod.params_start(plan, b)
+        let end = plan_mod.params_end(plan, b)
+        var k = start
+        loop decreases end - k {
+            if k >= end { break }
+            let local_raw = plan_mod.param_local_at(plan, k)
+            let local = mir_local_mod.LocalId { raw: local_raw }
+            let value = hlir_body_mod.HlirValue {
+                ty: support_mod.local_ty(body, local),
+                def: hlir_body_mod.HlirValueDef.block_param(
+                    block: hlir_block_mod.BlockId { raw: b as u32 wrapping },
+                    position: (k - start) as u32 wrapping,
+                ),
+            }
+            let vid = hlir_body_mod.push_value(mutable out, take value, allocator)?
+            plan_mod.set_param_value(mutable plan, k, vid.raw)
+            k += 1
+        }
+        b += 1
+    }
+}
+
+
+function seed_block_env(
+    out: init Vec_ValueId.Vec,
+    entry_env: Vec_ValueId.Vec,
+    out_envs: Vec_ValueId.Vec,
+    cfg: cfg_mod.Cfg,
+    plan: plan_mod.MergePlan,
+    b: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit working: Vec_ValueId.Vec
+    Vec_ValueId.new(init working, allocator)?
+
+    if b == 1 {
+        var l: usize = 0
+        loop decreases n_locals - l {
+            if l >= n_locals { break }
+            let v = if l < Vec_ValueId.len(entry_env) {
+                Vec_ValueId.at(entry_env, l)
+            } else {
+                hlir_value_mod.error()
+            }
+            Vec_ValueId.push(mutable working, take v, allocator)?
+            l += 1
+        }
+        out = working
+        return
+    }
+
+    let source = if b < Vec_u32.len(cfg.inherit_pred) {
+        Vec_u32.at(cfg.inherit_pred, b) as usize
+    } else {
+        0 as usize
+    }
+    var l: usize = 0
+    loop decreases n_locals - l {
+        if l >= n_locals { break }
+        let idx = source * n_locals + l
+        let v = if source != 0 && idx < Vec_ValueId.len(out_envs) {
+            Vec_ValueId.at(out_envs, idx)
+        } else {
+            hlir_value_mod.error()
+        }
+        Vec_ValueId.push(mutable working, take v, allocator)?
+        l += 1
+    }
+
+    let start = plan_mod.params_start(plan, b)
+    let end = plan_mod.params_end(plan, b)
+    var k = start
+    loop decreases end - k {
+        if k >= end { break }
+        let local_raw = plan_mod.param_local_at(plan, k) as usize
+        if local_raw < n_locals {
+            let vid = hlir_value_mod.ValueId { raw: plan_mod.param_value_at(plan, k) }
+            Vec_ValueId.set_at(mutable working, local_raw, take vid)
+        }
+        k += 1
+    }
+    out = working
+}
+
+
+function placeholder_block(allocator: Allocator) -> hlir_body_mod.HlirBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValueId.Vec
+    Vec_ValueId.new(init params, allocator)?
+    uninit ops: Vec_OpId.Vec
+    Vec_OpId.new(init ops, allocator)?
+    return hlir_body_mod.HlirBlock {
+        node_id_origin: node_mod.error(),
+        params: params,
+        ops: ops,
+        terminator: hlir_term_mod.HlirTerminator {
+            origin: node_mod.error(),
+            kind: hlir_term_mod.HlirTermKind.unreachable_,
+        },
+        coherence_region: Option_RegionId.none,
+    }
+}
+
+
+function lower_block(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    block: mir_body_mod.BasicBlock,
+    body: mir_body_mod.MirBody,
+    block_index: usize,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> hlir_body_mod.HlirBlock
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit ops: Vec_OpId.Vec
+    Vec_OpId.new(init ops, allocator)?
+    let params = if block_index == 1 {
+        entry_param_ids(body, allocator)?
+    } else {
+        merge_param_ids(plan, block_index, allocator)?
+    }
+
+    transcribe_statements(mutable out, mutable env, mutable ops, block, body, ty_interner, allocator)?
+    let terminator = terminator_mod.lower_terminator(mutable out, mutable env, mutable ops, block.terminator, body, plan, ty_interner, extern_defs, allocator)?
+
+    let coherence = match block.coherence_region {
+        case .none => Option_RegionId.none
+        case .some(let r) => Option_RegionId.some(
+            value: hlir_region_mod.RegionId { raw: r.raw },
+        )
+    }
+
+    return hlir_body_mod.HlirBlock {
+        node_id_origin: block.node_id_origin,
+        params: params,
+        ops: ops,
+        terminator: terminator,
+        coherence_region: coherence,
+    }
+}
+
+
+function merge_param_ids(
+    plan: plan_mod.MergePlan,
+    block_index: usize,
+    allocator: Allocator,
+) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_ValueId.Vec
+    Vec_ValueId.new(init ids, allocator)?
+    let start = plan_mod.params_start(plan, block_index)
+    let end = plan_mod.params_end(plan, block_index)
+    var k = start
+    loop decreases end - k {
+        if k >= end { break }
+        let vid = hlir_value_mod.ValueId { raw: plan_mod.param_value_at(plan, k) }
+        Vec_ValueId.push(mutable ids, take vid, allocator)?
+        k += 1
+    }
+    return ids
+}
+
+
+function transcribe_statements(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    block: mir_body_mod.BasicBlock,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let n = Vec_Statement.len(block.statements)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let stmt = Vec_Statement.at(block.statements, i)
+        transcribe_statement(mutable out, mutable env, mutable ops, stmt, body, ty_interner, allocator)?
+        i += 1
+    }
+}
+
+function transcribe_statement(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    stmt: mir_stmt_mod.Statement,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    match stmt.kind {
+        case .assign(let dest, let value) =>
+            transcribe_assign(mutable out, mutable env, mutable ops, stmt.origin, dest, value, body, ty_interner, allocator)?
+        case .storage_live(_) => ()
+        case .storage_dead(_) => ()
+        case .nop_ => ()
+    }
+}
+
+function transcribe_assign(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    dest: mir_place_mod.Place,
+    value: mir_rvalue_mod.Rvalue,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let nproj = mir_place_mod.proj_len(dest)
+    if nproj != (0 as usize) {
+        let slot_ty = mir_place_mod.proj_at(dest, nproj - (1 as usize)).result_ty
+        let stored = match value {
+            case .use_(let operand) => {
+                let raw_val = place_mod.operand_ssa(mutable out, env, mutable ops, origin, operand, body, ty_interner, allocator)?
+                retype_stored_value(mutable out, mutable ops, origin, raw_val, operand, slot_ty, body, allocator)?
+            }
+            case _ => {
+                let pkind = lower_rvalue(mutable out, env, mutable ops, origin, value, body, ty_interner, allocator)?
+                push_intermediate(mutable out, mutable ops, origin, pkind, slot_ty, flags_mod.flags_for_rvalue(value), allocator)?
+            }
+        }
+        place_mod.store_to_place(mutable out, env, mutable ops, origin, dest, stored, body, allocator)?
+        return
+    }
+    let dest_local = dest.local
+    match retyping_bare_copy_source(dest_local, value, body) {
+        case .some(let src_local) => {
+            let dest_ty = support_mod.local_ty(body, dest_local)
+            let src_ty = support_mod.local_ty(body, src_local)
+            let source = support_mod.env_get(env, src_local)
+            let reinterpret = if !is_by_memory_ty(body, dest_ty) && is_by_memory_ty(body, src_ty) {
+                hlir_op_mod.HlirOpKind.deref_(operand: source)
+            } else if is_by_memory_ty(body, dest_ty) || is_by_memory_ty(body, src_ty) {
+                hlir_op_mod.HlirOpKind.ref_(
+                    kind: hlir_op_mod.HBorrowKind.let_,
+                    operand: source,
+                )
+            } else {
+                hlir_op_mod.HlirOpKind.cast(
+                    value: source,
+                    from: src_ty,
+                    to: dest_ty,
+                    kind: hlir_op_mod.HCastKind.integer_wrapping,
+                )
+            }
+            let retyped = push_intermediate(mutable out, mutable ops, origin, reinterpret, dest_ty, flags_mod.default_flags(), allocator)?
+            support_mod.env_set(mutable env, dest_local, retyped)
+            return
+        }
+        case .none => ()
+    }
+    if alias_mod.try_alias_assign(mutable env, dest_local, value, body)? { return }
+    let ty = support_mod.local_ty(body, dest_local)
+    let kind = lower_rvalue(mutable out, env, mutable ops, origin, value, body, ty_interner, allocator)?
+    let result_val = hlir_body_mod.push_value(
+        mutable out,
+        take support_mod.fresh_op_result(ty),
+        allocator,
+    )?
+    let op = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: kind,
+        result_: result_val,
+        flags: flags_mod.flags_for_rvalue(value),
+    }
+    let op_id = hlir_body_mod.push_op(mutable out, take op, allocator)?
+    support_mod.bind_op_result(mutable out, result_val, op_id)
+    Vec_OpId.push(mutable ops, take op_id, allocator)?
+    support_mod.env_set(mutable env, dest_local, result_val)
+}
+
+
+function is_by_memory_ty(body: mir_body_mod.MirBody, ty: ty_mod.TyId) -> bool {
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let l) => l.total_size != (0 as u32) && lir_reg_mod.is_by_memory(l.total_size)
+        case .none => false
+    }
+}
+
+
+function retype_stored_value(
+    out: mutable hlir_body_mod.HlirBody,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    raw_val: hlir_value_mod.ValueId,
+    operand: mir_rvalue_mod.Operand,
+    slot_ty: ty_mod.TyId,
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> hlir_value_mod.ValueId
+    with {allocator, err: alloc.AllocError}
+{
+    let place = match operand {
+        case .copy_(let p, _) => p
+        case .move_(let p, _) => p
+        case .constant(_) => return raw_val
+    }
+    if mir_place_mod.proj_len(place) != (0 as usize) {
+        return raw_val
+    }
+    let src_ty = support_mod.local_ty(body, place.local)
+    if src_ty.raw == slot_ty.raw {
+        return raw_val
+    }
+    if !is_by_memory_ty(body, src_ty) {
+        return raw_val
+    }
+    let reinterpret = if is_by_memory_ty(body, slot_ty) {
+        hlir_op_mod.HlirOpKind.ref_(
+            kind: hlir_op_mod.HBorrowKind.let_,
+            operand: raw_val,
+        )
+    } else {
+        hlir_op_mod.HlirOpKind.deref_(operand: raw_val)
+    }
+    return push_intermediate(mutable out, mutable ops, origin, reinterpret, slot_ty, flags_mod.default_flags(), allocator)?
+}
+
+
+function retyping_bare_copy_source(
+    dest_local: mir_local_mod.LocalId,
+    value: mir_rvalue_mod.Rvalue,
+    body: mir_body_mod.MirBody,
+) -> Option_LocalId.Option {
+    let place = match value {
+        case .use_(let operand) => match operand {
+            case .copy_(let p, _) => p
+            case .move_(let p, _) => p
+            case .constant(_) => return Option_LocalId.none
+        }
+        case _ => return Option_LocalId.none
+    }
+    if mir_place_mod.proj_len(place) != (0 as usize) {
+        return Option_LocalId.none
+    }
+    let dest_ty = support_mod.local_ty(body, dest_local)
+    let src_ty = support_mod.local_ty(body, place.local)
+    if dest_ty.raw == src_ty.raw && !is_by_memory_ty(body, dest_ty) {
+        return Option_LocalId.none
+    }
+    return Option_LocalId.some(value: place.local)
+}
+
+
+function lower_rvalue(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    value: mir_rvalue_mod.Rvalue,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    return match value {
+        case .use_(let operand) => lower_use_operand(mutable out, env, mutable ops, origin, operand, body, ty_interner, allocator)?
+        case .binary(let op, let lhs, let rhs) => hlir_op_mod.HlirOpKind.binary(
+            op: convert_mod.convert_binop(op),
+            lhs: place_mod.operand_ssa(mutable out, env, mutable ops, origin, lhs, body, ty_interner, allocator)?,
+            rhs: place_mod.operand_ssa(mutable out, env, mutable ops, origin, rhs, body, ty_interner, allocator)?,
+        )
+        case .unary(let op, let operand) => hlir_op_mod.HlirOpKind.unary(
+            op: convert_mod.convert_unop(op),
+            operand: place_mod.operand_ssa(mutable out, env, mutable ops, origin, operand, body, ty_interner, allocator)?,
+        )
+        case .cast(let operand, let from, let to, let kind) => hlir_op_mod.HlirOpKind.cast(
+            value: place_mod.operand_ssa(mutable out, env, mutable ops, origin, operand, body, ty_interner, allocator)?,
+            from: from,
+            to: to,
+            kind: convert_mod.convert_cast_kind(kind),
+        )
+        case .aggregate(let kind, let elems, let result_ty) => lower_aggregate_op(mutable out, env, mutable ops, origin, kind, elems, result_ty, body, ty_interner, allocator)?
+        case .make_closure(let code, let env_op) => hlir_op_mod.HlirOpKind.make_closure(
+            code: code,
+            env: place_mod.operand_ssa(mutable out, env, mutable ops, origin, env_op, body, ty_interner, allocator)?,
+        )
+        case .ref_(let kind, let place) => if mir_place_mod.proj_len(place) != (0 as usize) {
+            hlir_op_mod.HlirOpKind.ref_(
+                kind: convert_mod.convert_borrow_kind(kind),
+                operand: place_mod.place_addr_ssa(mutable out, env, mutable ops, origin, place, body, allocator)?,
+            )
+        } else {
+            hlir_op_mod.HlirOpKind.ref_(
+                kind: convert_mod.convert_borrow_kind(kind),
+                operand: support_mod.env_get(env, place.local),
+            )
+        }
+        case .len(let place) => hlir_op_mod.HlirOpKind.len(
+            operand: place_mod.place_read_ssa(mutable out, env, mutable ops, origin, place, body, allocator)?,
+        )
+        case .discriminant(let place) => hlir_op_mod.HlirOpKind.discriminant(
+            operand: place_mod.place_read_ssa(mutable out, env, mutable ops, origin, place, body, allocator)?,
+        )
+    }
+}
+
+function lower_use_operand(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    operand: mir_rvalue_mod.Operand,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    return match operand {
+        case .constant(let c) => match support_mod.aggregate_zero_size(out, c) {
+            case .some(let sz) => hlir_op_mod.HlirOpKind.stack_alloc(bytes: sz)
+            case .none => hlir_op_mod.HlirOpKind.literal(
+                c: support_mod.operand_constant(operand, ty_interner)?,
+            )
+        }
+        case .copy_(let place, _) => lower_place_read(mutable out, env, mutable ops, origin, place, body, allocator)?
+        case .move_(let place, _) => lower_place_read(mutable out, env, mutable ops, origin, place, body, allocator)?
+    }
+}
+
+
+function lower_place_read(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    place: mir_place_mod.Place,
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let nproj = mir_place_mod.proj_len(place)
+    if nproj == (0 as usize) {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR -> HLIR: bare-local use should have been aliased before lower_rvalue",
+        )
+    }
+    var cur = support_mod.env_get(env, place.local)
+    var i: usize = 0
+    loop decreases (nproj - 1) - i {
+        if i >= nproj - 1 { break }
+        let proj = mir_place_mod.proj_at(place, i)
+        let kind = proj_field_kind(env, proj, cur)?
+        let proj_flags = if flags_mod.proj_proven(proj) { flags_mod.in_bounds_flags() } else { flags_mod.default_flags() }
+        cur = push_intermediate(mutable out, mutable ops, origin, kind, proj.result_ty, proj_flags, allocator)?
+        i += 1
+    }
+    let last = mir_place_mod.proj_at(place, nproj - 1)
+    let last_kind = proj_field_kind(env, last, cur)?
+    if is_by_memory_ty(body, last.result_ty) {
+        let last_flags = if flags_mod.proj_proven(last) { flags_mod.in_bounds_flags() } else { flags_mod.default_flags() }
+        let materialized = push_intermediate(mutable out, mutable ops, origin, last_kind, last.result_ty, last_flags, allocator)?
+        return hlir_op_mod.HlirOpKind.ref_(kind: hlir_op_mod.HBorrowKind.let_, operand: materialized)
+    }
+    return last_kind
+}
+
+
+function proj_field_kind(
+    env: Vec_ValueId.Vec,
+    proj: mir_place_mod.Projection,
+    base: hlir_value_mod.ValueId,
+) -> hlir_op_mod.HlirOpKind
+    with {err: hlir_error_mod.HlirError}
+{
+    return match proj.kind {
+        case .field(let idx) => hlir_op_mod.HlirOpKind.field(operand: base, index: idx)
+        case .index(let idx_local, _) => hlir_op_mod.HlirOpKind.index(
+            operand: base,
+            index_v: support_mod.env_get(env, idx_local),
+        )
+        case .slice_subrange(let lo_local, let hi_local, _) => hlir_op_mod.HlirOpKind.slice_subrange(
+            operand: base,
+            lo_v: support_mod.env_get(env, lo_local),
+            hi_v: support_mod.env_get(env, hi_local),
+        )
+        case .variant_payload(_) => hlir_op_mod.HlirOpKind.field(operand: base, index: 1 as u32)
+        case .deref_ => hlir_op_mod.HlirOpKind.deref_(operand: base)
+        case _ => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR projection requires place -> SSA dataflow",
+        )
+    }
+}
+
+
+function push_intermediate(
+    out: mutable hlir_body_mod.HlirBody,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    kind: hlir_op_mod.HlirOpKind,
+    ty: ty_mod.TyId,
+    flags: hlir_op_mod.OpFlags,
+    allocator: Allocator,
+) -> hlir_value_mod.ValueId
+    with {allocator, err: alloc.AllocError}
+{
+    let result_val = hlir_body_mod.push_value(
+        mutable out,
+        take support_mod.fresh_op_result(ty),
+        allocator,
+    )?
+    let op = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: kind,
+        result_: result_val,
+        flags: flags,
+    }
+    let op_id = hlir_body_mod.push_op(mutable out, take op, allocator)?
+    support_mod.bind_op_result(mutable out, result_val, op_id)
+    Vec_OpId.push(mutable ops, take op_id, allocator)?
+    return result_val
+}
+
+
+function lower_aggregate_op(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    kind: mir_rvalue_mod.AggregateKind,
+    elems: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    return match kind {
+        case .variant(_, let variant_idx) => if Vec_Operand.len(elems) == (0 as usize) && !alias_mod.ty_is_payload_bearing_sum(body, result_ty) {
+            hlir_op_mod.HlirOpKind.literal(
+                c: hlir_op_mod.HConstant.int_(value: variant_idx as i128, ty: result_ty),
+            )
+        } else {
+            build_value_aggregate(mutable out, env, mutable ops, origin, hlir_op_mod.HAggregateKind.sum_variant(variant: variant_idx), elems, body, ty_interner, allocator)?
+        }
+        case .array => build_value_aggregate(mutable out, env, mutable ops, origin, hlir_op_mod.HAggregateKind.array_, elems, body, ty_interner, allocator)?
+        case .tuple => build_value_aggregate(mutable out, env, mutable ops, origin, hlir_op_mod.HAggregateKind.tuple_, elems, body, ty_interner, allocator)?
+        case .record(_) => build_value_aggregate(mutable out, env, mutable ops, origin, hlir_op_mod.HAggregateKind.record_, elems, body, ty_interner, allocator)?
+    }
+}
+
+
+function build_value_aggregate(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    hkind: hlir_op_mod.HAggregateKind,
+    elems: Vec_Operand.Vec,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit elem_ids: Vec_ValueId.Vec
+    Vec_ValueId.new(init elem_ids, allocator)?
+    let n = Vec_Operand.len(elems)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = Vec_Operand.at(elems, i)
+        let v = place_mod.operand_ssa(mutable out, env, mutable ops, origin, e, body, ty_interner, allocator)?
+        Vec_ValueId.push(mutable elem_ids, take v, allocator)?
+        i += 1
+    }
+    return hlir_op_mod.HlirOpKind.aggregate(kind: hkind, elems: elem_ids)
+}
+
+
+function entry_param_ids(
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_ValueId.Vec
+    Vec_ValueId.new(init ids, allocator)?
+    let n_params_us = body.n_params as usize
+    var i: usize = 0
+    loop decreases n_params_us - i {
+        if i >= n_params_us { break }
+        let raw = (i + 1) as u32 wrapping
+        let vid = hlir_value_mod.ValueId { raw: raw }
+        Vec_ValueId.push(mutable ids, take vid, allocator)?
+        i += 1
+    }
+    return ids
+}

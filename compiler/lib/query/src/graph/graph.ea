@@ -1,0 +1,236 @@
+
+module query.graph.graph
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import cache.addr.hash as hash_mod
+import local.graph.idx.key as key_mod
+import local.graph.idx.node as node_mod
+import local.memo.revision as rev_mod
+
+spec std.collections.vec.Vec(node_mod.QueryNode)
+spec std.collections.vec.Vec(node_mod.NodeId)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(hash_mod.ArtifactHash)
+
+
+public type EnterResult {
+    case entered
+    case cycle
+}
+
+public type QueryGraph {
+    nodes: Vec_QueryNode.Vec
+    active: Vec_NodeId.Vec
+    current: rev_mod.Revision
+}
+
+
+public function new_graph(allocator: Allocator) -> QueryGraph
+    with {allocator, err: alloc.AllocError}
+{
+    uninit nodes: Vec_QueryNode.Vec
+    Vec_QueryNode.new(init nodes, allocator)?
+    uninit active: Vec_NodeId.Vec
+    Vec_NodeId.new(init active, allocator)?
+    return QueryGraph { nodes: nodes, active: active, current: rev_mod.zero() }
+}
+
+public function node_count(g: QueryGraph) -> usize {
+    return Vec_QueryNode.len(g.nodes)
+}
+
+public function from_parts(nodes: take Vec_QueryNode.Vec, current: rev_mod.Revision, allocator: Allocator) -> QueryGraph
+    with {allocator, err: alloc.AllocError}
+{
+    uninit active: Vec_NodeId.Vec
+    Vec_NodeId.new(init active, allocator)?
+    return QueryGraph { nodes: nodes, active: active, current: current }
+}
+
+public function node_at(g: QueryGraph, i: usize where i < node_count(g)) -> node_mod.QueryNode {
+    return Vec_QueryNode.at(g.nodes, i)
+}
+
+public function current_revision(g: QueryGraph) -> rev_mod.Revision {
+    return g.current
+}
+
+
+public function lookup(g: QueryGraph, key: key_mod.QueryKey) -> Option_NodeId {
+    let n = Vec_QueryNode.len(g.nodes)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let nd = Vec_QueryNode.at(g.nodes, i)
+        if key_mod.equals(nd.key, key) {
+            return Option_NodeId.some(value: node_mod.node_id(i))
+        }
+        i += 1
+    }
+    return Option_NodeId.none
+}
+
+public function intern(g: mutable QueryGraph, key: key_mod.QueryKey, allocator: Allocator) -> node_mod.NodeId
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match lookup(g, key) {
+        case .some(let id) => return id
+        case .none         => ()
+    }
+    let id = node_mod.node_id(Vec_QueryNode.len(g.nodes))
+    let nd = node_mod.new_node(key, allocator)?
+    Vec_QueryNode.push(mutable g.nodes, take nd, allocator)?
+    return id
+}
+
+
+public function add_edge(g: mutable QueryGraph, from: node_mod.NodeId, to: node_mod.NodeId, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    add_node_dep(mutable g, from, to, allocator)?
+}
+
+public function enter(g: mutable QueryGraph, id: node_mod.NodeId, allocator: Allocator) -> EnterResult
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    if is_active(g, id) {
+        return EnterResult.cycle
+    }
+    mark_in_progress(mutable g, id)
+    clear_node_deps(mutable g, id)
+    Vec_NodeId.push(mutable g.active, take id, allocator)?
+    return EnterResult.entered
+}
+
+public function record_read(g: mutable QueryGraph, dep: node_mod.NodeId, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let depth = Vec_NodeId.len(g.active)
+    if depth == 0 { return () }
+    let top = Vec_NodeId.at(g.active, depth - 1)
+    add_node_dep(mutable g, top, dep, allocator)?
+}
+
+public function exit(g: mutable QueryGraph, id: node_mod.NodeId, value_hash: hash_mod.ArtifactHash) -> () {
+    pop_active(mutable g)
+    finalize_node(mutable g, id, value_hash)
+}
+
+
+public function is_active(g: QueryGraph, id: node_mod.NodeId) -> bool {
+    let n = Vec_NodeId.len(g.active)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = Vec_NodeId.at(g.active, i)
+        if a.value == id.value { return true }
+        i += 1
+    }
+    return false
+}
+
+public function is_valid(g: QueryGraph, id: node_mod.NodeId) -> bool {
+    if id.value >= Vec_QueryNode.len(g.nodes) { return false }
+    let nd = Vec_QueryNode.at(g.nodes, id.value)
+    match nd.state {
+        case .valid       => ()
+        case .unevaluated => return false
+        case .in_progress => return false
+    }
+    return rev_mod.equals(nd.verified_at, g.current)
+}
+
+public function needs_recompute(g: QueryGraph, id: node_mod.NodeId) -> bool {
+    if id.value >= Vec_QueryNode.len(g.nodes) { return true }
+    let nd = Vec_QueryNode.at(g.nodes, id.value)
+    match nd.state {
+        case .valid       => ()
+        case .unevaluated => return true
+        case .in_progress => return true
+    }
+    if rev_mod.equals(nd.verified_at, g.current) { return false }
+    return deps_changed_after(g, nd, nd.verified_at)
+}
+
+public function result_of(g: QueryGraph, id: node_mod.NodeId) -> Option_ArtifactHash {
+    if id.value >= Vec_QueryNode.len(g.nodes) { return Option_ArtifactHash.none }
+    let nd = Vec_QueryNode.at(g.nodes, id.value)
+    return Option_ArtifactHash.some(value: nd.value_hash)
+}
+
+
+public function bump_revision(g: mutable QueryGraph) -> rev_mod.Revision
+    requires g.current.value < 18446744073709551615
+{
+    g.current = rev_mod.next(g.current)
+    return g.current
+}
+
+public function set_input(g: mutable QueryGraph, id: node_mod.NodeId, value_hash: hash_mod.ArtifactHash) -> () {
+    finalize_node(mutable g, id, value_hash)
+}
+
+public function note_input(g: mutable QueryGraph, id: node_mod.NodeId, fresh: hash_mod.ArtifactHash) -> bool {
+    let changed = match result_of(g, id) {
+        case .some(let h) => !key_mod.hash_equals(h, fresh)
+        case .none        => true
+    }
+    set_input(mutable g, id, fresh)
+    return changed
+}
+
+
+function deps_changed_after(g: QueryGraph, nd: node_mod.QueryNode, since: rev_mod.Revision) -> bool {
+    let n = node_mod.dep_count(nd)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        match node_mod.dep_get(nd, i) {
+            case .some(let dep) => {
+                if dep.value < Vec_QueryNode.len(g.nodes) {
+                    let dn = Vec_QueryNode.at(g.nodes, dep.value)
+                    if rev_mod.is_after(dn.changed_at, since) { return true }
+                }
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+    return false
+}
+
+function mark_in_progress(g: mutable QueryGraph, id: node_mod.NodeId) -> () {
+    if id.value >= Vec_QueryNode.len(g.nodes) { return () }
+    var nd = Vec_QueryNode.at(g.nodes, id.value)
+    node_mod.set_in_progress(mutable nd)
+    Vec_QueryNode.set_at(mutable g.nodes, id.value, take nd)
+}
+
+function clear_node_deps(g: mutable QueryGraph, id: node_mod.NodeId) -> () {
+    if id.value >= Vec_QueryNode.len(g.nodes) { return () }
+    var nd = Vec_QueryNode.at(g.nodes, id.value)
+    node_mod.clear_deps(mutable nd)
+    Vec_QueryNode.set_at(mutable g.nodes, id.value, take nd)
+}
+
+function finalize_node(g: mutable QueryGraph, id: node_mod.NodeId, value_hash: hash_mod.ArtifactHash) -> () {
+    if id.value >= Vec_QueryNode.len(g.nodes) { return () }
+    var nd = Vec_QueryNode.at(g.nodes, id.value)
+    node_mod.finalize(mutable nd, value_hash, g.current)
+    Vec_QueryNode.set_at(mutable g.nodes, id.value, take nd)
+}
+
+function add_node_dep(g: mutable QueryGraph, id: node_mod.NodeId, dep: node_mod.NodeId, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    if id.value >= Vec_QueryNode.len(g.nodes) { return () }
+    var nd = Vec_QueryNode.at(g.nodes, id.value)
+    node_mod.add_dep(mutable nd, dep, allocator)?
+    Vec_QueryNode.set_at(mutable g.nodes, id.value, take nd)
+}
+
+function pop_active(g: mutable QueryGraph) -> () {
+    let _ = Vec_NodeId.pop(mutable g.active)
+}

@@ -1,0 +1,493 @@
+module compile.instantiate.iter.instloop.instloop
+
+import std.collections.vec
+import std.collections.hashmap
+import std.mem.alloc
+import std.os.fs
+import cteval.builtin.target.reg.registry as cbi_registry_mod
+import cteval.res.output as cteval_output_mod
+import diagnostics.emit.collection as diags_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.build.drive.instances as resolve_inst_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as specsurface_mod
+import resolve.primitives.defs as primitives_mod
+import resolve.capabilities.defs as capabilities_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.ident as ast_ident_mod
+import target.arch as arch_mod
+import target.triple as triple_mod
+import types.check as types_check_mod
+import types.check.env.lower.nominals as nominals_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import specs.gen.build.output as spec_output_mod
+import specs.gen.typaths as typaths_mod
+import specs.specdefs as specdefs_mod
+import specs.cachectx as cachectx_mod
+import local.instantiate.iter.instances.instances as materialize_mod
+import local.instantiate.unroll.drive.drive as unroll_mod
+import local.phase.derives as derives_mod
+import local.phase.pipeline.lower as lower_mod
+import local.phase.pipeline.typecheck.feed as feed_mod
+import local.phase.pipeline.typecheck.full as typecheck_mod
+import local.instantiate.cteval as cteval_mod
+import local.instantiate.iter.specs.specs as specs_mod
+import local.instantiate.fninst.table.table as fntable_mod
+import local.instantiate.fninst.build.build as fnbuild_mod
+import local.phase.eqwire.tybuild.tybuild as tybuild_mod
+import local.trace.trace as trace_mod
+
+
+spec std.mem.alloc.Box(hir_item_mod.HTypeSignature)
+
+spec std.collections.hashmap.IntMap(bool)
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(spec_output_mod.SpecOutput)
+spec std.collections.vec.Vec(cteval_output_mod.ComptimeOutput)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(bool)
+
+
+public type ExpandResult {
+    hir: Vec_HirFile.Vec
+    output: resolve_ctx_mod.ResolveOutput
+    nominals: nominals_mod.NominalMap
+}
+
+
+type RoundStep {
+    output: resolve_ctx_mod.ResolveOutput
+    next: Vec_SpecOutput.Vec
+    lowered: usize
+}
+
+
+public function expand(
+    seed: Vec_SpecOutput.Vec,
+    seed_hir: Vec_HirFile.Vec,
+    dep_hir: Vec_HirFile.Vec,
+    output: take resolve_ctx_mod.ResolveOutput,
+    cat: specsurface_mod.SpecCatalogue,
+    spec_map: specdefs_mod.SpecDefMap,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    tmpl: mutable fntable_mod.TemplateTable,
+    ty_paths: mutable typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    trace: trace_mod.TraceConfig,
+    clock: MonotonicClock,
+    errout: Stderr,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    scratch: mutable diags_mod.Diagnostics,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ExpandResult
+    with {rfs, wfs, clock, errout, allocator, divergence, err: alloc.AllocError, err: fs.FsError, panic}
+{
+    uninit ctx_hir: Vec_HirFile.Vec
+    Vec_HirFile.new(init ctx_hir, allocator)?
+    append_hir_alias(mutable ctx_hir, seed_hir, allocator)?
+    append_hir_alias(mutable ctx_hir, dep_hir, allocator)?
+    uninit no_files: Vec_HirFile.Vec
+    Vec_HirFile.new(init no_files, allocator)?
+    let ctx_nominals = feed_mod.build_regular_nominals(ctx_hir, no_files, interner, mutable ty_interner, allocator)?
+    let s_decls = trace_mod.phase_begin(trace, clock, errout, "instloop.decls", allocator)?
+    uninit decls: types_check_mod.DeclTables
+    types_check_mod.new_decl_tables(init decls, allocator)?
+    let ptr_width = arch_mod.pointer_width(triple_mod.arch(triple))
+    let cn = Vec_HirFile.len(ctx_hir)
+    var ci: usize = 0
+    loop decreases (cn - ci + 1) as usize {
+        if ci >= cn { break }
+        types_check_mod.collect_file_decls(
+            mutable decls,
+            Vec_HirFile.at(ctx_hir, ci),
+            ctx_nominals,
+            ptr_width,
+            interner,
+            mutable ty_interner,
+            mutable effect_interner,
+            allocator,
+        )?
+        ci = ci + 1 as usize
+    }
+    trace_mod.phase_end_n(s_decls, clock, errout, cn, "files", allocator)?
+    uninit all_hir: Vec_HirFile.Vec
+    Vec_HirFile.new(init all_hir, allocator)?
+    uninit all_inst: Vec_File.Vec
+    Vec_File.new(init all_inst, allocator)?
+    var seen = IntMap_bool.new(allocator)?
+    let resolve_baseline = diags_mod.count(output.diags)
+    var final_out = expand_loop(
+        seed, 0 as usize, take output, mutable seen, mutable all_hir, mutable all_inst, mutable decls, ctx_nominals,
+        cat, spec_map, triple, prim_defs, cap_defs, builtin_registry,
+        mutable tmpl, mutable ty_paths, rfs, wfs, trace, clock, errout, mutable cache_ctx,
+        mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable scratch, mutable map, allocator,
+    )?
+    let global = build_instance_nominals(all_hir, mutable ty_interner, allocator)?
+    if !Vec_File.is_empty(all_inst) && diags_mod.count(final_out.diags) > resolve_baseline {
+        diags_mod.truncate(mutable final_out.diags, resolve_baseline)
+        var rectx = resolve_ctx_mod.reopen(take final_out, allocator)?
+        resolve_inst_mod.resolve_instance_files(mutable rectx, cat, all_inst, mutable interner, allocator)?
+        let reresolved = resolve_ctx_mod.finish(take rectx)
+        return ExpandResult { hir: all_hir, output: reresolved, nominals: global }
+    }
+    return ExpandResult { hir: all_hir, output: final_out, nominals: global }
+}
+
+
+function expand_loop(
+    work: Vec_SpecOutput.Vec,
+    round: usize,
+    out: take resolve_ctx_mod.ResolveOutput,
+    seen: mutable IntMap_bool.IntMap,
+    all_hir: mutable Vec_HirFile.Vec,
+    all_inst: mutable Vec_File.Vec,
+    decls: mutable types_check_mod.DeclTables,
+    ctx_nominals: nominals_mod.NominalMap,
+    cat: specsurface_mod.SpecCatalogue,
+    spec_map: specdefs_mod.SpecDefMap,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    tmpl: mutable fntable_mod.TemplateTable,
+    ty_paths: mutable typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    trace: trace_mod.TraceConfig,
+    clock: MonotonicClock,
+    errout: Stderr,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    scratch: mutable diags_mod.Diagnostics,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> resolve_ctx_mod.ResolveOutput
+    with {rfs, wfs, clock, errout, allocator, divergence, err: alloc.AllocError, err: fs.FsError, panic}
+{
+    let materialized = materialize_mod.materialize_instances(work, allocator)?
+    let filtered = filter_unseen(materialized, mutable seen, allocator)?
+    if Vec_File.is_empty(filtered) {
+        return out
+    }
+    let s_round = trace_mod.phase_begin(trace, clock, errout, "instloop.round", allocator)?
+    let step = expand_round_step(
+        take filtered, take out, mutable all_hir, mutable all_inst, mutable decls, ctx_nominals,
+        cat, spec_map, triple, prim_defs, cap_defs, builtin_registry,
+        mutable tmpl, mutable ty_paths, rfs, wfs, mutable cache_ctx,
+        mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable scratch, mutable map, allocator,
+    )?
+    trace_mod.phase_end_detail(s_round, clock, errout, f"round {round}: {step.lowered} files", allocator)?
+
+    return expand_loop(
+        step.next, round + 1, take step.output, mutable seen, mutable all_hir, mutable all_inst, mutable decls, ctx_nominals,
+        cat, spec_map, triple, prim_defs, cap_defs, builtin_registry,
+        mutable tmpl, mutable ty_paths, rfs, wfs, trace, clock, errout, mutable cache_ctx,
+        mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable scratch, mutable map, allocator,
+    )?
+}
+
+
+function expand_round_step(
+    filtered: take Vec_File.Vec,
+    out: take resolve_ctx_mod.ResolveOutput,
+    all_hir: mutable Vec_HirFile.Vec,
+    all_inst: mutable Vec_File.Vec,
+    decls: mutable types_check_mod.DeclTables,
+    ctx_nominals: nominals_mod.NominalMap,
+    cat: specsurface_mod.SpecCatalogue,
+    spec_map: specdefs_mod.SpecDefMap,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    tmpl: mutable fntable_mod.TemplateTable,
+    ty_paths: mutable typaths_mod.TyPathMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    cache_ctx: mutable cachectx_mod.SpecCacheCtx,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    scratch: mutable diags_mod.Diagnostics,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> RoundStep
+    with {rfs, wfs, allocator, divergence, err: alloc.AllocError, err: fs.FsError, panic}
+{
+    let inst_files = derives_mod.expand_derives(take filtered, mutable interner, allocator)?
+    append_file_alias(mutable all_inst, inst_files, allocator)?
+
+    var ctx = resolve_ctx_mod.reopen(take out, allocator)?
+    resolve_inst_mod.resolve_instance_files(mutable ctx, cat, inst_files, mutable interner, allocator)?
+    let out2 = resolve_ctx_mod.finish(take ctx)
+    tybuild_mod.extend_ty_paths_synthetic(mutable ty_paths, out2.registry, mutable ty_interner, allocator)?
+
+    var batch_hir = lower_mod.lower_to_hir(take inst_files, out2, out2.next_def_id, mutable interner, allocator, allocator)?
+    uninit no_decl_only: Vec_HirFile.Vec
+    Vec_HirFile.new(init no_decl_only, allocator)?
+    var round_nominals = feed_mod.build_regular_nominals(batch_hir, no_decl_only, interner, mutable ty_interner, allocator)?
+    nominals_mod.extend(mutable round_nominals, ctx_nominals, allocator)?
+    var batch_types = typecheck_mod.typecheck_files_prebuilt(
+        batch_hir, mutable decls, round_nominals, true,
+        triple, prim_defs, cap_defs,
+        interner, mutable ty_interner, mutable effect_interner, mutable scratch, allocator,
+    )?
+    let unrolled = unroll_mod.unroll_files(
+        batch_hir, batch_types, ty_interner, effect_interner,
+        builtin_registry, triple, mutable interner, allocator,
+    )?
+    batch_hir = unrolled.files
+    batch_types = retypecheck_changed(
+        batch_hir, batch_types, unrolled.file_changed, mutable decls, round_nominals,
+        triple, prim_defs, cap_defs,
+        interner, mutable ty_interner, mutable effect_interner, mutable scratch, allocator,
+    )?
+    let batch_cteval = cteval_mod.evaluate_files(
+        batch_hir, batch_types, ty_interner, effect_interner,
+        builtin_registry, triple, mutable interner, mutable diags, allocator,
+    )?
+    tybuild_mod.extend_ty_paths(mutable ty_paths, batch_hir, batch_types, mutable ty_interner, allocator)?
+    var next_work = specs_mod.monomorphise_files_with_map(
+        batch_hir, batch_cteval, out2.registry, out2.module_tree, spec_map, batch_types, ty_paths, rfs, wfs, mutable cache_ctx,
+        mutable interner, ty_interner, effect_interner, mutable diags, mutable map, allocator,
+    )?
+
+    fnbuild_mod.expand_round(
+        batch_hir, batch_types, mutable tmpl, ty_paths, out2.registry, out2.module_tree,
+        mutable interner, ty_interner, mutable map, mutable next_work, allocator,
+    )?
+
+    let batch_count = Vec_HirFile.len(batch_hir)
+    append_hir(mutable all_hir, mutable batch_hir, allocator)?
+    return RoundStep { output: take out2, next: take next_work, lowered: batch_count }
+}
+
+
+function retypecheck_changed(
+    batch_hir: Vec_HirFile.Vec,
+    batch_types: Vec_TypeOutput.Vec,
+    file_changed: Vec_bool.Vec,
+    decls: mutable types_check_mod.DeclTables,
+    round_nominals: nominals_mod.NominalMap,
+    triple: triple_mod.TargetTriple,
+    prim_defs: primitives_mod.PrimitiveDefs,
+    cap_defs: capabilities_mod.CapabilityDefs,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    scratch: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_TypeOutput.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HirFile.len(batch_hir)
+    uninit changed_hir: Vec_HirFile.Vec
+    Vec_HirFile.new(init changed_hir, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_bool.at(file_changed, i) {
+            Vec_HirFile.push(mutable changed_hir, Vec_HirFile.at(batch_hir, i), allocator)?
+        }
+        i = i + 1
+    }
+    if Vec_HirFile.is_empty(changed_hir) {
+        return batch_types
+    }
+    let new_types = typecheck_mod.typecheck_files_prebuilt(
+        changed_hir, mutable decls, round_nominals, false,
+        triple, prim_defs, cap_defs,
+        interner, mutable ty_interner, mutable effect_interner, mutable scratch, allocator,
+    )?
+    uninit merged: Vec_TypeOutput.Vec
+    Vec_TypeOutput.with_capacity(init merged, n, allocator)?
+    var j: usize = 0
+    var k: usize = 0
+    loop decreases (n - j) {
+        if j >= n { break }
+        if Vec_bool.at(file_changed, j) {
+            Vec_TypeOutput.push(mutable merged, Vec_TypeOutput.at(new_types, k), allocator)?
+            k = k + 1
+        } else {
+            Vec_TypeOutput.push(mutable merged, Vec_TypeOutput.at(batch_types, j), allocator)?
+        }
+        j = j + 1
+    }
+    return merged
+}
+
+
+function filter_unseen(
+    files: Vec_File.Vec,
+    seen: mutable IntMap_bool.IntMap,
+    allocator: Allocator,
+) -> Vec_File.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_File.Vec
+    Vec_File.new(init out, allocator)?
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        let name = module_name_of(f)
+        if name.raw == sym_mod.empty().raw {
+            Vec_File.push(mutable out, f, allocator)?
+        } else {
+            if !IntMap_bool.contains(seen, name.raw as i64) {
+                let _ = IntMap_bool.insert(mutable seen, name.raw as i64, true, allocator)?
+                Vec_File.push(mutable out, f, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+function module_name_of(file: ast_file_mod.File) -> sym_mod.Symbol {
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(file.items, i).kind {
+            case .module_(let decl) => {
+                let segs = decl.path.segments
+                let sn = Vec_Ident.len(segs)
+                if sn == 0 { return sym_mod.empty() }
+                return Vec_Ident.at(segs, sn - 1).name
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return sym_mod.empty()
+}
+
+
+function append_hir(
+    all_hir: mutable Vec_HirFile.Vec,
+    batch: mutable Vec_HirFile.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(batch)
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n { break }
+        let h = Vec_HirFile.at(batch, i)
+        Vec_HirFile.push(mutable all_hir, take h, allocator)?
+        i = i + 1 as usize
+    }
+    Vec_HirFile.clear(mutable batch)
+}
+
+
+function append_hir_alias(
+    dst: mutable Vec_HirFile.Vec,
+    src: Vec_HirFile.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_HirFile.push(mutable dst, Vec_HirFile.at(src, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function append_file_alias(
+    dst: mutable Vec_File.Vec,
+    src: Vec_File.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_File.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_File.push(mutable dst, Vec_File.at(src, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function build_instance_nominals(
+    hir_files: Vec_HirFile.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> nominals_mod.NominalMap
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: nominals_mod.NominalMap
+    out = nominals_mod.empty(allocator)?
+    let n = Vec_HirFile.len(hir_files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_HirFile.at(hir_files, i)
+        let modname = module_name_of(f.source)
+        if modname.raw != sym_mod.empty().raw {
+            collect_file_nominals(f.items, modname, mutable out, mutable ty_interner, allocator)?
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+function collect_file_nominals(
+    items: Vec_HItem.Vec,
+    modname: sym_mod.Symbol,
+    out: mutable nominals_mod.NominalMap,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                let ty = nominals_mod.nominal_ty_of(Box_HTypeSignature.get(sig_box), item.def_id, mutable ty_interner, allocator)?
+                nominals_mod.with_entry(mutable out, modname, modname, ty, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}

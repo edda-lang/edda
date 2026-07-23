@@ -1,0 +1,152 @@
+
+module std.os.process.wait
+
+import std.os.raw
+import std.os.pages
+import local.process
+import local.drain.drain
+
+public type WaitError {
+    case already_consumed
+    case wait_io_failure(reason: String)
+}
+
+public type ExitOutcome {
+    case exited(code: i32)
+    case signaled(signal: i32)
+    case wait_failed(reason: wait.WaitError)
+}
+
+public type ProcessOutput {
+    exit: i32
+    stdout: [u8]
+    stderr: [u8]
+}
+
+function wait_for_single_object(handle: u64, ms: u64) -> u32
+    extern "WaitForSingleObject" from "kernel32.dll"
+
+function get_exit_code_process(handle: u64, code_out: u64) -> i32
+    extern "GetExitCodeProcess" from "kernel32.dll"
+
+function terminate_process(handle: u64, exit_code: u64) -> i32
+    extern "TerminateProcess" from "kernel32.dll"
+
+function close_handle(handle: u64) -> i32
+    extern "CloseHandle" from "kernel32.dll"
+
+function release_page(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, 4096)?
+    }
+}
+
+function reap_posix(pid: i32) -> ExitOutcome
+    with {err: wait.WaitError}
+{
+    let pg: u64 = handle err: pages.PageError as _e -> (raise wait.WaitError.wait_io_failure(reason: "wait: no scratch page")) {
+        pages.map(4096)?
+    }
+    let r: i64 = raw.syscall6(61, pid as u64, pg, 0, 0, 0, 0)
+    if r < 0 {
+        release_page(pg)
+        raise wait.WaitError.wait_io_failure(reason: "wait: wait4 failed")
+    }
+    let status: u32 = raw.load_u32(pg)
+    release_page(pg)
+    let term: u32 = status & 0x7F
+    if term == 0 {
+        return ExitOutcome.exited(code: ((status >> 8) & 0xFF) as i32)
+    }
+    return ExitOutcome.signaled(signal: (term & 0x7F) as i32)
+}
+
+function reap_windows(handle: u64) -> ExitOutcome
+    with {err: wait.WaitError}
+{
+    let _ = wait_for_single_object(handle, 0xFFFFFFFF)
+    let pg: u64 = handle err: pages.PageError as _e -> (raise wait.WaitError.wait_io_failure(reason: "wait: no scratch page")) {
+        pages.map(4096)?
+    }
+    raw.store_u32(pg, 0)
+    let ok: i32 = get_exit_code_process(handle, pg)
+    let code: u32 = raw.load_u32(pg)
+    release_page(pg)
+    let _ = close_handle(handle)
+    if ok == 0 {
+        raise wait.WaitError.wait_io_failure(reason: "wait: GetExitCodeProcess failed")
+    }
+    return ExitOutcome.exited(code: code as i32 wrapping)
+}
+
+function reap(handle: u64) -> ExitOutcome
+    with {err: wait.WaitError}
+{
+    comptime if target_has("windows") {
+        return reap_windows(handle)?
+    } else {
+        return reap_posix(handle as i32 wrapping)?
+    }
+}
+
+public function wait(h: take process.ChildHandle) -> ExitOutcome
+    with {err: wait.WaitError}
+{
+    return reap(h.raw)?
+}
+
+public function kill(h: take process.ChildHandle) -> ExitOutcome
+    with {err: wait.WaitError}
+{
+    comptime if target_has("windows") {
+        let _ = terminate_process(h.raw, 9)
+        return reap_windows(h.raw)?
+    } else {
+        let _ = raw.syscall6(62, h.raw, 9, 0, 0, 0, 0)
+        return reap_posix(h.raw as i32 wrapping)?
+    }
+}
+
+public function detach(h: take process.ChildHandle) -> () {
+    comptime if target_has("windows") {
+        let _ = close_handle(h.raw)
+    } else {
+        let _ = h.raw
+    }
+}
+
+function negi(x: i32) -> i32 {
+    return (0 as i32) - x
+}
+
+function reap_code(raw_h: u64) -> i32 {
+    return handle err: wait.WaitError as _e -> negi(1) {
+        match reap(raw_h)? {
+            case .exited(let c) => c
+            case .signaled(let s) => negi(s)
+            case .wait_failed(_) => negi(1)
+        }
+    }
+}
+
+public function wait_with_output(h: take process.ChildHandle, allocator: Allocator) -> ProcessOutput
+    with {allocator}
+{
+    let out_fd: u64 = h.out_fd
+    let err_fd: u64 = h.err_fd
+    let raw_h: u64 = h.raw
+    if out_fd == process.no_capture_fd() {
+        return ProcessOutput { exit: reap_code(raw_h), stdout: "".bytes(), stderr: "".bytes() }
+    }
+    let cap: drain.TwoCaptured = handle err: pages.PageError as _e -> drain.empty_two() {
+        drain.drain_two(out_fd, err_fd, allocator)?
+    }
+    drain.close_fd(out_fd)
+    drain.close_fd(err_fd)
+    return ProcessOutput {
+        exit: reap_code(raw_h),
+        stdout: cap.out,
+        stderr: cap.err,
+    }
+}

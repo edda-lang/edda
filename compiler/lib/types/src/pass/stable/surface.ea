@@ -1,0 +1,285 @@
+
+module types.pass.stable.surface
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.attr as attr_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import syntax.ast.item as ast_item_mod
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.def as def_mod
+import local.check.env.sig as sig_mod
+import local.pass.stable.callee as callee_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+import target.capability as cap_mod
+import local.check.pass.avail.gate as gate_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(def_mod.DefId)
+
+
+spec std.core.option.Option(ast_item_mod.Stability)
+spec std.core.option.Option(ast_tree.EffectRow)
+spec std.core.option.Option(cap_mod.Capability)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public function check_stable_surface(
+    file: hir_file.HirFile,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_items(file, file.items, fn_signatures, node_call_method, interner, mutable diags, allocator)?
+}
+
+
+function walk_items(
+    file: hir_file.HirFile,
+    items: Vec_HItem.Vec,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        walk_item(file, Vec_HItem.at(items, i), fn_signatures, node_call_method, interner, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_item(
+    file: hir_file.HirFile,
+    item: hir_item.HItem,
+    fn_signatures: Vec_FnSig.Vec,
+    node_call_method: Vec_DefId.Vec,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(let sig_box, let body) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            check_fn(item, sig, interner, mutable diags, allocator)?
+            if is_stable(sig) {
+                callee_mod.walk_block(file, body, fn_signatures, node_call_method, mutable diags, allocator)?
+            }
+        }
+        case .function_extern(let sig_box, let _name, let _sp, let _dll) => {
+            check_fn(item, Box_HFnSignature.get(sig_box), interner, mutable diags, allocator)?
+        }
+        case .spec_decl(let _sig, let body) => {
+            walk_items(file, body, fn_signatures, node_call_method, interner, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function check_fn(
+    item: hir_item.HItem,
+    sig: hir_item.HFnSignature,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if !is_stable(sig) { return }
+    check_unverified(item, interner, mutable diags, allocator)?
+    let row = match sig.effects {
+        case .some(let r) => r
+        case .none        => return
+    }
+    check_row_members(row.members, sig.params, interner, mutable diags, allocator)?
+}
+
+
+function is_stable(sig: hir_item.HFnSignature) -> bool {
+    return match sig.stability {
+        case .some(let st) => match st {
+            case .stable_(let _since) => true
+            case .unstable_           => false
+        }
+        case .none => false
+    }
+}
+
+
+function check_unverified(
+    item: hir_item.HItem,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let attrs = item.ast_item.attributes
+    let n = Vec_Attribute.len(attrs)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let attr = Vec_Attribute.at(attrs, i)
+        if sym_eq(attr.name.name, "unverified".bytes(), interner) {
+            let d = diag_mod.error_at(code_mod.stability_violation(), attr.span, "`@unverified` is not admitted on a `stable` item")
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function check_row_members(
+    members: Vec_EffectMember.Vec,
+    params: Vec_HParam.Vec,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_EffectMember.len(members)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        check_member(Vec_EffectMember.at(members, i), params, interner, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function check_member(
+    m: ast_tree.EffectMember,
+    params: Vec_HParam.Vec,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match m {
+        case .named(let name, let _ty) => {
+            if sym_eq(name.name, "err".bytes(), interner) { return }
+            if sym_eq(name.name, "yield".bytes(), interner) { return }
+            emit_member_violation(name.span, mutable diags, allocator)?
+        }
+        case .graded(let kind, let _bound) => {
+            if sym_eq(kind.name, "alloc".bytes(), interner) { return }
+            emit_member_violation(kind.span, mutable diags, allocator)?
+        }
+        case .spread(let path) => {
+            emit_member_violation(path.span, mutable diags, allocator)?
+        }
+        case .capability(let id) => {
+            check_capability_member(id, params, interner, mutable diags, allocator)?
+        }
+    }
+}
+
+
+function check_capability_member(
+    id: ast_ident.Ident,
+    params: Vec_HParam.Vec,
+    interner: interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HParam.len(params)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let p = Vec_HParam.at(params, i)
+        if p.name.raw == id.name.raw {
+            if param_cap_allowed(p, interner) { return }
+            emit_member_violation(id.span, mutable diags, allocator)?
+            return
+        }
+        i = i + 1 as usize
+    }
+    if sym_eq(id.name, "panic".bytes(), interner) { return }
+    emit_member_violation(id.span, mutable diags, allocator)?
+}
+
+
+function param_cap_allowed(p: hir_item.HParam, interner: interner_mod.Interner) -> bool {
+    let seg = match extract_type_leaf(p.ty) {
+        case .some(let s) => s
+        case .none        => return false
+    }
+    if (seg.raw as usize) >= interner_mod.slot_count(interner) { return false }
+    return match gate_mod.cap_from_bytes(interner_mod.lookup(interner, seg)) {
+        case .some(let c) => cap_allowed(c)
+        case .none        => false
+    }
+}
+
+
+function cap_allowed(c: cap_mod.Capability) -> bool {
+    return match c {
+        case .allocator           => true
+        case .bounded_allocator   => true
+        case .deterministic_random => true
+        case _                    => false
+    }
+}
+
+
+function extract_type_leaf(ty: ast_tree.Ty) -> Option_Symbol {
+    let path = match ty.kind {
+        case .path(let p) => p
+        case _            => return Option_Symbol.none
+    }
+    if Vec_Ident.len(path.segments) != 1 as usize { return Option_Symbol.none }
+    return Option_Symbol.some(value: Vec_Ident.at(path.segments, 0).name)
+}
+
+
+function emit_member_violation(
+    at: span_mod.Span,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(code_mod.stability_violation(), at, "effect-row entry not admitted on a `stable` item (whitelist: err, panic, alloc, yield, DeterministicRandom)")
+    coll_mod.emit(mutable diags, take d, allocator)?
+}
+
+
+function sym_eq(sym: symbol.Symbol, name: [u8], interner: interner_mod.Interner) -> bool {
+    if (sym.raw as usize) >= interner_mod.slot_count(interner) { return false }
+    return slice.eq_u8(interner_mod.lookup(interner, sym), name)
+}

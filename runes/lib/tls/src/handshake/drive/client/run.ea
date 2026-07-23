@@ -1,0 +1,426 @@
+
+module tls.handshake.drive.client.run
+
+import std.net.socket
+import std.mem.alloc
+import std.crypto.random as crypto_random
+import std.crypto.ecdh as ecdh
+import local.error
+import local.crypto.aead
+import local.config as config_mod
+import local.crypto.ciphersuite as suite_mod
+import local.crypto.transcript as transcript_mod
+import local.record.kind as record_kind
+import local.record.plaintext as rec_plain
+import local.record.ciphertext as rec_cipher
+import local.handshake.kind as hs_kind
+import local.handshake.message as hs_msg
+import local.handshake.client.hello as ch_mod
+import local.handshake.client.finished as cf_mod
+import local.handshake.server.hello as sh_mod
+import local.handshake.server.certificate as cert_msg
+import local.handshake.server.verify as cv_msg
+import local.handshake.server.finished as sf_mod
+import local.cert.check as cert_check
+import local.cert.cv as cert_cv
+import local.key.secrets as secrets
+
+unstable public type HandshakeResult {
+    cipher: aead.AeadCipher
+    read_key: [u8]
+    read_iv: [u8] where read_iv.len() == 12
+    write_key: [u8]
+    write_iv: [u8] where write_iv.len() == 12
+}
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _cipher_for(suite: suite_mod.CipherSuite) -> aead.AeadCipher {
+    return match suite {
+        case .tls_aes_128_gcm_sha256       => aead.AeadCipher.aes_128_gcm
+        case .tls_chacha20_poly1305_sha256 => aead.AeadCipher.chacha20_poly1305
+        case .tls_aes_256_gcm_sha384       => aead.AeadCipher.aes_128_gcm
+        case .tls_aes_128_ccm_sha256       => aead.AeadCipher.aes_128_gcm
+        case .tls_aes_128_ccm_8_sha256     => aead.AeadCipher.aes_128_gcm
+    }
+}
+
+function _transcript_hash(t: transcript_mod.Transcript, allocator: Allocator) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    var out = _alloc_bytes(allocator, 32 as usize)?
+    transcript_mod.transcript_hash_sha256(t, mutable out)
+    return out
+}
+
+function _empty_hash(allocator: Allocator) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let empty = transcript_mod.transcript_new(allocator)?
+    return _transcript_hash(empty, allocator)?
+}
+
+function _max_records() -> usize { return 64 as usize }
+
+function _hs_reader_cap() -> usize { return 131072 as usize }
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_pos_box(allocator: Allocator) -> [usize]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_usize_slots(allocator, 2 as usize)?
+    }
+}
+
+unstable public type HsReader {
+    buf: [u8]
+    pos: [usize]
+}
+
+function _hs_reader_new(allocator: Allocator) -> HsReader
+    with {allocator, err: error.TlsError}
+{
+    let buf = _alloc_bytes(allocator, _hs_reader_cap())?
+    var pos = _alloc_pos_box(allocator)?
+    pos[0 as usize] = 0 as usize
+    pos[1 as usize] = 0 as usize
+    return HsReader { buf: buf, pos: pos }
+}
+
+function _hs_reader_compact(reader: mutable HsReader) -> () {
+    let cur = reader.pos[0 as usize]
+    if cur == (0 as usize) { return }
+    let fill = reader.pos[1 as usize]
+    let n = fill - cur
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        reader.buf[i] = reader.buf[cur + i]
+        i = i + (1 as usize)
+    }
+    reader.pos[0 as usize] = 0 as usize
+    reader.pos[1 as usize] = n
+}
+
+function _hs_reader_fill_one(
+    reader: mutable HsReader,
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    key: [u8],
+    iv: [u8] where iv.len() == 12,
+    seq: mutable [u64],
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    let rec = rec_cipher.read_ciphertext(mutable conn, cipher, key, iv, seq[0 as usize], mutable allocator)?
+    seq[0 as usize] = seq[0 as usize] + (1 as u64)
+    match rec.kind {
+        case .handshake => {
+        }
+        case .change_cipher_spec => {
+            return
+        }
+        case .alert => {
+            raise error.TlsError.alert_received(level: 2 as u8, code: 0 as u8)
+        }
+        case _ => {
+            raise error.TlsError.unexpected_message
+        }
+    }
+    let n = rec.plaintext.len()
+    var fill = reader.pos[1 as usize]
+    if fill + n > reader.buf.len() {
+        _hs_reader_compact(mutable reader)
+        fill = reader.pos[1 as usize]
+        if fill + n > reader.buf.len() { raise error.TlsError.bad_handshake }
+    }
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        reader.buf[fill + i] = rec.plaintext[i]
+        i = i + (1 as usize)
+    }
+    reader.pos[1 as usize] = fill + n
+}
+
+function _hs_reader_ensure(
+    reader: mutable HsReader,
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    key: [u8],
+    iv: [u8] where iv.len() == 12,
+    seq: mutable [u64],
+    allocator: mutable Allocator,
+    need: usize,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    var guard: usize = _max_records()
+    loop decreases guard {
+        if reader.pos[1 as usize] - reader.pos[0 as usize] >= need { break }
+        if guard == (0 as usize) { raise error.TlsError.bad_handshake }
+        guard = guard - (1 as usize)
+        _hs_reader_fill_one(mutable reader, mutable conn, cipher, key, iv, mutable seq, mutable allocator)?
+    }
+}
+
+function _copy_range(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let n = hi - lo
+    let out = _alloc_bytes(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        out[i] = src[lo + i]
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+function _expect_kind(body_kind: hs_kind.HandshakeKind, want: hs_kind.HandshakeKind) -> ()
+    with {err: error.TlsError}
+{
+    if hs_kind.handshake_kind_wire(body_kind) != hs_kind.handshake_kind_wire(want) {
+        raise error.TlsError.unexpected_message
+    }
+}
+
+function _copy32(src: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    if src.len() != (32 as usize) { raise error.TlsError.key_exchange_failed }
+    let out = _alloc_bytes(allocator, 32 as usize)?
+    var i: usize = 0 as usize
+    loop decreases (32 as usize) - i {
+        if i >= (32 as usize) { break }
+        out[i] = src[i]
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+function _send_client_hello(
+    conn: mutable socket.Connection,
+    random: Random,
+    t: mutable transcript_mod.Transcript,
+    hostname: [u8],
+    private_key: mutable [u8],
+    allocator: mutable Allocator,
+) -> ()
+    with {random, allocator, err: error.TlsError}
+{
+    var client_random = _alloc_bytes(allocator, 32 as usize)?
+    crypto_random.fill(random, mutable client_random)
+    var session_id = _alloc_bytes(allocator, 32 as usize)?
+    crypto_random.fill(random, mutable session_id)
+    var public_key = _alloc_bytes(allocator, 32 as usize)?
+    ecdh.generate_keypair_x25519(random, mutable private_key, mutable public_key)
+    let ch = ch_mod.encode_client_hello(hostname, client_random, session_id, public_key, allocator)?
+    transcript_mod.transcript_append(mutable t, ch)?
+    rec_plain.write_record(mutable conn, record_kind.RecordKind.handshake, ch, mutable allocator)?
+}
+
+function _recv_server_hello(
+    conn: mutable socket.Connection,
+    t: mutable transcript_mod.Transcript,
+    allocator: mutable Allocator,
+) -> sh_mod.ParsedServerHello
+    with {allocator, err: error.TlsError}
+{
+    let rec = rec_plain.read_record(mutable conn, mutable allocator)?
+    match rec.kind {
+        case .handshake => {
+        }
+        case _ => {
+            raise error.TlsError.unexpected_message
+        }
+    }
+    let header = hs_msg.read_header(rec.fragment, 0 as usize)?
+    _expect_kind(header.kind, hs_kind.HandshakeKind.server_hello)?
+    transcript_mod.transcript_append(mutable t, rec.fragment)?
+    let body_lo = hs_msg.header_len()
+    let body_hi = body_lo + header.body_len
+    if body_hi > rec.fragment.len() { raise error.TlsError.bad_handshake }
+    return sh_mod.decode_server_hello(rec.fragment[body_lo..<body_hi], allocator)?
+}
+
+unstable public type ServerHandshakeMessage {
+    kind: hs_kind.HandshakeKind
+    body: [u8]
+}
+
+function _recv_hs_message(
+    reader: mutable HsReader,
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    key: [u8],
+    iv: [u8] where iv.len() == 12,
+    seq: mutable [u64],
+    t: mutable transcript_mod.Transcript,
+    allocator: mutable Allocator,
+) -> ServerHandshakeMessage
+    with {allocator, err: error.TlsError}
+{
+    let hdr_len = hs_msg.header_len()
+    _hs_reader_ensure(mutable reader, mutable conn, cipher, key, iv, mutable seq, mutable allocator, hdr_len)?
+    let cur0 = reader.pos[0 as usize]
+    let header = hs_msg.read_header(reader.buf[cur0..<reader.pos[1 as usize]], 0 as usize)?
+    let total = hdr_len + header.body_len
+    if total > reader.buf.len() { raise error.TlsError.bad_handshake }
+    _hs_reader_ensure(mutable reader, mutable conn, cipher, key, iv, mutable seq, mutable allocator, total)?
+    let cur = reader.pos[0 as usize]
+    transcript_mod.transcript_append(mutable t, reader.buf[cur..<cur + total])?
+    let body = _copy_range(reader.buf, cur + hdr_len, cur + total, allocator)?
+    reader.pos[0 as usize] = cur + total
+    return ServerHandshakeMessage {
+        kind: header.kind,
+        body: body,
+    }
+}
+
+function _verify_certificate_flight(
+    reader: mutable HsReader,
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    s_hs_keys: secrets.TrafficKeys,
+    server_name: String,
+    config: config_mod.ClientConfig,
+    seq: mutable [u64],
+    t: mutable transcript_mod.Transcript,
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    let ee = _recv_hs_message(mutable reader, mutable conn, cipher, s_hs_keys.key, s_hs_keys.iv, mutable seq, mutable t, mutable allocator)?
+    _expect_kind(ee.kind, hs_kind.HandshakeKind.encrypted_extensions)?
+    let cert_in = _recv_hs_message(mutable reader, mutable conn, cipher, s_hs_keys.key, s_hs_keys.iv, mutable seq, mutable t, mutable allocator)?
+    _expect_kind(cert_in.kind, hs_kind.HandshakeKind.certificate)?
+    let th_cert = _transcript_hash(t, allocator)?
+    let chain = cert_msg.decode_certificate(cert_in.body, allocator)?
+    cert_check.verify_chain(chain, server_name, config.trust_store, config.now_unix_seconds, allocator)?
+    let cv_in = _recv_hs_message(mutable reader, mutable conn, cipher, s_hs_keys.key, s_hs_keys.iv, mutable seq, mutable t, mutable allocator)?
+    _expect_kind(cv_in.kind, hs_kind.HandshakeKind.certificate_verify)?
+    let cv = cv_msg.decode_certificate_verify(cv_in.body, allocator)?
+    let signed_input = cert_check.build_cv_signed_input_sha256(th_cert, allocator)?
+    let leaf = cert_msg.chain_at(chain, 0 as usize)
+    cert_cv.verify_certificate_verify(leaf, cv.algorithm, cv.signature, signed_input, allocator)?
+}
+
+function _verify_server_finished(
+    reader: mutable HsReader,
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    s_hs_keys: secrets.TrafficKeys,
+    server_hs_traffic: [u8] where server_hs_traffic.len() == 32,
+    seq: mutable [u64],
+    t: mutable transcript_mod.Transcript,
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    let th_cv = _transcript_hash(t, allocator)?
+    let sf = _recv_hs_message(mutable reader, mutable conn, cipher, s_hs_keys.key, s_hs_keys.iv, mutable seq, mutable t, mutable allocator)?
+    _expect_kind(sf.kind, hs_kind.HandshakeKind.finished)?
+    let s_fin_key = secrets.finished_key(server_hs_traffic, allocator)?
+    sf_mod.verify_finished_sha256(sf.body, s_fin_key, th_cv, allocator)?
+}
+
+function _send_client_finished(
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    c_hs_keys: secrets.TrafficKeys,
+    client_hs_traffic: [u8] where client_hs_traffic.len() == 32,
+    t: mutable transcript_mod.Transcript,
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    let th_sfin = _transcript_hash(t, allocator)?
+    let c_fin_key = secrets.finished_key(client_hs_traffic, allocator)?
+    let cf = cf_mod.encode_finished_sha256(c_fin_key, th_sfin, allocator)?
+    transcript_mod.transcript_append(mutable t, cf)?
+    rec_cipher.write_ciphertext(
+        mutable conn,
+        cipher,
+        c_hs_keys.key,
+        c_hs_keys.iv,
+        0 as u64,
+        record_kind.RecordKind.handshake,
+        cf,
+        mutable allocator,
+    )?
+}
+
+public function run_client_handshake(
+    conn: mutable socket.Connection,
+    random: Random,
+    host: String,
+    config: config_mod.ClientConfig,
+    allocator: mutable Allocator,
+) -> HandshakeResult
+    with {random, allocator, err: error.TlsError}
+{
+    var t = transcript_mod.transcript_new(allocator)?
+    var private_key = _alloc_bytes(allocator, 32 as usize)?
+    _send_client_hello(mutable conn, random, mutable t, host.bytes(), mutable private_key, mutable allocator)?
+    let sh = _recv_server_hello(mutable conn, mutable t, mutable allocator)?
+    let cipher = _cipher_for(sh.cipher_suite)
+    let peer_pub = _copy32(sh.server_key_share_key, allocator)?
+    var shared = _alloc_bytes(allocator, 32 as usize)?
+    handle err: ecdh.X25519Error -> (raise error.TlsError.key_exchange_failed) {
+        ecdh.derive_shared_secret_x25519(private_key, peer_pub, mutable shared)
+    }
+    let th_chsh = _transcript_hash(t, allocator)?
+    let early = secrets.early_secret(allocator)?
+    let empty_h = _empty_hash(allocator)?
+    let hs_sec = secrets.derive_handshake_secrets(shared, early, empty_h, th_chsh, allocator)?
+    let key_len = aead.cipher_key_len(cipher)
+    let s_hs_keys = secrets.traffic_key_iv(hs_sec.server_hs_traffic, key_len, allocator)?
+    let c_hs_keys = secrets.traffic_key_iv(hs_sec.client_hs_traffic, key_len, allocator)?
+    var read_seq = _alloc_seq(allocator)?
+    var reader = _hs_reader_new(allocator)?
+    _verify_certificate_flight(mutable reader, mutable conn, cipher, s_hs_keys, config.server_name, config, mutable read_seq, mutable t, mutable allocator)?
+    _verify_server_finished(mutable reader, mutable conn, cipher, s_hs_keys, hs_sec.server_hs_traffic, mutable read_seq, mutable t, mutable allocator)?
+    let th_sfin = _transcript_hash(t, allocator)?
+    _send_client_finished(mutable conn, cipher, c_hs_keys, hs_sec.client_hs_traffic, mutable t, mutable allocator)?
+    let app = secrets.derive_application_secrets(hs_sec.handshake_secret, empty_h, th_sfin, allocator)?
+    let c_ap_keys = secrets.traffic_key_iv(app.client_ap_traffic, key_len, allocator)?
+    let s_ap_keys = secrets.traffic_key_iv(app.server_ap_traffic, key_len, allocator)?
+    return HandshakeResult {
+        cipher: cipher,
+        read_key: s_ap_keys.key,
+        read_iv: s_ap_keys.iv,
+        write_key: c_ap_keys.key,
+        write_iv: c_ap_keys.iv,
+    }
+}
+
+function _alloc_u64_slots(allocator: Allocator, n: usize) -> [u64]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_seq(allocator: Allocator) -> [u64]
+    with {allocator, err: error.TlsError}
+{
+    let box = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u64_slots(allocator, 1 as usize)?
+    }
+    box[0 as usize] = 0 as u64
+    return box
+}

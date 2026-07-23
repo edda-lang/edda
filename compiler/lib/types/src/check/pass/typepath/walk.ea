@@ -1,0 +1,518 @@
+
+module types.check.pass.typepath.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import syntax.ast.item as ast_item
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import types.check.env.builtins as builtins_mod
+import types.check.env.lower.ty.ty as ty_lower_mod
+import types.check.env.lower.nominals as nominals_mod
+import types.check.env.sig as sig_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+import types.check.pass.typepath.generic as generic_mod
+
+
+spec std.mem.alloc.Box(ast_tree.Ty)
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+spec std.mem.alloc.Box(hir_item.HSpecSignature)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(ast_tree.Ty)
+spec std.collections.vec.Vec(ast_tree.FnTyParam)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(ast_item.TypeField)
+spec std.collections.vec.Vec(ast_item.Variant)
+spec std.collections.vec.Vec(ast_item.GenericParam)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.core.option.Option(ast_tree.EffectRow)
+spec std.core.option.Option(ast_tree.Ty)
+
+
+public function check_type_decl_paths(
+    file: hir_file.HirFile,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let mod_path = nominals_mod.file_module_path(file.items, allocator)?
+    let is_stdlib = if Vec_Symbol.len(mod_path) != 0 as usize {
+        sig_mod.sym_is(interner, Vec_Symbol.at(mod_path, 0 as usize), "std")
+    } else {
+        false
+    }
+    let gscope = ty_lower_mod.empty_generic_scope(allocator)?
+    walk_items(file.items, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+}
+
+
+function walk_items(
+    items: Vec_HItem.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                walk_type_sig(Box_HTypeSignature.get(sig_box), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case .function_(let fsig_box, _) => {
+                walk_fn_sig(Box_HFnSignature.get(fsig_box), builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case .function_extern(let fsig_box, _, _, _) => {
+                walk_fn_sig(Box_HFnSignature.get(fsig_box), builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case .spec_decl(let spec_box, let inner_items) => {
+                let spec_sig = Box_HSpecSignature.get(spec_box)
+                walk_spec_items(inner_items, spec_sig.generics, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_spec_items(
+    items: Vec_HItem.Vec,
+    spec_gens: Vec_GenericParam.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                var gscope = ty_lower_mod.empty_generic_scope(allocator)?
+                add_type_generics(mutable gscope, spec_gens, mutable ty_interner, allocator)?
+                walk_type_sig(Box_HTypeSignature.get(sig_box), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case .function_(let fsig_box, _) => {
+                walk_spec_fn_sig(Box_HFnSignature.get(fsig_box), spec_gens, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case .function_extern(let fsig_box, _, _, _) => {
+                walk_spec_fn_sig(Box_HFnSignature.get(fsig_box), spec_gens, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case .spec_decl(let spec_box, let inner_items) => {
+                let inner_sig = Box_HSpecSignature.get(spec_box)
+                let merged = merge_generics(spec_gens, inner_sig.generics, allocator)?
+                walk_spec_items(inner_items, merged, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function merge_generics(
+    outer: Vec_GenericParam.Vec,
+    inner: Vec_GenericParam.Vec,
+    allocator: Allocator,
+) -> Vec_GenericParam.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit merged: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init merged, allocator)?
+    let no = Vec_GenericParam.len(outer)
+    var i: usize = 0 as usize
+    loop decreases (no - i) {
+        if i >= no { break }
+        Vec_GenericParam.push(mutable merged, Vec_GenericParam.at(outer, i), allocator)?
+        i = i + 1 as usize
+    }
+    let ni = Vec_GenericParam.len(inner)
+    var j: usize = 0 as usize
+    loop decreases (ni - j) {
+        if j >= ni { break }
+        Vec_GenericParam.push(mutable merged, Vec_GenericParam.at(inner, j), allocator)?
+        j = j + 1 as usize
+    }
+    return merged
+}
+
+
+function walk_fn_sig(
+    sig: hir_item.HFnSignature,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var gscope = ty_lower_mod.empty_generic_scope(allocator)?
+    add_type_generics(mutable gscope, sig.outbound_generics, mutable ty_interner, allocator)?
+    add_type_generics(mutable gscope, sig.generics, mutable ty_interner, allocator)?
+    walk_fn_sig_tys(sig, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+}
+
+
+function walk_spec_fn_sig(
+    sig: hir_item.HFnSignature,
+    spec_gens: Vec_GenericParam.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var gscope = ty_lower_mod.empty_generic_scope(allocator)?
+    add_type_generics(mutable gscope, spec_gens, mutable ty_interner, allocator)?
+    add_type_generics(mutable gscope, sig.outbound_generics, mutable ty_interner, allocator)?
+    add_type_generics(mutable gscope, sig.generics, mutable ty_interner, allocator)?
+    walk_fn_sig_tys(sig, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+}
+
+
+function walk_fn_sig_tys(
+    sig: hir_item.HFnSignature,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HParam.len(sig.params)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_ty(Vec_HParam.at(sig.params, i).ty, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+    check_ty(sig.return_ty, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+    match sig.effects {
+        case .some(let row) => walk_effect_row(row, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+
+function add_type_generics(
+    gscope: mutable ty_lower_mod.GenericScope,
+    gens: Vec_GenericParam.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_GenericParam.len(gens)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let g = Vec_GenericParam.at(gens, i)
+        if is_type_generic(g) {
+            let oty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.opaque(def: def_mod.error()), allocator)?
+            ty_lower_mod.generic_scope_push(mutable gscope, g.name.name, oty, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function is_type_generic(g: ast_item.GenericParam) -> bool {
+    return match g.ty {
+        case .some(let t) => match t.kind {
+            case .meta => true
+            case _ => false
+        }
+        case .none => false
+    }
+}
+
+
+function walk_type_sig(
+    sig: hir_item.HTypeSignature,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match sig.kind {
+        case .product(let fields) => walk_fields(fields, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case .sum_(let variants) => walk_variants(variants, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+    }
+}
+
+
+function walk_variants(
+    variants: Vec_Variant.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Variant.len(variants)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Variant.at(variants, i).payload {
+            case .tuple(let elements) => walk_tys(elements, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            case .struct_(let fields) => walk_fields(fields, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            case .unit => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_fields(
+    fields: Vec_TypeField.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_TypeField.len(fields)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_ty(Vec_TypeField.at(fields, i).ty, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_tys(
+    elements: Vec_Ty.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Ty.len(elements)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_ty(Vec_Ty.at(elements, i), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function check_ty(
+    ty: ast_tree.Ty,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match ty.kind {
+        case .path(let p) => check_path_ty(ty, p, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case .tuple(let elements) => walk_tys(elements, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case .slice(let elem_box) => check_ty(Box_Ty.get(elem_box), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case .function_(let params, let ret_box, let effects) => {
+            let m = Vec_FnTyParam.len(params)
+            var i: usize = 0 as usize
+            loop decreases (m - i) {
+                if i >= m { break }
+                check_ty(Vec_FnTyParam.at(params, i).ty, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+                i = i + 1 as usize
+            }
+            check_ty(Box_Ty.get(ret_box), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            match effects {
+                case .some(let row) => walk_effect_row(row, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+                case .none => ()
+            }
+        }
+        case .comptime_(let inner_box) => check_ty(Box_Ty.get(inner_box), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case .refined(let base_box, _) => check_ty(Box_Ty.get(base_box), gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+        case _ => ()
+    }
+}
+
+
+function walk_effect_row(
+    row: ast_tree.EffectRow,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_EffectMember.len(row.members)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_EffectMember.at(row.members, i) {
+            case .named(_, let ty) => check_ty(ty, gscope, builtins, interner, is_stdlib, mutable ty_interner, mutable effect_interner, mutable diags, allocator)?
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function check_path_ty(
+    ty: ast_tree.Ty,
+    path: ast_ident.Path,
+    gscope: ty_lower_mod.GenericScope,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    is_stdlib: bool,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let t = ty_lower_mod.lower_ast_ty(ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+    if !ty_mod.is_error(t) {
+        return
+    }
+    let nseg = Vec_Ident.len(path.segments)
+    if nseg != 0 as usize {
+        let last = Vec_Ident.at(path.segments, nseg - 1 as usize).name
+        if sig_mod.sym_is(interner, last, "HeapPtr") {
+            if is_stdlib {
+                return
+            }
+            let hd = diag_mod.error_at(code_mod.heapptr_outside_box(), path.span, "HeapPtr is a stdlib-internal carrier and cannot be named in user code; use std.mem.alloc.Box(T) for heap indirection")
+            coll_mod.emit(mutable diags, take hd, allocator)?
+            return
+        }
+    }
+    if generic_mod.path_involves_generic(path, gscope, interner) {
+        return
+    }
+    let name = path_name_string(path, interner, allocator)?
+    let p1 = string.concat("unresolved path `", name, allocator)?
+    let msg = string.concat(p1, "`", allocator)?
+    let d = diag_mod.error_at(code_mod.import_resolution_error(), path.span, msg)
+    coll_mod.emit(mutable diags, take d, allocator)?
+}
+
+
+function path_name_string(
+    path: ast_ident.Path,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Ident.len(path.segments)
+    if n == 0 as usize {
+        return ""
+    }
+    var out = segment_string(Vec_Ident.at(path.segments, 0).name, interner, allocator)?
+    var i: usize = 1 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let dotted = string.concat(out, ".", allocator)?
+        out = string.concat(dotted, segment_string(Vec_Ident.at(path.segments, i).name, interner, allocator)?, allocator)?
+        i = i + 1 as usize
+    }
+    return out
+}
+
+
+function segment_string(
+    sym: symbol_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = interner_mod.lookup(interner, sym)
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}

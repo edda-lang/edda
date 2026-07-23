@@ -1,0 +1,125 @@
+
+module object.lib
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.coff as coff_mod
+import local.fmt.elf as elf_mod
+import local.fmt.macho as macho_mod
+import local.coff.serialize as coff_serialize_mod
+import local.elf.serialize as elf_serialize_mod
+import local.macho.serialize as macho_serialize_mod
+import local.coff.wrap.wrap as coff_wrap_mod
+import local.elf.wrap as elf_wrap_mod
+import local.macho.wrap as macho_wrap_mod
+
+import target.triple as triple_mod
+import target.arch as arch_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+derive eq, hash, debug for TargetFormat
+
+
+public type TargetFormat {
+    case coff
+    case elf
+    case macho
+}
+
+public type ObjectFile {
+    case coff_(file: coff_mod.CoffFile)
+    case elf_(file: elf_mod.ElfFile)
+    case macho_(file: macho_mod.MachoFile)
+}
+
+
+public function serialize_object(
+    out: mutable Vec_u8.Vec,
+    obj: ObjectFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match obj {
+        case .coff_(let f) => coff_serialize_mod.serialize_file(mutable out, f, allocator)?
+        case .elf_(let f) => elf_serialize_mod.serialize_file(mutable out, f, allocator)?
+        case .macho_(let f) => macho_serialize_mod.serialize_file(mutable out, f, allocator)?
+    }
+}
+
+public function format_name(fmt: TargetFormat) -> String {
+    return match fmt {
+        case .coff  => "coff"
+        case .elf   => "elf"
+        case .macho => "macho"
+    }
+}
+
+public function format_for_triple(t: triple_mod.TargetTriple) -> TargetFormat {
+    return match triple_mod.os(t) {
+        case .windows => TargetFormat.coff
+        case .macos   => TargetFormat.macho
+        case _        => TargetFormat.elf
+    }
+}
+
+
+public function build_function_object(
+    out: init ObjectFile,
+    code: take Vec_u8.Vec,
+    target: triple_mod.TargetTriple,
+    symbol_name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: coff_wrap_mod.WrapError}
+{
+    let arch = triple_mod.arch(target)
+    match format_for_triple(target) {
+        case .coff => {
+            uninit f: coff_mod.CoffFile
+            coff_wrap_mod.wrap_function_obj(init f, coff_machine_for(arch), take code, symbol_name, allocator)?
+            out = ObjectFile.coff_(file: f)
+        }
+        case .elf => {
+            uninit f: elf_mod.ElfFile
+            elf_wrap_mod.wrap_function_obj(init f, elf_machine_for(arch), take code, symbol_name, allocator)?
+            out = ObjectFile.elf_(file: f)
+        }
+        case .macho => {
+            uninit f: macho_mod.MachoFile
+            macho_wrap_mod.wrap_function_obj(init f, macho_cpu_for(arch), take code, symbol_name, allocator)?
+            out = ObjectFile.macho_(file: f)
+        }
+    }
+}
+
+
+public function coff_machine_for(a: arch_mod.Arch) -> coff_mod.CoffMachine {
+    return match a {
+        case .x86_64  => coff_mod.CoffMachine.amd64
+        case .aarch64 => coff_mod.CoffMachine.arm64
+        case _        => coff_mod.CoffMachine.unknown
+    }
+}
+
+
+public function elf_machine_for(a: arch_mod.Arch) -> elf_mod.ElfMachine {
+    return match a {
+        case .x86_64  => elf_mod.ElfMachine.amd64
+        case .aarch64 => elf_mod.ElfMachine.aarch64
+        case _        => elf_mod.ElfMachine.none
+    }
+}
+
+
+public function macho_cpu_for(a: arch_mod.Arch) -> macho_mod.MachoCpu {
+    return match a {
+        case .x86_64  => macho_mod.MachoCpu.x86_64
+        case .aarch64 => macho_mod.MachoCpu.arm64
+        case _        => macho_mod.MachoCpu.any
+    }
+}

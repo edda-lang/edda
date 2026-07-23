@@ -1,0 +1,234 @@
+
+module optimize.effect_gvn.hlir.build
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import hir.def as def_mod
+import egraph.eclass as eclass_mod
+import egraph.graph.graph as graph_mod
+import egraph.sat.saturate as saturate_mod
+import ir.hlir.id.value as value_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.tree.node.file as file_mod
+import ir.hlir.attrs as attrs_mod
+import local.effect_gvn.analysis.purity as purity_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+import local.effect_gvn.lower as lower_mod
+
+
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBody)
+spec std.collections.hashmap.IntMap(eclass_mod.EClassId)
+spec std.collections.hashmap.IntMap(u8)
+spec std.core.option.Option(eclass_mod.EClassId)
+spec std.core.option.Option(u8)
+spec std.core.option.Option(u32)
+
+
+public function build_egraph(
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    allocator: Allocator,
+) -> mapping_mod.BuildResult
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit graph: graph_mod.EGraph
+    graph_mod.new(init graph, allocator)?
+    uninit sat: saturate_mod.Saturator
+    saturate_mod.new(init sat, allocator)?
+    let value_to_class = IntMap_EClassId.new(allocator)?
+    let value_purity = IntMap_u8.new(allocator)?
+    var built = mapping_mod.BuildResult {
+        graph: graph,
+        sat: sat,
+        value_to_class: value_to_class,
+        value_purity: value_purity,
+        fresh_counter: 0,
+    }
+    seed_params(mutable built, body, allocator)?
+    walk_ops(mutable built, body, file, allocator)?
+    return built
+}
+
+
+function seed_params(
+    built: mutable mapping_mod.BuildResult,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirValue.len(body.values)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let value = Vec_HlirValue.at(body.values, i)
+        match value.def {
+            case .block_param(let blk, let pos) =>
+                seed_one_param(mutable built, i as u32, allocator)?
+            case .op_result(let op) => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function seed_one_param(
+    built: mutable mapping_mod.BuildResult,
+    raw: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let class_ = lower_mod.fresh_opaque(mutable built, allocator)?
+    let _ = IntMap_EClassId.insert(mutable built.value_to_class, raw as i64, class_, allocator)?
+    let code = purity_mod.to_code(purity_mod.Purity.pure_trapping)
+    let _ = IntMap_u8.insert(mutable built.value_purity, raw as i64, code, allocator)?
+}
+
+
+function walk_ops(
+    built: mutable mapping_mod.BuildResult,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        process_op(mutable built, op, body, file, allocator)?
+        i = i + 1
+    }
+}
+
+
+function process_op(
+    built: mutable mapping_mod.BuildResult,
+    op: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let result_raw = op.result_.raw
+    if result_raw == 0 { return () }
+    let attrs_result = resolve_callee_attrs(op, body, file)
+    let purity = purity_mod.classify_op(op, attrs_result.attrs, attrs_result.known)
+    if purity_mod.is_hashcons_eligible(purity) {
+        let node = lower_mod.lower_op_node(mutable built, op, allocator)?
+        let class_ = saturate_mod.add(mutable built.graph, mutable built.sat, take node, allocator)?
+        record_value(mutable built, result_raw, class_, purity, allocator)?
+        return ()
+    }
+    let class_ = lower_mod.fresh_opaque(mutable built, allocator)?
+    record_value(mutable built, result_raw, class_, purity, allocator)?
+}
+
+
+function record_value(
+    built: mutable mapping_mod.BuildResult,
+    raw: u32,
+    class_: eclass_mod.EClassId,
+    purity: purity_mod.Purity,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let _ = IntMap_EClassId.insert(mutable built.value_to_class, raw as i64, class_, allocator)?
+    let code = purity_mod.to_code(purity)
+    let _ = IntMap_u8.insert(mutable built.value_purity, raw as i64, code, allocator)?
+}
+
+
+type CalleeAttrs {
+    attrs: attrs_mod.HlirFnAttrs
+    known: bool
+}
+
+
+function resolve_callee_attrs(
+    op: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+) -> CalleeAttrs
+    with {panic}
+{
+    return match op.kind {
+        case .call_(let callee_v, let args) => resolve_fn_ref(callee_v, body, file)
+        case _ => CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+}
+
+
+function resolve_fn_ref(
+    callee_v: value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+) -> CalleeAttrs
+    with {panic}
+{
+    let callee_raw = callee_v.raw
+    if callee_raw == 0 { return CalleeAttrs { attrs: attrs_mod.empty(), known: false } }
+    if (callee_raw as usize) >= Vec_HlirValue.len(body.values) {
+        return CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+    let value = Vec_HlirValue.at(body.values, callee_raw as usize)
+    let def_op = match value.def {
+        case .op_result(let op_id) => op_id
+        case .block_param(let blk, let pos) => return CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+    if (def_op.raw as usize) >= Vec_HlirOp.len(body.ops) {
+        return CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+    let defining = Vec_HlirOp.at(body.ops, def_op.raw as usize)
+    return match defining.kind {
+        case .literal(let c) => resolve_const_fn(c, file)
+        case _ => CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+}
+
+
+function resolve_const_fn(
+    c: hlir_op_mod.HConstant,
+    file: file_mod.HlirFile,
+) -> CalleeAttrs
+{
+    return match c {
+        case .fn_ref(let def) => lookup_attrs(def, file)
+        case _ => CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+}
+
+
+function lookup_attrs(
+    def: def_mod.DefId,
+    file: file_mod.HlirFile,
+) -> CalleeAttrs
+{
+    return match file_mod.lookup_body_index(file, def) {
+        case .some(let slot) => attrs_at_slot(slot, file)
+        case .none => CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+}
+
+
+function attrs_at_slot(slot: u32, file: file_mod.HlirFile) -> CalleeAttrs {
+    if (slot as usize) >= Vec_HlirBody.len(file.bodies) {
+        return CalleeAttrs { attrs: attrs_mod.empty(), known: false }
+    }
+    let callee_body = Vec_HlirBody.at(file.bodies, slot as usize)
+    return CalleeAttrs { attrs: callee_body.fn_attrs, known: true }
+}

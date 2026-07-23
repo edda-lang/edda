@@ -1,0 +1,149 @@
+
+module intern.interner
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import local.symbol as sym_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.StringMap(u32)
+spec std.core.option.Option(u32)
+
+public linear type Interner {
+    arena: Vec_u8.Vec
+    offsets: Vec_usize.Vec
+    lengths: Vec_usize.Vec where lengths.len == offsets.len && forall i in 0..<offsets.len: Vec_usize.at(offsets, i) + Vec_usize.at(lengths, i) <= arena.len
+    dedup: StringMap_u32.StringMap where dedup.len == offsets.len
+}
+
+
+public function new_interner(out: init Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit arena: Vec_u8.Vec
+    Vec_u8.new(init arena, allocator)?
+    uninit offsets: Vec_usize.Vec
+    Vec_usize.new(init offsets, allocator)?
+    uninit lengths: Vec_usize.Vec
+    Vec_usize.new(init lengths, allocator)?
+    let dedup = StringMap_u32.new(allocator)?
+    out = Interner { arena: arena, offsets: offsets, lengths: lengths, dedup: dedup }
+    Vec_usize.push(mutable out.offsets, 0, allocator)?
+    Vec_usize.push(mutable out.lengths, 0, allocator)?
+    let _ = StringMap_u32.insert(mutable out.dedup, "", 0, allocator)?
+    seed_attribute_whitelist(mutable out, allocator)?
+    seed_contextual_keywords(mutable out, allocator)?
+    seed_diagnostic_messages(mutable out, allocator)?
+}
+
+
+function seed_contextual_keywords(it: mutable Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) == ((sym_mod.attr_whitelist_hi() as usize) + 1)
+    ensures  slot_count(it) == ((sym_mod.yield_raw() as usize) + 1)
+{
+    let _ = intern(mutable it, "from", allocator)?
+    let _ = intern(mutable it, "handle", allocator)?
+    let _ = intern(mutable it, "captures", allocator)?
+    let _ = intern(mutable it, "provides", allocator)?
+    let _ = intern(mutable it, "stable", allocator)?
+    let _ = intern(mutable it, "unstable", allocator)?
+    let _ = intern(mutable it, "affine", allocator)?
+    let _ = intern(mutable it, "linear", allocator)?
+    let _ = intern(mutable it, "derive", allocator)?
+    let _ = intern(mutable it, "result", allocator)?
+    let _ = intern(mutable it, "exec", allocator)?
+    let _ = intern(mutable it, "coherence", allocator)?
+    let _ = intern(mutable it, "spawn", allocator)?
+    let _ = intern(mutable it, "panic", allocator)?
+    let _ = intern(mutable it, "yield", allocator)?
+}
+
+
+function seed_attribute_whitelist(it: mutable Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) == 1
+    ensures  slot_count(it) == ((sym_mod.attr_whitelist_hi() as usize) + 1)
+{
+    let _ = intern(mutable it, "layout", allocator)?
+    let _ = intern(mutable it, "align", allocator)?
+    let _ = intern(mutable it, "repr", allocator)?
+    let _ = intern(mutable it, "abi", allocator)?
+    let _ = intern(mutable it, "unverified", allocator)?
+    let _ = intern(mutable it, "trust", allocator)?
+    let _ = intern(mutable it, "deprecated", allocator)?
+    let _ = intern(mutable it, "property", allocator)?
+    let _ = intern(mutable it, "target_requires", allocator)?
+}
+
+
+function seed_diagnostic_messages(it: mutable Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) == ((sym_mod.yield_raw() as usize) + 1)
+    ensures  slot_count(it) == ((sym_mod.trap_float_to_wide_range_raw() as usize) + 1)
+{
+    let _ = intern(mutable it, "float value out of range for i128/u128 cast", allocator)?
+}
+
+
+public function slot_count(it: Interner) -> usize {
+    return Vec_usize.len(it.offsets)
+}
+
+public function intern(it: mutable Interner, s: String, allocator: Allocator) -> sym_mod.Symbol
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) < 4294967296
+{
+    return intern_bytes(mutable it, s.bytes(), allocator)?
+}
+
+public function intern_bytes(it: mutable Interner, bytes: [u8], allocator: Allocator) -> sym_mod.Symbol
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) < 4294967296
+{
+    let prior = StringMap_u32.get_bytes(it.dedup, bytes)
+    match prior {
+        case .some(let raw) => return sym_mod.Symbol { raw: raw }
+        case .none          => ()
+    }
+    let offset = Vec_u8.len(it.arena)
+    let length = bytes.len()
+    let n: usize = length
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_u8.push(mutable it.arena, bytes[i], allocator)?
+        i += 1
+    }
+    let new_raw = Vec_usize.len(it.offsets) as u32
+    Vec_usize.push(mutable it.offsets, offset, allocator)?
+    Vec_usize.push(mutable it.lengths, length, allocator)?
+    let key_buf: [u8] = allocator.alloc_array(u8, length)?
+    var j: usize = 0
+    loop
+        decreases length - j
+    {
+        if j >= length { break }
+        key_buf[j] = bytes[j]
+        j += 1
+    }
+    let key = string.from_owned_utf8(take key_buf)
+    let _ = StringMap_u32.insert(mutable it.dedup, key, new_raw, allocator)?
+    return sym_mod.Symbol { raw: new_raw }
+}
+
+public stable function lookup(it: Interner, sym: sym_mod.Symbol where (sym.raw as usize) < slot_count(it)) -> [u8] {
+    let i: usize = sym.raw as usize
+    let offset = Vec_usize.at(it.offsets, i)
+    let length = Vec_usize.at(it.lengths, i)
+    return it.arena.data[offset..<(offset + length)]
+}
+
+
+public function dispose(it: take Interner) -> () { }

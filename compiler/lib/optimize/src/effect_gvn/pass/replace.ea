@@ -1,0 +1,340 @@
+
+module optimize.effect_gvn.pass.replace
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import ir.hlir.id.value as value_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as term_mod
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.gvn.cse as gvn_mod
+
+
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(term_mod.SwitchCase)
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+
+
+public function apply_replacements(
+    body: mutable hlir_body_mod.HlirBody,
+    gvn: gvn_mod.GvnPlan,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let rewrite = build_rewrite_map(gvn, allocator)?
+    rewrite_all_ops(mutable body, rewrite, allocator)?
+    rewrite_all_terms(mutable body, rewrite, allocator)?
+}
+
+
+function build_rewrite_map(
+    gvn: gvn_mod.GvnPlan,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var map = IntMap_u32.new(allocator)?
+    let n = gvn_mod.plan_len(gvn)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let rep = gvn_mod.plan_at(gvn, i)
+        if rep.redundant.raw != 0 {
+            let _ = IntMap_u32.insert(mutable map, rep.redundant.raw as i64, rep.canonical.raw, allocator)?
+        }
+        i = i + 1
+    }
+    return map
+}
+
+
+function resolve_value(rewrite: IntMap_u32.IntMap, v: value_mod.ValueId) -> value_mod.ValueId {
+    if v.raw == 0 { return v }
+    var cur: u32 = v.raw
+    var fuel: usize = 64
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        let next = match IntMap_u32.get(rewrite, cur as i64) {
+            case .some(let nxt) => nxt
+            case .none => cur
+        }
+        if next == cur { break }
+        cur = next
+        fuel = fuel - 1
+    }
+    return value_mod.ValueId { raw: cur }
+}
+
+
+function rewrite_all_ops(
+    body: mutable hlir_body_mod.HlirBody,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i >= Vec_HlirOp.len(body.ops) { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        let new_kind = rewrite_op_kind(op.kind, rewrite, allocator)?
+        let new_op = hlir_op_mod.HlirOp {
+            origin: op.origin,
+            kind: new_kind,
+            result_: op.result_,
+            flags: op.flags,
+        }
+        Vec_HlirOp.set_at(mutable body.ops, i, take new_op)
+        i = i + 1
+    }
+}
+
+
+function rewrite_op_kind(
+    kind: hlir_op_mod.HlirOpKind,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> hlir_op_mod.HlirOpKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    return match kind {
+        case .literal(let c) => hlir_op_mod.HlirOpKind.literal(c: c)
+        case .binary(let bop, let lhs, let rhs) =>
+            hlir_op_mod.HlirOpKind.binary(
+                op: bop,
+                lhs: resolve_value(rewrite, lhs),
+                rhs: resolve_value(rewrite, rhs),
+            )
+        case .unary(let uop, let operand) =>
+            hlir_op_mod.HlirOpKind.unary(op: uop, operand: resolve_value(rewrite, operand))
+        case .cast(let value, let from, let to, let ck) =>
+            hlir_op_mod.HlirOpKind.cast(
+                value: resolve_value(rewrite, value),
+                from: from,
+                to: to,
+                kind: ck,
+            )
+        case .call_(let callee, let args) =>
+            hlir_op_mod.HlirOpKind.call_(
+                callee: resolve_value(rewrite, callee),
+                args: rewrite_value_vec(args, rewrite, allocator)?,
+            )
+        case .call_indirect(let callee, let args) =>
+            hlir_op_mod.HlirOpKind.call_indirect(
+                callee: resolve_value(rewrite, callee),
+                args: rewrite_value_vec(args, rewrite, allocator)?,
+            )
+        case .make_closure(let code, let env) =>
+            hlir_op_mod.HlirOpKind.make_closure(code: code, env: resolve_value(rewrite, env))
+        case .field(let operand, let index) =>
+            hlir_op_mod.HlirOpKind.field(operand: resolve_value(rewrite, operand), index: index)
+        case .index(let operand, let index_v) =>
+            hlir_op_mod.HlirOpKind.index(
+                operand: resolve_value(rewrite, operand),
+                index_v: resolve_value(rewrite, index_v),
+            )
+        case .slice_subrange(let operand, let lo_v, let hi_v) =>
+            hlir_op_mod.HlirOpKind.slice_subrange(
+                operand: resolve_value(rewrite, operand),
+                lo_v: resolve_value(rewrite, lo_v),
+                hi_v: resolve_value(rewrite, hi_v),
+            )
+        case .len(let operand) =>
+            hlir_op_mod.HlirOpKind.len(operand: resolve_value(rewrite, operand))
+        case .discriminant(let operand) =>
+            hlir_op_mod.HlirOpKind.discriminant(operand: resolve_value(rewrite, operand))
+        case .aggregate(let akind, let elems) =>
+            hlir_op_mod.HlirOpKind.aggregate(
+                kind: akind,
+                elems: rewrite_value_vec(elems, rewrite, allocator)?,
+            )
+        case .ref_(let bkind, let operand) =>
+            hlir_op_mod.HlirOpKind.ref_(kind: bkind, operand: resolve_value(rewrite, operand))
+        case .deref_(let operand) =>
+            hlir_op_mod.HlirOpKind.deref_(operand: resolve_value(rewrite, operand))
+        case .field_addr(let operand, let index) =>
+            hlir_op_mod.HlirOpKind.field_addr(operand: resolve_value(rewrite, operand), index: index)
+        case .index_addr(let operand, let index_v) =>
+            hlir_op_mod.HlirOpKind.index_addr(
+                operand: resolve_value(rewrite, operand),
+                index_v: resolve_value(rewrite, index_v),
+            )
+        case .subrange_addr(let operand, let lo_v, let hi_v) =>
+            hlir_op_mod.HlirOpKind.subrange_addr(
+                operand: resolve_value(rewrite, operand),
+                lo_v: resolve_value(rewrite, lo_v),
+                hi_v: resolve_value(rewrite, hi_v),
+            )
+        case .deref_addr(let operand) =>
+            hlir_op_mod.HlirOpKind.deref_addr(operand: resolve_value(rewrite, operand))
+        case .store_(let addr, let value) =>
+            hlir_op_mod.HlirOpKind.store_(
+                addr: resolve_value(rewrite, addr),
+                value: resolve_value(rewrite, value),
+            )
+        case .stack_alloc(let bytes) =>
+            hlir_op_mod.HlirOpKind.stack_alloc(bytes: bytes)
+        case .err_flag => hlir_op_mod.HlirOpKind.err_flag
+    }
+}
+
+
+function rewrite_value_vec(
+    values: Vec_ValueId.Vec,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit out: Vec_ValueId.Vec
+    Vec_ValueId.new(init out, allocator)?
+    let n = Vec_ValueId.len(values)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let v = Vec_ValueId.at(values, i)
+        Vec_ValueId.push(mutable out, take resolve_value(rewrite, v), allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function rewrite_all_terms(
+    body: mutable hlir_body_mod.HlirBody,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop
+        decreases n - b
+    {
+        if b >= n { break }
+        if b >= Vec_HlirBlock.len(body.blocks) { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        let new_term = rewrite_term(block.terminator, rewrite, allocator)?
+        let new_block = hlir_body_mod.HlirBlock {
+            node_id_origin: block.node_id_origin,
+            params: block.params,
+            ops: block.ops,
+            terminator: new_term,
+            coherence_region: block.coherence_region,
+        }
+        Vec_HlirBlock.set_at(mutable body.blocks, b, take new_block)
+        b = b + 1
+    }
+}
+
+
+function rewrite_term(
+    term: term_mod.HlirTerminator,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> term_mod.HlirTerminator
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let new_kind = rewrite_term_kind(term.kind, rewrite, allocator)?
+    return term_mod.HlirTerminator {
+        origin: term.origin,
+        kind: new_kind,
+    }
+}
+
+
+function rewrite_term_kind(
+    kind: term_mod.HlirTermKind,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> term_mod.HlirTermKind
+    with {allocator, err: alloc.AllocError, panic}
+{
+    return match kind {
+        case .goto_(let target, let args) =>
+            term_mod.HlirTermKind.goto_(
+                target: target,
+                args: rewrite_value_vec(args, rewrite, allocator)?,
+            )
+        case .branch(let cond, let t, let ta, let f, let fa) =>
+            term_mod.HlirTermKind.branch(
+                cond: resolve_value(rewrite, cond),
+                true_: t,
+                true_args: rewrite_value_vec(ta, rewrite, allocator)?,
+                false_: f,
+                false_args: rewrite_value_vec(fa, rewrite, allocator)?,
+            )
+        case .switch_(let discr, let targets) =>
+            term_mod.HlirTermKind.switch_(
+                discr: resolve_value(rewrite, discr),
+                targets: rewrite_switch_targets(targets, rewrite, allocator)?,
+            )
+        case .return_(let values) =>
+            term_mod.HlirTermKind.return_(values: rewrite_value_vec(values, rewrite, allocator)?)
+        case .unreachable_ => term_mod.HlirTermKind.unreachable_
+        case .raise_(let value, let unwind) =>
+            term_mod.HlirTermKind.raise_(value: resolve_value(rewrite, value), unwind: unwind)
+        case .panic_(let message) =>
+            term_mod.HlirTermKind.panic_(message: resolve_value(rewrite, message))
+        case .drop_(let value, let dtor, let target, let unwind) =>
+            term_mod.HlirTermKind.drop_(
+                value: resolve_value(rewrite, value),
+                destructor: dtor,
+                target: target,
+                unwind: unwind,
+            )
+        case .coherence_enter(let entry, let exit) =>
+            term_mod.HlirTermKind.coherence_enter(body_entry: entry, exit: exit)
+        case .coherence_exit(let target) =>
+            term_mod.HlirTermKind.coherence_exit(target: target)
+    }
+}
+
+
+function rewrite_switch_targets(
+    targets: term_mod.SwitchTargets,
+    rewrite: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> term_mod.SwitchTargets
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit cases: Vec_SwitchCase.Vec
+    Vec_SwitchCase.new(init cases, allocator)?
+    let n = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let sc = Vec_SwitchCase.at(targets.cases, i)
+        let new_case = term_mod.SwitchCase {
+            value: sc.value,
+            target: sc.target,
+            args: rewrite_value_vec(sc.args, rewrite, allocator)?,
+        }
+        Vec_SwitchCase.push(mutable cases, take new_case, allocator)?
+        i = i + 1
+    }
+    return term_mod.SwitchTargets {
+        cases: cases,
+        default: targets.default,
+        default_args: rewrite_value_vec(targets.default_args, rewrite, allocator)?,
+    }
+}

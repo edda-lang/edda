@@ -1,0 +1,262 @@
+
+module pgsql.client.session.startup.connect
+
+import std.mem.alloc
+import std.net.socket
+import std.crypto.random
+import std.encoding.hex
+import local.error
+import local.link.io
+import local.message.tag
+import local.message.fe.startup as fe_startup
+import local.message.fe.query as fe_query
+import local.message.be.auth as be_auth
+import local.message.be.reply.status as be_status
+import local.message.be.reply.response as be_response
+import local.client.session.auth
+import local.client.session.auth.scram
+
+
+public linear type Connection {
+    socket: socket.Connection
+    backend_pid: i32
+    backend_secret: i32
+    tx_status: be_status.TransactionStatus
+}
+
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_startup_param_slots(allocator: Allocator, n: usize) -> [fe_startup.StartupParam]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+function _generate_nonce(rng: Random, allocator: Allocator) -> [u8]
+    with {rng, allocator, err: alloc.AllocError}
+{
+    var raw = _alloc_u8_slots(allocator, 18 as usize)?
+    random.fill(rng, mutable raw)
+    let encoded = hex.encode(raw, allocator)?
+    return encoded.bytes()
+}
+
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + (1 as usize)
+    }
+    return true
+}
+
+function _mechanism_offered(blob: [u8], target: [u8]) -> bool
+    with {err: error.ProtocolError}
+{
+    var pos: usize = 0 as usize
+    let n = blob.len()
+    loop decreases n - pos {
+        if pos >= n { break }
+        let cursor = be_auth.next_sasl_mechanism(blob, pos)?
+        if be_auth.sasl_mech_done(cursor) { break }
+        if _bytes_eq(blob[cursor.bytes_lo..<cursor.bytes_hi], target) {
+            return true
+        }
+        pos = cursor.next_pos
+    }
+    return false
+}
+
+
+function _build_startup_params(
+    username: [u8],
+    database: [u8],
+    allocator: Allocator,
+) -> [fe_startup.StartupParam]
+    with {allocator, err: alloc.AllocError}
+{
+    let count: usize = if database.len() > (0 as usize) { 2 as usize } else { 1 as usize }
+    let params = _alloc_startup_param_slots(allocator, count)?
+    params[0 as usize] = fe_startup.StartupParam {
+        name: "user".bytes(),
+        value: username,
+    }
+    if database.len() > (0 as usize) {
+        params[1 as usize] = fe_startup.StartupParam {
+            name: "database".bytes(),
+            value: database,
+        }
+    }
+    return params
+}
+
+
+type _AuthState {
+    case awaiting_initial
+    case awaiting_sasl_continue(session: scram.ScramSession)
+    case awaiting_sasl_final(session: scram.ScramSession)
+}
+
+
+function _drive_auth(
+    sock: mutable socket.Connection,
+    password: [u8],
+    rng: Random,
+    allocator: Allocator,
+) -> ()
+    with {
+        rng, allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.AuthError, err: error.QueryError,
+        divergence,
+    }
+{
+    var state: _AuthState = _AuthState.awaiting_initial
+    loop {
+        let msg = io.read_message(mutable sock, allocator)?
+        if msg.tag == tag.be_authentication() {
+            let req = be_auth.decode_authentication_request(msg.body)?
+            match req {
+                case .ok => { return }
+                case .cleartext_password => {
+                    let resp = auth.handle_cleartext(password, allocator)?
+                    io.write_all(mutable sock, resp)?
+                }
+                case .md5_password(_) => {
+                    raise error.AuthError.unsupported_auth_method
+                }
+                case .sasl(let mechanisms_blob) => {
+                    if !_mechanism_offered(mechanisms_blob, auth.mechanism_scram_sha256())? {
+                        raise error.AuthError.unsupported_auth_method
+                    }
+                    let nonce = _generate_nonce(rng, allocator)?
+                    let begun = auth.begin_scram(password, nonce, allocator)?
+                    io.write_all(mutable sock, begun.bytes)?
+                    state = _AuthState.awaiting_sasl_continue(session: begun.session)
+                }
+                case .sasl_continue(let server_first) => {
+                    match state {
+                        case .awaiting_sasl_continue(let session) => {
+                            let cont = auth.continue_scram(session, server_first, allocator)?
+                            io.write_all(mutable sock, cont.bytes)?
+                            state = _AuthState.awaiting_sasl_final(session: cont.session)
+                        }
+                        case _ => raise error.AuthError.malformed_scram_message
+                    }
+                }
+                case .sasl_final(let server_final) => {
+                    match state {
+                        case .awaiting_sasl_final(let session) => {
+                            auth.finish_scram(session, server_final, allocator)?
+                        }
+                        case _ => raise error.AuthError.malformed_scram_message
+                    }
+                }
+                case .unsupported(_) => {
+                    raise error.AuthError.unsupported_auth_method
+                }
+            }
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            raise error.QueryError.sql_error(
+                sqlstate: be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty),
+                severity: be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty),
+                message: be_response.field_value_or(err_resp.fields, be_response.field_message(), empty),
+            )
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+}
+
+
+public function connect(
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    host: String,
+    port: u16,
+    username: [u8],
+    password: [u8],
+    database: [u8],
+    rng: Random,
+    allocator: Allocator,
+) -> Connection
+    with {
+        net, fs, rng, allocator,
+        err: socket.SocketError, err: alloc.AllocError,
+        err: error.ProtocolError, err: error.AuthError, err: error.QueryError,
+        divergence,
+    }
+{
+    var sock = socket.dial(net, fs, host, port)?
+
+    let params = _build_startup_params(username, database, allocator)?
+    let startup_bytes = fe_startup.encode_startup(
+        fe_startup.protocol_v3_0(),
+        params,
+        allocator,
+    )?
+    io.write_all(mutable sock, startup_bytes)?
+
+    _drive_auth(mutable sock, password, rng, allocator)?
+
+    var pid: i32 = 0 as i32
+    var secret: i32 = 0 as i32
+    var status: be_status.TransactionStatus = be_status.TransactionStatus.idle
+    loop {
+        let msg = io.read_message(mutable sock, allocator)?
+        if msg.tag == tag.be_backend_key_data() {
+            let bkd = be_status.decode_backend_key_data(msg.body)?
+            pid = bkd.pid
+            secret = bkd.secret_key
+        } else if msg.tag == tag.be_parameter_status() {
+            let _ = be_status.decode_parameter_status(msg.body)?
+        } else if msg.tag == tag.be_notice_response() {
+            let _ = be_response.decode_notice_response(msg.body, allocator)?
+        } else if msg.tag == tag.be_ready_for_query() {
+            let rfq = be_status.decode_ready_for_query(msg.body)?
+            status = rfq.transaction_status
+            break
+        } else if msg.tag == tag.be_error_response() {
+            let err_resp = be_response.decode_error_response(msg.body, allocator)?
+            let empty = "".bytes()
+            raise error.QueryError.sql_error(
+                sqlstate: be_response.field_value_or(err_resp.fields, be_response.field_sqlstate(), empty),
+                severity: be_response.field_value_or(err_resp.fields, be_response.field_severity(), empty),
+                message: be_response.field_value_or(err_resp.fields, be_response.field_message(), empty),
+            )
+        } else {
+            raise error.ProtocolError.unexpected_message_type
+        }
+    }
+
+    return Connection {
+        socket: sock,
+        backend_pid: pid,
+        backend_secret: secret,
+        tx_status: status,
+    }
+}
+
+
+public function close(
+    conn: take Connection,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let term = fe_query.encode_terminate(allocator)?
+    handle err: socket.SocketError -> () {
+        io.write_all(mutable conn.socket, term)?
+    }
+    socket.close(take conn.socket)
+}

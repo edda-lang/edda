@@ -1,0 +1,262 @@
+
+module structmap.walk.emit.item
+
+import std.mem.alloc
+import std.collections.vec
+import source.map as source_map_mod
+import span.file as file_mod
+import intern.interner as interner_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree
+import hir.item as hir_item
+import hir.def as def_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import local.data.model as model
+import local.render.expr.refine as refine
+import local.walk.core.util as util
+import local.walk.emit.fn as walkfn
+import local.walk.emit.types as walktype
+import local.walk.emit.doc as walkdoc
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(model.ModuleEntry)
+spec std.collections.vec.Vec(model.TypeEntry)
+spec std.collections.vec.Vec(model.InvariantEntry)
+
+
+public function push_module(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    ast: ast_file_mod.File,
+    items_hir: Vec_HItem.Vec,
+    file_rel: String,
+    file_id: file_mod.FileId,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    file_idx: usize,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let module_name = util.module_name_from_rel(file_rel, allocator)?
+    Vec_ModuleEntry.push(
+        mutable tree.modules,
+        model.ModuleEntry {
+            dir_idx: dir_idx,
+            name: util.clone_str(module_name, allocator)?,
+            file: util.clone_str(file_rel, allocator)?,
+            line: 1 as u32,
+            visibility: model.Visibility.public_(),
+        },
+        allocator,
+    )?
+    let n: usize = Vec_Item.len(ast.items)
+    let hn: usize = Vec_HItem.len(items_hir)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let def_id = if i < hn { Vec_HItem.at(items_hir, i).def_id } else { def_mod.error() }
+        walk_item(
+            mutable tree,
+            dir_idx,
+            Vec_Item.at(ast.items, i),
+            def_id,
+            file_rel,
+            module_name,
+            file_id,
+            interner,
+            source_map,
+            type_outputs,
+            file_idx,
+            effect_interner,
+            allocator,
+        )?
+        i += 1
+    }
+}
+
+
+public function walk_item(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    item: ast_item_mod.Item,
+    def_id: def_mod.DefId,
+    file_rel: String,
+    module_path: String,
+    file_id: file_mod.FileId,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    file_idx: usize,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target = util.item_target_qualified(item, module_path, interner, allocator)?
+    walkdoc.push_trust_attrs(
+        mutable tree, dir_idx, target, file_rel, file_id, item.attributes,
+        interner, source_map, allocator,
+    )?
+    let start_line = util.line_of(source_map, file_id, item.span)
+    let end_line = util.end_line_of(source_map, file_id, item.span)
+    match item.kind {
+        case .function_(let fd_box) => walkfn.push_fn(
+            mutable tree, dir_idx, start_line, end_line, util.box_FnDecl_get(fd_box),
+            file_rel, module_path, file_id, interner, source_map,
+            type_outputs, file_idx, def_id, effect_interner, allocator,
+        )?
+        case .type_decl(let td_box) => walktype.push_type_decl(
+            mutable tree, dir_idx, start_line, end_line, util.box_TypeDecl_get(td_box),
+            file_rel, file_id, interner, source_map, allocator,
+        )?
+        case .spec_(let s_box) => push_spec(
+            mutable tree, dir_idx, start_line, end_line, util.box_Spec_get(s_box),
+            file_rel, module_path, file_id, interner, source_map,
+            type_outputs, file_idx, effect_interner, allocator,
+        )?
+        case _ => ()
+    }
+}
+
+
+function push_spec(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    start_line: u32,
+    end_line: u32,
+    s: ast_item_mod.Spec,
+    file_rel: String,
+    module_path: String,
+    file_id: file_mod.FileId,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    type_outputs: Vec_TypeOutput.Vec,
+    file_idx: usize,
+    effect_interner: effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let name = util.sym_to_string(s.name.name, interner, allocator)?
+    uninit generics_v: Vec_String.Vec
+    Vec_String.new(init generics_v, allocator)?
+    collect_generics(mutable generics_v, s.generics, interner, allocator)?
+    uninit refinements_v: Vec_String.Vec
+    Vec_String.new(init refinements_v, allocator)?
+    push_spec_where_invariants(
+        mutable tree, dir_idx, name, file_rel, file_id, s.where_clauses,
+        mutable refinements_v, interner, source_map, allocator,
+    )?
+    Vec_TypeEntry.push(
+        mutable tree.types_,
+        model.TypeEntry {
+            dir_idx: dir_idx,
+            name: util.clone_str(name, allocator)?,
+            kind: model.TypeKind.spec_(),
+            file: util.clone_str(file_rel, allocator)?,
+            line: start_line,
+            end: end_line,
+            visibility: util.vis_to_map(s.visibility),
+            stability: util.stability_to_map(s.stability),
+            generics: generics_v,
+            fields_or_variants: util.clone_str("", allocator)?,
+            refinements: refinements_v,
+        },
+        allocator,
+    )?
+    let inner_path = util.qualify_str(module_path, name, allocator)?
+    let bn: usize = Vec_Item.len(s.body)
+    var i: usize = 0
+    loop
+        decreases bn - i
+    {
+        if i >= bn { break }
+        walk_item(
+            mutable tree,
+            dir_idx,
+            Vec_Item.at(s.body, i),
+            def_mod.error(),
+            file_rel,
+            inner_path,
+            file_id,
+            interner,
+            source_map,
+            type_outputs,
+            file_idx,
+            effect_interner,
+            allocator,
+        )?
+        i += 1
+    }
+}
+
+function collect_generics(
+    out: mutable Vec_String.Vec,
+    generics: Vec_GenericParam.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_GenericParam.len(generics)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let g = Vec_GenericParam.at(generics, i)
+        let txt = util.sym_to_string(g.name.name, interner, allocator)?
+        Vec_String.push(mutable out, txt, allocator)?
+        i += 1
+    }
+}
+
+function push_spec_where_invariants(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    name: String,
+    file_rel: String,
+    file_id: file_mod.FileId,
+    where_clauses: Vec_RefinementClause.Vec,
+    refinements_out: mutable Vec_String.Vec,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_RefinementClause.len(where_clauses)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let c = Vec_RefinementClause.at(where_clauses, i)
+        let rule = refine.refinement_rule_text(c, interner, allocator)?
+        Vec_InvariantEntry.push(
+            mutable tree.invariants,
+            model.InvariantEntry {
+                dir_idx: dir_idx,
+                target: util.clone_str(name, allocator)?,
+                file: util.clone_str(file_rel, allocator)?,
+                line: util.line_of(source_map, file_id, c.span),
+                rule: util.clone_str(rule, allocator)?,
+            },
+            allocator,
+        )?
+        Vec_String.push(mutable refinements_out, rule, allocator)?
+        i += 1
+    }
+}

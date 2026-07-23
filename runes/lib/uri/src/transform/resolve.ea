@@ -1,0 +1,243 @@
+
+module uri.transform.resolve
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import uri.error
+import uri.value
+import uri.syntax.parse
+
+spec option.Option(String)
+spec option.Option(u16)
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _pop_segment(buf: [u8], o: usize) -> usize {
+    var k: usize = o
+    loop decreases k + 1 as usize {
+        if k == 0 as usize { return 0 as usize }
+        k = k - 1 as usize
+        if buf[k] == 47 as u8 { return k }
+    }
+    return 0 as usize
+}
+
+function _copy_first_segment(
+    src: [u8], i: usize, buf: mutable [u8], o: usize,
+) -> (usize, usize) {
+    let n = src.len()
+    var ip: usize = i
+    var op: usize = o
+    if ip < n && src[ip] == 47 as u8 {
+        buf[op] = 47 as u8
+        op = op + 1 as usize
+        ip = ip + 1 as usize
+    }
+    loop decreases n - ip + 1 as usize {
+        if ip >= n { break }
+        if src[ip] == 47 as u8 { break }
+        buf[op] = src[ip]
+        op = op + 1 as usize
+        ip = ip + 1 as usize
+    }
+    return (ip, op)
+}
+
+
+public function remove_dot_segments(path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let src = path.bytes()
+    let n = src.len()
+    var buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0 as usize
+    var o: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let rem = n - i
+        if rem >= 3 as usize
+            && src[i] == 46 as u8 && src[i + 1 as usize] == 46 as u8
+            && src[i + 2 as usize] == 47 as u8
+        {
+            i = i + 3 as usize
+            continue
+        }
+        if rem >= 2 as usize
+            && src[i] == 46 as u8 && src[i + 1 as usize] == 47 as u8
+        {
+            i = i + 2 as usize
+            continue
+        }
+        if rem >= 3 as usize
+            && src[i] == 47 as u8 && src[i + 1 as usize] == 46 as u8
+            && src[i + 2 as usize] == 47 as u8
+        {
+            i = i + 2 as usize
+            continue
+        }
+        if rem == 2 as usize
+            && src[i] == 47 as u8 && src[i + 1 as usize] == 46 as u8
+        {
+            buf[o] = 47 as u8
+            o = o + 1 as usize
+            break
+        }
+        if rem >= 4 as usize
+            && src[i] == 47 as u8 && src[i + 1 as usize] == 46 as u8
+            && src[i + 2 as usize] == 46 as u8 && src[i + 3 as usize] == 47 as u8
+        {
+            i = i + 3 as usize
+            o = _pop_segment(buf, o)
+            continue
+        }
+        if rem == 3 as usize
+            && src[i] == 47 as u8 && src[i + 1 as usize] == 46 as u8
+            && src[i + 2 as usize] == 46 as u8
+        {
+            o = _pop_segment(buf, o)
+            buf[o] = 47 as u8
+            o = o + 1 as usize
+            break
+        }
+        if rem == 1 as usize && src[i] == 46 as u8 { break }
+        if rem == 2 as usize
+            && src[i] == 46 as u8 && src[i + 1 as usize] == 46 as u8 { break }
+        let (ni, no) = _copy_first_segment(src, i, mutable buf, o)
+        i = ni
+        o = no
+    }
+    return string.bytes_slice_to_string(buf, 0, o, allocator)?
+}
+
+
+function _last_slash_offset(bytes: [u8]) -> usize {
+    let n = bytes.len()
+    var k: usize = n
+    loop decreases k + 1 as usize {
+        if k == 0 as usize { return 0 as usize }
+        k = k - 1 as usize
+        if bytes[k] == 47 as u8 { return k + 1 as usize }
+    }
+    return 0 as usize
+}
+
+function _merge_paths(
+    base: value.Uri, ref_path: String, allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let base_bytes = base.path.bytes()
+    let ref_bytes = ref_path.bytes()
+    let base_len = base_bytes.len()
+    let ref_len = ref_bytes.len()
+
+    if value.has_authority(base) && base_len == 0 as usize {
+        let buf = _alloc_byte_slab(allocator, 1 as usize + ref_len)?
+        buf[0 as usize] = 47 as u8
+        var i: usize = 0 as usize
+        loop decreases ref_len - i + 1 as usize {
+            if i >= ref_len { break }
+            buf[1 as usize + i] = ref_bytes[i]
+            i = i + 1 as usize
+        }
+        return string.from_owned_utf8(take buf)
+    }
+
+    let prefix_end = _last_slash_offset(base_bytes)
+    let total = prefix_end + ref_len
+    let buf = _alloc_byte_slab(allocator, total)?
+    var p: usize = 0 as usize
+    loop decreases prefix_end - p + 1 as usize {
+        if p >= prefix_end { break }
+        buf[p] = base_bytes[p]
+        p = p + 1 as usize
+    }
+    var q: usize = 0 as usize
+    loop decreases ref_len - q + 1 as usize {
+        if q >= ref_len { break }
+        buf[prefix_end + q] = ref_bytes[q]
+        q = q + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+public function resolve(
+    base: value.Uri, ref: value.UriReference, allocator: Allocator,
+) -> value.Uri
+    with {allocator, err: alloc.AllocError}
+{
+    var t_scheme: String = ""
+    var t_userinfo: Option_String = Option_String.none
+    var t_host: Option_String = Option_String.none
+    var t_port: Option_u16 = Option_u16.none
+    var t_path: String = ""
+    var t_query: Option_String = Option_String.none
+    var t_fragment: Option_String = Option_String.none
+
+    match ref.scheme {
+        case .some(let s) => {
+            t_scheme = s
+            t_userinfo = ref.userinfo
+            t_host = ref.host
+            t_port = ref.port
+            t_path = remove_dot_segments(ref.path, allocator)?
+            t_query = ref.query
+        }
+        case .none => {
+            if value.reference_has_authority(ref) {
+                t_userinfo = ref.userinfo
+                t_host = ref.host
+                t_port = ref.port
+                t_path = remove_dot_segments(ref.path, allocator)?
+                t_query = ref.query
+            } else {
+                let ref_bytes = ref.path.bytes()
+                let ref_len = ref_bytes.len()
+                if ref_len == 0 as usize {
+                    t_path = base.path
+                    t_query = match ref.query {
+                        case .some(_) => ref.query
+                        case .none    => base.query
+                    }
+                } else {
+                    if ref_bytes[0 as usize] == 47 as u8 {
+                        t_path = remove_dot_segments(ref.path, allocator)?
+                    } else {
+                        let merged = _merge_paths(base, ref.path, allocator)?
+                        t_path = remove_dot_segments(merged, allocator)?
+                    }
+                    t_query = ref.query
+                }
+                t_userinfo = base.userinfo
+                t_host = base.host
+                t_port = base.port
+            }
+            t_scheme = base.scheme
+        }
+    }
+    t_fragment = ref.fragment
+
+    return value.Uri {
+        scheme: t_scheme,
+        userinfo: t_userinfo,
+        host: t_host,
+        port: t_port,
+        path: t_path,
+        query: t_query,
+        fragment: t_fragment,
+    }
+}
+
+public function resolve_str(
+    base: value.Uri, ref: String, allocator: Allocator,
+) -> value.Uri
+    with {allocator, err: alloc.AllocError, err: error.ParseError}
+{
+    let parsed = parse.parse_reference(ref, allocator)?
+    return resolve(base, parsed, allocator)?
+}

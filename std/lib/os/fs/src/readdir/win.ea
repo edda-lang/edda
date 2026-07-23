@@ -1,0 +1,206 @@
+
+module std.os.fs.readdir.win
+import std.text.string
+
+import std.os.raw
+import std.mem.alloc
+import local.readdir.error as rderr
+
+function find_first_file_w(file_name: u64, find_data: u64) -> u64
+    extern "FindFirstFileW" from "kernel32.dll"
+
+function find_next_file_w(find_handle: u64, find_data: u64) -> i32
+    extern "FindNextFileW" from "kernel32.dll"
+
+function find_close(find_handle: u64) -> i32
+    extern "FindClose" from "kernel32.dll"
+
+function get_last_error() -> u32
+    extern "GetLastError" from "kernel32.dll"
+
+function multi_byte_to_wide_char(
+    code_page: u64,
+    flags: u64,
+    mb_str: u64,
+    mb_len: i32,
+    wide_str: u64,
+    wide_count: i32,
+) -> i32
+    extern "MultiByteToWideChar" from "kernel32.dll"
+
+function wide_char_to_multi_byte(
+    code_page: u64,
+    flags: u64,
+    wide_str: u64,
+    wide_len_: i32,
+    multi_str: u64,
+    multi_len: i32,
+    default_char: u64,
+    used_default: u64,
+) -> i32
+    extern "WideCharToMultiByte" from "kernel32.dll"
+
+public function read_dir_windows(rfs: ReadOnlyFilesystem, path: String, allocator: Allocator) -> [String]
+    with {rfs, allocator, err: rderr.ReadDirError}
+{
+    comptime if target_has("windows") {
+        let wsearch_buf: [u8] = wide_search_bytes(path, allocator)?
+        let wsearch: u64 = raw.slice_addr(wsearch_buf)
+        let find_data: [u8] = handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(u8, 592)?
+        }
+        let fd_addr: u64 = raw.slice_addr(find_data)
+        let count: usize = dir_count_windows(wsearch, fd_addr, path)?
+        var out: [String] = handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(String, count)?
+        }
+        dir_fill_windows(wsearch, fd_addr, mutable out, allocator)?
+        return out
+    } else {
+        return handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(String, 0)?
+        }
+    }
+}
+
+function wide_search_bytes(path: String, allocator: Allocator) -> [u8]
+    with {allocator, err: rderr.ReadDirError}
+{
+    comptime if target_has("windows") {
+        let pb: [u8] = path.bytes()
+        let mb: [u8] = handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(u8, pb.len() + 3)?
+        }
+        var i: usize = 0
+        loop
+            decreases pb.len() - i
+        {
+            if i >= pb.len() { break }
+            mb[i] = pb[i]
+            i = i + 1
+        }
+        mb[pb.len()] = 0x5C
+        mb[pb.len() + 1] = 0x2A
+        mb[pb.len() + 2] = 0
+        let mb_addr: u64 = raw.slice_addr(mb)
+        let wlen: i32 = multi_byte_to_wide_char(65001, 0, mb_addr, -1, 0, 0)
+        if wlen <= 0 { raise rderr.ReadDirError.other }
+        let wbuf: [u8] = handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(u8, (wlen as usize) * 2)?
+        }
+        let _ = multi_byte_to_wide_char(65001, 0, mb_addr, -1, raw.slice_addr(wbuf), wlen)
+        return wbuf
+    } else {
+        return handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(u8, 0)?
+        }
+    }
+}
+
+function find_first_errno(path: String) -> rderr.ReadDirError {
+    let code: u32 = get_last_error()
+    if code == 2 { return rderr.ReadDirError.not_found(path: path) }
+    if code == 3 { return rderr.ReadDirError.not_a_directory(path: path) }
+    if code == 267 { return rderr.ReadDirError.not_a_directory(path: path) }
+    if code == 5 { return rderr.ReadDirError.permission_denied(path: path) }
+    return rderr.ReadDirError.os_error(code: code as i32 wrapping)
+}
+
+function dir_count_windows(wsearch: u64, fd_addr: u64, path: String) -> usize
+    with {err: rderr.ReadDirError}
+{
+    comptime if target_has("windows") {
+        let h: u64 = find_first_file_w(wsearch, fd_addr)
+        if h == 0xFFFFFFFFFFFFFFFF { raise find_first_errno(path) }
+        var total: usize = 0
+        if !dir_is_dot_w(fd_addr) { total = total + 1 }
+        var fuel: u64 = 16777216
+        loop
+            decreases fuel
+        {
+            if fuel == 0 { break }
+            fuel = fuel - 1
+            let r: i32 = find_next_file_w(h, fd_addr)
+            if r == 0 { break }
+            if !dir_is_dot_w(fd_addr) { total = total + 1 }
+        }
+        let _ = find_close(h)
+        return total
+    } else {
+        return 0
+    }
+}
+
+function dir_fill_windows(wsearch: u64, fd_addr: u64, out: mutable [String], allocator: Allocator) -> ()
+    with {allocator, err: rderr.ReadDirError}
+{
+    comptime if target_has("windows") {
+        let h: u64 = find_first_file_w(wsearch, fd_addr)
+        if h == 0xFFFFFFFFFFFFFFFF { return () }
+        var idx: usize = 0
+        if !dir_is_dot_w(fd_addr) && idx < out.len() {
+            out[idx] = wide_name_string(fd_addr, allocator)?
+            idx = idx + 1
+        }
+        var fuel: u64 = 16777216
+        loop
+            decreases fuel
+        {
+            if fuel == 0 { break }
+            fuel = fuel - 1
+            let r: i32 = find_next_file_w(h, fd_addr)
+            if r == 0 { break }
+            if !dir_is_dot_w(fd_addr) && idx < out.len() {
+                out[idx] = wide_name_string(fd_addr, allocator)?
+                idx = idx + 1
+            }
+        }
+        let _ = find_close(h)
+        return ()
+    } else {
+        return ()
+    }
+}
+
+function dir_is_dot_w(fd_addr: u64) -> bool {
+    let c0: u16 = raw.load_u16(fd_addr +% 44)
+    if c0 != 0x2E { return false }
+    let c1: u16 = raw.load_u16(fd_addr +% 46)
+    if c1 == 0 { return true }
+    if c1 != 0x2E { return false }
+    let c2: u16 = raw.load_u16(fd_addr +% 48)
+    return c2 == 0
+}
+
+function wide_len_w(wptr: u64) -> usize {
+    var n: usize = 0
+    var fuel: u64 = 260
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if raw.load_u16(wptr +% ((n as u64) *% 2)) == 0 { break }
+        n = n + 1
+    }
+    return n
+}
+
+function wide_name_string(fd_addr: u64, allocator: Allocator) -> String
+    with {allocator, err: rderr.ReadDirError}
+{
+    comptime if target_has("windows") {
+        let wptr: u64 = fd_addr +% 44
+        let wlen: usize = wide_len_w(wptr)
+        if wlen == 0 { return "" }
+        let mblen: i32 = wide_char_to_multi_byte(65001, 0, wptr, wlen as i32 wrapping, 0, 0, 0, 0)
+        if mblen <= 0 { return "" }
+        let sbuf: [u8] = handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(u8, mblen as usize)?
+        }
+        let _ = wide_char_to_multi_byte(65001, 0, wptr, wlen as i32 wrapping, raw.slice_addr(sbuf), mblen, 0, 0)
+        return string.from_owned_utf8(take sbuf)
+    } else {
+        return ""
+    }
+}

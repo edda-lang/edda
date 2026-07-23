@@ -1,0 +1,286 @@
+
+module ir.hlir.tree.oplower.wide.mul.mul
+
+import std.mem.alloc
+import std.collections.vec
+
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+
+import local.lir.tree.body as lir_body_mod
+import local.lir.op as lir_op_mod
+import local.lir.error as lir_error_mod
+import local.lir.tree.reg as lir_reg_mod
+import local.lir.id.vreg as lir_vreg_mod
+import local.lir.id.op as lir_op_id_mod
+
+import local.hlir.tree.oplower.wide.support.support as support_mod
+
+
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+
+
+public function lower_mul(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    signed_: bool,
+    trap: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 0 as i32, b_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 8 as i32, b_hi, mutable ids, allocator)?
+    let r_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let high = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let cross_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let cross_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let partial = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let r_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), r_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.umulhi, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), high, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_lo, lir_reg_mod.Operand.vreg(id: b_hi), cross_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_hi, lir_reg_mod.Operand.vreg(id: b_lo), cross_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, high, lir_reg_mod.Operand.vreg(id: cross_hi), partial, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, partial, lir_reg_mod.Operand.vreg(id: cross_lo), r_hi, mutable ids, allocator)?
+    if trap {
+        let of = overflow_mul(mutable out, origin, signed_, operand_ty, a_lo, a_hi, b_lo, b_hi, high, partial, r_hi, mutable ids, allocator)?
+        support_mod.trap_if(mutable out, origin, of, mutable ids, allocator)?
+    }
+    support_mod.store_half(mutable out, origin, dst, 0 as i32, r_lo, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 8 as i32, r_hi, mutable ids, allocator)?
+}
+
+
+public function lower_mul_sat(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    signed_: bool,
+    operand_ty: ty_mod.TyId,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), mutable ids, allocator)?
+    let a_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let a_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let b_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 0 as i32, a_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, lhs, 8 as i32, a_hi, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 0 as i32, b_lo, mutable ids, allocator)?
+    support_mod.load_half(mutable out, origin, rhs, 8 as i32, b_hi, mutable ids, allocator)?
+    let r_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let high = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let cross_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let cross_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let partial = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let r_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), r_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.umulhi, a_lo, lir_reg_mod.Operand.vreg(id: b_lo), high, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_lo, lir_reg_mod.Operand.vreg(id: b_hi), cross_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_hi, lir_reg_mod.Operand.vreg(id: b_lo), cross_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, high, lir_reg_mod.Operand.vreg(id: cross_hi), partial, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, partial, lir_reg_mod.Operand.vreg(id: cross_lo), r_hi, mutable ids, allocator)?
+    let of = overflow_mul(mutable out, origin, signed_, operand_ty, a_lo, a_hi, b_lo, b_hi, high, partial, r_hi, mutable ids, allocator)?
+    saturate_blend(mutable out, origin, signed_, operand_ty, a_hi, b_hi, of, r_lo, r_hi, dst, mutable ids, allocator)?
+}
+
+
+function saturate_blend(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    signed_: bool,
+    operand_ty: ty_mod.TyId,
+    a_hi: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    of: lir_vreg_mod.LirVRegId,
+    wr_lo: lir_vreg_mod.LirVRegId,
+    wr_hi: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let mask = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, of, lir_reg_mod.Operand.imm(value: -1 as i64), mask, mutable ids, allocator)?
+    let sat_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let sat_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    if signed_ {
+        let xab = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        let ss = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), xab, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.ashr, xab, lir_reg_mod.Operand.imm(value: 63 as i64), ss, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, ss, lir_reg_mod.Operand.imm(value: -1 as i64), sat_lo, mutable ids, allocator)?
+        let i64_max = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        support_mod.push(mutable out, origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: 9223372036854775807 as i128, ty: operand_ty), dst: i64_max), mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, ss, lir_reg_mod.Operand.vreg(id: i64_max), sat_hi, mutable ids, allocator)?
+    } else {
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, a_hi, lir_reg_mod.Operand.imm(value: -1 as i64), sat_lo, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, a_hi, lir_reg_mod.Operand.imm(value: -1 as i64), sat_hi, mutable ids, allocator)?
+    }
+    let d_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let t_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let out_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, wr_lo, lir_reg_mod.Operand.vreg(id: sat_lo), d_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, d_lo, lir_reg_mod.Operand.vreg(id: mask), t_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, wr_lo, lir_reg_mod.Operand.vreg(id: t_lo), out_lo, mutable ids, allocator)?
+    let d_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let t_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let out_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, wr_hi, lir_reg_mod.Operand.vreg(id: sat_hi), d_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, d_hi, lir_reg_mod.Operand.vreg(id: mask), t_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_xor, wr_hi, lir_reg_mod.Operand.vreg(id: t_hi), out_hi, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 0 as i32, out_lo, mutable ids, allocator)?
+    support_mod.store_half(mutable out, origin, dst, 8 as i32, out_hi, mutable ids, allocator)?
+}
+
+
+function overflow_mul(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    signed_: bool,
+    operand_ty: ty_mod.TyId,
+    a_lo: lir_vreg_mod.LirVRegId,
+    a_hi: lir_vreg_mod.LirVRegId,
+    b_lo: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    high: lir_vreg_mod.LirVRegId,
+    partial: lir_vreg_mod.LirVRegId,
+    r_hi: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let hi1 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let hi2 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let c1 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let c2 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.umulhi, a_lo, lir_reg_mod.Operand.vreg(id: b_hi), hi1, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.umulhi, a_hi, lir_reg_mod.Operand.vreg(id: b_lo), hi2, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, partial, lir_reg_mod.Operand.vreg(id: high), c1, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, r_hi, lir_reg_mod.Operand.vreg(id: partial), c2, mutable ids, allocator)?
+    if signed_ {
+        return overflow_mul_signed(mutable out, origin, operand_ty, a_lo, a_hi, b_lo, b_hi, hi1, hi2, c1, c2, r_hi, mutable ids, allocator)?
+    }
+    let anz = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+        let bnz = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+        let both = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        let n1 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+        let n2 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+        let o1 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        let o2 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        let o3 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        let of = support_mod.mint_half(mutable out, operand_ty, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ne, a_hi, lir_reg_mod.Operand.imm(value: 0 as i64), anz, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ne, b_hi, lir_reg_mod.Operand.imm(value: 0 as i64), bnz, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, anz, lir_reg_mod.Operand.vreg(id: bnz), both, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ne, hi1, lir_reg_mod.Operand.imm(value: 0 as i64), n1, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ne, hi2, lir_reg_mod.Operand.imm(value: 0 as i64), n2, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, both, lir_reg_mod.Operand.vreg(id: n1), o1, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, o1, lir_reg_mod.Operand.vreg(id: n2), o2, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, o2, lir_reg_mod.Operand.vreg(id: c1), o3, mutable ids, allocator)?
+        support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, o3, lir_reg_mod.Operand.vreg(id: c2), of, mutable ids, allocator)?
+    return of
+}
+
+
+function overflow_mul_signed(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    operand_ty: ty_mod.TyId,
+    a_lo: lir_vreg_mod.LirVRegId,
+    a_hi: lir_vreg_mod.LirVRegId,
+    b_lo: lir_vreg_mod.LirVRegId,
+    b_hi: lir_vreg_mod.LirVRegId,
+    hi1: lir_vreg_mod.LirVRegId,
+    hi2: lir_vreg_mod.LirVRegId,
+    c1: lir_vreg_mod.LirVRegId,
+    c2: lir_vreg_mod.LirVRegId,
+    r_hi: lir_vreg_mod.LirVRegId,
+    ids: mutable Vec_LirOpId.Vec,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let p_hh_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let p_hh_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.mul, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), p_hh_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.umulhi, a_hi, lir_reg_mod.Operand.vreg(id: b_hi), p_hh_hi, mutable ids, allocator)?
+    let carry_in2 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, c1, lir_reg_mod.Operand.vreg(id: c2), carry_in2, mutable ids, allocator)?
+    let s1 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let k1 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let s2 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let k2 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let s3 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let k3 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, hi1, lir_reg_mod.Operand.vreg(id: hi2), s1, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, s1, lir_reg_mod.Operand.vreg(id: hi1), k1, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, s1, lir_reg_mod.Operand.vreg(id: p_hh_lo), s2, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, s2, lir_reg_mod.Operand.vreg(id: s1), k2, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, s2, lir_reg_mod.Operand.vreg(id: carry_in2), s3, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, s3, lir_reg_mod.Operand.vreg(id: s2), k3, mutable ids, allocator)?
+    let uh_lo = s3
+    let ck12 = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let ck = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let uh_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, k1, lir_reg_mod.Operand.vreg(id: k2), ck12, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, ck12, lir_reg_mod.Operand.vreg(id: k3), ck, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.add, p_hh_hi, lir_reg_mod.Operand.vreg(id: ck), uh_hi, mutable ids, allocator)?
+    let mask_a = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let mask_b = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.ashr, a_hi, lir_reg_mod.Operand.imm(value: 63 as i64), mask_a, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.ashr, b_hi, lir_reg_mod.Operand.imm(value: 63 as i64), mask_b, mutable ids, allocator)?
+    let sa_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let sa_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let sb_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let sb_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, b_lo, lir_reg_mod.Operand.vreg(id: mask_a), sa_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, b_hi, lir_reg_mod.Operand.vreg(id: mask_a), sa_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, a_lo, lir_reg_mod.Operand.vreg(id: mask_b), sb_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_and, a_hi, lir_reg_mod.Operand.vreg(id: mask_b), sb_hi, mutable ids, allocator)?
+    let d1_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let br1 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let t1_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let d1_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.sub, uh_lo, lir_reg_mod.Operand.vreg(id: sa_lo), d1_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, uh_lo, lir_reg_mod.Operand.vreg(id: sa_lo), br1, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.sub, uh_hi, lir_reg_mod.Operand.vreg(id: sa_hi), t1_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.sub, t1_hi, lir_reg_mod.Operand.vreg(id: br1), d1_hi, mutable ids, allocator)?
+    let sh_lo = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let br2 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let t2_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    let sh_hi = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.sub, d1_lo, lir_reg_mod.Operand.vreg(id: sb_lo), sh_lo, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ult, d1_lo, lir_reg_mod.Operand.vreg(id: sb_lo), br2, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.sub, d1_hi, lir_reg_mod.Operand.vreg(id: sb_hi), t2_hi, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.sub, t2_hi, lir_reg_mod.Operand.vreg(id: br2), sh_hi, mutable ids, allocator)?
+    let se = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.ashr, r_hi, lir_reg_mod.Operand.imm(value: 63 as i64), se, mutable ids, allocator)?
+    let ne1 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let ne2 = support_mod.mint_bool(mutable out, operand_ty, allocator)?
+    let of = support_mod.mint_half(mutable out, operand_ty, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ne, sh_lo, lir_reg_mod.Operand.vreg(id: se), ne1, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.icmp_ne, sh_hi, lir_reg_mod.Operand.vreg(id: se), ne2, mutable ids, allocator)?
+    support_mod.bin(mutable out, origin, lir_op_mod.LBinOp.bit_or, ne1, lir_reg_mod.Operand.vreg(id: ne2), of, mutable ids, allocator)?
+    return of
+}

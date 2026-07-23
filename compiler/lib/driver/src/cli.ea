@@ -1,0 +1,264 @@
+
+module driver.cli
+
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import compile.dump.dump as dump_mod
+import compile.trace.trace as trace_mod
+
+
+spec std.core.option.Option(Subcommand)
+spec std.core.option.Option(ParsedArgs)
+spec std.core.option.Option(String)
+
+
+public type Subcommand {
+    case build
+    case check
+    case run
+    case test
+    case bench
+    case fmt
+    case lint
+    case gc
+    case promote
+    case demote
+    case regenerate
+    case clean
+    case daemon
+    case structmap
+    case version
+}
+
+public type ParsedArgs {
+    subcommand: Subcommand
+    target: Option_String.Option
+    manifest_path: Option_String.Option
+    stdlib_path: Option_String.Option
+    verbose: bool
+    dump: dump_mod.DumpFlags
+    json: bool
+    trace: trace_mod.TraceConfig
+}
+
+
+public function parse_args(
+    args: [String],
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_ParsedArgs.Option
+    with {allocator, err: alloc.AllocError}
+{
+    if args.len() == 0 {
+        emit_cli_error(mutable diags, "missing subcommand — usage: edda <subcommand> [args...]", allocator)?
+        return Option_ParsedArgs.none
+    }
+    let name = args[0]
+    if string.equals(name, "--version") || string.equals(name, "-V") {
+        return parse_flags(Subcommand.version, args, mutable diags, allocator)?
+    }
+    let sub_opt = parse_subcommand(name)
+    let sub = match sub_opt {
+        case .some(let s) => s
+        case .none => {
+            let msg = string.concat("unknown subcommand: ", name, allocator)?
+            emit_cli_error(mutable diags, msg, allocator)?
+            return Option_ParsedArgs.none
+        }
+    }
+    return parse_flags(sub, args, mutable diags, allocator)?
+}
+
+
+function parse_subcommand(name: String) -> Option_Subcommand.Option {
+    if string.equals(name, "build") { return Option_Subcommand.some(value: Subcommand.build) }
+    if string.equals(name, "check") { return Option_Subcommand.some(value: Subcommand.check) }
+    if string.equals(name, "run") { return Option_Subcommand.some(value: Subcommand.run) }
+    if string.equals(name, "test") { return Option_Subcommand.some(value: Subcommand.test) }
+    if string.equals(name, "bench") { return Option_Subcommand.some(value: Subcommand.bench) }
+    if string.equals(name, "fmt") { return Option_Subcommand.some(value: Subcommand.fmt) }
+    if string.equals(name, "lint") { return Option_Subcommand.some(value: Subcommand.lint) }
+    if string.equals(name, "gc") { return Option_Subcommand.some(value: Subcommand.gc) }
+    if string.equals(name, "promote") { return Option_Subcommand.some(value: Subcommand.promote) }
+    if string.equals(name, "demote") { return Option_Subcommand.some(value: Subcommand.demote) }
+    if string.equals(name, "regenerate") { return Option_Subcommand.some(value: Subcommand.regenerate) }
+    if string.equals(name, "clean") { return Option_Subcommand.some(value: Subcommand.clean) }
+    if string.equals(name, "daemon") { return Option_Subcommand.some(value: Subcommand.daemon) }
+    if string.equals(name, "structmap") { return Option_Subcommand.some(value: Subcommand.structmap) }
+    if string.equals(name, "version") { return Option_Subcommand.some(value: Subcommand.version) }
+    return Option_Subcommand.none
+}
+
+
+function parse_flags(
+    sub: Subcommand,
+    args: [String],
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_ParsedArgs.Option
+    with {allocator, err: alloc.AllocError}
+{
+    var target: Option_String.Option = Option_String.none
+    var manifest_path: Option_String.Option = Option_String.none
+    var stdlib_path: Option_String.Option = Option_String.none
+    var verbose: bool = false
+    var dump_ast: bool = false
+    var dump_hir: bool = false
+    var dump_types: bool = false
+    var dump_mir: bool = false
+    var json: bool = false
+    var trace_enabled: bool = false
+    var trace_filter: String = ""
+
+    let n = args.len()
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arg = args[i]
+        if string.equals(arg, "--target") {
+            let v_opt = read_flag_value(arg, args, i, mutable diags, allocator)?
+            let v = match v_opt {
+                case .some(let s) => s
+                case .none => return Option_ParsedArgs.none
+            }
+            target = Option_String.some(value: v)
+            i = i + 2
+        } else if string.equals(arg, "--manifest-path") {
+            let v_opt = read_flag_value(arg, args, i, mutable diags, allocator)?
+            let v = match v_opt {
+                case .some(let s) => s
+                case .none => return Option_ParsedArgs.none
+            }
+            manifest_path = Option_String.some(value: v)
+            i = i + 2
+        } else if string.equals(arg, "--stdlib") {
+            let v_opt = read_flag_value(arg, args, i, mutable diags, allocator)?
+            let v = match v_opt {
+                case .some(let s) => s
+                case .none => return Option_ParsedArgs.none
+            }
+            stdlib_path = Option_String.some(value: v)
+            i = i + 2
+        } else if string.equals(arg, "--verbose") || string.equals(arg, "-v") {
+            verbose = true
+            i = i + 1
+        } else if string.equals(arg, "--json") {
+            json = true
+            i = i + 1
+        } else if string.equals(arg, "--trace") {
+            trace_enabled = true
+            i = i + 1
+        } else if string.equals(arg, "--dump-ast") || string.equals(arg, "--dump=ast") {
+            dump_ast = true
+            i = i + 1
+        } else if string.equals(arg, "--dump-hir") || string.equals(arg, "--dump=hir") {
+            dump_hir = true
+            i = i + 1
+        } else if string.equals(arg, "--dump-types") || string.equals(arg, "--dump=types") {
+            dump_types = true
+            i = i + 1
+        } else if string.equals(arg, "--dump-mir") || string.equals(arg, "--dump=mir") {
+            dump_mir = true
+            i = i + 1
+        } else if string.equals(arg, "--dump-all") || string.equals(arg, "--dump=all") {
+            dump_ast = true
+            dump_hir = true
+            dump_types = true
+            dump_mir = true
+            i = i + 1
+        } else {
+            let tf_opt = trace_filter_of(arg, allocator)?
+            match tf_opt {
+                case .some(let ph) => {
+                    trace_enabled = true
+                    trace_filter = ph
+                    i = i + 1
+                }
+                case .none => {
+                    let msg = string.concat("unknown flag: ", arg, allocator)?
+                    emit_cli_error(mutable diags, msg, allocator)?
+                    return Option_ParsedArgs.none
+                }
+            }
+        }
+    }
+
+    if !trace_enabled {
+        match env.read_optional("EDDA_TRACE", allocator) {
+            case .some(let raw) => {
+                trace_enabled = true
+                if string.equals(raw, "") || string.equals(raw, "1") || string.equals(raw, "all") {
+                    trace_filter = ""
+                } else {
+                    trace_filter = raw
+                }
+            }
+            case .none => ()
+        }
+    }
+
+    let trace = if trace_enabled {
+        trace_mod.on(trace_filter)
+    } else {
+        trace_mod.off()
+    }
+    let parsed = ParsedArgs {
+        subcommand: sub,
+        target: target,
+        manifest_path: manifest_path,
+        stdlib_path: stdlib_path,
+        verbose: verbose,
+        dump: dump_mod.DumpFlags { ast: dump_ast, hir: dump_hir, types: dump_types, mir: dump_mir },
+        json: json,
+        trace: trace,
+    }
+    return Option_ParsedArgs.some(value: parsed)
+}
+
+
+function trace_filter_of(arg: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let segs = string.split(arg, "=", allocator)?
+    if segs.len() != 2 as usize { return Option_String.none }
+    if !string.equals(segs[0], "--trace") { return Option_String.none }
+    let v = string.clone(segs[1], allocator)?
+    return Option_String.some(value: v)
+}
+
+function read_flag_value(
+    flag: String,
+    args: [String],
+    i: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    if i + 1 >= args.len() {
+        let prefix = string.concat("flag ", flag, allocator)?
+        let msg = string.concat(prefix, " requires a value", allocator)?
+        emit_cli_error(mutable diags, msg, allocator)?
+        return Option_String.none
+    }
+    let v = string.clone(args[i + 1], allocator)?
+    return Option_String.some(value: v)
+}
+
+
+function emit_cli_error(
+    diags: mutable diags_mod.Diagnostics,
+    message: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.cli_error(), span_mod.dummy(), message)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

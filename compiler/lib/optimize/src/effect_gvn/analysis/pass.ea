@@ -1,0 +1,73 @@
+
+module optimize.effect_gvn.analysis.pass
+
+import std.mem.alloc
+import std.collections.vec
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.tree.node.file as file_mod
+import types.ty.interner as ty_interner_mod
+import egraph.sat.saturate as saturate_mod
+import egraph.sat.extract as extract_mod
+import local.effect_gvn.hlir.build as build_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+import local.effect_gvn.gvn.cse as gvn_mod
+import local.effect_gvn.pure.dce as dce_mod
+import local.effect_gvn.licm as licm_mod
+import local.effect_gvn.stack.promote.promote as alloc_mod
+import local.effect_gvn.pass.replace as replace_mod
+import local.effect_gvn.pass.dead as dead_mod
+import local.effect_gvn.pass.promote as promote_mod
+
+
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+
+
+public type EffectGvnPlan {
+    gvn: gvn_mod.GvnPlan
+    built: mapping_mod.BuildResult
+    licm: licm_mod.LicmPlan
+    alloc_promote: alloc_mod.AllocPromotePlan
+}
+
+
+public function run(
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> EffectGvnPlan
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var built = build_mod.build_egraph(body, file, allocator)?
+    let ops_budget = Vec_HlirOp.len(body.ops) + 1
+    let cap: usize = 8
+    let budget = if ops_budget < cap { ops_budget } else { cap }
+    let _ = saturate_mod.saturate(mutable built.graph, mutable built.sat, budget, allocator)?
+    let _ = extract_mod.extract(mutable built.graph, allocator)?
+    let gvn_plan = gvn_mod.analyze(body, mutable built, allocator)?
+    let licm_plan = licm_mod.analyze(body, mutable built, allocator)?
+    let alloc_plan = alloc_mod.analyze(body, file, ty_interner, mutable built, allocator)?
+    return EffectGvnPlan {
+        gvn: gvn_plan,
+        built: built,
+        licm: licm_plan,
+        alloc_promote: alloc_plan,
+    }
+}
+
+
+public function apply(
+    body: mutable hlir_body_mod.HlirBody,
+    plan: mutable EffectGvnPlan,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    replace_mod.apply_replacements(mutable body, plan.gvn, allocator)?
+    let dce_plan = dce_mod.analyze(body, mutable plan.built, allocator)?
+    dead_mod.apply_dead(mutable body, dce_plan)
+    promote_mod.apply_promotions(mutable body, plan.alloc_promote, allocator)?
+    let post_promote_dce = dce_mod.analyze(body, mutable plan.built, allocator)?
+    dead_mod.apply_dead(mutable body, post_promote_dce)
+}

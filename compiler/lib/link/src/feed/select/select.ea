@@ -1,0 +1,207 @@
+
+module link.feed.select.select
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import object.coff as coff_mod
+import local.emit.image.fix.res.resolve as resolve_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(coff_mod.CoffSymbol)
+spec std.collections.vec.Vec(MemberSyms)
+spec std.collections.hashmap.StringMap(bool)
+
+
+public type MemberSyms {
+    defined: Vec_String.Vec
+    undefined: Vec_String.Vec
+}
+
+
+function is_external(sc: u8) -> bool {
+    return sc == (2 as u8) || sc == (105 as u8)
+}
+
+
+function is_weak(sc: u8) -> bool {
+    return sc == (105 as u8)
+}
+
+
+function is_defined(section_number: i16, value: u32) -> bool {
+    if section_number > (0 as i16) { return true }
+    if section_number == (0 as i16) && value != (0 as u32) { return true }
+    return false
+}
+
+
+function is_undefined(section_number: i16, value: u32) -> bool {
+    return section_number == (0 as i16) && value == (0 as u32)
+}
+
+
+function member_syms(file: coff_mod.CoffFile, allocator: Allocator) -> MemberSyms
+    with {allocator, err: alloc.AllocError}
+{
+    uninit defined: Vec_String.Vec
+    Vec_String.new(init defined, allocator)?
+    uninit undefined: Vec_String.Vec
+    Vec_String.new(init undefined, allocator)?
+    let n = Vec_CoffSymbol.len(file.symbols)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sym = Vec_CoffSymbol.at(file.symbols, i)
+        if is_external(sym.storage_class) {
+            let name = resolve_mod.symbol_name(sym.name, file.string_table, allocator)?
+            if is_weak(sym.storage_class) || is_defined(sym.section_number, sym.value) {
+                Vec_String.push(mutable defined, take name, allocator)?
+            } else if is_undefined(sym.section_number, sym.value) {
+                Vec_String.push(mutable undefined, take name, allocator)?
+            }
+        }
+        i = i + (1 as usize)
+    }
+    return MemberSyms { defined: defined, undefined: undefined }
+}
+
+
+function add_needed(
+    needed: mutable StringMap_bool.StringMap,
+    names: Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let name = Vec_String.at(names, i)
+        let flag = true
+        let _ = StringMap_bool.insert(mutable needed, name, take flag, allocator)?
+        i = i + (1 as usize)
+    }
+}
+
+
+function defines_needed(syms: MemberSyms, needed: StringMap_bool.StringMap) -> bool {
+    let n = Vec_String.len(syms.defined)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if StringMap_bool.contains(needed, Vec_String.at(syms.defined, i)) {
+            return true
+        }
+        i = i + (1 as usize)
+    }
+    return false
+}
+
+
+public function defined_symbols(
+    members: Vec_CoffFile.Vec,
+    allocator: Allocator,
+) -> StringMap_bool.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var out = StringMap_bool.new(allocator)?
+    let n = Vec_CoffFile.len(members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let syms = member_syms(Vec_CoffFile.at(members, i), allocator)?
+        add_needed(mutable out, syms.defined, allocator)?
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+
+public function pulled_undefined(
+    members: Vec_CoffFile.Vec,
+    pulled: Vec_bool.Vec,
+    allocator: Allocator,
+) -> StringMap_bool.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var out = StringMap_bool.new(allocator)?
+    let n = Vec_CoffFile.len(members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_bool.at(pulled, i) {
+            let syms = member_syms(Vec_CoffFile.at(members, i), allocator)?
+            add_needed(mutable out, syms.undefined, allocator)?
+        }
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+
+public function select_members(
+    roots: Vec_CoffFile.Vec,
+    members: Vec_CoffFile.Vec,
+    allocator: Allocator,
+) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    var needed = StringMap_bool.new(allocator)?
+    let nroots = Vec_CoffFile.len(roots)
+    var r: usize = 0
+    loop decreases (nroots - r) {
+        if r >= nroots { break }
+        let syms = member_syms(Vec_CoffFile.at(roots, r), allocator)?
+        add_needed(mutable needed, syms.undefined, allocator)?
+        r = r + (1 as usize)
+    }
+
+    let n = Vec_CoffFile.len(members)
+    uninit index: Vec_MemberSyms.Vec
+    Vec_MemberSyms.new(init index, allocator)?
+    var m: usize = 0
+    loop decreases (n - m) {
+        if m >= n { break }
+        let syms = member_syms(Vec_CoffFile.at(members, m), allocator)?
+        Vec_MemberSyms.push(mutable index, take syms, allocator)?
+        m = m + (1 as usize)
+    }
+
+    uninit pulled: Vec_bool.Vec
+    Vec_bool.new(init pulled, allocator)?
+    var p: usize = 0
+    loop decreases (n - p) {
+        if p >= n { break }
+        let f = false
+        Vec_bool.push(mutable pulled, take f, allocator)?
+        p = p + (1 as usize)
+    }
+
+    var rounds: usize = 0
+    loop decreases ((n + (1 as usize)) - rounds) {
+        if rounds > n { break }
+        var progress = false
+        var i: usize = 0
+        loop decreases (n - i) {
+            if i >= n { break }
+            if !Vec_bool.at(pulled, i) {
+                let syms = Vec_MemberSyms.at(index, i)
+                if defines_needed(syms, needed) {
+                    let t = true
+                    Vec_bool.set_at(mutable pulled, i, take t)
+                    add_needed(mutable needed, syms.undefined, allocator)?
+                    progress = true
+                }
+            }
+            i = i + (1 as usize)
+        }
+        if !progress { break }
+        rounds = rounds + (1 as usize)
+    }
+    return pulled
+}

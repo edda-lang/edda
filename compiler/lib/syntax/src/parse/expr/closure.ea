@@ -1,0 +1,316 @@
+
+module syntax.parse.expr.closure
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.ops as ops_mod
+import local.parse.util as util_mod
+import local.parse.ty.core.core as ty_mod
+import local.parse.stmt.kinds.core as stmt_mod
+
+spec std.collections.vec.Vec(tree_mod.Param)
+spec std.collections.vec.Vec(tree_mod.Capture)
+spec std.mem.alloc.Box(tree_mod.Closure)
+spec std.core.option.Option(tree_mod.EffectRow)
+spec std.core.option.Option(Vec_Capture)
+
+
+public function parse_closure(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    let params_r = parse_closure_params(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = params_r.1
+    let ret_r = parse_closure_return(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = ret_r.1
+    let effects_r = parse_closure_effects(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = effects_r.1
+    let captures_r = parse_closure_captures(tokens, p, mutable diags, allocator)?
+    p = captures_r.1
+    let body_r = stmt_mod.parse_block(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    let full_span = merge_spans(kw_span, body_r.0.span)
+    let closure = tree_mod.Closure {
+        span: full_span,
+        params: params_r.0,
+        ret: ret_r.0,
+        effects: effects_r.0,
+        captures_: captures_r.0,
+        body: body_r.0,
+    }
+    let payload = Box_Closure.new(closure, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.closure(payload: payload),
+    }
+    return (expr, body_r.1)
+}
+
+
+function parse_closure_params(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_Param.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit params: Vec_Param.Vec
+    Vec_Param.new(init params, allocator)?
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .l_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `(` to open closure parameter list", allocator)?
+            return (params, p)
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1; return (params, p) }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let param_r = parse_closure_param(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_Param.push(mutable params, param_r.0, allocator)?
+        p = param_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` to close closure parameter list", allocator)?
+        }
+    }
+    return (params, p)
+}
+
+function parse_closure_param(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Param, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    var p = pos
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, start_span, "expected closure parameter name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: start_span }
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .colon => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `:` after closure parameter name", allocator)?
+        }
+    }
+    var mode: ops_mod.ParamMode = ops_mod.ParamMode.default
+    match util_mod.peek(tokens, p) {
+        case .kw_mutable => { mode = ops_mod.ParamMode.mutable_; p = p + 1 }
+        case .kw_take => { mode = ops_mod.ParamMode.take_; p = p + 1 }
+        case .kw_init => { mode = ops_mod.ParamMode.init_; p = p + 1 }
+        case _ => ()
+    }
+    let ty_r = ty_mod.parse_ty(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    let full_span = merge_spans(start_span, ty_r.0.span)
+    let param = tree_mod.Param {
+        span: full_span,
+        name: name,
+        mode: mode,
+        ty: ty_r.0,
+    }
+    return (param, ty_r.1)
+}
+
+
+function parse_closure_return(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Ty, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match util_mod.peek(tokens, pos) {
+        case .arrow => {
+            return ty_mod.parse_ty_no_where(tokens, pos + 1, mutable diags, allocator, parse_expr_fn, depth)?
+        }
+        case _ => {
+            let span = util_mod.span_at(tokens, pos)
+            util_mod.emit_error(mutable diags, span, "expected `->` — closure return type is mandatory", allocator)?
+            let err_ty = tree_mod.Ty { span: span, kind: tree_mod.TyKind.error }
+            return (err_ty, pos)
+        }
+    }
+}
+
+
+function parse_closure_captures(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (Option_Vec_Capture.Option, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let has_captures = match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => symbol.is_captures(sym)
+        case _ => false
+    }
+    if !has_captures { return (Option_Vec_Capture.none, pos) }
+    var p = pos + 1
+    match util_mod.peek(tokens, p) {
+        case .l_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `{` after `captures` to open the capture list", allocator)?
+            return (Option_Vec_Capture.none, p)
+        }
+    }
+    uninit captures: Vec_Capture.Vec
+    Vec_Capture.new(init captures, allocator)?
+    match util_mod.peek(tokens, p) {
+        case .r_brace => {
+            return (Option_Vec_Capture.some(value: captures), p + 1)
+        }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let cap_r = parse_one_capture(tokens, p, mutable diags, allocator)?
+        Vec_Capture.push(mutable captures, cap_r.0, allocator)?
+        p = cap_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_brace => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `}` to close `captures` clause", allocator)?
+        }
+    }
+    return (Option_Vec_Capture.some(value: captures), p)
+}
+
+function parse_one_capture(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Capture, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    let name = match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => ident_mod.Ident { name: sym, span: start_span }
+        case _ => {
+            util_mod.emit_error(mutable diags, start_span, "expected captured-name identifier in `captures` clause", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: start_span }
+        }
+    }
+    var p = pos + 1
+    var mode: ops_mod.CaptureMode = ops_mod.CaptureMode.let_
+    var end_span: span_mod.Span = start_span
+    match util_mod.peek(tokens, p) {
+        case .colon => {
+            let mode_pos = p + 1
+            let mode_span = util_mod.span_at(tokens, mode_pos)
+            match util_mod.peek(tokens, mode_pos) {
+                case .kw_take => {
+                    mode = ops_mod.CaptureMode.take_
+                    end_span = mode_span
+                    p = mode_pos + 1
+                }
+                case .kw_mutable => {
+                    util_mod.emit_error(mutable diags, mode_span, "`mutable` capture mode is forbidden — closure captures admit only `let` (default) or `take`", allocator)?
+                    p = mode_pos + 1
+                }
+                case _ => {
+                    util_mod.emit_error(mutable diags, mode_span, "expected `take` after `:` in capture entry (omit `:` for the default `let` mode)", allocator)?
+                }
+            }
+        }
+        case _ => ()
+    }
+    let full_span = merge_spans(start_span, end_span)
+    let cap = tree_mod.Capture {
+        span: full_span,
+        name: name,
+        mode: mode,
+    }
+    return (cap, p)
+}
+
+
+function parse_closure_effects(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Option_EffectRow.Option, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match util_mod.peek(tokens, pos) {
+        case .kw_with => {
+            let row_r = ty_mod.parse_effect_row(tokens, pos, mutable diags, allocator, parse_expr_fn, depth)?
+            return (Option_EffectRow.some(value: row_r.0), row_r.1)
+        }
+        case _ => return (Option_EffectRow.none, pos)
+    }
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

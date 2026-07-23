@@ -1,0 +1,443 @@
+
+module link.feed.classify.classify
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import local.coff.archive as archive_mod
+import local.pe.imports as imports_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(archive_mod.ShortImport)
+spec std.collections.vec.Vec(imports_mod.ImportDll)
+spec std.collections.vec.Vec(imports_mod.ImportFunction)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(String)
+spec std.core.option.Option(String)
+
+
+public type SynthPlan {
+    fltused: bool
+    chkstk: bool
+    type_info_vtable: bool
+    tls_index: bool
+    tls_used: bool
+    security_cookie: bool
+    security_check_cookie: bool
+    gs_handler_check: bool
+    tls_guard: bool
+    isa_available: bool
+    dyn_tls_init: bool
+    report_rangecheck: bool
+    atexit_stub: bool
+    get_new_handler_stub: bool
+}
+
+
+public type ImportPlan {
+    dlls: Vec_ImportDll.Vec
+    provided: StringMap_bool.StringMap
+    thunks: Vec_String.Vec
+    synth: SynthPlan
+}
+
+
+function imp_prefix() -> String {
+    return "__imp_"
+}
+
+
+function strip_imp(name: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = name.bytes()
+    let plen = imp_prefix().len()
+    let n = nb.len() - plen
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = nb[plen + i]
+        i = i + (1 as usize)
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function shorts_dll(base: String, shorts: Vec_ShortImport.Vec) -> Option_String.Option {
+    let n = Vec_ShortImport.len(shorts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let si = Vec_ShortImport.at(shorts, i)
+        if string.equals(si.symbol, base) {
+            return Option_String.some(value: si.dll)
+        }
+        i = i + (1 as usize)
+    }
+    return Option_String.none
+}
+
+
+function is_socket_fn(base: String) -> bool {
+    if string.starts_with(base, "WSA") { return true }
+    return string.equals(base, "accept")
+        || string.equals(base, "bind")
+        || string.equals(base, "closesocket")
+        || string.equals(base, "connect")
+        || string.equals(base, "freeaddrinfo")
+        || string.equals(base, "getaddrinfo")
+        || string.equals(base, "getpeername")
+        || string.equals(base, "getsockname")
+        || string.equals(base, "getsockopt")
+        || string.equals(base, "ioctlsocket")
+        || string.equals(base, "listen")
+        || string.equals(base, "recv")
+        || string.equals(base, "recvfrom")
+        || string.equals(base, "send")
+        || string.equals(base, "sendto")
+        || string.equals(base, "setsockopt")
+        || string.equals(base, "shutdown")
+        || string.equals(base, "socket")
+}
+
+
+function is_mem_fn(base: String) -> bool {
+    return string.equals(base, "memcpy")
+        || string.equals(base, "memmove")
+        || string.equals(base, "memset")
+        || string.equals(base, "memcmp")
+}
+
+
+function is_crt_math_fn(base: String) -> bool {
+    return string.equals(base, "abort")
+        || string.equals(base, "_hypot")
+        || string.equals(base, "_hypotf")
+        || string.equals(base, "atan2")
+        || string.equals(base, "atan2f")
+        || string.equals(base, "cbrt")
+        || string.equals(base, "cbrtf")
+        || string.equals(base, "ceil")
+        || string.equals(base, "ceilf")
+        || string.equals(base, "cos")
+        || string.equals(base, "cosf")
+        || string.equals(base, "exp")
+        || string.equals(base, "expf")
+        || string.equals(base, "floor")
+        || string.equals(base, "floorf")
+        || string.equals(base, "fmod")
+        || string.equals(base, "fmodf")
+        || string.equals(base, "log")
+        || string.equals(base, "log2")
+        || string.equals(base, "log2f")
+        || string.equals(base, "logf")
+        || string.equals(base, "pow")
+        || string.equals(base, "powf")
+        || string.equals(base, "round")
+        || string.equals(base, "roundf")
+        || string.equals(base, "sin")
+        || string.equals(base, "sinf")
+        || string.equals(base, "tan")
+        || string.equals(base, "tanf")
+        || string.equals(base, "trunc")
+        || string.equals(base, "truncf")
+}
+
+
+function is_ucrt_c_fn(base: String) -> bool {
+    return string.equals(base, "_errno")
+        || string.equals(base, "__acrt_iob_func")
+        || string.equals(base, "_wgetenv")
+        || string.equals(base, "fputs")
+        || string.equals(base, "free")
+        || string.equals(base, "getenv")
+        || string.equals(base, "strtol")
+}
+
+
+function is_advapi_fn(base: String) -> bool {
+    return string.equals(base, "OpenProcessToken")
+        || string.equals(base, "AdjustTokenPrivileges")
+        || string.equals(base, "LookupPrivilegeValueA")
+}
+
+
+function dll_of_import(base: String, shorts: Vec_ShortImport.Vec) -> String {
+    return match shorts_dll(base, shorts) {
+        case .some(let dll) => dll
+        case .none => {
+            if string.starts_with(base, "Nt") || string.starts_with(base, "Rtl") {
+                "ntdll.dll"
+            } else if is_socket_fn(base) {
+                "ws2_32.dll"
+            } else if string.starts_with(base, "BCrypt") {
+                "bcrypt.dll"
+            } else if string.equals(base, "SystemFunction036") {
+                "advapi32.dll"
+            } else if string.equals(base, "CommandLineToArgvW") {
+                "shell32.dll"
+            } else if is_advapi_fn(base) {
+                "advapi32.dll"
+            } else if is_ucrt_c_fn(base) {
+                "ucrtbase.dll"
+            } else if is_crt_math_fn(base) {
+                "ucrtbase.dll"
+            } else if string.starts_with(base, "?") {
+                "msvcp140.dll"
+            } else {
+                "kernel32.dll"
+            }
+        }
+    }
+}
+
+
+function is_eh_fn(base: String) -> bool {
+    return string.equals(base, "__CxxFrameHandler3")
+        || string.equals(base, "_CxxThrowException")
+}
+
+
+function is_virtual_mem_fn(base: String) -> bool {
+    return string.equals(base, "VirtualAlloc")
+        || string.equals(base, "VirtualFree")
+}
+
+
+function dll_of_direct(
+    base: String,
+    shorts: Vec_ShortImport.Vec,
+    rt_referenced: StringMap_bool.StringMap,
+    declared_externs: StringMap_bool.StringMap,
+    declared_extern_dlls: StringMap_String.StringMap,
+) -> Option_String.Option {
+    return match shorts_dll(base, shorts) {
+        case .some(let dll) => Option_String.some(value: dll)
+        case .none => match StringMap_String.get(declared_extern_dlls, base) {
+            case .some(let dll) => Option_String.some(value: dll)
+            case .none => {
+                if is_mem_fn(base) {
+                    Option_String.some(value: "ntdll.dll")
+                } else if is_crt_math_fn(base) {
+                    Option_String.some(value: "ucrtbase.dll")
+                } else if is_eh_fn(base) {
+                    Option_String.some(value: "vcruntime140.dll")
+                } else if is_virtual_mem_fn(base) {
+                    Option_String.some(value: "kernel32.dll")
+                } else if string.starts_with(base, "__edda_") {
+                    Option_String.none
+                } else if StringMap_bool.contains(rt_referenced, base) {
+                    Option_String.some(value: dll_of_import(base, shorts))
+                } else if StringMap_bool.contains(declared_externs, base) {
+                    Option_String.some(value: dll_of_import(base, shorts))
+                } else {
+                    Option_String.none
+                }
+            }
+        }
+    }
+}
+
+
+function add_import(
+    dlls: mutable Vec_ImportDll.Vec,
+    dll: String,
+    base: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_ImportDll.len(dlls)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_ImportDll.at(dlls, i).name, dll) {
+            let entry = Vec_ImportDll.at(dlls, i)
+            if has_function(entry.functions, base) {
+                return ()
+            }
+            uninit fresh: Vec_ImportFunction.Vec
+            Vec_ImportFunction.new(init fresh, allocator)?
+            let nf = Vec_ImportFunction.len(entry.functions)
+            var j: usize = 0
+            loop decreases (nf - j) {
+                if j >= nf { break }
+                let existing = Vec_ImportFunction.at(entry.functions, j)
+                Vec_ImportFunction.push(mutable fresh, take existing, allocator)?
+                j = j + (1 as usize)
+            }
+            let f = imports_mod.ImportFunction { name: base }
+            Vec_ImportFunction.push(mutable fresh, take f, allocator)?
+            let updated = imports_mod.ImportDll { name: entry.name, functions: fresh }
+            Vec_ImportDll.set_at(mutable dlls, i, take updated)
+            return ()
+        }
+        i = i + (1 as usize)
+    }
+    uninit fns: Vec_ImportFunction.Vec
+    Vec_ImportFunction.new(init fns, allocator)?
+    let f = imports_mod.ImportFunction { name: base }
+    Vec_ImportFunction.push(mutable fns, take f, allocator)?
+    let entry = imports_mod.ImportDll { name: dll, functions: fns }
+    Vec_ImportDll.push(mutable dlls, take entry, allocator)?
+}
+
+
+function has_thunk(thunks: Vec_String.Vec, name: String) -> bool {
+    let n = Vec_String.len(thunks)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_String.at(thunks, i), name) {
+            return true
+        }
+        i = i + (1 as usize)
+    }
+    return false
+}
+
+
+function has_function(fns: Vec_ImportFunction.Vec, base: String) -> bool {
+    let n = Vec_ImportFunction.len(fns)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_ImportFunction.at(fns, i).name, base) {
+            return true
+        }
+        i = i + (1 as usize)
+    }
+    return false
+}
+
+
+function mark_provided(
+    provided: mutable StringMap_bool.StringMap,
+    base: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let key = string.concat(imp_prefix(), base, allocator)?
+    let flag = true
+    let _ = StringMap_bool.insert(mutable provided, key, take flag, allocator)?
+}
+
+
+public function classify(
+    unresolved: Vec_String.Vec,
+    shorts: Vec_ShortImport.Vec,
+    rt_referenced: StringMap_bool.StringMap,
+    declared_externs: StringMap_bool.StringMap,
+    declared_extern_dlls: StringMap_String.StringMap,
+    allocator: Allocator,
+) -> ImportPlan
+    with {allocator, err: alloc.AllocError}
+{
+    uninit dlls: Vec_ImportDll.Vec
+    Vec_ImportDll.new(init dlls, allocator)?
+    var provided = StringMap_bool.new(allocator)?
+    uninit thunks: Vec_String.Vec
+    Vec_String.new(init thunks, allocator)?
+    var fltused = false
+    var chkstk = false
+    var type_info_vtable = false
+    var tls_index = false
+    var tls_used = false
+    var security_cookie = false
+    var security_check_cookie = false
+    var gs_handler_check = false
+    var tls_guard = false
+    var isa_available = false
+    var dyn_tls_init = false
+    var report_rangecheck = false
+    var atexit_stub = false
+    var get_new_handler_stub = false
+
+    let n = Vec_String.len(unresolved)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let name = Vec_String.at(unresolved, i)
+        if string.starts_with(name, imp_prefix()) {
+            let base = strip_imp(name, allocator)?
+            let dll = dll_of_import(base, shorts)
+            add_import(mutable dlls, dll, base, allocator)?
+            mark_provided(mutable provided, base, allocator)?
+        } else if string.equals(name, "_fltused") {
+            fltused = true
+        } else if string.equals(name, "__chkstk") {
+            chkstk = true
+        } else if string.equals(name, "??_7type_info@@6B@") {
+            type_info_vtable = true
+        } else if string.equals(name, "_tls_index") {
+            tls_index = true
+        } else if string.equals(name, "_tls_used") {
+            tls_used = true
+        } else if string.equals(name, "__security_cookie") {
+            security_cookie = true
+        } else if string.equals(name, "__security_check_cookie") {
+            security_check_cookie = true
+        } else if string.equals(name, "__GSHandlerCheck") {
+            gs_handler_check = true
+        } else if string.equals(name, "__tls_guard") {
+            tls_guard = true
+        } else if string.equals(name, "__isa_available") {
+            isa_available = true
+        } else if string.equals(name, "__dyn_tls_on_demand_init") {
+            dyn_tls_init = true
+        } else if string.equals(name, "__report_rangecheckfailure") {
+            report_rangecheck = true
+        } else if string.equals(name, "atexit") {
+            atexit_stub = true
+        } else if string.equals(name, "?get_new_handler@std@@YAP6AXXZXZ") {
+            get_new_handler_stub = true
+        } else if string.equals(name, "__ImageBase") {
+            let flag = true
+            let key = "__ImageBase"
+            let _ = StringMap_bool.insert(mutable provided, key, take flag, allocator)?
+        } else {
+            match dll_of_direct(name, shorts, rt_referenced, declared_externs, declared_extern_dlls) {
+                case .some(let dll) => {
+                    add_import(mutable dlls, dll, name, allocator)?
+                    mark_provided(mutable provided, name, allocator)?
+                    if !has_thunk(thunks, name) {
+                        let t = name
+                        Vec_String.push(mutable thunks, take t, allocator)?
+                    }
+                }
+                case .none => {}
+            }
+        }
+        i = i + (1 as usize)
+    }
+    if tls_used {
+        let start_flag = true
+        let start_key = "__edda_tls_start"
+        let _ = StringMap_bool.insert(mutable provided, start_key, take start_flag, allocator)?
+        let end_flag = true
+        let end_key = "__edda_tls_end"
+        let _ = StringMap_bool.insert(mutable provided, end_key, take end_flag, allocator)?
+    }
+    let synth = SynthPlan {
+        fltused: fltused,
+        chkstk: chkstk,
+        type_info_vtable: type_info_vtable,
+        tls_index: tls_index,
+        tls_used: tls_used,
+        security_cookie: security_cookie,
+        security_check_cookie: security_check_cookie,
+        gs_handler_check: gs_handler_check,
+        tls_guard: tls_guard,
+        isa_available: isa_available,
+        dyn_tls_init: dyn_tls_init,
+        report_rangecheck: report_rangecheck,
+        atexit_stub: atexit_stub,
+        get_new_handler_stub: get_new_handler_stub,
+    }
+    return ImportPlan { dlls: dlls, provided: provided, thunks: thunks, synth: synth }
+}

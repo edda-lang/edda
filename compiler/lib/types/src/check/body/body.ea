@@ -1,0 +1,1118 @@
+
+module types.check.body.body
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.pass.effect as effect_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.env.lower.instname.instname as instname_mod
+import local.check.env.sig as sig_mod
+import local.check.env.fields as fields_mod
+import local.check.env.lower.ty.ty as ty_lower_mod
+import local.check.body.ops.ops as ops_mod
+import local.check.body.loops.loops as loops_mod
+import local.check.body.literal.literal as literal_mod
+import local.check.body.retype.retype as retype_mod
+import local.check.effect.effects as effects_mod
+import types.effect.interner as effect_interner_mod
+import resolve.build.builtins as resolve_builtins_mod
+import local.check.body.defwrite.defwrite as defwrite_mod
+import local.check.body.generics.generics as generics_mod
+import local.check.body.lookup.lookup as lookup_mod
+import local.check.body.methodret.methodret as methodret_mod
+import local.check.body.fieldty.fieldty as fieldty_mod
+import local.check.body.comptimeret.comptimeret as comptimeret_mod
+import local.check.body.retkinds.retkinds as retkinds_mod
+import local.check.body.patbind.patbind as patbind_mod
+import local.check.body.patbind.letbind as letbind_mod
+import local.check.body.iterhelp.iterhelp as iterhelp_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HClosureParam)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+spec std.collections.vec.Vec(fields_mod.FieldNameMatrix)
+
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(u32)
+
+public function process_bodies(
+    file: hir_file.HirFile,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    prefill_node_types(mutable node_types, file.next_node_id, allocator)?
+    walk_items(file.items, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+}
+
+
+function walk_items(
+    items: Vec_HItem.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        process_item(item, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        i = i + 1
+    }
+}
+
+function process_item(
+    item: hir_item.HItem,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(let sig_box, let body) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            let gscope = generics_mod.record_param_types(sig, builtins, interner, mutable ty_interner, mutable effect_interner, mutable local_types, allocator)?
+            let _ = infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        }
+        case .function_extern(let sig_box, _, _, _) => {
+            let sig = Box_HFnSignature.get(sig_box)
+            let _ = generics_mod.record_param_types(sig, builtins, interner, mutable ty_interner, mutable effect_interner, mutable local_types, allocator)?
+        }
+        case .spec_decl(_, let inner_items) => {
+            walk_items(inner_items, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+function infer_block(
+    block: hir_tree.HBlock,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var si: usize = 0
+    loop decreases (n - si) {
+        if si >= n { break }
+        let s = Vec_HStmt.at(block.stmts, si)
+        infer_stmt(s, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        si = si + 1
+    }
+    let trailing_ty = match block.trailing {
+        case .some(let box_e) => {
+            let inner = Box_HExpr.get(box_e)
+            infer_expr(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        }
+        case .none => builtins.unit_
+    }
+    return trailing_ty
+}
+
+function infer_stmt(
+    stmt: hir_tree.HStmt,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match stmt.kind {
+        case .let_(_, let pat, let bindings, let ty_opt, let init_) => {
+            let init_ty = infer_expr(init_, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let binding_ty = match ty_opt {
+                case .some(let ann) => {
+                    let ann_ty = ty_lower_mod.lower_ast_ty(ann, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+                    let _ = literal_mod.adopt_value(init_, init_ty, ann_ty, builtins, ty_interner, mutable node_types)
+                    ann_ty
+                }
+                case .none => {
+                    let hint_raw = retkinds_mod.for_hint_raw(builtins.for_hints, stmt.node_id)
+                    if hint_raw == 0 as u32 {
+                        init_ty
+                    } else {
+                        let peer_ty = lookup_mod.lookup_local_type(local_types, def_mod.from_raw(hint_raw))
+                        if ty_mod.is_error(peer_ty) {
+                            init_ty
+                        } else {
+                            literal_mod.adopt_value(init_, init_ty, peer_ty, builtins, ty_interner, mutable node_types)
+                        }
+                    }
+                }
+            }
+            letbind_mod.record_let_bindings(bindings, pat, binding_ty, ty_interner, mutable local_types, allocator)?
+        }
+        case .uninit_(let pat, let bindings, let ty) => {
+            let bty = ty_lower_mod.lower_ast_ty(ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+            letbind_mod.record_let_bindings(bindings, pat, bty, ty_interner, mutable local_types, allocator)?
+        }
+        case .assign(let target, _, let rhs) => {
+            let target_ty = infer_expr(target, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let rhs_ty = infer_expr(rhs, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let _ = literal_mod.adopt_value(rhs, rhs_ty, target_ty, builtins, ty_interner, mutable node_types)
+        }
+    }
+}
+
+function infer_expr(
+    expr: hir_tree.HExpr,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let self_ty = match expr.kind {
+        case .literal(let lit) => retkinds_mod.infer_literal(lit, builtins)
+        case .block_(let body) => infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .if_(let cond, let then_b, let else_opt) => {
+            let _ = infer_boxed(cond, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let then_ty = infer_block(then_b, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let else_ty = infer_opt_block(else_opt, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let then_ty2 = literal_mod.adopt_block_tail(then_b, then_ty, else_ty, builtins, ty_interner, mutable node_types)
+            let else_ty2 = match else_opt {
+                case .some(let else_b) => literal_mod.adopt_block_tail(else_b, else_ty, then_ty2, builtins, ty_interner, mutable node_types)
+                case .none => else_ty
+            }
+            ops_mod.unify(then_ty2, else_ty2, builtins)
+        }
+        case .match_(let scrut, let arms) => {
+            let scrut_ty = infer_boxed(scrut, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            infer_arms_unified(arms, scrut_ty, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        }
+        case .binary(let op, let lhs, let rhs) => {
+            let lhs_ty = infer_boxed(lhs, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let rhs_ty = infer_boxed(rhs, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let lhs_ty2 = literal_mod.adopt_expr(Box_HExpr.get(lhs), lhs_ty, rhs_ty, builtins, mutable node_types)
+            let rhs_ty2 = literal_mod.adopt_expr(Box_HExpr.get(rhs), rhs_ty, lhs_ty2, builtins, mutable node_types)
+            ops_mod.infer_binary(op, lhs_ty2, rhs_ty2, builtins, ty_interner)
+        }
+        case .unary(let op, let inner) => {
+            let inner_ty = infer_boxed(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            ops_mod.infer_unary(op, inner_ty, builtins)
+        }
+        case .use_(let def) => lookup_mod.lookup_use_type(local_types, fn_signatures, type_defs, builtins, def)
+        case .ident_literal(_) => builtins.unit_
+        case .call(let callee_def, let args) => {
+            infer_args(args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            adopt_call_args(callee_def, args, fn_signatures, builtins, ty_interner, mutable node_types)
+            let iter_ret = iter_call_ret(callee_def, args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            if !ty_mod.is_error(iter_ret) {
+                iter_ret
+            } else if retkinds_mod.is_string_builtin(callee_def, builtins) {
+                builtins.string_
+            } else {
+                let await_ret = retkinds_mod.task_await_ret(callee_def, args, builtins, node_types)
+                let cb_ret = retkinds_mod.comptime_builtin_ret(callee_def, builtins)
+                let disc_ret = if !def_mod.is_error(callee_def) && Vec_HArg.len(args) == 1 as usize && callee_def.raw == resolve_builtins_mod.discriminant_of(builtins.iter_defs).raw {
+                    builtins.usize_
+                } else {
+                    ty_mod.error()
+                }
+                if !ty_mod.is_error(await_ret) {
+                    await_ret
+                } else if !ty_mod.is_error(cb_ret) {
+                    cb_ret
+                } else if !ty_mod.is_error(disc_ret) {
+                    disc_ret
+                } else {
+                    let fn_ret = retkinds_mod.lookup_fn_ret(fn_signatures, callee_def)
+                    if ty_mod.is_error(fn_ret) && !def_mod.is_error(callee_def) {
+                        let scope_opaque = ty_lower_mod.first_opaque_in_scope(gscope, ty_interner)
+                        if !ty_mod.is_error(scope_opaque) {
+                            scope_opaque
+                        } else {
+                            comptimeret_mod.comptime_leading_ret(callee_def, args, fn_signatures, type_defs, field_tys, builtins, mutable ty_interner, allocator)?
+                        }
+                    } else {
+                        fn_ret
+                    }
+                }
+            }
+        }
+        case .variant_ctor(let def, let variant, let args) => {
+            infer_args(args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            adopt_variant_ctor_args(def, variant, args, variant_names, field_tys, builtins, ty_interner, mutable node_types)
+            lookup_mod.lookup_type_def(type_defs, def)
+        }
+        case .dyn_call(let callee, let args) => infer_dyn_call_ty(callee, args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .method_call(let name, let args) => infer_method_call_ty(name, args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .field(let recv, let accessor) => {
+            let recv_ty = infer_boxed(recv, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            fieldty_mod.infer_field_ty(recv_ty, accessor, field_tys, field_names, ty_interner, builtins)
+        }
+        case .index(let recv, let idx) => infer_index_ty(recv, idx, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .subrange(let recv, let lo, let hi, _) => infer_subrange_ty(recv, lo, hi, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .range(let lo, let hi, _) => {
+            let lo_ty = infer_boxed(lo, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let hi_ty = infer_boxed(hi, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let lo_ty2 = literal_mod.adopt_value(Box_HExpr.get(lo), lo_ty, hi_ty, builtins, ty_interner, mutable node_types)
+            let hi_ty2 = literal_mod.adopt_value(Box_HExpr.get(hi), hi_ty, lo_ty2, builtins, ty_interner, mutable node_types)
+            let elem = ops_mod.unify(lo_ty2, hi_ty2, builtins)
+            if ty_mod.is_error(elem) {
+                ty_mod.error()
+            } else {
+                instname_mod.instance_by_elem(builtins.nominals, "Range".bytes(), elem, interner, ty_interner)
+            }
+        }
+        case .tuple(let elements) => infer_tuple_ty(elements, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .struct_lit(let def, let fields) => {
+            infer_struct_lit_fields(def, fields, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            lookup_mod.lookup_type_def(type_defs, def)
+        }
+        case .cast(let inner, let target_ty, _) => {
+            let inner_ty = infer_boxed(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let to_ty = ty_lower_mod.lower_ast_ty(target_ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+            let _ = literal_mod.adopt_value(Box_HExpr.get(inner), inner_ty, to_ty, builtins, ty_interner, mutable node_types)
+            to_ty
+        }
+        case .loop_(let body, let label, let dec_opt) => {
+            let _ = infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let _ = infer_opt_boxed(dec_opt, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            loops_mod.loop_result_type(body, label, node_types, builtins, allocator)?
+        }
+        case .raise_(let inner) => {
+            let _ = infer_boxed(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.never_
+        }
+        case .panic_(let inner) => {
+            let _ = infer_boxed(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.never_
+        }
+        case .return_(let opt) => {
+            let _ = infer_opt_boxed(opt, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.never_
+        }
+        case .break_(_, let opt) => {
+            let _ = infer_opt_boxed(opt, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.never_
+        }
+        case .continue_(_) => builtins.never_
+        case .comptime_(let inner) => infer_boxed(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .comptime_block(let body) => infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .scope_(_, _, let body) => infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .handle_(let caught_ty, let binder, let recovery, let body) => {
+            let bty = ty_lower_mod.lower_ast_ty(caught_ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+            defwrite_mod.write_at_def_id(mutable local_types, binder, bty, allocator)?
+            let rec_ty = infer_boxed(recovery, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let body_ty = infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let body_ty2 = literal_mod.adopt_block_tail(body, body_ty, rec_ty, builtins, ty_interner, mutable node_types)
+            let rec_ty2 = literal_mod.adopt_value(Box_HExpr.get(recovery), rec_ty, body_ty2, builtins, ty_interner, mutable node_types)
+            ops_mod.unify(body_ty2, rec_ty2, builtins)
+        }
+        case .forall_(_, let iter, let body) => {
+            let _ = infer_boxed(iter, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let _ = infer_boxed(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.bool_
+        }
+        case .exists_(_, let iter, let body) => {
+            let _ = infer_boxed(iter, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let _ = infer_boxed(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.bool_
+        }
+        case .closure(let c) => infer_closure_ty(c, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .spawn_(let sp) => infer_spawn_ty(sp, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .positional(let recv, let idx) => {
+            let recv_ty = infer_boxed(recv, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let _ = infer_boxed(idx, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            if ty_interner_mod.is_opaque(ty_interner, recv_ty) {
+                recv_ty
+            } else {
+                match Box_HExpr.get(idx).kind {
+                    case .literal(let lit) => match lit {
+                        case .int(let v, _) => fieldty_mod.infer_field_ty(recv_ty, hir_tree.FieldAccessor.indexed(index: v as u32 wrapping), field_tys, field_names, ty_interner, builtins)
+                        case _ => ty_mod.error()
+                    }
+                    case _ => ty_mod.error()
+                }
+            }
+        }
+        case .comptime_for(let binding, let lo, let hi, _, let body) => {
+            let _ = infer_boxed(lo, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            let _ = infer_boxed(hi, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            defwrite_mod.write_at_def_id(mutable local_types, binding, builtins.usize_, allocator)?
+            let _ = infer_block(body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            builtins.unit_
+        }
+        case _ => ty_mod.error()
+    }
+    set_node_type(mutable node_types, expr.node_id, self_ty)
+    return self_ty
+}
+
+function infer_boxed(
+    boxed: Box_HExpr,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_HExpr.get(boxed)
+    return infer_expr(inner, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+}
+
+function infer_opt_boxed(
+    opt: Option_Box_HExpr.Option,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let b) => infer_boxed(b, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .none => builtins.unit_
+    }
+}
+
+function infer_opt_block(
+    opt: Option_HBlock.Option,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let b) => infer_block(b, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        case .none => builtins.unit_
+    }
+}
+
+function infer_method_call_ty(
+    name: symbol_mod.Symbol,
+    args: Vec_HArg.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    infer_args(args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    if Vec_HArg.len(args) == 0 as usize {
+        return ty_mod.error()
+    }
+    let recv = Vec_HArg.at(args, 0 as usize).expr
+    let ri = node_mod.index(recv.node_id)
+    let recv_ty = if ri < Vec_TyId.len(node_types) {
+        Vec_TyId.at(node_types, ri)
+    } else {
+        ty_mod.error()
+    }
+    if ty_interner_mod.is_opaque(ty_interner, recv_ty) {
+        return recv_ty
+    }
+    return match sig_mod.resolve_method_in_index(method_index, recv_ty, name) {
+        case .some(let def) => retkinds_mod.lookup_fn_ret(fn_signatures, def)
+        case .none => methodret_mod.builtin_method_ret(name, recv_ty, args, builtins, interner, type_defs, mutable ty_interner, allocator)?
+    }
+}
+
+function iter_call_ret(
+    callee_def: def_mod.DefId,
+    args: Vec_HArg.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let ib = builtins.iter_defs
+    let is_slice_new = callee_def.raw == resolve_builtins_mod.slice_iter_new(ib).raw
+    let is_slice_next = callee_def.raw == resolve_builtins_mod.slice_iter_next(ib).raw
+    let is_range_new = callee_def.raw == resolve_builtins_mod.range_iter_new(ib).raw
+    let is_range_next = callee_def.raw == resolve_builtins_mod.range_iter_next(ib).raw
+    if !(is_slice_new || is_slice_next || is_range_new || is_range_next) {
+        return ty_mod.error()
+    }
+    if Vec_HArg.len(args) == 0 as usize {
+        return ty_mod.error()
+    }
+    let arg0 = Vec_HArg.at(args, 0 as usize)
+    let arg0_ty = infer_expr(arg0.expr, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    let elem = if is_slice_new {
+        iterhelp_mod.slice_elem_ty(ty_interner, arg0_ty)
+    } else {
+        if is_range_new {
+            iterhelp_mod.record_field0_ty(ty_interner, field_tys, arg0_ty)
+        } else {
+            if is_slice_next {
+                iterhelp_mod.slice_elem_ty(ty_interner, iterhelp_mod.record_field0_ty(ty_interner, field_tys, arg0_ty))
+            } else {
+                iterhelp_mod.record_field0_ty(ty_interner, field_tys, arg0_ty)
+            }
+        }
+    }
+    if ty_mod.is_error(elem) {
+        return ty_mod.error()
+    }
+    let base = if is_slice_new {
+        "SliceIter".bytes()
+    } else {
+        if is_range_new {
+            "RangeIter".bytes()
+        } else {
+            "Option".bytes()
+        }
+    }
+    return instname_mod.instance_by_elem(builtins.nominals, base, elem, interner, ty_interner)
+}
+
+function infer_args(
+    args: Vec_HArg.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        let _ = infer_expr(a.expr, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        i = i + 1
+    }
+}
+
+function infer_struct_lit_fields(
+    def: def_mod.DefId,
+    fields: Vec_HArg.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArg.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(fields, i)
+        let ft = infer_expr(a.expr, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        match a.name {
+            case .some(let sym) => {
+                let decl_ty = fieldty_mod.named_field_ty(field_tys, field_names, def, sym)
+                if !ty_mod.is_error(decl_ty) {
+                    let _ = literal_mod.adopt_value(a.expr, ft, decl_ty, builtins, ty_interner, mutable node_types)
+                }
+            }
+            case .none => ()
+        }
+        i = i + 1
+    }
+}
+
+function adopt_call_args(
+    callee: def_mod.DefId,
+    args: Vec_HArg.Vec,
+    fn_signatures: Vec_FnSig.Vec,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    if def_mod.is_error(callee) {
+        return
+    }
+    if resolve_builtins_mod.is_inline_intrinsic_def(callee) {
+        return
+    }
+    let ci = def_mod.index(callee)
+    if ci >= Vec_FnSig.len(fn_signatures) {
+        return
+    }
+    let sig = Vec_FnSig.at(fn_signatures, ci)
+    let np = Vec_TyId.len(sig.params)
+    let na = Vec_HArg.len(args)
+    let skip = if na > np { na - np } else { 0 as usize }
+    var i: usize = 0 as usize
+    loop decreases (np - i) {
+        if i >= np { break }
+        if (i + skip) >= na { break }
+        let a = Vec_HArg.at(args, i + skip)
+        let decl_ty = Vec_TyId.at(sig.params, i)
+        if !ty_mod.is_error(decl_ty) {
+            let arg_ty = retype_mod.node_ty_at(node_types, a.expr.node_id)
+            let _ = literal_mod.adopt_value(a.expr, arg_ty, decl_ty, builtins, ty_interner, mutable node_types)
+        }
+        i = i + 1 as usize
+    }
+}
+
+function adopt_variant_ctor_args(
+    def: def_mod.DefId,
+    variant: symbol_mod.Symbol,
+    args: Vec_HArg.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let di = def_mod.index(def)
+    let found = match fields_mod.variant_index_in(variant_names, def, variant) {
+        case .some(let vi) => vi as usize
+        case .none => return
+    }
+    if di >= Vec_FieldTyList.len(field_tys) {
+        return
+    }
+    let flist = Vec_FieldTyList.at(field_tys, di)
+    if found >= Vec_TyId.len(flist.tys) {
+        return
+    }
+    let payload_ty = Vec_TyId.at(flist.tys, found)
+    if ty_mod.is_error(payload_ty) {
+        return
+    }
+    match ty_interner_mod.lookup(ty_interner, payload_ty) {
+        case .tuple_(let elem_tys) => adopt_args_against_elems(args, elem_tys, builtins, ty_interner, mutable node_types)
+        case _ => adopt_single_variant_arg(args, payload_ty, builtins, ty_interner, mutable node_types)
+    }
+}
+
+function adopt_args_against_elems(
+    args: Vec_HArg.Vec,
+    elem_tys: Vec_TyId.Vec,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    let na = Vec_HArg.len(args)
+    let ne = Vec_TyId.len(elem_tys)
+    var i: usize = 0 as usize
+    loop decreases (na - i) {
+        if i >= na { break }
+        if i >= ne { break }
+        let a = Vec_HArg.at(args, i)
+        let decl_ty = Vec_TyId.at(elem_tys, i)
+        if !ty_mod.is_error(decl_ty) {
+            let arg_ty = retype_mod.node_ty_at(node_types, a.expr.node_id)
+            let _ = literal_mod.adopt_value(a.expr, arg_ty, decl_ty, builtins, ty_interner, mutable node_types)
+        }
+        i = i + 1 as usize
+    }
+}
+
+function adopt_single_variant_arg(
+    args: Vec_HArg.Vec,
+    payload_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    ty_interner: ty_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+) -> ()
+    with {divergence}
+{
+    if Vec_HArg.len(args) != 1 as usize {
+        return
+    }
+    let a = Vec_HArg.at(args, 0 as usize)
+    let arg_ty = retype_mod.node_ty_at(node_types, a.expr.node_id)
+    let _ = literal_mod.adopt_value(a.expr, arg_ty, payload_ty, builtins, ty_interner, mutable node_types)
+}
+
+function infer_arms_unified(
+    arms: Vec_HArm.Vec,
+    scrut_ty: ty_mod.TyId,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArm.len(arms)
+    if n == 0 as usize {
+        return ty_mod.error()
+    }
+    var acc: ty_mod.TyId = ty_mod.error()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        patbind_mod.bind_arm_binders(arm, scrut_ty, field_tys, variant_names, field_names, ty_interner, mutable local_types, allocator)?
+        match arm.guard {
+            case .some(let g) => {
+                let _ = infer_expr(g, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+            }
+            case .none => ()
+        }
+        let body_ty = infer_expr(arm.body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        if i == 0 as usize {
+            acc = body_ty
+        } else {
+            let body_ty2 = literal_mod.adopt_value(arm.body, body_ty, acc, builtins, ty_interner, mutable node_types)
+            var acc2 = acc
+            if body_ty2.raw == body_ty.raw {
+                if literal_mod.adopt_arms_prefix(arms, i, body_ty2, builtins, ty_interner, mutable node_types) {
+                    acc2 = body_ty2
+                }
+            }
+            acc = ops_mod.unify(acc2, body_ty2, builtins)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+function infer_tuple_ty(
+    elements: Vec_HExpr.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit elem_tys: Vec_TyId.Vec
+    Vec_TyId.new(init elem_tys, allocator)?
+    let n = Vec_HExpr.len(elements)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_HExpr.at(elements, i)
+        let t = infer_expr(e, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        Vec_TyId.push(mutable elem_tys, t, allocator)?
+        i = i + 1
+    }
+    return ty_interner_mod.intern(
+        mutable ty_interner,
+        ty_kind_mod.CTy.tuple_(elems: elem_tys),
+        allocator,
+    )?
+}
+
+function infer_index_ty(
+    recv: Box_HExpr,
+    idx: Box_HExpr,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let recv_ty = infer_boxed(recv, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    let _ = infer_boxed(idx, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    if ty_mod.is_error(recv_ty) {
+        return ty_mod.error()
+    }
+    let recv_cty = ty_interner_mod.lookup(ty_interner, recv_ty)
+    if ty_kind_mod.is_opaque(recv_cty) {
+        return recv_ty
+    }
+    return match recv_cty {
+        case .slice(let elem) => elem
+        case _ => ty_mod.error()
+    }
+}
+
+function infer_subrange_ty(
+    recv: Box_HExpr,
+    lo: Option_Box_HExpr.Option,
+    hi: Option_Box_HExpr.Option,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let recv_ty = infer_boxed(recv, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    let _ = infer_opt_boxed(lo, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    let _ = infer_opt_boxed(hi, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    if ty_mod.is_error(recv_ty) {
+        return ty_mod.error()
+    }
+    let recv_cty = ty_interner_mod.lookup(ty_interner, recv_ty)
+    if ty_kind_mod.is_opaque(recv_cty) {
+        return recv_ty
+    }
+    return match recv_cty {
+        case .slice(_) => recv_ty
+        case _ => ty_mod.error()
+    }
+}
+
+function infer_dyn_call_ty(
+    callee: Box_HExpr,
+    args: Vec_HArg.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let callee_ty = infer_boxed(callee, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    infer_args(args, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    if ty_mod.is_error(callee_ty) {
+        return ty_mod.error()
+    }
+    let callee_cty = ty_interner_mod.lookup(ty_interner, callee_ty)
+    match callee_cty {
+        case .fn_(_, let ret, _) => return ret
+        case _ => ()
+    }
+    let ctor_ty = match Box_HExpr.get(callee).kind {
+        case .positional(let recv_box, _) => {
+            let rexpr = Box_HExpr.get(recv_box)
+            let tdef_ty = match rexpr.kind {
+                case .use_(let rdef) => lookup_mod.lookup_type_def(type_defs, rdef)
+                case _ => ty_mod.error()
+            }
+            if ty_mod.is_error(tdef_ty) {
+                let ridx = node_mod.index(rexpr.node_id)
+                if ridx < Vec_TyId.len(node_types) { Vec_TyId.at(node_types, ridx) } else { ty_mod.error() }
+            } else {
+                tdef_ty
+            }
+        }
+        case _ => ty_mod.error()
+    }
+    if !ty_mod.is_error(ctor_ty) {
+        let ctor_cty = ty_interner_mod.lookup(ty_interner, ctor_ty)
+        match ctor_cty {
+            case .sum_(_) => return ctor_ty
+            case .record(_) => return ctor_ty
+            case .opaque(_) => return ctor_ty
+            case _ => ()
+        }
+    }
+    return ty_mod.error()
+}
+
+
+function infer_closure_ty(
+    c_box: Box_HClosure,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let c = Box_HClosure.get(c_box)
+    uninit param_tys: Vec_TyId.Vec
+    Vec_TyId.new(init param_tys, allocator)?
+    let pn = Vec_HClosureParam.len(c.params)
+    var pi: usize = 0
+    loop decreases (pn - pi) {
+        if pi >= pn { break }
+        let p = Vec_HClosureParam.at(c.params, pi)
+        let pty = ty_lower_mod.lower_ast_ty(p.ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        defwrite_mod.write_at_def_id(mutable local_types, p.def_id, pty, allocator)?
+        Vec_TyId.push(mutable param_tys, pty, allocator)?
+        pi = pi + 1
+    }
+    let ret_ty = ty_lower_mod.lower_ast_ty(c.ret, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+    let _ = infer_block(c.body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+    let _ = effects_mod.lower_closure_effect_row(c.effects, c.params, c.captures, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+    return ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.fn_(params: param_tys, ret: ret_ty, effects: effect_mod.empty()), allocator)?
+}
+
+
+function infer_spawn_ty(
+    sp_box: Box_HSpawn,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    fn_signatures: Vec_FnSig.Vec,
+    method_index: sig_mod.MethodIndex,
+    type_defs: Vec_TyId.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    field_names: Vec_FieldNameMatrix.Vec,
+    gscope: ty_lower_mod.GenericScope,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    node_types: mutable Vec_TyId.Vec,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let sp = Box_HSpawn.get(sp_box)
+    let n = Vec_HSpawnArg.len(sp.args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arg = Vec_HSpawnArg.at(sp.args, i)
+        let aty = infer_expr(arg.init_, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+        defwrite_mod.write_at_def_id(mutable local_types, arg.def_id, aty, allocator)?
+        i = i + 1
+    }
+    return infer_block(sp.body, builtins, interner, fn_signatures, method_index, type_defs, field_tys, variant_names, field_names, gscope, mutable ty_interner, mutable effect_interner, mutable node_types, mutable local_types, allocator)?
+}
+
+function prefill_node_types(
+    node_types: mutable Vec_TyId.Vec,
+    target: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target_us = target as usize
+    loop {
+        let len = Vec_TyId.len(node_types)
+        if len >= target_us { break }
+        Vec_TyId.push(mutable node_types, ty_mod.error(), allocator)?
+    }
+}
+
+function set_node_type(
+    node_types: mutable Vec_TyId.Vec,
+    n: node_mod.NodeId,
+    ty: ty_mod.TyId,
+) -> ()
+{
+    let idx = node_mod.index(n)
+    if idx < Vec_TyId.len(node_types) {
+        Vec_TyId.set_at(mutable node_types, idx, ty)
+    }
+}

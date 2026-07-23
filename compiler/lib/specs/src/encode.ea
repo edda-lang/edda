@@ -1,0 +1,116 @@
+
+module specs.encode
+
+import std.mem.alloc
+import std.collections.vec
+import cteval.state.value as value_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as row_interner_mod
+import intern.interner as sym_interner_mod
+import span.loc.pos.span as span_mod
+import hir.def as def_mod
+import local.address.key as key_mod
+import local.error as err_mod
+import local.encode.prim as prim_mod
+import local.encode.ty as ty_enc_mod
+import local.encode.row as row_enc_mod
+import local.gen.typaths as typaths_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function encode_args(
+    spec_def: def_mod.DefId,
+    args: [value_mod.ComptimeValue],
+    at: span_mod.Span,
+    allocator: Allocator,
+    ty_interner: ty_interner_mod.Interner,
+    ty_paths: typaths_mod.TyPathMap,
+    row_interner: row_interner_mod.Interner,
+    sym_interner: sym_interner_mod.Interner,
+) -> key_mod.SpecKey
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    let n = args.len()
+    uninit buf: Vec_u8.Vec
+    Vec_u8.with_capacity(init buf, n *| 16, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        encode_value(
+            mutable buf, args[i], at,
+            allocator, ty_interner, ty_paths, row_interner, sym_interner,
+        )?
+        i += 1
+    }
+    return key_mod.new(spec_def, take buf)
+}
+
+
+public function encode_value(
+    buf: mutable Vec_u8.Vec,
+    v: value_mod.ComptimeValue,
+    at: span_mod.Span,
+    allocator: Allocator,
+    ty_interner: ty_interner_mod.Interner,
+    ty_paths: typaths_mod.TyPathMap,
+    row_interner: row_interner_mod.Interner,
+    sym_interner: sym_interner_mod.Interner,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    match v {
+        case .bool_(let b) =>
+            prim_mod.encode_bool(mutable buf, b, allocator)?
+        case .int_signed(let n, let w) =>
+            prim_mod.encode_int_signed(mutable buf, n, w, allocator)?
+        case .int_unsigned(let n, let w) =>
+            prim_mod.encode_int_unsigned(mutable buf, n, w, allocator)?
+        case .float_f32(let f) =>
+            prim_mod.encode_f32(mutable buf, f, allocator)?
+        case .float_f64(let f) =>
+            prim_mod.encode_f64(mutable buf, f, allocator)?
+        case .string_(let s) =>
+            prim_mod.encode_string(mutable buf, s, sym_interner, allocator)?
+        case .unit_ =>
+            prim_mod.encode_unit(mutable buf, allocator)?
+        case .type_meta(let ty) =>
+            ty_enc_mod.encode_type(mutable buf, ty, at, ty_interner, ty_paths, sym_interner, allocator)?
+        case .module_meta(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "module_meta",
+                message: "module-meta comptime values are reserved for the spec walker; the encoder does not see them as arg inputs",
+            )
+        case .effect_row(let row) =>
+            row_enc_mod.encode_effect_row(
+                mutable buf, row, at,
+                row_interner, sym_interner, allocator,
+            )?
+        case .function_meta(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "function_meta",
+                message: "function-meta comptime values are reserved for the spec walker; the encoder does not see them as arg inputs",
+            )
+        case .doc_importance(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "doc_importance",
+                message: "doc-importance comptime values are reserved for the spec walker; the encoder does not see them as arg inputs",
+            )
+        case .parameter_meta(_, _, _) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "parameter_meta",
+                message: "parameter-meta comptime values are reserved for the spec walker; the encoder does not see them as arg inputs",
+            )
+        case .list_(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "list_",
+                message: "list comptime values are reserved for the spec walker; the encoder does not see them as arg inputs",
+            )
+    }
+}

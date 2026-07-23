@@ -1,0 +1,550 @@
+
+module compile.phase.emit.reach.reach
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import intern.interner as interner_mod
+import source.map as source_map_mod
+import hir.build.file as hir_file_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as body_mod
+import mir.stmt as stmt_mod
+import mir.term as term_mod
+import mir.rvalue as rvalue_mod
+import span.file as file_mod
+import local.phase.emit.symbols.surface as surface_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(body_mod.MirBody)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(body_mod.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+spec std.collections.vec.Vec(rvalue_mod.Constant)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(String)
+
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.StringMap(bool)
+
+
+spec std.core.option.Option(u32)
+
+
+spec std.collections.vec.Vec(FileRefs)
+
+
+public type ReachMarks {
+    visited: IntMap_u32.IntMap
+    referenced_externs: IntMap_u32.IntMap
+}
+
+
+public type FileRefs {
+    has_file: bool
+    file_id_raw: u32
+    body_defs: Vec_u32.Vec
+    edge_start: Vec_u32.Vec
+    edge_len: Vec_u32.Vec
+    pool: Vec_u32.Vec
+    extern_defs: Vec_u32.Vec
+    extern_names: Vec_String.Vec
+    abi_defs: Vec_u32.Vec
+    abi_names: Vec_String.Vec
+}
+
+
+public function collect_file_refs(
+    files: Vec_MirFile.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_FileRefs.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_FileRefs.Vec
+    Vec_FileRefs.new(init out, allocator)?
+    let nf = Vec_MirFile.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let mf = Vec_MirFile.at(files, fi)
+        uninit body_defs: Vec_u32.Vec
+        Vec_u32.new(init body_defs, allocator)?
+        uninit edge_start: Vec_u32.Vec
+        Vec_u32.new(init edge_start, allocator)?
+        uninit edge_len: Vec_u32.Vec
+        Vec_u32.new(init edge_len, allocator)?
+        uninit pool: Vec_u32.Vec
+        Vec_u32.new(init pool, allocator)?
+        uninit extern_defs: Vec_u32.Vec
+        Vec_u32.new(init extern_defs, allocator)?
+        uninit extern_names: Vec_String.Vec
+        Vec_String.new(init extern_names, allocator)?
+        uninit abi_defs: Vec_u32.Vec
+        Vec_u32.new(init abi_defs, allocator)?
+        uninit abi_names: Vec_String.Vec
+        Vec_String.new(init abi_names, allocator)?
+        surface_mod.collect_export_surface(mf, mutable extern_defs, mutable extern_names, mutable abi_defs, mutable abi_names, interner, allocator)?
+        let nb = Vec_MirBody.len(mf.bodies)
+        var bi: usize = 0
+        loop decreases nb - bi {
+            if bi >= nb { break }
+            let body = Vec_MirBody.at(mf.bodies, bi)
+            Vec_u32.push(mutable body_defs, body.def_id.raw, allocator)?
+            let estart = Vec_u32.len(pool) as u32
+            collect_body_refs(body, mutable pool, allocator)?
+            let elen = (Vec_u32.len(pool) as u32) - estart
+            Vec_u32.push(mutable edge_start, estart, allocator)?
+            Vec_u32.push(mutable edge_len, elen, allocator)?
+            bi = bi + 1 as usize
+        }
+        let has_file = Vec_HirFile.len(mf.hir_files) >= 2 as usize
+        let fid_raw = if has_file { Vec_HirFile.at(mf.hir_files, 1 as usize).source.span.file.raw } else { 0 as u32 }
+        let fr = FileRefs {
+            has_file: has_file,
+            file_id_raw: fid_raw,
+            body_defs: take body_defs,
+            edge_start: take edge_start,
+            edge_len: take edge_len,
+            pool: take pool,
+            extern_defs: take extern_defs,
+            extern_names: take extern_names,
+            abi_defs: take abi_defs,
+            abi_names: take abi_names,
+        }
+        Vec_FileRefs.push(mutable out, take fr, allocator)?
+        fi = fi + 1 as usize
+    }
+    return out
+}
+
+
+public function extra_is_package_own(
+    fr: FileRefs,
+    path_set: StringMap_bool.StringMap,
+    map: source_map_mod.SourceMap,
+) -> bool {
+    if !fr.has_file {
+        return false
+    }
+    if (fr.file_id_raw as usize) >= source_map_mod.file_count(map) {
+        return false
+    }
+    let path = source_map_mod.file_name_of(map, file_mod.FileId { raw: fr.file_id_raw })
+    return StringMap_bool.contains(path_set, path)
+}
+
+
+public function mark_reachable(
+    optimized: Vec_MirFile.Vec,
+    path_set: StringMap_bool.StringMap,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ReachMarks
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit no_extra: Vec_FileRefs.Vec
+    Vec_FileRefs.new(init no_extra, allocator)?
+    return mark_reachable_full(optimized, no_extra, path_set, map, interner, allocator)?
+}
+
+
+public function mark_reachable_full(
+    optimized: Vec_MirFile.Vec,
+    extra: Vec_FileRefs.Vec,
+    path_set: StringMap_bool.StringMap,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ReachMarks
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var def_to_slot = IntMap_u32.new(allocator)?
+    var visited = IntMap_u32.new(allocator)?
+    var referenced_externs = IntMap_u32.new(allocator)?
+    uninit edge_start: Vec_u32.Vec
+    Vec_u32.new(init edge_start, allocator)?
+    uninit edge_len: Vec_u32.Vec
+    Vec_u32.new(init edge_len, allocator)?
+    uninit pool: Vec_u32.Vec
+    Vec_u32.new(init pool, allocator)?
+    uninit worklist: Vec_u32.Vec
+    Vec_u32.new(init worklist, allocator)?
+
+    uninit extern_defs: Vec_u32.Vec
+    Vec_u32.new(init extern_defs, allocator)?
+    uninit extern_names: Vec_String.Vec
+    Vec_String.new(init extern_names, allocator)?
+    uninit abi_defs: Vec_u32.Vec
+    Vec_u32.new(init abi_defs, allocator)?
+    uninit abi_names: Vec_String.Vec
+    Vec_String.new(init abi_names, allocator)?
+
+    let nf = Vec_MirFile.len(optimized)
+    var fi: usize = 0
+    var slot: u32 = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let mf = Vec_MirFile.at(optimized, fi)
+        let pkg = file_is_package_own(mf, path_set, map)
+        surface_mod.collect_export_surface(mf, mutable extern_defs, mutable extern_names, mutable abi_defs, mutable abi_names, interner, allocator)?
+        let nb = Vec_MirBody.len(mf.bodies)
+        var bi: usize = 0
+        loop decreases nb - bi {
+            if bi >= nb { break }
+            let body = Vec_MirBody.at(mf.bodies, bi)
+            let draw = body.def_id.raw
+            let _ins = IntMap_u32.insert(mutable def_to_slot, draw as i64, slot, allocator)?
+            let estart = Vec_u32.len(pool) as u32
+            collect_body_refs(body, mutable pool, allocator)?
+            let elen = (Vec_u32.len(pool) as u32) - estart
+            Vec_u32.push(mutable edge_start, estart, allocator)?
+            Vec_u32.push(mutable edge_len, elen, allocator)?
+            if pkg {
+                let _v = IntMap_u32.insert(mutable visited, draw as i64, 1 as u32, allocator)?
+                Vec_u32.push(mutable worklist, slot, allocator)?
+            }
+            slot = slot + 1 as u32
+            bi = bi + 1 as usize
+        }
+        fi = fi + 1 as usize
+    }
+
+    let nx = Vec_FileRefs.len(extra)
+    var xi: usize = 0
+    loop decreases nx - xi {
+        if xi >= nx { break }
+        let fr = Vec_FileRefs.at(extra, xi)
+        let xpkg = extra_is_package_own(fr, path_set, map)
+        let nxe = Vec_u32.len(fr.extern_defs)
+        var ei: usize = 0
+        loop decreases nxe - ei {
+            if ei >= nxe { break }
+            Vec_u32.push(mutable extern_defs, Vec_u32.at(fr.extern_defs, ei), allocator)?
+            Vec_String.push(mutable extern_names, Vec_String.at(fr.extern_names, ei), allocator)?
+            ei = ei + 1 as usize
+        }
+        let nxa = Vec_u32.len(fr.abi_defs)
+        var ai: usize = 0
+        loop decreases nxa - ai {
+            if ai >= nxa { break }
+            Vec_u32.push(mutable abi_defs, Vec_u32.at(fr.abi_defs, ai), allocator)?
+            Vec_String.push(mutable abi_names, Vec_String.at(fr.abi_names, ai), allocator)?
+            ai = ai + 1 as usize
+        }
+        let nxb = Vec_u32.len(fr.body_defs)
+        var ki: usize = 0
+        loop decreases nxb - ki {
+            if ki >= nxb { break }
+            let draw = Vec_u32.at(fr.body_defs, ki)
+            let _ins = IntMap_u32.insert(mutable def_to_slot, draw as i64, slot, allocator)?
+            let estart = Vec_u32.len(pool) as u32
+            let pstart = Vec_u32.at(fr.edge_start, ki)
+            let plen = Vec_u32.at(fr.edge_len, ki)
+            var pj: u32 = 0
+            loop decreases plen - pj {
+                if pj >= plen { break }
+                Vec_u32.push(mutable pool, Vec_u32.at(fr.pool, (pstart + pj) as usize), allocator)?
+                pj = pj + 1 as u32
+            }
+            Vec_u32.push(mutable edge_start, estart, allocator)?
+            Vec_u32.push(mutable edge_len, plen, allocator)?
+            if xpkg {
+                let _v = IntMap_u32.insert(mutable visited, draw as i64, 1 as u32, allocator)?
+                Vec_u32.push(mutable worklist, slot, allocator)?
+            }
+            slot = slot + 1 as u32
+            ki = ki + 1 as usize
+        }
+        xi = xi + 1 as usize
+    }
+
+    drain_worklist(edge_start, edge_len, pool, def_to_slot, mutable visited, mutable referenced_externs, mutable worklist, allocator)?
+
+    var fuel = Vec_u32.len(abi_defs) + 1
+    loop decreases fuel {
+        if fuel == 0 { break }
+        let woke = wake_referenced_abi_bodies(
+            extern_defs, extern_names, abi_defs, abi_names, def_to_slot,
+            referenced_externs, mutable visited, mutable worklist, allocator,
+        )?
+        if woke == 0 { break }
+        drain_worklist(edge_start, edge_len, pool, def_to_slot, mutable visited, mutable referenced_externs, mutable worklist, allocator)?
+        fuel -= 1
+    }
+
+    return ReachMarks { visited: visited, referenced_externs: referenced_externs }
+}
+
+
+function drain_worklist(
+    edge_start: Vec_u32.Vec,
+    edge_len: Vec_u32.Vec,
+    pool: Vec_u32.Vec,
+    def_to_slot: IntMap_u32.IntMap,
+    visited: mutable IntMap_u32.IntMap,
+    referenced_externs: mutable IntMap_u32.IntMap,
+    worklist: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        match Vec_u32.pop(mutable worklist) {
+            case .some(let s) => {
+                let estart = Vec_u32.at(edge_start, s as usize)
+                let elen = Vec_u32.at(edge_len, s as usize)
+                var k: u32 = 0
+                loop decreases elen - k {
+                    if k >= elen { break }
+                    let ref_def = Vec_u32.at(pool, (estart + k) as usize)
+                    match IntMap_u32.get(def_to_slot, ref_def as i64) {
+                        case .some(let rs) => {
+                            if !is_marked(visited, ref_def) {
+                                let _m = IntMap_u32.insert(mutable visited, ref_def as i64, 1 as u32, allocator)?
+                                Vec_u32.push(mutable worklist, rs, allocator)?
+                            }
+                        }
+                        case .none => {
+                            let _e = IntMap_u32.insert(mutable referenced_externs, ref_def as i64, 1 as u32, allocator)?
+                        }
+                    }
+                    k = k + 1 as u32
+                }
+            }
+            case .none => break
+        }
+    }
+}
+
+
+function wake_referenced_abi_bodies(
+    extern_defs: Vec_u32.Vec,
+    extern_names: Vec_String.Vec,
+    abi_defs: Vec_u32.Vec,
+    abi_names: Vec_String.Vec,
+    def_to_slot: IntMap_u32.IntMap,
+    referenced_externs: IntMap_u32.IntMap,
+    visited: mutable IntMap_u32.IntMap,
+    worklist: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var wanted = StringMap_bool.new(allocator)?
+    let ne = Vec_u32.len(extern_defs)
+    var i: usize = 0
+    loop decreases ne - i {
+        if i >= ne { break }
+        if is_marked(referenced_externs, Vec_u32.at(extern_defs, i)) {
+            let _w = StringMap_bool.insert(mutable wanted, Vec_String.at(extern_names, i), true, allocator)?
+        }
+        i += 1
+    }
+    var woke: usize = 0
+    let na = Vec_u32.len(abi_defs)
+    var j: usize = 0
+    loop decreases na - j {
+        if j >= na { break }
+        let draw = Vec_u32.at(abi_defs, j)
+        if !is_marked(visited, draw) && StringMap_bool.contains(wanted, Vec_String.at(abi_names, j)) {
+            match IntMap_u32.get(def_to_slot, draw as i64) {
+                case .some(let s) => {
+                    let _m = IntMap_u32.insert(mutable visited, draw as i64, 1 as u32, allocator)?
+                    Vec_u32.push(mutable worklist, s, allocator)?
+                    woke += 1
+                }
+                case .none => ()
+            }
+        }
+        j += 1
+    }
+    return woke
+}
+
+
+public function build_path_set(
+    source_paths: [String],
+    allocator: Allocator,
+) -> StringMap_bool.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    var set = StringMap_bool.new(allocator)?
+    let n = source_paths.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let _ = StringMap_bool.insert(mutable set, source_paths[i], true, allocator)?
+        i = i + 1 as usize
+    }
+    return set
+}
+
+
+public function file_is_package_own(
+    mf: mir_file_mod.MirFile,
+    path_set: StringMap_bool.StringMap,
+    map: source_map_mod.SourceMap,
+) -> bool {
+    if Vec_HirFile.len(mf.hir_files) < 2 as usize {
+        return false
+    }
+    let hf = Vec_HirFile.at(mf.hir_files, 1 as usize)
+    let fid = hf.source.span.file
+    if (fid.raw as usize) >= source_map_mod.file_count(map) {
+        return false
+    }
+    let path = source_map_mod.file_name_of(map, fid)
+    return StringMap_bool.contains(path_set, path)
+}
+
+
+public function is_marked(m: IntMap_u32.IntMap, raw: u32) -> bool {
+    return match IntMap_u32.get(m, raw as i64) {
+        case .some(_) => true
+        case .none => false
+    }
+}
+
+
+function collect_body_refs(
+    body: body_mod.MirBody,
+    pool: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases nb - bi {
+        if bi >= nb { break }
+        let blk = Vec_BasicBlock.at(body.blocks, bi)
+        let ns = Vec_Statement.len(blk.statements)
+        var si: usize = 0
+        loop decreases ns - si {
+            if si >= ns { break }
+            let st = Vec_Statement.at(blk.statements, si)
+            match st.kind {
+                case .assign(_, let rv) => collect_rvalue(rv, mutable pool, allocator)?
+                case _ => ()
+            }
+            si = si + 1 as usize
+        }
+        collect_term(blk.terminator, mutable pool, allocator)?
+        bi = bi + 1 as usize
+    }
+}
+
+
+function collect_term(
+    t: term_mod.Terminator,
+    pool: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match t.kind {
+        case .call_(let callee, let args, _, _, _) => {
+            collect_operand(callee, mutable pool, allocator)?
+            collect_operands(args, mutable pool, allocator)?
+        }
+        case .spawn_(let child, let args, _, _, _, _) => {
+            Vec_u32.push(mutable pool, child.raw, allocator)?
+            collect_operands(args, mutable pool, allocator)?
+        }
+        case .await_(let handle, _, _, _) => collect_operand(handle, mutable pool, allocator)?
+        case .branch(let cond, _, _) => collect_operand(cond, mutable pool, allocator)?
+        case .switch_(let discr, _) => collect_operand(discr, mutable pool, allocator)?
+        case .raise_(let value, _) => collect_operand(value, mutable pool, allocator)?
+        case .panic_(let message) => collect_operand(message, mutable pool, allocator)?
+        case _ => ()
+    }
+}
+
+
+function collect_rvalue(
+    rv: rvalue_mod.Rvalue,
+    pool: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match rv {
+        case .use_(let op) => collect_operand(op, mutable pool, allocator)?
+        case .binary(_, let l, let r) => {
+            collect_operand(l, mutable pool, allocator)?
+            collect_operand(r, mutable pool, allocator)?
+        }
+        case .unary(_, let op) => collect_operand(op, mutable pool, allocator)?
+        case .cast(let op, _, _, _) => collect_operand(op, mutable pool, allocator)?
+        case .aggregate(_, let elems, _) => collect_operands(elems, mutable pool, allocator)?
+        case .make_closure(let code, let env) => {
+            Vec_u32.push(mutable pool, code.raw, allocator)?
+            collect_operand(env, mutable pool, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function collect_operands(
+    ops: Vec_Operand.Vec,
+    pool: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        collect_operand(Vec_Operand.at(ops, i), mutable pool, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function collect_operand(
+    op: rvalue_mod.Operand,
+    pool: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match op {
+        case .constant(let c) => collect_constant(c, mutable pool, allocator)?
+        case _ => ()
+    }
+}
+
+
+function collect_constant(
+    c: rvalue_mod.Constant,
+    pool: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match c.kind {
+        case .fn_ref(let d) => Vec_u32.push(mutable pool, d.raw, allocator)?
+        case .aggregate(let elems) => {
+            let n = Vec_Constant.len(elems)
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                let e = Vec_Constant.at(elems, i)
+                match e.kind {
+                    case .fn_ref(let d) => Vec_u32.push(mutable pool, d.raw, allocator)?
+                    case _ => ()
+                }
+                i = i + 1 as usize
+            }
+        }
+        case _ => ()
+    }
+}

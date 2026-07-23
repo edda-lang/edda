@@ -1,0 +1,166 @@
+
+module tls.handshake.extensions
+
+import local.error
+import local.wire
+import local.handshake.extension as ext_type
+import local.crypto.group as group_mod
+import local.crypto.signature as sig_mod
+import local.version as version_mod
+
+function _write_ext_header(
+    buf: mutable [u8],
+    pos: usize,
+    ext: ext_type.ExtensionType,
+    body_len: u16,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = wire.write_u16_be(mutable buf, pos, ext_type.extension_type_wire(ext))?
+    p = wire.write_u16_be(mutable buf, p, body_len)?
+    return p
+}
+
+
+public function write_server_name(
+    buf: mutable [u8],
+    pos: usize,
+    hostname: [u8],
+) -> usize
+    with {err: error.TlsError}
+{
+    let host_len = hostname.len()
+    if host_len > 0xfffc as usize { raise error.TlsError.invalid_server_name }
+    let body_len = (5 as usize) + host_len
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.server_name, body_len as u16)?
+    let list_len = (3 as usize) + host_len
+    p = wire.write_u16_be(mutable buf, p, list_len as u16)?
+    p = wire.write_u8(mutable buf, p, 0 as u8)?
+    p = wire.write_u16_be(mutable buf, p, host_len as u16)?
+    p = wire.write_bytes(mutable buf, p, hostname)?
+    return p
+}
+
+
+public function write_supported_versions_client(
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.supported_versions, 3 as u16)?
+    p = wire.write_u8(mutable buf, p, 2 as u8)?
+    p = wire.write_u16_be(mutable buf, p, version_mod.tls13_value())?
+    return p
+}
+
+
+public function write_supported_groups(
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.supported_groups, 4 as u16)?
+    p = wire.write_u16_be(mutable buf, p, 2 as u16)?
+    p = wire.write_u16_be(mutable buf, p, group_mod.named_group_wire(group_mod.NamedGroup.x25519))?
+    return p
+}
+
+
+public function write_signature_algorithms(
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.signature_algorithms, 8 as u16)?
+    p = wire.write_u16_be(mutable buf, p, 6 as u16)?
+    p = wire.write_u16_be(mutable buf, p, sig_mod.sig_scheme_wire(sig_mod.SignatureScheme.rsa_pss_rsae_sha256))?
+    p = wire.write_u16_be(mutable buf, p, sig_mod.sig_scheme_wire(sig_mod.SignatureScheme.ecdsa_secp256r1_sha256))?
+    p = wire.write_u16_be(mutable buf, p, sig_mod.sig_scheme_wire(sig_mod.SignatureScheme.ed25519))?
+    return p
+}
+
+
+public function write_key_share_client(
+    buf: mutable [u8],
+    pos: usize,
+    group: group_mod.NamedGroup,
+    public_key: [u8],
+) -> usize
+    with {err: error.TlsError}
+{
+    let key_len = public_key.len()
+    if key_len > 0xfffb as usize { raise error.TlsError.bad_handshake }
+    let entry_len = (4 as usize) + key_len
+    let body_len = (2 as usize) + entry_len
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.key_share, body_len as u16)?
+    p = wire.write_u16_be(mutable buf, p, entry_len as u16)?
+    p = wire.write_u16_be(mutable buf, p, group_mod.named_group_wire(group))?
+    p = wire.write_u16_be(mutable buf, p, key_len as u16)?
+    p = wire.write_bytes(mutable buf, p, public_key)?
+    return p
+}
+
+
+public function write_supported_versions_server(
+    buf: mutable [u8],
+    pos: usize,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.supported_versions, 2 as u16)?
+    p = wire.write_u16_be(mutable buf, p, version_mod.tls13_value())?
+    return p
+}
+
+
+public function write_key_share_server(
+    buf: mutable [u8],
+    pos: usize,
+    group: group_mod.NamedGroup,
+    public_key: [u8],
+) -> usize
+    with {err: error.TlsError}
+{
+    let key_len = public_key.len()
+    if key_len > 0xfffb as usize { raise error.TlsError.bad_handshake }
+    let body_len = (4 as usize) + key_len
+    var p = _write_ext_header(mutable buf, pos, ext_type.ExtensionType.key_share, body_len as u16)?
+    p = wire.write_u16_be(mutable buf, p, group_mod.named_group_wire(group))?
+    p = wire.write_u16_be(mutable buf, p, key_len as u16)?
+    p = wire.write_bytes(mutable buf, p, public_key)?
+    return p
+}
+
+
+public function write_server_extensions(
+    buf: mutable [u8],
+    pos: usize,
+    public_key: [u8] where public_key.len() == 32,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = write_supported_versions_server(mutable buf, pos)?
+    p = write_key_share_server(mutable buf, p, group_mod.NamedGroup.x25519, public_key)?
+    return p
+}
+
+
+public function write_client_extensions(
+    buf: mutable [u8],
+    pos: usize,
+    hostname: [u8],
+    public_key: [u8] where public_key.len() == 32,
+) -> usize
+    with {err: error.TlsError}
+{
+    var p = write_server_name(mutable buf, pos, hostname)?
+    p = write_supported_versions_client(mutable buf, p)?
+    p = write_supported_groups(mutable buf, p)?
+    p = write_signature_algorithms(mutable buf, p)?
+    p = write_key_share_client(mutable buf, p, group_mod.NamedGroup.x25519, public_key)?
+    return p
+}
+

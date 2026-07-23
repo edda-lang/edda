@@ -1,0 +1,113 @@
+
+module refine.smt.render.script
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.smt.render.render as render_mod
+import local.smt.render.sort as sort_mod
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function assemble_script(
+    vars: Vec_VariableBinding.Vec,
+    context_terms: Vec_SmtTerm.Vec,
+    goal: term_mod.SmtTerm,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decls = render_declarations(vars, ty_interner, interner, allocator)?
+    let asserts = render_context(context_terms, interner, allocator)?
+    let goal_str = render_mod.render_term(goal, interner, allocator)?
+    let p1 = string.concat("(set-logic AUFLIA)\n", decls, allocator)?
+    let p2 = string.concat(p1, asserts, allocator)?
+    let p3 = string.concat(p2, "(assert (not ", allocator)?
+    let p4 = string.concat(p3, goal_str, allocator)?
+    let p5 = string.concat(p4, "))\n", allocator)?
+    return string.concat(p5, "(check-sat)\n(get-model)\n", allocator)?
+}
+
+
+function render_declarations(
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var acc: String = ""
+    let n = Vec_VariableBinding.len(vars)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let binding = Vec_VariableBinding.at(vars, i)
+        let decl = declaration_for(binding, ty_interner, interner, allocator)?
+        acc = string.concat(acc, decl, allocator)?
+        i = i + 1
+    }
+    return acc
+}
+
+
+function declaration_for(
+    binding: ctx_mod.VariableBinding,
+    ty_interner: ty_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match sort_mod.sort_of(binding.ty, ty_interner, allocator)? {
+        case .ok(let sort) => {
+            let name = render_mod.symbol_text(binding.name, interner, allocator)?
+            let sort_str = render_mod.render_sort(sort, interner, allocator)?
+            let p1 = string.concat("(declare-const ", name, allocator)?
+            let p2 = string.concat(p1, " ", allocator)?
+            let p3 = string.concat(p2, sort_str, allocator)?
+            string.concat(p3, ")\n", allocator)?
+        }
+        case .unsupported(_) => ""
+    }
+}
+
+
+function render_context(
+    terms: Vec_SmtTerm.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var acc: String = ""
+    let n = Vec_SmtTerm.len(terms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let term = Vec_SmtTerm.at(terms, i)
+        let term_str = render_mod.render_term(term, interner, allocator)?
+        let p1 = string.concat("(assert ", term_str, allocator)?
+        let p2 = string.concat(p1, ")\n", allocator)?
+        acc = string.concat(acc, p2, allocator)?
+        i = i + 1
+    }
+    return acc
+}

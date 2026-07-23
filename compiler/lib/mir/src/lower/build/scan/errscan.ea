@@ -1,0 +1,385 @@
+
+module mir.lower.build.scan.errscan
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.node as node_mod
+import syntax.ast.tree as ast_tree
+import types.pass.ty as ty_mod
+import types.check as check_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(ast_tree.Pat)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+
+spec std.collections.vec.Vec(ast_tree.Pat)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(DroppedNode)
+
+
+public type DropCause {
+    case ill_typed_or_unresolved
+    case error_node
+    case comptime_for_unsupported
+    case match_scrutinee_not_sum
+    case nonconst_positional_index
+}
+
+public type DroppedNode {
+    node_id: node_mod.NodeId
+    cause: DropCause
+}
+
+
+public function first_error_node(body: hir_tree.HBlock, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    return find_block_error(body, types_out)
+}
+
+
+public function cause_label(cause: DropCause) -> String {
+    return match cause {
+        case .ill_typed_or_unresolved => "body contains an unresolved or ill-typed node"
+        case .error_node => "body contains an error node left unresolved during type-checking"
+        case .comptime_for_unsupported => "body contains a `comptime for` form that has no MIR lowering"
+        case .match_scrutinee_not_sum => "body contains a `match` whose scrutinee is not a sum type (no MIR lowering)"
+        case .nonconst_positional_index => "body contains a tuple positional access with a non-constant index"
+    }
+}
+
+
+function node_of(expr: hir_tree.HExpr, cause: DropCause) -> Option_DroppedNode.Option {
+    return Option_DroppedNode.some(value: DroppedNode { node_id: expr.node_id, cause: cause })
+}
+
+
+function or_node(a: Option_DroppedNode.Option, b: Option_DroppedNode.Option) -> Option_DroppedNode.Option {
+    return match a {
+        case .some(_) => a
+        case .none => b
+    }
+}
+
+
+function find_block_error(block: hir_tree.HBlock, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let r = find_stmt_error(Vec_HStmt.at(block.stmts, i), types_out)
+        match r {
+            case .some(_) => return r
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return match block.trailing {
+        case .some(let box) => find_expr_error(Box_HExpr.get(box), types_out)
+        case .none => Option_DroppedNode.none
+    }
+}
+
+
+function find_stmt_error(stmt: hir_tree.HStmt, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, _, _, let init_) => find_expr_error(init_, types_out)
+        case .uninit_(_, _, _) => Option_DroppedNode.none
+        case .assign(let target, _, let rhs) =>
+            or_node(find_expr_error(target, types_out), find_expr_error(rhs, types_out))
+    }
+}
+
+
+function find_expr_error(expr: hir_tree.HExpr, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    if ty_mod.is_error(check_mod.type_of_node(types_out, expr.node_id)) {
+        return node_of(expr, DropCause.ill_typed_or_unresolved)
+    }
+    return match expr.kind {
+        case .literal(_) => Option_DroppedNode.none
+        case .use_(_) => Option_DroppedNode.none
+        case .ident_literal(_) => Option_DroppedNode.none
+        case .binary(_, let lhs, let rhs) =>
+            or_node(find_expr_error(Box_HExpr.get(lhs), types_out), find_expr_error(Box_HExpr.get(rhs), types_out))
+        case .unary(_, let e) => find_expr_error(Box_HExpr.get(e), types_out)
+        case .call(_, let args) => find_args_error(args, types_out)
+        case .dyn_call(let callee, let args) =>
+            or_node(find_expr_error(Box_HExpr.get(callee), types_out), find_args_error(args, types_out))
+        case .method_call(_, let args) => find_args_error(args, types_out)
+        case .field(let receiver, _) => find_expr_error(Box_HExpr.get(receiver), types_out)
+        case .positional(let receiver, let idx) => {
+            let sub = or_node(find_expr_error(Box_HExpr.get(receiver), types_out), find_expr_error(Box_HExpr.get(idx), types_out))
+            match sub {
+                case .some(_) => sub
+                case .none => if positional_index_is_const(Box_HExpr.get(idx)) {
+                    Option_DroppedNode.none
+                } else {
+                    node_of(expr, DropCause.nonconst_positional_index)
+                }
+            }
+        }
+        case .index(let receiver, let idx) =>
+            or_node(find_expr_error(Box_HExpr.get(receiver), types_out), find_expr_error(Box_HExpr.get(idx), types_out))
+        case .if_(let cond, let then_block, let else_block) =>
+            or_node(
+                find_expr_error(Box_HExpr.get(cond), types_out),
+                or_node(find_block_error(then_block, types_out), find_opt_block_error(else_block, types_out)),
+            )
+        case .match_(let scrutinee, let arms) =>
+            or_node(
+                find_expr_error(Box_HExpr.get(scrutinee), types_out),
+                or_node(
+                    find_arms_error(arms, types_out),
+                    find_match_unlowerable(expr, Box_HExpr.get(scrutinee), arms, types_out),
+                ),
+            )
+        case .block_(let body) => find_block_error(body, types_out)
+        case .loop_(let body, _, let decreases_) =>
+            or_node(find_block_error(body, types_out), find_opt_box_error(decreases_, types_out))
+        case .cast(let e, _, _) => find_expr_error(Box_HExpr.get(e), types_out)
+        case .tuple(let elements) => find_exprs_error(elements, types_out)
+        case .struct_lit(_, let fields) => find_args_error(fields, types_out)
+        case .variant_ctor(_, _, let args) => find_args_error(args, types_out)
+        case .subrange(let receiver, let lo, let hi, _) =>
+            or_node(
+                find_expr_error(Box_HExpr.get(receiver), types_out),
+                or_node(find_opt_box_error(lo, types_out), find_opt_box_error(hi, types_out)),
+            )
+        case .range(let lo, let hi, _) =>
+            or_node(find_expr_error(Box_HExpr.get(lo), types_out), find_expr_error(Box_HExpr.get(hi), types_out))
+        case .raise_(let e) => find_expr_error(Box_HExpr.get(e), types_out)
+        case .panic_(let e) => find_expr_error(Box_HExpr.get(e), types_out)
+        case .return_(let value) => find_opt_box_error(value, types_out)
+        case .break_(_, let value) => find_opt_box_error(value, types_out)
+        case .continue_(_) => Option_DroppedNode.none
+        case .comptime_(let e) => find_expr_error(Box_HExpr.get(e), types_out)
+        case .comptime_block(let body) => find_block_error(body, types_out)
+        case .comptime_for(_, _, _, _, _) => node_of(expr, DropCause.comptime_for_unsupported)
+        case .scope_(_, _, let body) => find_block_error(body, types_out)
+        case .handle_(_, _, let recovery, let body) =>
+            or_node(find_expr_error(Box_HExpr.get(recovery), types_out), find_block_error(body, types_out))
+        case .closure(_) => Option_DroppedNode.none
+        case .spawn_(let sp) => find_spawn_error(Box_HSpawn.get(sp), types_out)
+        case .forall_(_, let iter, let body) =>
+            or_node(find_expr_error(Box_HExpr.get(iter), types_out), find_expr_error(Box_HExpr.get(body), types_out))
+        case .exists_(_, let iter, let body) =>
+            or_node(find_expr_error(Box_HExpr.get(iter), types_out), find_expr_error(Box_HExpr.get(body), types_out))
+        case .error => node_of(expr, DropCause.error_node)
+    }
+}
+
+
+function positional_index_is_const(e: hir_tree.HExpr) -> bool {
+    return match e.kind {
+        case .literal(let lit) => match lit {
+            case .int(_, _) => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function find_spawn_error(sp: hir_tree.HSpawn, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    let n = Vec_HSpawnArg.len(sp.args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let r = find_expr_error(Vec_HSpawnArg.at(sp.args, i).init_, types_out)
+        match r {
+            case .some(_) => return r
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return find_block_error(sp.body, types_out)
+}
+
+
+function find_match_unlowerable(match_expr: hir_tree.HExpr, scrutinee: hir_tree.HExpr, arms: Vec_HArm.Vec, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    if !arms_have_variant_pattern(arms) {
+        return Option_DroppedNode.none
+    }
+    let scrut_ty = check_mod.type_of_node(types_out, scrutinee.node_id)
+    return match check_mod.sum_def_of_ty(types_out, scrut_ty) {
+        case .some(_) => Option_DroppedNode.none
+        case .none => node_of(match_expr, DropCause.match_scrutinee_not_sum)
+    }
+}
+
+
+function arms_have_variant_pattern(arms: Vec_HArm.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if pat_is_variant_shaped(Vec_HArm.at(arms, i).pat) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function pat_is_variant_shaped(p: ast_tree.Pat) -> bool
+    with {divergence}
+{
+    return match p.kind {
+        case .variant(_, _) => true
+        case .at_binding(_, let inner) => pat_is_variant_shaped(Box_Pat.get(inner))
+        case .or_(let alts) => pats_any_variant_shaped(alts)
+        case _ => false
+    }
+}
+
+
+function pats_any_variant_shaped(pats: Vec_Pat.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if pat_is_variant_shaped(Vec_Pat.at(pats, i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function find_exprs_error(exprs: Vec_HExpr.Vec, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let r = find_expr_error(Vec_HExpr.at(exprs, i), types_out)
+        match r {
+            case .some(_) => return r
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return Option_DroppedNode.none
+}
+
+
+function find_args_error(args: Vec_HArg.Vec, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let r = find_expr_error(Vec_HArg.at(args, i).expr, types_out)
+        match r {
+            case .some(_) => return r
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return Option_DroppedNode.none
+}
+
+
+function find_arms_error(arms: Vec_HArm.Vec, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arm = Vec_HArm.at(arms, i)
+        let r = or_node(find_opt_expr_error(arm.guard, types_out), find_expr_error(arm.body, types_out))
+        match r {
+            case .some(_) => return r
+            case .none => ()
+        }
+        i = i + 1
+    }
+    return Option_DroppedNode.none
+}
+
+
+function find_opt_box_error(o: Option_Box_HExpr.Option, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    return match o {
+        case .some(let box) => find_expr_error(Box_HExpr.get(box), types_out)
+        case .none => Option_DroppedNode.none
+    }
+}
+
+
+function find_opt_block_error(o: Option_HBlock.Option, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    return match o {
+        case .some(let b) => find_block_error(b, types_out)
+        case .none => Option_DroppedNode.none
+    }
+}
+
+
+function find_opt_expr_error(o: Option_HExpr.Option, types_out: check_mod.TypeOutput) -> Option_DroppedNode.Option
+    with {divergence}
+{
+    return match o {
+        case .some(let e) => find_expr_error(e, types_out)
+        case .none => Option_DroppedNode.none
+    }
+}

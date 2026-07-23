@@ -1,0 +1,327 @@
+
+module regalloc.materialize.ops.aapcs64
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import hir.node as node_mod
+import target.triple as triple_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.hlir.op as hlir_op_mod
+
+import local.frame.frame as frame_mod
+import local.materialize.rewrite.subst as subst_mod
+import local.materialize.ops.shared as shared_mod
+
+
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+
+
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+type ArgPlace {
+    on_stack: bool
+    pos: u32
+    is_fp: bool
+    class_index: u32
+}
+
+
+public function rw_call_aapcs64(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let sret = match return_ {
+        case .some(let rv) => lir_reg_mod.is_by_memory(subst_mod.size_of_vreg(body, rv.raw))
+        case .none => false
+    }
+    let sret_buf = match return_ {
+        case .some(let rv) => if sret { shared_mod.align16_local(subst_mod.size_of_vreg(body, rv.raw)) } else { 0 as u32 }
+        case .none => 0 as u32
+    }
+
+    let sp_base = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, stack_ptr_preg(target), allocator)?
+
+    let nstack = count_stack_args(body, args, 0 as u32)
+
+    stage_slots_aapcs64(mutable body, mutable new_ops, args, sret, sret_buf, nstack, agg_base, origin, layout, framebase, sp_base, 0 as u32, target, allocator)?
+
+    let code_preg = shared_mod.stash_callee(mutable body, mutable new_ops, callee, origin, layout, framebase, target, allocator)?
+
+    load_arg_pregs_aapcs64(mutable body, mutable new_ops, args, sret, nstack, origin, sp_base, 0 as u32, allocator)?
+
+    let new_callee = lir_reg_mod.Operand.preg(reg: code_preg)
+    match return_ {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: new_callee, args: args, return_: return_), allocator)?
+        case .some(let rv) => shared_mod.rw_call_ret(mutable body, mutable new_ops, new_callee, args, rv, origin, flags, layout, framebase, target, allocator)?
+    }
+}
+
+
+public function rw_call_indirect_aapcs64(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_vreg_mod.LirVRegId,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let sret = match return_ {
+        case .some(let rv) => lir_reg_mod.is_by_memory(subst_mod.size_of_vreg(body, rv.raw))
+        case .none => false
+    }
+    let sret_buf = match return_ {
+        case .some(let rv) => if sret { shared_mod.align16_local(subst_mod.size_of_vreg(body, rv.raw)) } else { 0 as u32 }
+        case .none => 0 as u32
+    }
+
+    let sp_base = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, stack_ptr_preg(target), allocator)?
+
+    let nstack = count_stack_args(body, args, 1 as u32)
+
+    stage_slots_aapcs64(mutable body, mutable new_ops, args, sret, sret_buf, nstack, agg_base, origin, layout, framebase, sp_base, 1 as u32, target, allocator)?
+
+    let env_slot: usize = nstack as usize
+    let s_addr_env = subst_mod.subst_use(mutable body, mutable new_ops, callee, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    let env_v = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_a(target), allocator)?
+    let env_ref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_addr_env),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 8 as i32,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: env_ref, dst: env_v, width: 8 as u32), allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, env_v, sp_base, shared_mod.home_disp(env_slot), origin, allocator)?
+
+    let s_addr_code = subst_mod.subst_use(mutable body, mutable new_ops, callee, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    let code_v = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+    let code_ref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_addr_code),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: code_ref, dst: code_v, width: 8 as u32), allocator)?
+
+    load_arg_pregs_aapcs64(mutable body, mutable new_ops, args, sret, nstack, origin, sp_base, 1 as u32, allocator)?
+
+    let x0 = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, aapcs64_gp_arg_raw(0 as u32), allocator)?
+    let env_addr = shared_mod.rsp_memref(sp_base, shared_mod.home_disp(env_slot))
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: env_addr, dst: x0, width: 8 as u32), allocator)?
+
+    let new_callee = lir_reg_mod.Operand.preg(reg: subst_mod.scratch_b(target))
+    match return_ {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: new_callee, args: args, return_: return_), allocator)?
+        case .some(let rv) => shared_mod.rw_call_ret(mutable body, mutable new_ops, new_callee, args, rv, origin, flags, layout, framebase, target, allocator)?
+    }
+}
+
+
+function stage_slots_aapcs64(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    sret: bool,
+    sret_buf: u32,
+    nstack: u32,
+    agg_base: u32,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    sp_base: lir_vreg_mod.LirVRegId,
+    lead_gp: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    var cursor: u32 = agg_base
+    let sret_slot = Vec_LirVRegId.len(args) + (lead_gp as usize)
+
+    if sret {
+        let addr = shared_mod.compute_rsp_addr(mutable body, mutable new_ops, sp_base, cursor as i32, subst_mod.scratch_a(target), origin, allocator)?
+        subst_mod.store_slot(mutable body, mutable new_ops, addr, sp_base, shared_mod.home_disp(sret_slot), origin, allocator)?
+        cursor = cursor +% sret_buf
+    }
+
+    let n = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = Vec_LirVRegId.at(args, i)
+        let place = arg_place(body, args, i, lead_gp)
+        let dst_slot: usize = if place.on_stack { place.pos as usize } else { (nstack +% place.pos) as usize }
+        let asize = subst_mod.size_of_vreg(body, a.raw)
+        if lir_reg_mod.is_by_memory(asize) && !subst_mod.is_ref_vreg(body, a.raw) {
+            shared_mod.copy_aggregate(mutable body, mutable new_ops, a, sp_base, cursor, asize, layout, framebase, origin, target, allocator)?
+            let addr = shared_mod.compute_rsp_addr(mutable body, mutable new_ops, sp_base, cursor as i32, subst_mod.scratch_a(target), origin, allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, addr, sp_base, shared_mod.home_disp(dst_slot), origin, allocator)?
+            cursor = cursor +% shared_mod.align16_local(asize)
+        } else {
+            let s_arg = subst_mod.subst_use(mutable body, mutable new_ops, a, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_arg, sp_base, shared_mod.home_disp(dst_slot), origin, allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function load_arg_pregs_aapcs64(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    sret: bool,
+    nstack: u32,
+    origin: node_mod.NodeId,
+    sp_base: lir_vreg_mod.LirVRegId,
+    lead_gp: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if sret {
+        let x8 = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, sret_preg(), allocator)?
+        let addr = shared_mod.rsp_memref(sp_base, shared_mod.home_disp(Vec_LirVRegId.len(args) + (lead_gp as usize)))
+        subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: addr, dst: x8, width: 8 as u32), allocator)?
+    }
+
+    let n = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let place = arg_place(body, args, i, lead_gp)
+        if !place.on_stack {
+            let cls = if place.is_fp { lir_reg_mod.RegClass.fp } else { lir_reg_mod.RegClass.gp }
+            let preg = if place.is_fp { aapcs64_fp_arg_raw(place.class_index) } else { aapcs64_gp_arg_raw(place.class_index) }
+            let dstv = subst_mod.mint_pinned(mutable body, cls, preg, allocator)?
+            let addr = shared_mod.rsp_memref(sp_base, shared_mod.home_disp((nstack +% place.pos) as usize))
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: addr, dst: dstv, width: 8 as u32), allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function arg_is_fp(body: lir_body_mod.LirBody, a: lir_vreg_mod.LirVRegId) -> bool {
+    if lir_reg_mod.is_by_memory(subst_mod.size_of_vreg(body, a.raw)) { return false }
+    return match subst_mod.class_of(body, a.raw) {
+        case .fp => true
+        case _  => false
+    }
+}
+
+
+function count_stack_args(body: lir_body_mod.LirBody, args: Vec_LirVRegId.Vec, lead_gp: u32) -> u32 {
+    var gp: u32 = lead_gp
+    var fp: u32 = 0
+    var stack: u32 = 0
+    let n = Vec_LirVRegId.len(args)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        let a = Vec_LirVRegId.at(args, j)
+        if arg_is_fp(body, a) {
+            if fp < (8 as u32) { fp = fp +% (1 as u32) } else { stack = stack +% (1 as u32) }
+        } else {
+            if gp < (8 as u32) { gp = gp +% (1 as u32) } else { stack = stack +% (1 as u32) }
+        }
+        j += 1
+    }
+    return stack
+}
+
+
+function arg_place(body: lir_body_mod.LirBody, args: Vec_LirVRegId.Vec, idx: usize, lead_gp: u32) -> ArgPlace {
+    var gp: u32 = lead_gp
+    var fp: u32 = 0
+    var stack: u32 = 0
+    var seq: u32 = lead_gp
+    var ans = ArgPlace { on_stack: false, pos: 0 as u32, is_fp: false, class_index: 0 as u32 }
+    let n = Vec_LirVRegId.len(args)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        if j > idx { break }
+        let a = Vec_LirVRegId.at(args, j)
+        let isfp = arg_is_fp(body, a)
+        var place = ArgPlace { on_stack: true, pos: stack, is_fp: isfp, class_index: 0 as u32 }
+        if isfp {
+            if fp < (8 as u32) {
+                place = ArgPlace { on_stack: false, pos: seq, is_fp: true, class_index: fp }
+                fp = fp +% (1 as u32)
+                seq = seq +% (1 as u32)
+            } else {
+                stack = stack +% (1 as u32)
+            }
+        } else {
+            if gp < (8 as u32) {
+                place = ArgPlace { on_stack: false, pos: seq, is_fp: false, class_index: gp }
+                gp = gp +% (1 as u32)
+                seq = seq +% (1 as u32)
+            } else {
+                stack = stack +% (1 as u32)
+            }
+        }
+        if j == idx { ans = place }
+        j += 1
+    }
+    return ans
+}
+
+
+function is_aarch64_target(target: triple_mod.TargetTriple) -> bool {
+    return match triple_mod.arch(target) {
+        case .aarch64 => true
+        case _        => false
+    }
+}
+
+
+function stack_ptr_preg(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if is_aarch64_target(target) { return lir_reg_mod.PReg { raw: 31 as u32 } }
+    return lir_reg_mod.PReg { raw: 4 as u32 }
+}
+
+
+function sret_preg() -> lir_reg_mod.PReg {
+    return lir_reg_mod.PReg { raw: 8 as u32 }
+}
+
+
+function aapcs64_gp_arg_raw(i: u32) -> lir_reg_mod.PReg {
+    return lir_reg_mod.PReg { raw: i }
+}
+
+
+function aapcs64_fp_arg_raw(i: u32) -> lir_reg_mod.PReg {
+    return lir_reg_mod.PReg { raw: i }
+}

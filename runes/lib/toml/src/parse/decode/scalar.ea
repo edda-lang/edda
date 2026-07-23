@@ -1,0 +1,206 @@
+
+module toml.parse.decode.scalar
+
+import std.mem.alloc
+import std.text.string
+import toml.error
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _hex_value(c: u8) -> u32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as u32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return ((c - 97 as u8) as u32) + (10 as u32)
+    }
+    return ((c - 65 as u8) as u32) + (10 as u32)
+}
+
+function _emit_utf8(buf: mutable [u8], pos: usize, cp: u32) -> usize {
+    if cp < (0x80 as u32) {
+        buf[pos] = (cp & (0xFF as u32)) as u8
+        return pos + 1 as usize
+    }
+    if cp < (0x800 as u32) {
+        buf[pos]              = (((0xC0 as u32) | (cp >> (6 as u32))) & (0xFF as u32)) as u8
+        buf[pos + 1 as usize] = (((0x80 as u32) | (cp & (0x3F as u32))) & (0xFF as u32)) as u8
+        return pos + 2 as usize
+    }
+    if cp < (0x10000 as u32) {
+        buf[pos]              = (((0xE0 as u32) | (cp >> (12 as u32))) & (0xFF as u32)) as u8
+        buf[pos + 1 as usize] = (((0x80 as u32) | ((cp >> (6 as u32)) & (0x3F as u32))) & (0xFF as u32)) as u8
+        buf[pos + 2 as usize] = (((0x80 as u32) | (cp & (0x3F as u32))) & (0xFF as u32)) as u8
+        return pos + 3 as usize
+    }
+    buf[pos]              = (((0xF0 as u32) | (cp >> (18 as u32))) & (0xFF as u32)) as u8
+    buf[pos + 1 as usize] = (((0x80 as u32) | ((cp >> (12 as u32)) & (0x3F as u32))) & (0xFF as u32)) as u8
+    buf[pos + 2 as usize] = (((0x80 as u32) | ((cp >> (6 as u32)) & (0x3F as u32))) & (0xFF as u32)) as u8
+    buf[pos + 3 as usize] = (((0x80 as u32) | (cp & (0x3F as u32))) & (0xFF as u32)) as u8
+    return pos + 4 as usize
+}
+
+public function parse_i64(src: [u8], start: usize, end: usize) -> i64
+    with {err: error.ParseError}
+{
+    if start >= end { raise error.ParseError.bad_number(at: start) }
+    var neg: bool = false
+    var i: usize = start
+    if src[i] == 45 as u8 {
+        neg = true
+        i = i + 1 as usize
+        if i >= end { raise error.ParseError.bad_number(at: start) }
+    }
+    var n: i64 = 0 as i64
+    var digits: usize = 0
+    var saw_digit: bool = false
+    loop decreases end - i + 1 as usize {
+        if i >= end { break }
+        let c = src[i]
+        if c == 95 as u8 {
+            i = i + 1 as usize
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            digits = digits + 1 as usize
+            if digits > 18 as usize {
+                raise error.ParseError.bad_number(at: i)
+            }
+            n = (n *% (10 as i64)) +% ((c - 48 as u8) as i64)
+            saw_digit = true
+            i = i + 1 as usize
+        } else {
+            raise error.ParseError.bad_number(at: i)
+        }
+    }
+    if !saw_digit { raise error.ParseError.bad_number(at: start) }
+    return if neg { (0 as i64) -% n } else { n }
+}
+
+public function parse_f64(src: [u8], start: usize, end: usize) -> f64
+    with {err: error.ParseError}
+{
+    if start >= end { raise error.ParseError.bad_number(at: start) }
+    var neg: bool = false
+    var i: usize = start
+    if src[i] == 45 as u8 {
+        neg = true
+        i = i + 1 as usize
+    }
+    var int_part: f64 = 0.0 as f64
+    loop decreases end - i + 1 as usize {
+        if i >= end { break }
+        let c = src[i]
+        if c == 95 as u8 {
+            i = i + 1 as usize
+        } else if c >= 48 as u8 && c <= 57 as u8 {
+            int_part = int_part * (10.0 as f64) + ((c - 48 as u8) as f64)
+            i = i + 1 as usize
+        } else if c == 46 as u8 || c == 101 as u8 || c == 69 as u8 {
+            break
+        } else {
+            raise error.ParseError.bad_number(at: i)
+        }
+    }
+    var frac_part: f64 = 0.0 as f64
+    var frac_div: f64 = 1.0 as f64
+    if i < end && src[i] == 46 as u8 {
+        i = i + 1 as usize
+        loop decreases end - i + 1 as usize {
+            if i >= end { break }
+            let c = src[i]
+            if c == 95 as u8 {
+                i = i + 1 as usize
+            } else if c >= 48 as u8 && c <= 57 as u8 {
+                frac_part = frac_part * (10.0 as f64) + ((c - 48 as u8) as f64)
+                frac_div = frac_div * (10.0 as f64)
+                i = i + 1 as usize
+            } else if c == 101 as u8 || c == 69 as u8 {
+                break
+            } else {
+                raise error.ParseError.bad_number(at: i)
+            }
+        }
+    }
+    var abs_val = int_part + frac_part / frac_div
+    if i < end && (src[i] == 101 as u8 || src[i] == 69 as u8) {
+        i = i + 1 as usize
+        var exp_neg: bool = false
+        if i < end && src[i] == 43 as u8 {
+            i = i + 1 as usize
+        } else if i < end && src[i] == 45 as u8 {
+            exp_neg = true
+            i = i + 1 as usize
+        }
+        var exp_val: u32 = 0 as u32
+        loop decreases end - i + 1 as usize {
+            if i >= end { break }
+            let c = src[i]
+            if c == 95 as u8 {
+                i = i + 1 as usize
+            } else if c >= 48 as u8 && c <= 57 as u8 {
+                exp_val = exp_val *% (10 as u32) +% ((c - 48 as u8) as u32)
+                i = i + 1 as usize
+            } else {
+                raise error.ParseError.bad_number(at: i)
+            }
+        }
+        var mul: f64 = 1.0 as f64
+        var k: u32 = exp_val
+        loop decreases k {
+            if k == 0 as u32 { break }
+            mul = mul * (10.0 as f64)
+            k = k -% (1 as u32)
+        }
+        if exp_neg {
+            abs_val = abs_val / mul
+        } else {
+            abs_val = abs_val * mul
+        }
+    }
+    return if neg { 0.0 as f64 - abs_val } else { abs_val }
+}
+
+public function parse_string_body(
+    src: [u8], s: usize, e: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    var buf = _alloc_byte_slab(allocator, e - s)?
+    var p: usize = 0
+    var i: usize = s
+    loop decreases e - i + 1 as usize {
+        if i >= e { break }
+        let c = src[i]
+        if c != 92 as u8 {
+            buf[p] = c
+            p = p + 1 as usize
+            i = i + 1 as usize
+        } else {
+            let nx = src[i + 1 as usize]
+            if nx == 34 as u8       { buf[p] = 34 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 92 as u8  { buf[p] = 92 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 110 as u8 { buf[p] = 10 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 114 as u8 { buf[p] = 13 as u8; p = p + 1 as usize; i = i + 2 as usize }
+            else if nx == 116 as u8 { buf[p] = 9 as u8;  p = p + 1 as usize; i = i + 2 as usize }
+            else {
+                var j: usize = i + 3 as usize
+                var cp: u32 = 0 as u32
+                loop decreases e - j + 1 as usize {
+                    if j >= e { raise error.ParseError.bad_escape(at: i) }
+                    let cj = src[j]
+                    if cj == 125 as u8 { break }
+                    cp = (cp << (4 as u32)) | _hex_value(cj)
+                    j = j + 1 as usize
+                }
+                if cp > (0x10FFFF as u32) {
+                    raise error.ParseError.bad_escape(at: i)
+                }
+                p = _emit_utf8(mutable buf, p, cp)
+                i = j + 1 as usize
+            }
+        }
+    }
+    return string.bytes_slice_to_string(buf, 0 as usize, p, allocator)?
+}

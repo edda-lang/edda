@@ -1,0 +1,114 @@
+
+module regalloc.frame.frame
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.lir.tree.reg as lir_reg_mod
+
+
+spec std.collections.vec.Vec(SpillSlot)
+spec std.core.option.Option(i32)
+
+
+public type SpillSlot {
+    vreg_raw: u32
+    offset: u32
+    size: u32
+}
+
+
+public type FrameLayout {
+    total_size: u32
+    slots: Vec_SpillSlot.Vec
+    buffers: Vec_SpillSlot.Vec
+}
+
+
+public function empty_layout(out: init FrameLayout, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit slots: Vec_SpillSlot.Vec
+    Vec_SpillSlot.new(init slots, allocator)?
+    uninit buffers: Vec_SpillSlot.Vec
+    Vec_SpillSlot.new(init buffers, allocator)?
+    out = FrameLayout { total_size: 0 as u32, slots: slots, buffers: buffers }
+}
+
+
+public function add_buffer(
+    layout: mutable FrameLayout,
+    vreg_raw: u32,
+    bytes: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let size = align_up(bytes, 8 as u32)
+    let offset = align_up(layout.total_size, 8 as u32)
+    let slot = SpillSlot { vreg_raw: vreg_raw, offset: offset, size: size }
+    Vec_SpillSlot.push(mutable layout.buffers, take slot, allocator)?
+    layout.total_size = offset + size
+    return offset
+}
+
+
+public function buffer_count(layout: FrameLayout) -> usize {
+    return Vec_SpillSlot.len(layout.buffers)
+}
+
+
+public function buffer_disp(layout: FrameLayout, vreg_raw: u32) -> Option_i32.Option {
+    let n = Vec_SpillSlot.len(layout.buffers)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let b = Vec_SpillSlot.at(layout.buffers, i)
+        if b.vreg_raw == vreg_raw {
+            return Option_i32.some(value: (0 as i32) - ((b.offset + b.size) as i32))
+        }
+        i = i + 1
+    }
+    return Option_i32.none
+}
+
+
+public function slot_size_for(class_: lir_reg_mod.RegClass) -> u32 {
+    return match class_ {
+        case .gp     => 8 as u32
+        case .fp     => 8 as u32
+        case .vector => 16 as u32
+        case .mask   => 8 as u32
+    }
+}
+
+
+public function add_slot(
+    layout: mutable FrameLayout,
+    vreg_raw: u32,
+    class_: lir_reg_mod.RegClass,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let size = slot_size_for(class_)
+    let offset = align_up(layout.total_size, size)
+    let slot = SpillSlot { vreg_raw: vreg_raw, offset: offset, size: size }
+    Vec_SpillSlot.push(mutable layout.slots, take slot, allocator)?
+    layout.total_size = offset + size
+    return offset
+}
+
+
+public function slot_count(layout: FrameLayout) -> usize {
+    return Vec_SpillSlot.len(layout.slots)
+}
+
+
+function align_up(value: u32, align: u32) -> u32 {
+    if align == (0 as u32) { return value }
+    let rem = value % align
+    if rem == (0 as u32) { return value }
+    return (value - rem) + align
+}

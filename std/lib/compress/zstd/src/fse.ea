@@ -1,0 +1,275 @@
+
+module std.compress.zstd.fse
+
+import std.mem.alloc
+import local.bits.stream as bits
+import local.fault
+
+spec std.mem.alloc.Array(u8)
+spec std.mem.alloc.Array(usize)
+spec std.mem.alloc.Array(i64)
+
+
+public type Norm {
+    counts: [i64]
+    count: usize where count <= counts.len()
+    al: usize where al <= 20
+}
+
+public type Table {
+    al: usize where al <= 20
+    size: usize
+    symbol: [u8]
+    bits: [u8]
+    base: [usize]
+}
+
+
+public function pow2(n: usize where n <= 32) -> usize
+    ensures result >= 1
+{
+    var r: usize = 1
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        r = r *| 2
+        i += 1
+    }
+    return r
+}
+
+public function highbit(v: usize where v > 0) -> usize {
+    var h: usize = 0
+    var p: usize = v
+    loop
+        decreases p
+    {
+        if p <= 1 { break }
+        p = p >> 1
+        h += 1
+    }
+    return h
+}
+
+
+public function read_norm(
+    data: [u8],
+    f: mutable bits.Fwd,
+    max_symbols: usize where max_symbols >= 1 && max_symbols <= 256,
+    max_al: usize where max_al <= 12,
+    allocator: Allocator,
+) -> Norm
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    let al: usize = bits.read_fwd(data, mutable f, 4) + 5
+    if al > max_al { raise fault.Fault.bad_distribution }
+    var counts: [i64] = Array_i64.alloc(allocator, max_symbols)?
+    var k: usize = 0
+    loop
+        decreases max_symbols - k
+    {
+        if k >= max_symbols { break }
+        counts[k] = 0
+        k += 1
+    }
+    let table_size: usize = pow2(al)
+    var remaining: i64 = (table_size as i64) + 1
+    var sym: usize = 0
+    var prev_zero: bool = false
+    loop
+        decreases max_symbols - sym
+    {
+        if remaining <= 1 { break }
+        if sym >= max_symbols { break }
+        if f.overrun { raise fault.Fault.truncated }
+        if prev_zero {
+            prev_zero = false
+            var run: bool = true
+            loop
+                decreases max_symbols - sym
+            {
+                if !run { break }
+                if f.overrun { raise fault.Fault.truncated }
+                let rep: usize = bits.read_fwd(data, mutable f, 2)
+                if sym +| rep > max_symbols { raise fault.Fault.bad_distribution }
+                sym = sym + rep
+                if rep < 3 { run = false }
+                if run && sym >= max_symbols { raise fault.Fault.bad_distribution }
+            }
+            if sym >= max_symbols { break }
+            continue
+        }
+        let bits_needed: usize = highbit(remaining as usize) + 1
+        if bits_needed > 16 { raise fault.Fault.bad_distribution }
+        let threshold: usize = pow2(bits_needed - 1)
+        let peeked: usize = bits.peek_fwd(data, f, bits_needed)
+        let low: usize = peeked & (threshold - 1)
+        let cap: usize = (threshold *| 2) - 1
+        if (remaining as usize) > cap { raise fault.Fault.bad_distribution }
+        let max_short: usize = cap - (remaining as usize)
+        var value: usize = 0
+        if low < max_short {
+            value = low
+            bits.skip_fwd(data, mutable f, bits_needed - 1)
+        } else {
+            var full: usize = peeked & cap
+            if full >= threshold { full = full - max_short }
+            value = full
+            bits.skip_fwd(data, mutable f, bits_needed)
+        }
+        let count: i64 = (value as i64) - 1
+        counts[sym] = count
+        if count < 0 {
+            remaining = remaining + count
+        } else {
+            remaining = remaining - count
+        }
+        prev_zero = count == 0
+        sym += 1
+    }
+    if remaining != 1 { raise fault.Fault.bad_distribution }
+    if f.overrun { raise fault.Fault.truncated }
+    f.pos = ((f.pos +| 7) / 8) *| 8
+    return Norm { counts: counts, count: sym, al: al }
+}
+
+
+public function build_table(norm: Norm, allocator: Allocator) -> Table
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    let size: usize = pow2(norm.al)
+    var symbol: [u8] = Array_u8.alloc(allocator, size)?
+    var tbits: [u8] = Array_u8.alloc(allocator, size)?
+    var base: [usize] = Array_usize.alloc(allocator, size)?
+    var next: [usize] = Array_usize.alloc(allocator, 256)?
+    var z: usize = 0
+    loop
+        decreases 256 - z
+    {
+        if z >= 256 { break }
+        next[z] = 0
+        z += 1
+    }
+    var high: usize = size
+    var s: usize = 0
+    loop
+        decreases norm.count - s
+    {
+        if s >= norm.count { break }
+        let c: i64 = norm.counts[s]
+        if c == -1 {
+            if high == 0 { raise fault.Fault.bad_distribution }
+            high = high - 1
+            symbol[high] = s as u8 wrapping
+            next[s % 256] = 1
+        }
+        if c > 0 {
+            if c > 65536 { raise fault.Fault.bad_distribution }
+            next[s % 256] = c as usize
+        }
+        s += 1
+    }
+    let step: usize = (size >> 1) + (size >> 3) + 3
+    let pos: usize = spread_all(mutable symbol, norm, step, high, size)?
+    if pos != 0 { raise fault.Fault.bad_distribution }
+    var i: usize = 0
+    loop
+        decreases size - i
+    {
+        if i >= size { break }
+        let si: usize = (symbol[i] as usize) % 256
+        let x: usize = next[si]
+        next[si] = x + 1
+        if x == 0 { raise fault.Fault.bad_distribution }
+        let hb: usize = highbit(x)
+        if hb > norm.al { raise fault.Fault.bad_distribution }
+        let nb: usize = norm.al - hb
+        tbits[i] = nb as u8 wrapping
+        let shifted: usize = x *| pow2(nb)
+        if shifted < size { raise fault.Fault.bad_distribution }
+        base[i] = shifted - size
+        i += 1
+    }
+    return Table { al: norm.al, size: size, symbol: symbol, bits: tbits, base: base }
+}
+
+function spread_all(
+    symbol: mutable [u8],
+    norm: Norm,
+    step: usize,
+    high: usize,
+    size: usize where size >= 1,
+) -> usize
+    with {err: fault.Fault}
+{
+    var pos: usize = 0
+    var s: usize = 0
+    loop
+        decreases norm.count - s
+    {
+        if s >= norm.count { break }
+        let c: i64 = norm.counts[s]
+        if c > 0 {
+            var placed: usize = 0
+            let target: usize = c as usize
+            loop
+                decreases target - placed
+            {
+                if placed >= target { break }
+                if pos >= symbol.len() { raise fault.Fault.bad_distribution }
+                symbol[pos] = s as u8 wrapping
+                placed += 1
+                pos = advance_pos(pos, step, high, size)?
+            }
+        }
+        s += 1
+    }
+    return pos
+}
+
+function advance_pos(
+    pos: usize,
+    step: usize,
+    high: usize,
+    size: usize where size >= 1,
+) -> usize
+    with {err: fault.Fault}
+    ensures result < size
+{
+    var p: usize = (pos +| step) % size
+    var fuel: usize = size
+    loop
+        decreases fuel
+    {
+        if p < high { break }
+        if fuel == 0 { raise fault.Fault.bad_distribution }
+        fuel = fuel - 1
+        p = (p +| step) % size
+    }
+    return p
+}
+
+
+public function init_state(data: [u8], b: mutable bits.Back, t: Table) -> usize {
+    return bits.read_back(data, mutable b, t.al)
+}
+
+public function symbol_at(t: Table, state: usize) -> u8
+    with {err: fault.Fault}
+{
+    if state >= t.symbol.len() { raise fault.Fault.bad_distribution }
+    return t.symbol[state]
+}
+
+public function next_state(data: [u8], b: mutable bits.Back, t: Table, state: usize) -> usize
+    with {err: fault.Fault}
+{
+    if state >= t.bits.len() { raise fault.Fault.bad_distribution }
+    if state >= t.base.len() { raise fault.Fault.bad_distribution }
+    let nb: usize = t.bits[state] as usize
+    if nb > 32 { raise fault.Fault.bad_distribution }
+    let add: usize = bits.read_back(data, mutable b, nb)
+    return t.base[state] +| add
+}

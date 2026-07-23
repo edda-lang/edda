@@ -1,0 +1,461 @@
+
+module mir.layout.table
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import target.triple as triple_mod
+import cteval.builtin.target.layout.compute.engine as layout_engine_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.hashmap.IntMap(AggLayout)
+spec std.core.option.Option(AggLayout)
+
+
+derive eq, hash, debug for AggLayout
+derive eq, hash, debug for LayoutTable
+
+
+public type AggLayout {
+    total_size: u32
+    field_offsets: Vec_u32.Vec
+    field_sizes: Vec_u32.Vec
+    scalar_wrapper: bool
+}
+
+
+public type LayoutTable {
+    by_ty: IntMap_AggLayout.IntMap
+    by_variant: IntMap_AggLayout.IntMap
+}
+
+
+public type LayoutCache {
+    table: LayoutTable
+    scanned: usize where scanned >= 1
+    pending: Vec_u32.Vec
+}
+
+
+public function new_table(allocator: Allocator) -> LayoutTable
+    with {allocator, err: alloc.AllocError}
+{
+    let m = IntMap_AggLayout.new(allocator)?
+    let v = IntMap_AggLayout.new(allocator)?
+    return LayoutTable { by_ty: m, by_variant: v }
+}
+
+
+public function lookup(table: LayoutTable, ty: ty_mod.TyId) -> Option_AggLayout.Option {
+    return IntMap_AggLayout.get(table.by_ty, ty.raw as i64)
+}
+
+
+function variant_key(ty: ty_mod.TyId, variant: u32) -> i64 {
+    return ((ty.raw as i64) << 32) | (variant as i64)
+}
+
+
+public function lookup_variant(table: LayoutTable, ty: ty_mod.TyId, variant: u32) -> Option_AggLayout.Option {
+    return IntMap_AggLayout.get(table.by_variant, variant_key(ty, variant))
+}
+
+
+public function new_cache(allocator: Allocator) -> LayoutCache
+    with {allocator, err: alloc.AllocError}
+{
+    uninit pending: Vec_u32.Vec
+    Vec_u32.new(init pending, allocator)?
+    return LayoutCache { table: new_table(allocator)?, scanned: 1 as usize, pending: pending }
+}
+
+
+public function extend_cache(
+    cache: mutable LayoutCache,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    retry_pending(mutable cache, ty_interner, type_out, triple, allocator)?
+    let n = ty_interner_mod.slot_count(ty_interner)
+    var i: usize = cache.scanned
+    loop decreases n - i {
+        if i >= n { break }
+        let ty = ty_mod.TyId { raw: i as u32 wrapping }
+        match agg_field_offsets(ty, ty_interner, type_out, triple, allocator)? {
+            case .some(let layout) => {
+                register_variant_layouts(mutable cache.table, ty, layout, ty_interner, type_out, triple, allocator)?
+                let _ = IntMap_AggLayout.insert(mutable cache.table.by_ty, i as i64, take layout, allocator)?
+            }
+            case .none => {
+                if is_deferrable(ty, ty_interner) {
+                    Vec_u32.push(mutable cache.pending, i as u32 wrapping, allocator)?
+                }
+            }
+        }
+        i += 1
+    }
+    if n > cache.scanned {
+        cache.scanned = n
+    }
+}
+
+
+function retry_pending(
+    cache: mutable LayoutCache,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_u32.len(cache.pending)
+    if n == 0 { return }
+    uninit still: Vec_u32.Vec
+    Vec_u32.new(init still, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let raw = Vec_u32.at(cache.pending, i)
+        let ty = ty_mod.TyId { raw: raw }
+        match agg_field_offsets(ty, ty_interner, type_out, triple, allocator)? {
+            case .some(let layout) => {
+                register_variant_layouts(mutable cache.table, ty, layout, ty_interner, type_out, triple, allocator)?
+                let _ = IntMap_AggLayout.insert(mutable cache.table.by_ty, raw as i64, take layout, allocator)?
+            }
+            case .none => Vec_u32.push(mutable still, raw, allocator)?
+        }
+        i += 1
+    }
+    cache.pending = still
+}
+
+
+function is_deferrable(ty: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool {
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .record(_) => true
+        case .sum_(_) => true
+        case .tuple_(_) => true
+        case .array(_, _) => true
+        case .refined(_, _) => true
+        case _ => false
+    }
+}
+
+
+function agg_field_offsets(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_AggLayout.none
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, ty)
+    return match cty {
+        case .tuple_(let elems) => fold_offsets(elems, ty_interner, type_out, triple, allocator)?
+        case .array(let elem, let n) => {
+            uninit elem_tys: Vec_TyId.Vec
+            Vec_TyId.new(init elem_tys, allocator)?
+            let count = n as usize
+            var k: usize = 0
+            loop decreases count - k {
+                if k >= count { break }
+                Vec_TyId.push(mutable elem_tys, take ty_mod.TyId { raw: elem.raw }, allocator)?
+                k += 1
+            }
+            fold_offsets(elem_tys, ty_interner, type_out, triple, allocator)?
+        }
+        case .record(let def) => {
+            let count = check_mod.field_ty_count(type_out, def)
+            if count == 0 {
+                return Option_AggLayout.none
+            }
+            uninit field_tys: Vec_TyId.Vec
+            Vec_TyId.new(init field_tys, allocator)?
+            var k: usize = 0
+            loop decreases count - k {
+                if k >= count { break }
+                Vec_TyId.push(mutable field_tys, take check_mod.field_ty_at(type_out, def, k), allocator)?
+                k += 1
+            }
+            fold_offsets(field_tys, ty_interner, type_out, triple, allocator)?
+        }
+        case .slice(_) => slice_fat_layout(allocator)?
+        case .string_ => slice_fat_layout(allocator)?
+        case .fn_(_, _, _) => slice_fat_layout(allocator)?
+        case .sum_(_) => sum_agg_layout(ty, ty_interner, type_out, triple, allocator)?
+        case .refined(let base, _) => agg_field_offsets(base, ty_interner, type_out, triple, allocator)?
+        case _ => Option_AggLayout.none
+    }
+}
+
+
+function slice_fat_layout(allocator: Allocator) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    Vec_u32.push(mutable offsets, take 0 as u32, allocator)?
+    Vec_u32.push(mutable offsets, take 8 as u32, allocator)?
+    uninit sizes: Vec_u32.Vec
+    Vec_u32.new(init sizes, allocator)?
+    Vec_u32.push(mutable sizes, take 8 as u32, allocator)?
+    Vec_u32.push(mutable sizes, take 8 as u32, allocator)?
+    return Option_AggLayout.some(value: AggLayout {
+        total_size: 16 as u32,
+        field_offsets: offsets,
+        field_sizes: sizes,
+        scalar_wrapper: false,
+    })
+}
+
+
+function sum_agg_layout(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let def = match ty_interner_mod.lookup(ty_interner, ty) {
+        case .sum_(let d) => d
+        case _ => return Option_AggLayout.none
+    }
+    return match layout_engine_mod.sum_layout_parts(def, ty_interner, type_out, triple) {
+        case .ok(let p) => {
+            uninit offsets: Vec_u32.Vec
+            Vec_u32.new(init offsets, allocator)?
+            Vec_u32.push(mutable offsets, take 0 as u32, allocator)?
+            Vec_u32.push(mutable offsets, take p.payload_off as u32 wrapping, allocator)?
+            uninit sizes: Vec_u32.Vec
+            Vec_u32.new(init sizes, allocator)?
+            Vec_u32.push(mutable sizes, take p.disc_size as u32 wrapping, allocator)?
+            Vec_u32.push(mutable sizes, take p.payload_size as u32 wrapping, allocator)?
+            Option_AggLayout.some(value: AggLayout {
+                total_size: p.total_size as u32 wrapping,
+                field_offsets: offsets,
+                field_sizes: sizes,
+                scalar_wrapper: false,
+            })
+        }
+        case .unsupported(_) => Option_AggLayout.none
+    }
+}
+
+
+function is_single_heap_ptr_field(
+    field_tys: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool {
+    if Vec_TyId.len(field_tys) != (1 as usize) { return false }
+    let fty = Vec_TyId.at(field_tys, 0 as usize)
+    if (fty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return false }
+    return match ty_interner_mod.lookup(ty_interner, fty) {
+        case .primitive(let pk) => match pk {
+            case .heap_ptr => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+
+function fold_offsets(
+    field_tys: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    uninit sizes: Vec_u32.Vec
+    Vec_u32.new(init sizes, allocator)?
+
+    var cursor: usize = 0
+    var max_align: usize = 1
+    let n = Vec_TyId.len(field_tys)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let fty = Vec_TyId.at(field_tys, i)
+        let fl = match layout_engine_mod.compute_layout(fty, ty_interner, type_out, triple) {
+            case .ok(let l) => l
+            case .unsupported(_) => return Option_AggLayout.none
+        }
+        let off = layout_engine_mod.align_up_to(cursor, fl.align)
+        Vec_u32.push(mutable offsets, take off as u32 wrapping, allocator)?
+        Vec_u32.push(mutable sizes, take fl.size as u32 wrapping, allocator)?
+        cursor = off + fl.size
+        if fl.align > max_align { max_align = fl.align }
+        i += 1
+    }
+
+    let total = layout_engine_mod.align_up_to(cursor, max_align)
+    return Option_AggLayout.some(value: AggLayout {
+        total_size: total as u32 wrapping,
+        field_offsets: offsets,
+        field_sizes: sizes,
+        scalar_wrapper: is_single_heap_ptr_field(field_tys, ty_interner),
+    })
+}
+
+
+function peel_refined(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> ty_mod.TyId
+    decreases fuel
+{
+    if fuel == (0 as u32) { return ty }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return ty }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .refined(let base, _) => peel_refined(base, ty_interner, fuel - (1 as u32))
+        case _ => ty
+    }
+}
+
+
+function register_variant_layouts(
+    table: mutable LayoutTable,
+    ty: ty_mod.TyId,
+    layout: AggLayout,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_u32.len(layout.field_offsets) < (2 as usize) { return }
+    let peeled = peel_refined(ty, ty_interner, 16 as u32)
+    if (peeled.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return }
+    let def = match ty_interner_mod.lookup(ty_interner, peeled) {
+        case .sum_(let d) => d
+        case _ => return
+    }
+    let payload_off = Vec_u32.at(layout.field_offsets, 1 as usize)
+    let n = check_mod.variant_count_of(type_out, def)
+    var v: usize = 0
+    loop decreases n - v {
+        if v >= n { break }
+        let payload_ty = check_mod.variant_payload_ty(type_out, def, v as u32 wrapping)
+        match variant_field_layout(payload_off, payload_ty, ty_interner, type_out, triple, allocator)? {
+            case .some(let vl) => {
+                let _ = IntMap_AggLayout.insert(mutable table.by_variant, variant_key(ty, v as u32 wrapping), take vl, allocator)?
+            }
+            case .none => ()
+        }
+        v += 1
+    }
+}
+
+
+function variant_field_layout(
+    payload_off: u32,
+    payload_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    type_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let base_off = payload_off as usize
+    let peeled = peel_refined(payload_ty, ty_interner, 16 as u32)
+    if (peeled.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_AggLayout.none
+    }
+    match ty_interner_mod.lookup(ty_interner, peeled) {
+        case .tuple_(let elems) => {
+            return match fold_offsets(elems, ty_interner, type_out, triple, allocator)? {
+                case .some(let fl) => shift_layout(fl, base_off, allocator)?
+                case .none => Option_AggLayout.none
+            }
+        }
+        case _ => ()
+    }
+    return match layout_engine_mod.compute_layout(payload_ty, ty_interner, type_out, triple) {
+        case .ok(let l) => single_field_layout(base_off, l.size, allocator)?
+        case .unsupported(_) => Option_AggLayout.none
+    }
+}
+
+
+function shift_layout(
+    fl: AggLayout,
+    base_off: usize,
+    allocator: Allocator,
+) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    uninit sizes: Vec_u32.Vec
+    Vec_u32.new(init sizes, allocator)?
+    let n = Vec_u32.len(fl.field_offsets)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let off = base_off + (Vec_u32.at(fl.field_offsets, i) as usize)
+        Vec_u32.push(mutable offsets, take off as u32 wrapping, allocator)?
+        Vec_u32.push(mutable sizes, take Vec_u32.at(fl.field_sizes, i), allocator)?
+        i += 1
+    }
+    let total = base_off + (fl.total_size as usize)
+    return Option_AggLayout.some(value: AggLayout {
+        total_size: total as u32 wrapping,
+        field_offsets: offsets,
+        field_sizes: sizes,
+        scalar_wrapper: false,
+    })
+}
+
+
+function single_field_layout(
+    base_off: usize,
+    size: usize,
+    allocator: Allocator,
+) -> Option_AggLayout.Option
+    with {allocator, err: alloc.AllocError}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    uninit sizes: Vec_u32.Vec
+    Vec_u32.new(init sizes, allocator)?
+    if size > (0 as usize) {
+        Vec_u32.push(mutable offsets, take base_off as u32 wrapping, allocator)?
+        Vec_u32.push(mutable sizes, take size as u32 wrapping, allocator)?
+    }
+    let total = base_off + size
+    return Option_AggLayout.some(value: AggLayout {
+        total_size: total as u32 wrapping,
+        field_offsets: offsets,
+        field_sizes: sizes,
+        scalar_wrapper: false,
+    })
+}

@@ -1,0 +1,82 @@
+
+module optimize.effect_gvn.licm
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.hlir.mapping as mapping_mod
+import local.effect_gvn.licm.dom.dom as dom_mod
+import local.effect_gvn.licm.cfg as cfg_mod
+import local.effect_gvn.licm.rel.invariant.invariant as invariant_mod
+
+
+spec std.collections.vec.Vec(invariant_mod.Hoist)
+spec std.collections.vec.Vec(cfg_mod.Loop)
+spec std.collections.vec.Vec(cfg_mod.BackEdge)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public type LicmPlan {
+    hoists: Vec_Hoist.Vec
+    loops_seen: usize
+    loops_skipped: usize
+    irreducible: bool
+}
+
+
+public function analyze(
+    body: hlir_body_mod.HlirBody,
+    built: mutable mapping_mod.BuildResult,
+    allocator: Allocator,
+) -> LicmPlan
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit hoists: Vec_Hoist.Vec
+    Vec_Hoist.new(init hoists, allocator)?
+    let cfg = dom_mod.build_cfg(body, allocator)?
+    let back_edges = cfg_mod.collect_back_edges(cfg, body, allocator)?
+    if Vec_BackEdge.len(back_edges) == 0 {
+        return LicmPlan {
+            hoists: hoists,
+            loops_seen: 0,
+            loops_skipped: 0,
+            irreducible: false,
+        }
+    }
+    let op_block = invariant_mod.build_op_block_map(body, allocator)?
+    let loops = cfg_mod.build_loops(cfg, body, back_edges, allocator)?
+    var skipped: usize = 0
+    let n = Vec_Loop.len(loops)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let lp = Vec_Loop.at(loops, i)
+        if lp.preheader_known {
+            invariant_mod.hoist_loop_invariants(mutable hoists, body, built, op_block, lp, allocator)?
+        } else {
+            skipped = skipped + 1
+        }
+        i = i + 1
+    }
+    return LicmPlan {
+        hoists: hoists,
+        loops_seen: n,
+        loops_skipped: skipped,
+        irreducible: skipped > 0,
+    }
+}
+
+
+public function hoist_count(plan: LicmPlan) -> usize {
+    return Vec_Hoist.len(plan.hoists)
+}
+
+
+public function hoist_at(plan: LicmPlan, i: usize) -> invariant_mod.Hoist
+    requires i < Vec_Hoist.len(plan.hoists)
+{
+    return Vec_Hoist.at(plan.hoists, i)
+}

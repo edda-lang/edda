@@ -1,0 +1,393 @@
+
+module wasm.lower
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.collections.slice
+import ir.lir.tree.file as lir_file_mod
+import ir.lir.tree.body as body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.tree.reg as reg_mod
+import ir.lir.id.vreg as vreg_mod
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import local.model as model_mod
+import local.fmt.encode as enc_mod
+import local.reactor.reactor as reactor_mod
+import local.isel.ctx.ctx as ctx_mod
+import local.isel.body.body as body_isel_mod
+import local.isel.valtype.valtype as vt_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(model_mod.ValType)
+spec std.collections.vec.Vec(model_mod.Import)
+spec std.collections.vec.Vec(lir_file_mod.LirFile)
+spec std.collections.vec.Vec(body_mod.LirBody)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(vreg_mod.LirVRegId)
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.IntMap(String)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(String)
+spec std.core.option.Option(vreg_mod.LirVRegId)
+
+
+public function build_module(
+    out: init model_mod.WasmModule,
+    files: Vec_LirFile.Vec,
+    syms: IntMap_String.IntMap,
+    wake_def_raw: u32,
+    dispatch_def_raw: u32,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit wmod: model_mod.WasmModule
+    model_mod.new_module(init wmod, allocator)?
+
+    var func_pos = IntMap_u32.new(allocator)?
+    var import_by_def = IntMap_u32.new(allocator)?
+    var str_lo = IntMap_u32.new(allocator)?
+    var str_len = IntMap_u32.new(allocator)?
+    var reactor_def_by_kind = IntMap_u32.new(allocator)?
+
+    assign_func_positions(mutable func_pos, files, allocator)?
+    collect_imports_and_data(mutable wmod, mutable import_by_def, mutable str_lo, mutable str_len, mutable reactor_def_by_kind, func_pos, files, syms, interner, allocator)?
+
+    let num_bodies = count_bodies(files)
+    reactor_mod.assign_reactor_positions(mutable func_pos, reactor_def_by_kind, num_bodies, allocator)?
+
+    let num_imports = Vec_Import.len(wmod.imports) as u32
+    let wake_idx = reserved_funcidx(func_pos, num_imports, wake_def_raw)
+    let dispatch_idx = reserved_funcidx(func_pos, num_imports, dispatch_def_raw)
+    let mctx = ctx_mod.ModuleCtx {
+        num_imports: num_imports,
+        func_pos_by_def: func_pos,
+        import_by_def: import_by_def,
+        str_lo_by_sym: str_lo,
+        str_len_by_sym: str_len,
+    }
+
+    emit_all_bodies(mutable wmod, mctx, files, syms, allocator)?
+    reactor_mod.emit_reactor_intrinsics(mutable wmod, reactor_def_by_kind, allocator)?
+    reactor_mod.emit_reactor_exports(mutable wmod, num_imports, wake_idx, dispatch_idx, allocator)?
+    out = wmod
+}
+
+
+function reserved_funcidx(func_pos: IntMap_u32.IntMap, num_imports: u32, def_raw: u32) -> Option_u32.Option {
+    return match IntMap_u32.get(func_pos, def_raw as i64) {
+        case .some(let pos) => Option_u32.some(value: num_imports +% pos)
+        case .none => Option_u32.none
+    }
+}
+
+
+function count_bodies(files: Vec_LirFile.Vec) -> u32 {
+    var pos: u32 = 0
+    let nf: usize = Vec_LirFile.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let file = Vec_LirFile.at(files, fi)
+        pos = pos +% (Vec_LirBody.len(file.bodies) as u32)
+        fi += 1
+    }
+    return pos
+}
+
+
+function assign_func_positions(func_pos: mutable IntMap_u32.IntMap, files: Vec_LirFile.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var pos: u32 = 0
+    let nf: usize = Vec_LirFile.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let file = Vec_LirFile.at(files, fi)
+        let nb: usize = Vec_LirBody.len(file.bodies)
+        var bi: usize = 0
+        loop decreases nb - bi {
+            if bi >= nb { break }
+            let body = Vec_LirBody.at(file.bodies, bi)
+            let _ = IntMap_u32.insert(mutable func_pos, body.def_id.raw as i64, pos, allocator)?
+            pos = pos +% (1 as u32)
+            bi += 1
+        }
+        fi += 1
+    }
+}
+
+
+function collect_imports_and_data(
+    wmod: mutable model_mod.WasmModule,
+    import_by_def: mutable IntMap_u32.IntMap,
+    str_lo: mutable IntMap_u32.IntMap,
+    str_len: mutable IntMap_u32.IntMap,
+    reactor_def_by_kind: mutable IntMap_u32.IntMap,
+    func_pos: IntMap_u32.IntMap,
+    files: Vec_LirFile.Vec,
+    syms: IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nf: usize = Vec_LirFile.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let file = Vec_LirFile.at(files, fi)
+        let nb: usize = Vec_LirBody.len(file.bodies)
+        var bi: usize = 0
+        loop decreases nb - bi {
+            if bi >= nb { break }
+            let body = Vec_LirBody.at(file.bodies, bi)
+            scan_body(mutable wmod, mutable import_by_def, mutable str_lo, mutable str_len, mutable reactor_def_by_kind, func_pos, body, syms, interner, allocator)?
+            bi += 1
+        }
+        fi += 1
+    }
+}
+
+
+function scan_body(
+    wmod: mutable model_mod.WasmModule,
+    import_by_def: mutable IntMap_u32.IntMap,
+    str_lo: mutable IntMap_u32.IntMap,
+    str_len: mutable IntMap_u32.IntMap,
+    reactor_def_by_kind: mutable IntMap_u32.IntMap,
+    func_pos: IntMap_u32.IntMap,
+    body: body_mod.LirBody,
+    syms: IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var vdef = IntMap_u32.new(allocator)?
+    scan_fn_refs(mutable vdef, body, allocator)?
+    let n: usize = Vec_LirOp.len(body.ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_LirOp.at(body.ops, i)
+        match op.kind {
+            case .constant_(let c, _) => {
+                match c {
+                    case .string_(let sym) => register_string(mutable wmod, mutable str_lo, mutable str_len, sym, interner, allocator)?
+                    case _ => ()
+                }
+            }
+            case .call_(let callee, let args, let return_) => {
+                if !is_intrinsic_op(op) {
+                    maybe_register_import(mutable wmod, mutable import_by_def, mutable reactor_def_by_kind, func_pos, vdef, body, callee, args, return_, syms, interner, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}
+
+
+function scan_fn_refs(vdef: mutable IntMap_u32.IntMap, body: body_mod.LirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_LirOp.len(body.ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_LirOp.at(body.ops, i)
+        match op.kind {
+            case .constant_(let c, let dst) => {
+                match c {
+                    case .fn_ref(let def) => { let _ = IntMap_u32.insert(mutable vdef, dst.raw as i64, def.raw, allocator)? }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}
+
+
+function is_intrinsic_op(op: lir_op_mod.LirOp) -> bool {
+    return match op.flags.intrinsic {
+        case .none => false
+        case _ => true
+    }
+}
+
+
+function register_string(
+    wmod: mutable model_mod.WasmModule,
+    str_lo: mutable IntMap_u32.IntMap,
+    str_len: mutable IntMap_u32.IntMap,
+    sym: symbol_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match IntMap_u32.get(str_lo, sym.raw as i64) {
+        case .some(_) => { return }
+        case .none => ()
+    }
+    if (sym.raw as usize) < interner_mod.slot_count(interner) {
+        let bytes = interner_mod.lookup(interner, sym)
+        let len = bytes.len() as u32
+        uninit data: Vec_u8.Vec
+        Vec_u8.new(init data, allocator)?
+        enc_mod.push_slice(mutable data, bytes, allocator)?
+        let off = model_mod.add_data(mutable wmod, take data, allocator)?
+        let _ = IntMap_u32.insert(mutable str_lo, sym.raw as i64, off, allocator)?
+        let _ = IntMap_u32.insert(mutable str_len, sym.raw as i64, len, allocator)?
+    }
+}
+
+
+function maybe_register_import(
+    wmod: mutable model_mod.WasmModule,
+    import_by_def: mutable IntMap_u32.IntMap,
+    reactor_def_by_kind: mutable IntMap_u32.IntMap,
+    func_pos: IntMap_u32.IntMap,
+    vdef: IntMap_u32.IntMap,
+    body: body_mod.LirBody,
+    callee: reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    syms: IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let def_raw = match trace_callee(vdef, callee) {
+        case .some(let d) => d
+        case .none => return
+    }
+    match IntMap_u32.get(func_pos, def_raw as i64) {
+        case .some(_) => { return }
+        case .none => ()
+    }
+    match IntMap_u32.get(import_by_def, def_raw as i64) {
+        case .some(_) => { return }
+        case .none => ()
+    }
+    let name = sym_name_for_def(syms, def_raw)
+    match reactor_mod.reactor_kind_for_name(name) {
+        case .some(let kind) => {
+            match IntMap_u32.get(reactor_def_by_kind, kind as i64) {
+                case .some(_) => ()
+                case .none => { let _ = IntMap_u32.insert(mutable reactor_def_by_kind, kind as i64, def_raw, allocator)? }
+            }
+            return
+        }
+        case .none => ()
+    }
+    if is_compiler_owned_symbol(name) { return }
+    let ft = infer_import_functype(body, args, return_, allocator)?
+    let type_idx = model_mod.add_type(mutable wmod, take ft, allocator)?
+    let mod_name = import_module_for(name)
+    let imp = model_mod.Import { module_name: mod_name, field_name: name, type_idx: type_idx }
+    let idx = model_mod.add_import(mutable wmod, take imp, allocator)?
+    let _ = IntMap_u32.insert(mutable import_by_def, def_raw as i64, idx, allocator)?
+}
+
+
+function trace_callee(vdef: IntMap_u32.IntMap, callee: reg_mod.Operand) -> Option_u32.Option {
+    return match callee {
+        case .vreg(let v) => IntMap_u32.get(vdef, v.raw as i64)
+        case _ => Option_u32.none
+    }
+}
+
+
+function infer_import_functype(
+    body: body_mod.LirBody,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    allocator: Allocator,
+) -> model_mod.FuncType
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValType.Vec
+    Vec_ValType.new(init params, allocator)?
+    let n: usize = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_ValType.push(mutable params, vt_mod.valtype_of_vreg(body, Vec_LirVRegId.at(args, i)), allocator)?
+        i += 1
+    }
+    uninit results: Vec_ValType.Vec
+    Vec_ValType.new(init results, allocator)?
+    match return_ {
+        case .some(let dst) => Vec_ValType.push(mutable results, vt_mod.valtype_of_vreg(body, dst), allocator)?
+        case .none => ()
+    }
+    return model_mod.FuncType { params: params, results: results }
+}
+
+
+function sym_name_for_def(syms: IntMap_String.IntMap, def_raw: u32) -> String {
+    return match IntMap_String.get(syms, def_raw as i64) {
+        case .some(let s) => s
+        case .none => "__edda_extern"
+    }
+}
+
+
+function is_compiler_owned_symbol(name: String) -> bool {
+    let b = name.bytes()
+    if slice.starts_with_u8(b, "__edda_task_".bytes()) { return true }
+    if slice.starts_with_u8(b, "__edda_reactor_".bytes()) { return true }
+    return false
+}
+
+
+function import_module_for(name: String) -> String {
+    let b = name.bytes()
+    if slice.starts_with_u8(b, "__edda_dom_".bytes()) { return "dom" }
+    if slice.starts_with_u8(b, "__edda_webext_".bytes()) { return "webext" }
+    return "env"
+}
+
+
+function emit_all_bodies(
+    wmod: mutable model_mod.WasmModule,
+    mctx: ctx_mod.ModuleCtx,
+    files: Vec_LirFile.Vec,
+    syms: IntMap_String.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let nf: usize = Vec_LirFile.len(files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let file = Vec_LirFile.at(files, fi)
+        let nb: usize = Vec_LirBody.len(file.bodies)
+        var bi: usize = 0
+        loop decreases nb - bi {
+            if bi >= nb { break }
+            let body = Vec_LirBody.at(file.bodies, bi)
+            uninit func: model_mod.Func
+            body_isel_mod.lower_body(init func, mutable wmod, mctx, body, allocator)?
+            let func_idx = model_mod.add_func(mutable wmod, take func, allocator)?
+            let name = sym_name_for_def(syms, body.def_id.raw)
+            model_mod.add_export(mutable wmod, take model_mod.Export { name: name, func_idx: mctx.num_imports +% func_idx }, allocator)?
+            bi += 1
+        }
+        fi += 1
+    }
+}

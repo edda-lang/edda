@@ -1,0 +1,381 @@
+
+module link.emit.layout
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import object.coff as coff_mod
+import local.emit.group as group_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(Placement)
+spec std.collections.vec.Vec(group_mod.GroupItem)
+spec std.core.option.Option(Placement)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(SectionClass)
+
+
+derive eq, debug for SectionClass
+
+
+public type SectionClass {
+    case text
+    case rdata
+    case data
+    case tls
+    case crt
+    case bss
+    case other_
+}
+
+
+public type Placement {
+    object_index: usize
+    section_index: usize
+    class_: SectionClass
+    offset: u32
+    rva: u32
+}
+
+
+public type LayoutPlan {
+    placements: Vec_Placement.Vec
+    image_base: u64
+    text_rva: u32
+    rdata_rva: u32
+    data_rva: u32
+    tls_rva: u32
+    crt_rva: u32
+    bss_rva: u32
+    text_size: u32
+    rdata_size: u32
+    data_size: u32
+    tls_size: u32
+    crt_size: u32
+    bss_size: u32
+}
+
+
+public function align_up(value: u32, align: u32) -> u32 {
+    if align == (0 as u32) { return value }
+    let r = value % align
+    if r == (0 as u32) { return value }
+    return value + (align - r)
+}
+
+
+function section_packed8(name: coff_mod.CoffSectionName, table: coff_mod.CoffStringTable) -> u64 {
+    return match name {
+        case .inline_(let packed)          => packed
+        case .string_table_ref(let offset) => strtab_packed8(table, offset)
+    }
+}
+
+
+function strtab_packed8(table: coff_mod.CoffStringTable, offset: u32) -> u64 {
+    if offset < (4 as u32) { return 0 as u64 }
+    let bytes = table.bytes
+    let len = Vec_u8.len(bytes)
+    let start = (offset - (4 as u32)) as usize
+    var packed: u64 = 0
+    var i: usize = 0
+    loop decreases ((8 as usize) - i) {
+        if i >= (8 as usize) { break }
+        let idx = start + i
+        if idx >= len { break }
+        let b = Vec_u8.at(bytes, idx) as u64
+        let shift = (8 as u64) * (i as u64)
+        packed = packed | (b << shift)
+        i = i + 1
+    }
+    return packed
+}
+
+
+function byte0(p: u64) -> u8 { return (p & (0xFF as u64)) as u8 }
+function byte1(p: u64) -> u8 { return ((p >> (8 as u64)) & (0xFF as u64)) as u8 }
+function byte2(p: u64) -> u8 { return ((p >> (16 as u64)) & (0xFF as u64)) as u8 }
+function byte3(p: u64) -> u8 { return ((p >> (24 as u64)) & (0xFF as u64)) as u8 }
+function byte4(p: u64) -> u8 { return ((p >> (32 as u64)) & (0xFF as u64)) as u8 }
+function byte5(p: u64) -> u8 { return ((p >> (40 as u64)) & (0xFF as u64)) as u8 }
+
+
+function classify_packed(p: u64) -> SectionClass {
+    if byte0(p) == (0x2E as u8) && byte1(p) == (0x62 as u8) && byte2(p) == (0x73 as u8) && byte3(p) == (0x73 as u8) {
+        return SectionClass.bss
+    }
+    if byte0(p) == (0x2E as u8) && byte1(p) == (0x74 as u8) && byte2(p) == (0x6C as u8) && byte3(p) == (0x73 as u8) {
+        if byte4(p) == (0x00 as u8) || byte4(p) == (0x24 as u8) {
+            return SectionClass.tls
+        }
+    }
+    if byte0(p) == (0x2E as u8) && byte1(p) == (0x43 as u8) && byte2(p) == (0x52 as u8) && byte3(p) == (0x54 as u8) && byte4(p) == (0x24 as u8) {
+        return SectionClass.crt
+    }
+    if byte0(p) == (0x2E as u8) && byte1(p) == (0x74 as u8) && byte2(p) == (0x65 as u8) && byte3(p) == (0x78 as u8) && byte4(p) == (0x74 as u8) {
+        return SectionClass.text
+    }
+    if byte0(p) == (0x2E as u8) && byte1(p) == (0x64 as u8) && byte2(p) == (0x61 as u8) && byte3(p) == (0x74 as u8) && byte4(p) == (0x61 as u8) {
+        return SectionClass.data
+    }
+    if byte0(p) == (0x2E as u8) && byte1(p) == (0x72 as u8) && byte2(p) == (0x64 as u8) && byte3(p) == (0x61 as u8) && byte4(p) == (0x74 as u8) && byte5(p) == (0x61 as u8) {
+        return SectionClass.rdata
+    }
+    return SectionClass.other_
+}
+
+
+public function section_class_of(sec: coff_mod.CoffSection, table: coff_mod.CoffStringTable) -> SectionClass {
+    return classify_packed(section_packed8(sec.header.name, table))
+}
+
+
+function collect_group_items(objects: Vec_CoffFile.Vec, class_: SectionClass, allocator: Allocator) -> Vec_GroupItem.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit items: Vec_GroupItem.Vec
+    Vec_GroupItem.new(init items, allocator)?
+    let n_obj = Vec_CoffFile.len(objects)
+    var oi: usize = 0
+    loop decreases (n_obj - oi) {
+        if oi >= n_obj { break }
+        let file = Vec_CoffFile.at(objects, oi)
+        let nsec = Vec_CoffSection.len(file.sections)
+        var si: usize = 0
+        loop decreases (nsec - si) {
+            if si >= nsec { break }
+            let sec = Vec_CoffSection.at(file.sections, si)
+            if section_class_of(sec, file.string_table) == class_ {
+                let item = group_mod.GroupItem {
+                    object_index: oi,
+                    section_index: si,
+                    packed: section_packed8(sec.header.name, file.string_table),
+                }
+                Vec_GroupItem.push(mutable items, take item, allocator)?
+            }
+            si = si + 1
+        }
+        oi = oi + 1
+    }
+    return items
+}
+
+
+function place_sorted(
+    objects: Vec_CoffFile.Vec,
+    class_: SectionClass,
+    class_base: u32,
+    item_align: u32,
+    placements: mutable Vec_Placement.Vec,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    var items = collect_group_items(objects, class_, allocator)?
+    group_mod.sort_items(mutable items)
+    var rva = class_base
+    let n = Vec_GroupItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_GroupItem.at(items, i)
+        let file = Vec_CoffFile.at(objects, item.object_index)
+        let sec = Vec_CoffSection.at(file.sections, item.section_index)
+        rva = align_up(rva, item_align)
+        let placement = Placement {
+            object_index: item.object_index,
+            section_index: item.section_index,
+            class_: class_,
+            offset: rva - class_base,
+            rva: rva,
+        }
+        Vec_Placement.push(mutable placements, take placement, allocator)?
+        rva = rva + sec.header.size_of_raw_data
+        i = i + 1
+    }
+    return rva
+}
+
+
+function place_class(
+    objects: Vec_CoffFile.Vec,
+    class_: SectionClass,
+    class_base: u32,
+    item_align: u32,
+    placements: mutable Vec_Placement.Vec,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    var rva = class_base
+    let n_obj = Vec_CoffFile.len(objects)
+    var oi: usize = 0
+    loop decreases (n_obj - oi) {
+        if oi >= n_obj { break }
+        let file = Vec_CoffFile.at(objects, oi)
+        let nsec = Vec_CoffSection.len(file.sections)
+        var si: usize = 0
+        loop decreases (nsec - si) {
+            if si >= nsec { break }
+            let sec = Vec_CoffSection.at(file.sections, si)
+            if section_class_of(sec, file.string_table) == class_ {
+                rva = align_up(rva, item_align)
+                let placement = Placement {
+                    object_index: oi,
+                    section_index: si,
+                    class_: class_,
+                    offset: rva - class_base,
+                    rva: rva,
+                }
+                Vec_Placement.push(mutable placements, take placement, allocator)?
+                rva = rva + sec.header.size_of_raw_data
+            }
+            si = si + 1
+        }
+        oi = oi + 1
+    }
+    return rva
+}
+
+
+public function plan_layout(objects: Vec_CoffFile.Vec, image_base: u64, allocator: Allocator) -> LayoutPlan
+    with {allocator, err: alloc.AllocError}
+{
+    let page: u32 = 0x1000
+    let item_align: u32 = 16
+
+    uninit placements: Vec_Placement.Vec
+    Vec_Placement.new(init placements, allocator)?
+
+    let text_rva = page
+    let after_text = place_class(objects, SectionClass.text, text_rva, item_align, mutable placements, allocator)?
+    let text_size = after_text - text_rva
+
+    let rdata_rva = align_up(after_text, page)
+    let after_rdata = place_class(objects, SectionClass.rdata, rdata_rva, item_align, mutable placements, allocator)?
+    let rdata_size = after_rdata - rdata_rva
+
+    let data_rva = align_up(after_rdata, page)
+    let after_data = place_class(objects, SectionClass.data, data_rva, item_align, mutable placements, allocator)?
+    let data_size = after_data - data_rva
+
+    let tls_rva = align_up(after_data, page)
+    let after_tls = place_sorted(objects, SectionClass.tls, tls_rva, item_align, mutable placements, allocator)?
+    let tls_size = after_tls - tls_rva
+
+    let crt_rva = align_up(after_tls, page)
+    let after_crt = place_sorted(objects, SectionClass.crt, crt_rva, 8 as u32, mutable placements, allocator)?
+    let crt_size = after_crt - crt_rva
+
+    let bss_rva = align_up(after_crt, page)
+    let after_bss = place_class(objects, SectionClass.bss, bss_rva, item_align, mutable placements, allocator)?
+    let bss_size = after_bss - bss_rva
+
+    return LayoutPlan {
+        placements: placements,
+        image_base: image_base,
+        text_rva: text_rva,
+        rdata_rva: rdata_rva,
+        data_rva: data_rva,
+        tls_rva: tls_rva,
+        crt_rva: crt_rva,
+        bss_rva: bss_rva,
+        text_size: text_size,
+        rdata_size: rdata_size,
+        data_size: data_size,
+        tls_size: tls_size,
+        crt_size: crt_size,
+        bss_size: bss_size,
+    }
+}
+
+
+public function class_base_rva(plan: LayoutPlan, class_: SectionClass) -> u32 {
+    return match class_ {
+        case .text   => plan.text_rva
+        case .rdata  => plan.rdata_rva
+        case .data   => plan.data_rva
+        case .tls    => plan.tls_rva
+        case .crt    => plan.crt_rva
+        case .bss    => plan.bss_rva
+        case .other_ => 0 as u32
+    }
+}
+
+
+public function class_size(plan: LayoutPlan, class_: SectionClass) -> u32 {
+    return match class_ {
+        case .text   => plan.text_size
+        case .rdata  => plan.rdata_size
+        case .data   => plan.data_size
+        case .tls    => plan.tls_size
+        case .crt    => plan.crt_size
+        case .bss    => plan.bss_size
+        case .other_ => 0 as u32
+    }
+}
+
+
+public function class_of_rva(plan: LayoutPlan, rva: u32) -> Option_SectionClass.Option {
+    if rva >= plan.text_rva && rva - plan.text_rva < plan.text_size { return Option_SectionClass.some(value: SectionClass.text) }
+    if rva >= plan.rdata_rva && rva - plan.rdata_rva < plan.rdata_size { return Option_SectionClass.some(value: SectionClass.rdata) }
+    if rva >= plan.data_rva && rva - plan.data_rva < plan.data_size { return Option_SectionClass.some(value: SectionClass.data) }
+    if rva >= plan.tls_rva && rva - plan.tls_rva < plan.tls_size { return Option_SectionClass.some(value: SectionClass.tls) }
+    if rva >= plan.crt_rva && rva - plan.crt_rva < plan.crt_size { return Option_SectionClass.some(value: SectionClass.crt) }
+    if rva >= plan.bss_rva && rva - plan.bss_rva < plan.bss_size { return Option_SectionClass.some(value: SectionClass.bss) }
+    return Option_SectionClass.none
+}
+
+
+public function section_ordinal(plan: LayoutPlan, class_: SectionClass) -> u16 {
+    var ordinal: u16 = 0
+    if plan.text_size > (0 as u32) {
+        ordinal = ordinal + (1 as u16)
+        if class_ == SectionClass.text { return ordinal }
+    }
+    if plan.rdata_size > (0 as u32) {
+        ordinal = ordinal + (1 as u16)
+        if class_ == SectionClass.rdata { return ordinal }
+    }
+    if plan.data_size > (0 as u32) {
+        ordinal = ordinal + (1 as u16)
+        if class_ == SectionClass.data { return ordinal }
+    }
+    if plan.tls_size > (0 as u32) {
+        ordinal = ordinal + (1 as u16)
+        if class_ == SectionClass.tls { return ordinal }
+    }
+    if plan.crt_size > (0 as u32) {
+        ordinal = ordinal + (1 as u16)
+        if class_ == SectionClass.crt { return ordinal }
+    }
+    return 0 as u16
+}
+
+
+public function placement_of(plan: LayoutPlan, object_index: usize, section_index: usize) -> Option_Placement.Option {
+    let n = Vec_Placement.len(plan.placements)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_Placement.at(plan.placements, i)
+        if p.object_index == object_index && p.section_index == section_index {
+            return Option_Placement.some(value: p)
+        }
+        i = i + 1
+    }
+    return Option_Placement.none
+}
+
+
+public function section_rva(plan: LayoutPlan, object_index: usize, section_number: i16, value: u32) -> Option_u32.Option {
+    if section_number <= (0 as i16) { return Option_u32.none }
+    let section_index = (section_number as usize) - (1 as usize)
+    return match placement_of(plan, object_index, section_index) {
+        case .some(let p) => Option_u32.some(value: p.rva + value)
+        case .none        => Option_u32.none
+    }
+}

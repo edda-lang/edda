@@ -1,0 +1,397 @@
+
+module types.check.decl.types.typedecl
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.item as ast_item_mod
+import hir.item as hir_item
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.env.fields as fields_mod
+import local.check.env.lower.ty.ty as ty_lower_mod
+import local.check.decl.types.store.vnames as vnames_mod
+import local.check.decl.types.store.frefs as frefs_mod
+
+
+spec std.collections.vec.Vec(ast_tree.Ty)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+spec std.collections.vec.Vec(ast_item_mod.Variant)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+spec std.collections.vec.Vec(fields_mod.FieldNameMatrix)
+spec std.collections.vec.Vec(fields_mod.FieldRefinementList)
+
+
+public function process_type_decl(
+    sig: hir_item.HTypeSignature,
+    def_id: def_mod.DefId,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    type_defs: mutable Vec_TyId.Vec,
+    field_tys: mutable Vec_FieldTyList.Vec,
+    variant_names: mutable Vec_VariantNameList.Vec,
+    field_names: mutable Vec_FieldNameMatrix.Vec,
+    field_refinements: mutable Vec_FieldRefinementList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires ty_interner_mod.slot_count(ty_interner) < 4294967296
+{
+    let cty = match sig.kind {
+        case .product(_) => ty_kind_mod.CTy.record(def: def_id)
+        case .sum_(_) => ty_kind_mod.CTy.sum_(def: def_id)
+    }
+    let ty_id = ty_interner_mod.intern(mutable ty_interner, take cty, allocator)?
+    write_type_at_def_id(mutable type_defs, def_id, ty_id, allocator)?
+
+    let name_bytes = interner_mod.lookup(interner, sig.name)
+    let name_str = string.from_owned_utf8(take name_bytes)
+    ty_interner_mod.set_type_name(mutable ty_interner, ty_id, take name_str)
+
+    let list = build_field_ty_list(sig.kind, sig.synthesize_box_ptr, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+    write_field_tys_at_def_id(mutable field_tys, def_id, take list, allocator)?
+
+    let vnames = build_variant_name_list(sig.kind, allocator)?
+    vnames_mod.write_variant_names_at_def_id(mutable variant_names, def_id, take vnames, allocator)?
+
+    let fnames = build_field_name_matrix(sig.kind, sig.synthesize_box_ptr, allocator)?
+    write_field_names_at_def_id(mutable field_names, def_id, take fnames, allocator)?
+
+    let frefs = frefs_mod.build_field_refinement_list(sig.kind, sig.synthesize_box_ptr, allocator)?
+    frefs_mod.write_field_refinements_at_def_id(mutable field_refinements, def_id, take frefs, allocator)?
+}
+
+function build_field_name_matrix(
+    kind: hir_item.HTypeDeclKind,
+    synthesize_box_ptr: bool,
+    allocator: Allocator,
+) -> fields_mod.FieldNameMatrix
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit rows: Vec_VariantNameList.Vec
+    Vec_VariantNameList.new(init rows, allocator)?
+    match kind {
+        case .product(let fields) => {
+            uninit names: Vec_Symbol.Vec
+            Vec_Symbol.new(init names, allocator)?
+            if synthesize_box_ptr {
+                Vec_Symbol.push(mutable names, symbol_mod.empty(), allocator)?
+            }
+            let n = Vec_TypeField.len(fields)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                Vec_Symbol.push(mutable names, Vec_TypeField.at(fields, i).name.name, allocator)?
+                i = i + 1
+            }
+            let row = fields_mod.VariantNameList { names: names }
+            Vec_VariantNameList.push(mutable rows, take row, allocator)?
+        }
+        case .sum_(let variants) => {
+            let n = Vec_Variant.len(variants)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let variant = Vec_Variant.at(variants, i)
+                let row = variant_payload_field_names(variant.payload, allocator)?
+                Vec_VariantNameList.push(mutable rows, take row, allocator)?
+                i = i + 1
+            }
+        }
+    }
+    return fields_mod.FieldNameMatrix { rows: rows }
+}
+
+function field_names_of(
+    fields: Vec_TypeField.Vec,
+    allocator: Allocator,
+) -> fields_mod.VariantNameList
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit names: Vec_Symbol.Vec
+    Vec_Symbol.new(init names, allocator)?
+    let n = Vec_TypeField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable names, Vec_TypeField.at(fields, i).name.name, allocator)?
+        i = i + 1
+    }
+    return fields_mod.VariantNameList { names: names }
+}
+
+function variant_payload_field_names(
+    payload: ast_item_mod.VariantPayload,
+    allocator: Allocator,
+) -> fields_mod.VariantNameList
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match payload {
+        case .struct_(let fields) => field_names_of(fields, allocator)?
+        case .tuple(_) => vnames_mod.sentinel_variant_name_list(allocator)?
+        case .unit => vnames_mod.sentinel_variant_name_list(allocator)?
+    }
+}
+
+function write_field_names_at_def_id(
+    field_names: mutable Vec_FieldNameMatrix.Vec,
+    def_id: def_mod.DefId,
+    matrix: take fields_mod.FieldNameMatrix,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target = def_mod.index(def_id)
+    pad_field_names_with_sentinels(mutable field_names, target, allocator)?
+    let current = Vec_FieldNameMatrix.len(field_names)
+    if current == target {
+        Vec_FieldNameMatrix.push(mutable field_names, take matrix, allocator)?
+    } else {
+        Vec_FieldNameMatrix.set_at(mutable field_names, target, take matrix)
+    }
+}
+
+function pad_field_names_with_sentinels(
+    field_names: mutable Vec_FieldNameMatrix.Vec,
+    target: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        let len = Vec_FieldNameMatrix.len(field_names)
+        if len >= target { break }
+        let sentinel = sentinel_field_name_matrix(allocator)?
+        Vec_FieldNameMatrix.push(mutable field_names, take sentinel, allocator)?
+    }
+}
+
+function sentinel_field_name_matrix(allocator: Allocator) -> fields_mod.FieldNameMatrix
+    with {allocator, err: alloc.AllocError}
+{
+    uninit empty_rows: Vec_VariantNameList.Vec
+    Vec_VariantNameList.new(init empty_rows, allocator)?
+    return fields_mod.FieldNameMatrix { rows: empty_rows }
+}
+
+function build_variant_name_list(
+    kind: hir_item.HTypeDeclKind,
+    allocator: Allocator,
+) -> fields_mod.VariantNameList
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit names: Vec_Symbol.Vec
+    Vec_Symbol.new(init names, allocator)?
+    match kind {
+        case .product(_) => ()
+        case .sum_(let variants) => {
+            let n = Vec_Variant.len(variants)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let variant = Vec_Variant.at(variants, i)
+                Vec_Symbol.push(mutable names, variant.name.name, allocator)?
+                i = i + 1
+            }
+        }
+    }
+    return fields_mod.VariantNameList { names: names }
+}
+
+
+public function write_type_at_def_id(
+    type_defs: mutable Vec_TyId.Vec,
+    def_id: def_mod.DefId,
+    ty_id: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target = def_mod.index(def_id)
+    pad_type_defs_with_sentinels(mutable type_defs, target, allocator)?
+    let current = Vec_TyId.len(type_defs)
+    if current == target {
+        Vec_TyId.push(mutable type_defs, ty_id, allocator)?
+    } else {
+        Vec_TyId.set_at(mutable type_defs, target, ty_id)
+    }
+}
+
+function pad_type_defs_with_sentinels(
+    type_defs: mutable Vec_TyId.Vec,
+    target: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        let len = Vec_TyId.len(type_defs)
+        if len >= target { break }
+        Vec_TyId.push(mutable type_defs, ty_mod.error(), allocator)?
+    }
+}
+
+
+function build_field_ty_list(
+    kind: hir_item.HTypeDeclKind,
+    synthesize_box_ptr: bool,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> fields_mod.FieldTyList
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit tys: Vec_TyId.Vec
+    Vec_TyId.new(init tys, allocator)?
+    if synthesize_box_ptr {
+        Vec_TyId.push(mutable tys, builtins.heap_ptr, allocator)?
+    }
+    let empty_gs = ty_lower_mod.empty_generic_scope(allocator)?
+    match kind {
+        case .product(let fields) => {
+            let n = Vec_TypeField.len(fields)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let field = Vec_TypeField.at(fields, i)
+                let fty = ty_lower_mod.lower_ast_ty(field.ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+                Vec_TyId.push(mutable tys, fty, allocator)?
+                i = i + 1
+            }
+        }
+        case .sum_(let variants) => {
+            let n = Vec_Variant.len(variants)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let variant = Vec_Variant.at(variants, i)
+                let pty = lower_variant_payload(variant.payload, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+                Vec_TyId.push(mutable tys, pty, allocator)?
+                i = i + 1
+            }
+        }
+    }
+    return fields_mod.FieldTyList { tys: tys }
+}
+
+function lower_variant_payload(
+    payload: ast_item_mod.VariantPayload,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match payload {
+        case .unit => builtins.unit_
+        case .tuple(let elements) => lower_payload_tuple(elements, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+        case .struct_(let fields) => lower_payload_struct(fields, builtins, interner, mutable ty_interner, mutable effect_interner, allocator)?
+    }
+}
+
+function lower_payload_tuple(
+    elements: Vec_Ty.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let empty_gs = ty_lower_mod.empty_generic_scope(allocator)?
+    uninit elems: Vec_TyId.Vec
+    Vec_TyId.new(init elems, allocator)?
+    let n = Vec_Ty.len(elements)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_Ty.at(elements, i)
+        let ety = ty_lower_mod.lower_ast_ty(e, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        Vec_TyId.push(mutable elems, ety, allocator)?
+        i = i + 1
+    }
+    return ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.tuple_(elems: elems), allocator)?
+}
+
+function lower_payload_struct(
+    fields: Vec_TypeField.Vec,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let empty_gs = ty_lower_mod.empty_generic_scope(allocator)?
+    uninit elems: Vec_TyId.Vec
+    Vec_TyId.new(init elems, allocator)?
+    let n = Vec_TypeField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let field = Vec_TypeField.at(fields, i)
+        let fty = ty_lower_mod.lower_ast_ty(field.ty, builtins, interner, empty_gs, mutable ty_interner, mutable effect_interner, allocator)?
+        Vec_TyId.push(mutable elems, fty, allocator)?
+        i = i + 1
+    }
+    return ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.tuple_(elems: elems), allocator)?
+}
+
+function write_field_tys_at_def_id(
+    field_tys: mutable Vec_FieldTyList.Vec,
+    def_id: def_mod.DefId,
+    list: take fields_mod.FieldTyList,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target = def_mod.index(def_id)
+    pad_field_tys_with_sentinels(mutable field_tys, target, allocator)?
+    let current = Vec_FieldTyList.len(field_tys)
+    if current == target {
+        Vec_FieldTyList.push(mutable field_tys, take list, allocator)?
+    } else {
+        Vec_FieldTyList.set_at(mutable field_tys, target, take list)
+    }
+}
+
+function pad_field_tys_with_sentinels(
+    field_tys: mutable Vec_FieldTyList.Vec,
+    target: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        let len = Vec_FieldTyList.len(field_tys)
+        if len >= target { break }
+        let sentinel = sentinel_field_ty_list(allocator)?
+        Vec_FieldTyList.push(mutable field_tys, take sentinel, allocator)?
+    }
+}
+
+function sentinel_field_ty_list(allocator: Allocator) -> fields_mod.FieldTyList
+    with {allocator, err: alloc.AllocError}
+{
+    uninit empty_tys: Vec_TyId.Vec
+    Vec_TyId.new(init empty_tys, allocator)?
+    return fields_mod.FieldTyList { tys: empty_tys }
+}

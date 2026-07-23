@@ -1,0 +1,694 @@
+module compile.instantiate.unroll.drive.drive
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import hir.tree as hir_tree
+import hir.def as def_mod
+import hir.item as hir_item
+import hir.build.file as hir_file_mod
+import types.check as check_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import target.triple as triple_mod
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ops as ast_ops
+import cteval.eval.ops.expr as cteval_expr_mod
+import cteval.eval.ctx as cteval_ctx_mod
+import cteval.state.env as cteval_env_mod
+import cteval.builtin.target.reg.registry as registry_mod
+import hir.node as node_mod
+import local.instantiate.unroll.clone.clone as clone_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(check_mod.TypeOutput)
+spec std.collections.vec.Vec(clone_mod.DefPair)
+spec std.collections.vec.Vec(bool)
+
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(ast_tree.Ty)
+spec std.core.option.Option(i64)
+spec std.core.option.Option(bool)
+spec std.core.option.Option(CountRange)
+spec std.core.option.Option(registry_mod.BuiltinTag)
+spec std.core.option.Option(Vec_HirFile)
+
+
+public type UnrollOutcome {
+    files: Vec_HirFile.Vec
+    file_changed: Vec_bool.Vec
+}
+
+type UnrollCtx {
+    type_out: check_mod.TypeOutput
+    ty_interner: ty_interner_mod.Interner
+    effect_interner: effect_interner_mod.Interner
+    builtin_registry: registry_mod.BuiltinRegistry
+    triple: triple_mod.TargetTriple
+    elide_only: bool
+}
+
+public type CountRange {
+    lo: u128
+    hi_excl: u128
+}
+
+
+public function unroll_files(
+    files: Vec_HirFile.Vec,
+    types: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> UnrollOutcome
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return run_files(files, types, ty_interner, effect_interner, builtin_registry, triple, mutable interner, false, allocator)?
+}
+
+
+public function elide_comptime_if_files(
+    files: Vec_HirFile.Vec,
+    types: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> UnrollOutcome
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return run_files(files, types, ty_interner, effect_interner, builtin_registry, triple, mutable interner, true, allocator)?
+}
+
+
+function run_files(
+    files: Vec_HirFile.Vec,
+    types: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    interner: mutable interner_mod.Interner,
+    elide_only: bool,
+    allocator: Allocator,
+) -> UnrollOutcome
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(files)
+    uninit out_files: Vec_HirFile.Vec
+    Vec_HirFile.with_capacity(init out_files, n, allocator)?
+    uninit file_changed: Vec_bool.Vec
+    Vec_bool.with_capacity(init file_changed, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i >= Vec_TypeOutput.len(types) {
+            Vec_HirFile.push(mutable out_files, Vec_HirFile.at(files, i), allocator)?
+            Vec_bool.push(mutable file_changed, false, allocator)?
+            i = i + 1
+            continue
+        }
+        var f = Vec_HirFile.at(files, i)
+        let uctx = UnrollCtx {
+            type_out: Vec_TypeOutput.at(types, i),
+            ty_interner: ty_interner,
+            effect_interner: effect_interner,
+            builtin_registry: builtin_registry,
+            triple: triple,
+            elide_only: elide_only,
+        }
+        let this_changed = unroll_file(mutable f, uctx, mutable interner, allocator)?
+        Vec_bool.push(mutable file_changed, this_changed, allocator)?
+        Vec_HirFile.push(mutable out_files, take f, allocator)?
+        i = i + 1
+    }
+    return UnrollOutcome { files: out_files, file_changed: file_changed }
+}
+
+
+function unroll_file(
+    file: mutable hir_file_mod.HirFile,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let items = file.items
+    var changed = false
+    let n = Vec_HItem.len(items)
+    uninit new_items: Vec_HItem.Vec
+    Vec_HItem.with_capacity(init new_items, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        if !item.has_comptime {
+            Vec_HItem.push(mutable new_items, item, allocator)?
+            i = i + 1
+            continue
+        }
+        let new_kind = match item.kind {
+            case .function_(let sig, let body) => {
+                let rb = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+                if rb.1 { changed = true }
+                hir_item.HItemKind.function_(sig: sig, body: rb.0)
+            }
+            case _ => item.kind
+        }
+        Vec_HItem.push(
+            mutable new_items,
+            take hir_item.HItem { node_id: item.node_id, def_id: item.def_id, ast_item: item.ast_item, kind: new_kind, has_comptime: item.has_comptime },
+            allocator,
+        )?
+        i = i + 1
+    }
+    file.items = new_items
+    return changed
+}
+
+
+function rewrite_block(
+    file: mutable hir_file_mod.HirFile,
+    block: hir_tree.HBlock,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> (hir_tree.HBlock, bool)
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    if !block_has_ct(block) {
+        return (block, false)
+    }
+    var changed = false
+    let n = Vec_HStmt.len(block.stmts)
+    uninit new_stmts: Vec_HStmt.Vec
+    Vec_HStmt.with_capacity(init new_stmts, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let stmt = Vec_HStmt.at(block.stmts, i)
+        let new_kind = match stmt.kind {
+            case .let_(let binding, let pat, let bindings, let ty, let init_) => {
+                let r = rewrite_expr(mutable file, init_, uctx, mutable interner, allocator)?
+                if r.1 { changed = true }
+                hir_tree.HStmtKind.let_(binding: binding, pat: pat, bindings: bindings, ty: ty, init_: r.0)
+            }
+            case .uninit_(let pat, let bindings, let ty) =>
+                hir_tree.HStmtKind.uninit_(pat: pat, bindings: bindings, ty: ty)
+            case .assign(let target, let op, let rhs) => {
+                let rt = rewrite_expr(mutable file, target, uctx, mutable interner, allocator)?
+                let rr = rewrite_expr(mutable file, rhs, uctx, mutable interner, allocator)?
+                if rt.1 { changed = true }
+                if rr.1 { changed = true }
+                hir_tree.HStmtKind.assign(target: rt.0, op: op, rhs: rr.0)
+            }
+        }
+        Vec_HStmt.push(mutable new_stmts, take hir_tree.HStmt { node_id: stmt.node_id, kind: new_kind }, allocator)?
+        i = i + 1
+    }
+    let rtrail = rewrite_opt_box(mutable file, block.trailing, uctx, mutable interner, allocator)?
+    if rtrail.1 { changed = true }
+    return (hir_tree.HBlock { node_id: block.node_id, stmts: new_stmts, trailing: rtrail.0 }, changed)
+}
+
+
+function rewrite_expr(
+    file: mutable hir_file_mod.HirFile,
+    e: hir_tree.HExpr,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> (hir_tree.HExpr, bool)
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    if !expr_has_ct(e) {
+        return (e, false)
+    }
+    return match e.kind {
+        case .comptime_for(let binding, let lo, let hi, let inclusive, let body) => {
+            if uctx.elide_only {
+                let r = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+                (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.comptime_for(binding: binding, lo: lo, hi: hi, inclusive: inclusive, body: r.0) }, r.1)
+            } else {
+                match compute_range(file, Box_HExpr.get(lo), Box_HExpr.get(hi), inclusive, uctx, mutable interner, allocator)? {
+                    case .some(let cr) => {
+                        let blk = build_unrolled(mutable file, binding, body, cr, allocator)?
+                        (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.block_(body: blk) }, true)
+                    }
+                    case .none => (e, false)
+                }
+            }
+        }
+        case .comptime_(let inner_box) => {
+            let inner = Box_HExpr.get(inner_box)
+            match inner.kind {
+                case .if_(let cond, let then_block, let else_block) =>
+                    match eval_bool(file, Box_HExpr.get(cond), uctx, mutable interner, allocator)? {
+                        case .some(let taken) => {
+                            let chosen = if taken {
+                                then_block
+                            } else {
+                                match else_block {
+                                    case .some(let eb) => eb
+                                    case .none => empty_block(mutable file, then_block.node_id, allocator)?
+                                }
+                            }
+                            let r = rewrite_block(mutable file, chosen, uctx, mutable interner, allocator)?
+                            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.block_(body: r.0) }, true)
+                        }
+                        case .none => (e, false)
+                    }
+                case _ => (e, false)
+            }
+        }
+        case .block_(let body) => {
+            let r = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.block_(body: r.0) }, r.1)
+        }
+        case .if_(let cond, let then_block, let else_block) => {
+            let rt = rewrite_block(mutable file, then_block, uctx, mutable interner, allocator)?
+            let re = rewrite_opt_block(mutable file, else_block, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.if_(cond: cond, then_block: rt.0, else_block: re.0) }, rt.1 || re.1)
+        }
+        case .loop_(let body, let label, let dec) => {
+            let r = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.loop_(body: r.0, label: label, decreases_: dec) }, r.1)
+        }
+        case .scope_(let skind, let name, let body) => {
+            let r = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.scope_(kind: skind, name: name, body: r.0) }, r.1)
+        }
+        case .comptime_block(let body) => {
+            let r = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.comptime_block(body: r.0) }, r.1)
+        }
+        case .handle_(let caught_ty, let binder, let recovery, let body) => {
+            let r = rewrite_block(mutable file, body, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.handle_(caught_ty: caught_ty, binder: binder, recovery: recovery, body: r.0) }, r.1)
+        }
+        case .match_(let scrut, let arms) => {
+            let ra = rewrite_arms(mutable file, arms, uctx, mutable interner, allocator)?
+            (hir_tree.HExpr { node_id: e.node_id, kind: hir_tree.HExprKind.match_(scrutinee: scrut, arms: ra.0) }, ra.1)
+        }
+        case _ => (e, false)
+    }
+}
+
+
+function rewrite_arms(
+    file: mutable hir_file_mod.HirFile,
+    arms: Vec_HArm.Vec,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> (Vec_HArm.Vec, bool)
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    var changed = false
+    let n = Vec_HArm.len(arms)
+    uninit out: Vec_HArm.Vec
+    Vec_HArm.with_capacity(init out, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        let r = rewrite_expr(mutable file, arm.body, uctx, mutable interner, allocator)?
+        if r.1 { changed = true }
+        Vec_HArm.push(mutable out, take hir_tree.HArm { node_id: arm.node_id, pat: arm.pat, bindings: arm.bindings, guard: arm.guard, body: r.0 }, allocator)?
+        i = i + 1
+    }
+    return (out, changed)
+}
+
+
+function rewrite_opt_box(
+    file: mutable hir_file_mod.HirFile,
+    opt: Option_Box_HExpr.Option,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> (Option_Box_HExpr.Option, bool)
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match opt {
+        case .some(let b) => {
+            let inner = Box_HExpr.get(b)
+            let r = rewrite_expr(mutable file, inner, uctx, mutable interner, allocator)?
+            (Option_Box_HExpr.some(value: Box_HExpr.new(take r.0, allocator)?), r.1)
+        }
+        case .none => (Option_Box_HExpr.none, false)
+    }
+}
+
+
+function rewrite_opt_block(
+    file: mutable hir_file_mod.HirFile,
+    opt: Option_HBlock.Option,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> (Option_HBlock.Option, bool)
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match opt {
+        case .some(let b) => {
+            let r = rewrite_block(mutable file, b, uctx, mutable interner, allocator)?
+            (Option_HBlock.some(value: r.0), r.1)
+        }
+        case .none => (Option_HBlock.none, false)
+    }
+}
+
+
+function build_unrolled(
+    file: mutable hir_file_mod.HirFile,
+    binding: def_mod.DefId,
+    body: hir_tree.HBlock,
+    cr: CountRange,
+    allocator: Allocator,
+) -> hir_tree.HBlock
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init stmts, allocator)?
+    var k: u128 = cr.lo
+    loop decreases ((cr.hi_excl -% k) as usize wrapping) {
+        if k >= cr.hi_excl { break }
+        uninit remap: Vec_DefPair.Vec
+        Vec_DefPair.new(init remap, allocator)?
+        let cb = clone_mod.clone_block(mutable file, body, binding, k, mutable remap, allocator)?
+        let sp = hir_file_mod.span_of(file, body.node_id)
+        let bnode = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+        let bexpr = hir_tree.HExpr { node_id: bnode, kind: hir_tree.HExprKind.block_(body: cb) }
+        let st = discard_stmt(mutable file, bexpr, allocator)?
+        Vec_HStmt.push(mutable stmts, take st, allocator)?
+        k = k +% (1 as u128)
+    }
+    let sp2 = hir_file_mod.span_of(file, body.node_id)
+    let wn = hir_file_mod.alloc_node(mutable file, sp2, hir_file_mod.NodeKind.block, allocator)?
+    return hir_tree.HBlock { node_id: wn, stmts: stmts, trailing: Option_Box_HExpr.none }
+}
+
+
+function discard_stmt(
+    file: mutable hir_file_mod.HirFile,
+    e: hir_tree.HExpr,
+    allocator: Allocator,
+) -> hir_tree.HStmt
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_node_id < 4294967295
+{
+    uninit binds: Vec_HBinding.Vec
+    Vec_HBinding.new(init binds, allocator)?
+    let sp = hir_file_mod.span_of(file, e.node_id)
+    let pat = ast_tree.Pat { span: sp, kind: ast_tree.PatKind.wildcard }
+    let nid = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    return hir_tree.HStmt {
+        node_id: nid,
+        kind: hir_tree.HStmtKind.let_(binding: ast_ops.BindingMode.immutable, pat: pat, bindings: binds, ty: Option_Ty.none, init_: e),
+    }
+}
+
+
+function compute_range(
+    file: hir_file_mod.HirFile,
+    lo_expr: hir_tree.HExpr,
+    hi_expr: hir_tree.HExpr,
+    inclusive: bool,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_CountRange.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let lo_opt = eval_bound(file, lo_expr, uctx, mutable interner, allocator)?
+    let hi_opt = eval_bound(file, hi_expr, uctx, mutable interner, allocator)?
+    return match lo_opt {
+        case .some(let lo_v) => match hi_opt {
+            case .some(let hi_v) => {
+                if lo_v < 0 || hi_v < 0 { return Option_CountRange.none }
+                let lo_u = lo_v as u128 wrapping
+                let hi_base = hi_v as u128 wrapping
+                let hi_u = if inclusive { hi_base +% (1 as u128) } else { hi_base }
+                if hi_u < lo_u { return Option_CountRange.none }
+                Option_CountRange.some(value: CountRange { lo: lo_u, hi_excl: hi_u })
+            }
+            case .none => Option_CountRange.none
+        }
+        case .none => Option_CountRange.none
+    }
+}
+
+
+function eval_bound(
+    file: hir_file_mod.HirFile,
+    expr: hir_tree.HExpr,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_i64.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match expr.kind {
+        case .literal(let lit) => match lit {
+            case .int(let v, _) => return Option_i64.some(value: v as i64 wrapping)
+            case _ => ()
+        }
+        case .call(let callee, let args) => {
+            match registry_mod.classify(uctx.builtin_registry, callee) {
+                case .some(let tag) => match tag {
+                    case .field_count => {
+                        if Vec_HArg.len(args) == (1 as usize) {
+                            let fc = field_count_via_types(file, Vec_HArg.at(args, 0 as usize).expr, uctx, mutable interner, allocator)?
+                            match fc {
+                                case .some(let c) => return Option_i64.some(value: c)
+                                case .none => ()
+                            }
+                        }
+                    }
+                    case _ => ()
+                }
+                case .none => ()
+            }
+        }
+        case _ => ()
+    }
+    return eval_via_cteval(file, expr, uctx, mutable interner, allocator)?
+}
+
+
+function field_count_via_types(
+    file: hir_file_mod.HirFile,
+    arg_expr: hir_tree.HExpr,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_i64.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit env: cteval_env_mod.ComptimeEnv
+    cteval_env_mod.new_env(init env, allocator)?
+    let ctx = cteval_ctx_mod.EvalCtx {
+        file: file,
+        type_output: uctx.type_out,
+        ty_interner: uctx.ty_interner,
+        effect_interner: uctx.effect_interner,
+        builtin_registry: uctx.builtin_registry,
+        triple: uctx.triple,
+        program_files: Option_Vec_HirFile.none,
+    }
+    let at = hir_file_mod.span_of(file, arg_expr.node_id)
+    let r = cteval_expr_mod.evaluate_expr(arg_expr, mutable env, ctx, mutable interner, allocator, at)?
+    let t = match r {
+        case .ok(let v) => match v {
+            case .type_meta(let tt) => tt
+            case _ => return Option_i64.none
+        }
+        case .failed(_) => return Option_i64.none
+    }
+    let def = match ty_interner_mod.lookup(uctx.ty_interner, t) {
+        case .record(let d) => d
+        case .spec_instance(let d, _) => d
+        case _ => return Option_i64.none
+    }
+    let cnt = check_mod.field_ty_count(uctx.type_out, def)
+    return Option_i64.some(value: cnt as i64 wrapping)
+}
+
+
+function eval_bool(
+    file: hir_file_mod.HirFile,
+    expr: hir_tree.HExpr,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_bool.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit env: cteval_env_mod.ComptimeEnv
+    cteval_env_mod.new_env(init env, allocator)?
+    let ctx = cteval_ctx_mod.EvalCtx {
+        file: file,
+        type_output: uctx.type_out,
+        ty_interner: uctx.ty_interner,
+        effect_interner: uctx.effect_interner,
+        builtin_registry: uctx.builtin_registry,
+        triple: uctx.triple,
+        program_files: Option_Vec_HirFile.none,
+    }
+    let at = hir_file_mod.span_of(file, expr.node_id)
+    let r = cteval_expr_mod.evaluate_expr(expr, mutable env, ctx, mutable interner, allocator, at)?
+    return match r {
+        case .ok(let v) => match v {
+            case .bool_(let b) => Option_bool.some(value: b)
+            case _ => Option_bool.none
+        }
+        case .failed(_) => Option_bool.none
+    }
+}
+
+
+function empty_block(
+    file: mutable hir_file_mod.HirFile,
+    ref_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> hir_tree.HBlock
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_node_id < 4294967295
+{
+    uninit stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init stmts, allocator)?
+    let sp = hir_file_mod.span_of(file, ref_node)
+    let wn = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    return hir_tree.HBlock { node_id: wn, stmts: stmts, trailing: Option_Box_HExpr.none }
+}
+
+
+function eval_via_cteval(
+    file: hir_file_mod.HirFile,
+    expr: hir_tree.HExpr,
+    uctx: UnrollCtx,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_i64.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit env: cteval_env_mod.ComptimeEnv
+    cteval_env_mod.new_env(init env, allocator)?
+    let ctx = cteval_ctx_mod.EvalCtx {
+        file: file,
+        type_output: uctx.type_out,
+        ty_interner: uctx.ty_interner,
+        effect_interner: uctx.effect_interner,
+        builtin_registry: uctx.builtin_registry,
+        triple: uctx.triple,
+        program_files: Option_Vec_HirFile.none,
+    }
+    let at = hir_file_mod.span_of(file, expr.node_id)
+    let r = cteval_expr_mod.evaluate_expr(expr, mutable env, ctx, mutable interner, allocator, at)?
+    return match r {
+        case .ok(let v) => match v {
+            case .int_signed(let s_v, _) => Option_i64.some(value: s_v)
+            case .int_unsigned(let u_v, _) => Option_i64.some(value: u_v as i64 wrapping)
+            case _ => Option_i64.none
+        }
+        case .failed(_) => Option_i64.none
+    }
+}
+
+
+function expr_has_ct(e: hir_tree.HExpr) -> bool
+    with {divergence}
+{
+    return match e.kind {
+        case .comptime_(_) => true
+        case .comptime_block(_) => true
+        case .comptime_for(_, _, _, _, _) => true
+        case .block_(let body) => block_has_ct(body)
+        case .if_(_, let then_block, let else_block) =>
+            block_has_ct(then_block) || opt_block_has_ct(else_block)
+        case .loop_(let body, _, _) => block_has_ct(body)
+        case .scope_(_, _, let body) => block_has_ct(body)
+        case .handle_(_, _, _, let body) => block_has_ct(body)
+        case .match_(_, let arms) => arms_has_ct(arms)
+        case _ => false
+    }
+}
+
+
+function block_has_ct(block: hir_tree.HBlock) -> bool
+    with {divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if stmt_has_ct(Vec_HStmt.at(block.stmts, i)) { return true }
+        i = i + 1
+    }
+    return opt_box_has_ct(block.trailing)
+}
+
+
+function stmt_has_ct(stmt: hir_tree.HStmt) -> bool
+    with {divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, _, _, let init_) => expr_has_ct(init_)
+        case .uninit_(_, _, _) => false
+        case .assign(let target, _, let rhs) => expr_has_ct(target) || expr_has_ct(rhs)
+    }
+}
+
+
+function arms_has_ct(arms: Vec_HArm.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if expr_has_ct(Vec_HArm.at(arms, i).body) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function opt_box_has_ct(opt: Option_Box_HExpr.Option) -> bool
+    with {divergence}
+{
+    return match opt {
+        case .some(let b) => expr_has_ct(Box_HExpr.get(b))
+        case .none => false
+    }
+}
+
+
+function opt_block_has_ct(opt: Option_HBlock.Option) -> bool
+    with {divergence}
+{
+    return match opt {
+        case .some(let b) => block_has_ct(b)
+        case .none => false
+    }
+}

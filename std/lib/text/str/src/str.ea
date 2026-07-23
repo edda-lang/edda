@@ -1,0 +1,131 @@
+
+module std.text.str
+
+import std.text.atoi
+import std.collections.slice
+import std.os.raw
+import std.os.pages
+import local.atof
+
+public type ParseFloatError {
+    case invalid_input
+    case overflow
+}
+
+public type ParseIntError {
+    case invalid_input
+    case overflow
+    case underflow
+}
+
+public type ParseBoolError {
+    case invalid_input
+}
+
+@abi("__edda_parse_f64")
+public function parse_f64(bytes: [u8]) -> f64
+    with {err: str.ParseFloatError}
+{
+    let pg: u64 = handle err: pages.PageError as _e -> (raise ParseFloatError.invalid_input) {
+        pages.map(4096)?
+    }
+    var scratch: [u8] = raw.slice_from_raw(pg, 800)
+    let value: f64 = handle err: atof.AtofError as _e -> {
+        let _ = handle err: pages.PageError as _pe -> () { pages.unmap(pg, 4096)? }
+        raise ParseFloatError.invalid_input
+    } { atof.parse_with_scratch(bytes, mutable scratch)? }
+    let _ = handle err: pages.PageError as _pe -> () { pages.unmap(pg, 4096)? }
+    return value
+}
+
+public function parse_f32(bytes: [u8]) -> f32
+    with {err: str.ParseFloatError}
+{
+    let pg: u64 = handle err: pages.PageError as _e -> (raise ParseFloatError.invalid_input) {
+        pages.map(4096)?
+    }
+    var scratch: [u8] = raw.slice_from_raw(pg, 800)
+    let value: f32 = handle err: atof.AtofError as _e -> {
+        let _ = handle err: pages.PageError as _pe -> () { pages.unmap(pg, 4096)? }
+        raise ParseFloatError.invalid_input
+    } { atof.parse_with_scratch_f32(bytes, mutable scratch)? }
+    let _ = handle err: pages.PageError as _pe -> () { pages.unmap(pg, 4096)? }
+    return value
+}
+
+@abi("__edda_parse_i64")
+public function parse_i64(bytes: [u8]) -> i64
+    with {err: str.ParseIntError}
+{
+    let n: usize = bytes.len()
+    if n == 0 { raise ParseIntError.invalid_input }
+    var negative: bool = false
+    var start: usize = 0
+    if bytes[0] == 43 {
+        start = 1
+    } else if bytes[0] == 45 {
+        negative = true
+        start = 1
+    }
+    let parsed = handle err: atoi.ParseError as e -> match e {
+        case .overflow => if negative {
+            raise ParseIntError.underflow
+        } else {
+            raise ParseIntError.overflow
+        }
+        case _ => raise ParseIntError.invalid_input
+    } { atoi.parse_u64_decimal(bytes, start)? }
+    if parsed.end != n { raise ParseIntError.invalid_input }
+    let magnitude: u64 = parsed.value
+    if negative {
+        if magnitude > 9223372036854775808 { raise ParseIntError.underflow }
+        return 0 -% (magnitude as i64 wrapping)
+    }
+    if magnitude > 9223372036854775807 { raise ParseIntError.overflow }
+    return magnitude as i64
+}
+
+@abi("__edda_parse_u64")
+public function parse_u64(bytes: [u8]) -> u64
+    with {err: str.ParseIntError}
+{
+    let n: usize = bytes.len()
+    if n == 0 { raise ParseIntError.invalid_input }
+    var start: usize = 0
+    if bytes[0] == 43 { start = 1 }
+    if bytes[0] == 45 { raise ParseIntError.invalid_input }
+    let parsed = handle err: atoi.ParseError as e -> match e {
+        case .overflow => raise ParseIntError.overflow
+        case _ => raise ParseIntError.invalid_input
+    } { atoi.parse_u64_decimal(bytes, start)? }
+    if parsed.end != n { raise ParseIntError.invalid_input }
+    return parsed.value
+}
+
+public function parse_i32(bytes: [u8]) -> i32
+    with {err: str.ParseIntError}
+{
+    let value: i64 = parse_i64(bytes)?
+    if value > 2147483647 { raise ParseIntError.overflow }
+    if value < -2147483648 { raise ParseIntError.underflow }
+    return value as i32
+}
+
+public function parse_u32(bytes: [u8]) -> u32
+    with {err: str.ParseIntError}
+{
+    let value: u64 = parse_u64(bytes)?
+    if value > 4294967295 { raise ParseIntError.overflow }
+    return value as u32
+}
+
+@abi("__edda_parse_bool")
+public function parse_bool(bytes: [u8]) -> bool
+    with {err: str.ParseBoolError}
+{
+    let true_text: String = "true"
+    if slice.eq_u8(bytes, true_text.bytes()) { return true }
+    let false_text: String = "false"
+    if slice.eq_u8(bytes, false_text.bytes()) { return false }
+    raise ParseBoolError.invalid_input
+}

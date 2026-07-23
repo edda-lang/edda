@@ -1,0 +1,219 @@
+
+module std.mem.suballoc
+
+import std.os.raw
+import std.mem.bits
+
+public type HeapError {
+    case exhausted
+    case corrupt
+}
+
+
+public stable function region_header_bytes() -> usize {
+    return 672
+}
+
+public stable function block_header_bytes() -> usize {
+    return 8
+}
+
+public stable function min_region_bytes() -> usize {
+    return 1024
+}
+
+public stable function max_alloc_bytes() -> usize {
+    return 0x1000000000000
+}
+
+function no_fail_sentinel() -> u64 {
+    return 0x2000000000000
+}
+
+function bin_count() -> u64 {
+    return 80
+}
+
+
+function walk_fuel(base: u64) -> u64 {
+    let region_end: u64 = raw.load_u64(base +% 8)
+    return ((region_end -% base) / 16) +% 1
+}
+
+function bin_index(span: u64) -> u64 {
+    if span < 512 { return (span -% 32) / 8 }
+    let k: u64 = 63 -% (bits.leading_zeros_u64(span) as u64)
+    let idx: u64 = 60 +% (k -% 9)
+    if idx >= bin_count() { return bin_count() -% 1 }
+    return idx
+}
+
+function bin_slot(base: u64, idx: u64) -> u64 {
+    return base +% 16 +% (idx *% 8)
+}
+
+function insert_free(base: u64, block: u64, span: u64) -> () {
+    raw.store_u64(block, span)
+    raw.store_u64(block +% span -% 8, span)
+    let slot: u64 = bin_slot(base, bin_index(span))
+    let head: u64 = raw.load_u64(slot)
+    raw.store_u64(block +% 8, head)
+    raw.store_u64(block +% 16, 0)
+    if head != 0 { raw.store_u64(head +% 16, block) }
+    raw.store_u64(slot, block)
+}
+
+function unlink_free(base: u64, block: u64) -> () {
+    let span: u64 = raw.load_u64(block)
+    let fd: u64 = raw.load_u64(block +% 8)
+    let bk: u64 = raw.load_u64(block +% 16)
+    if bk == 0 {
+        raw.store_u64(bin_slot(base, bin_index(span)), fd)
+    } else {
+        raw.store_u64(bk +% 8, fd)
+    }
+    if fd != 0 { raw.store_u64(fd +% 16, bk) }
+}
+
+function take_block(base: u64, node: u64, span: u64) -> u64 {
+    let nspan: u64 = raw.load_u64(node)
+    unlink_free(base, node)
+    if nspan -% span >= 32 {
+        insert_free(base, node +% span, nspan -% span)
+        raw.store_u64(node, span | 1)
+        raw.store_u64(node +% span -% 8, span | 1)
+    } else {
+        raw.store_u64(node, nspan | 1)
+        raw.store_u64(node +% nspan -% 8, nspan | 1)
+    }
+    return node +% 8
+}
+
+
+public function init_region(
+    base: u64 where base != 0 && base % 8 == 0,
+    byte_count: usize where byte_count % 8 == 0 && byte_count >= min_region_bytes() && byte_count <= max_alloc_bytes(),
+) -> () {
+    let size: u64 = byte_count as u64
+    raw.store_u64(base, no_fail_sentinel())
+    raw.store_u64(base +% 8, base +% size)
+    var idx: u64 = 0
+    loop
+        decreases bin_count() - idx
+    {
+        if idx >= bin_count() { break }
+        raw.store_u64(bin_slot(base, idx), 0)
+        idx = idx + 1
+    }
+    insert_free(base, base +% 672, size -% 672)
+}
+
+public function alloc(
+    base: u64 where base != 0 && base % 8 == 0,
+    byte_count: usize where byte_count >= 1 && byte_count <= max_alloc_bytes(),
+) -> u64
+    with {err: HeapError}
+{
+    let want: u64 = byte_count as u64
+    var span: u64 = (((want +% 7) / 8) *% 8) +% 16
+    if span < 32 { span = 32 }
+    if span >= raw.load_u64(base) { raise HeapError.exhausted }
+    let start_idx: u64 = bin_index(span)
+    if span >= 512 {
+        var fuel: u64 = walk_fuel(base)
+        var node: u64 = raw.load_u64(bin_slot(base, start_idx))
+        loop
+            decreases fuel
+        {
+            if node == 0 { break }
+            if fuel == 0 { raise HeapError.corrupt }
+            fuel = fuel - 1
+            if raw.load_u64(node) >= span {
+                return take_block(base, node, span)
+            }
+            node = raw.load_u64(node +% 8)
+        }
+    } else {
+        let head: u64 = raw.load_u64(bin_slot(base, start_idx))
+        if head != 0 {
+            return take_block(base, head, span)
+        }
+    }
+    var idx: u64 = start_idx +% 1
+    loop
+        decreases bin_count() - idx
+    {
+        if idx >= bin_count() {
+            raw.store_u64(base, span)
+            raise HeapError.exhausted
+        }
+        let head: u64 = raw.load_u64(bin_slot(base, idx))
+        if head != 0 && raw.load_u64(head) >= span {
+            return take_block(base, head, span)
+        }
+        idx = idx + 1
+    }
+}
+
+public function free(
+    base: u64 where base != 0 && base % 8 == 0,
+    payload: u64 where payload != 0 && payload % 8 == 0,
+) -> ()
+    with {err: HeapError}
+{
+    let block: u64 = payload -% 8
+    let region_end: u64 = raw.load_u64(base +% 8)
+    if block < base +% 672 || block >= region_end { raise HeapError.corrupt }
+    let hdr: u64 = raw.load_u64(block)
+    if (hdr & 1) == 0 { raise HeapError.corrupt }
+    var span: u64 = hdr -% 1
+    var start: u64 = block
+    if span < 32 || span % 8 != 0 || block +% span > region_end { raise HeapError.corrupt }
+    if raw.load_u64(block +% span -% 8) != hdr { raise HeapError.corrupt }
+    let next: u64 = block +% span
+    if next < region_end {
+        let nhdr: u64 = raw.load_u64(next)
+        if (nhdr & 1) == 0 {
+            if nhdr < 32 || nhdr % 8 != 0 || next +% nhdr > region_end { raise HeapError.corrupt }
+            unlink_free(base, next)
+            span = span +% nhdr
+        }
+    }
+    if start > base +% 672 {
+        let pftr: u64 = raw.load_u64(start -% 8)
+        if (pftr & 1) == 0 {
+            if pftr < 32 || pftr % 8 != 0 || start -% pftr < base +% 672 { raise HeapError.corrupt }
+            start = start -% pftr
+            unlink_free(base, start)
+            span = span +% pftr
+        }
+    }
+    if start +% span > region_end { raise HeapError.corrupt }
+    insert_free(base, start, span)
+    raw.store_u64(base, no_fail_sentinel())
+}
+
+public function free_bytes(base: u64 where base != 0 && base % 8 == 0) -> u64
+    with {err: HeapError}
+{
+    var fuel: u64 = walk_fuel(base)
+    var total: u64 = 0
+    var idx: u64 = 0
+    loop
+        decreases bin_count() - idx
+    {
+        if idx >= bin_count() { break }
+        var node: u64 = raw.load_u64(bin_slot(base, idx))
+        loop
+            decreases fuel
+        {
+            if node == 0 { break }
+            if fuel == 0 { raise HeapError.corrupt }
+            fuel = fuel - 1
+            total = total +% raw.load_u64(node)
+            node = raw.load_u64(node +% 8)
+        }
+        idx = idx + 1
+    }
+    return total
+}

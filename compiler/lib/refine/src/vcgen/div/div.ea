@@ -1,0 +1,91 @@
+
+module refine.vcgen.div.div
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import mir.body.model as mir_body
+import mir.id.block as block_mod
+import mir.rvalue as rvalue_mod
+import mir.stmt as stmt_mod
+import local.smt.term as term_mod
+import local.vcgen.term.term as vterm_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+
+
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtTerm)
+
+
+public function vc_div_by_zero(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    obligation: mir_body.Obligation,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let bi = block_mod.index(obligation.block)
+    if bi >= Vec_BasicBlock.len(body.blocks) {
+        return Option_SmtTerm.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, bi)
+    let si = obligation.stmt_index as usize
+    if si >= Vec_Statement.len(bb.statements) {
+        return Option_SmtTerm.none
+    }
+    let stmt = Vec_Statement.at(bb.statements, si)
+    return match stmt.kind {
+        case .assign(_, let value) => vc_from_rvalue(body, idx, value, allocator)?
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function vc_from_rvalue(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    value: rvalue_mod.Rvalue,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match value {
+        case .binary(let op, _, let rhs) => {
+            if is_div_or_mod(op) {
+                match vterm_mod.operand_to_int_term(body, idx, rhs) {
+                    case .some(let t) => Option_SmtTerm.some(value: distinct_zero(take t, allocator)?)
+                    case .none => Option_SmtTerm.none
+                }
+            } else {
+                Option_SmtTerm.none
+            }
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function is_div_or_mod(op: rvalue_mod.MBinOp) -> bool {
+    return match op {
+        case .div(_, _, _) => true
+        case .mod_(_, _, _) => true
+        case _ => false
+    }
+}
+
+
+function distinct_zero(
+    divisor: take term_mod.SmtTerm,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take divisor, allocator)?
+    Vec_SmtTerm.push(mutable args, take term_mod.SmtTerm.numeral(value: 0 as i128), allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.distinct_, args: args)
+}

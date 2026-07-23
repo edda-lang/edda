@@ -1,0 +1,763 @@
+
+module syntax.parse.expr.forms.core
+
+import std.mem.alloc
+import std.mem.raw
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.kind as kind_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.literal as literal_mod
+import syntax.ast.ops as ops_mod
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+import local.parse.expr.postfix.postfix as postfix_mod
+import local.parse.stmt.control as control_mod
+import local.parse.stmt.flow.flow as flow_mod
+import local.parse.expr.quant.quant as quant_mod
+import local.parse.expr.closure as closure_mod
+import local.parse.expr.spawn as spawn_mod
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(tree_mod.StructLitField)
+spec std.collections.vec.Vec(tree_mod.FStringSeg)
+spec std.mem.alloc.Box(tree_mod.Expr)
+spec std.mem.raw.Mem(tree_mod.Expr)
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(ops_mod.CallMode)
+
+derive eq, clone, debug for BinOpInfo
+derive eq, clone, debug for ContinueAction
+
+public type ContinueAction {
+    case stop
+    case range(kind: ops_mod.RangeKind, allow_missing_rhs: bool)
+    case binary(prec: u32, op: ops_mod.BinOp)
+}
+
+function decide_continue_action(tokens: [lexed_mod.Lexed], pos: usize, min_prec: u32) -> ContinueAction {
+    let tok = util_mod.peek(tokens, pos)
+    let is_range = match tok {
+        case .dot_dot => true
+        case .dot_dot_lt => true
+        case .dot_dot_eq => true
+        case _ => false
+    }
+    if is_range && min_prec <= 5 {
+        let kind = match tok {
+            case .dot_dot_eq => ops_mod.RangeKind.closed
+            case _ => ops_mod.RangeKind.half_open
+        }
+        let allow_missing_rhs = match tok {
+            case .dot_dot => true
+            case _ => false
+        }
+        return ContinueAction.range(kind: kind, allow_missing_rhs: allow_missing_rhs)
+    }
+    let info = binop_info(tok)
+    if info.prec == 0 { return ContinueAction.stop }
+    if info.prec < min_prec { return ContinueAction.stop }
+    return ContinueAction.binary(prec: info.prec, op: info.op)
+}
+
+public function parse_expr(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return parse_binary(tokens, pos, 1, mutable diags, allocator, depth)?
+}
+
+
+function depth_exceeded_expr(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError}
+{
+    let span = util_mod.span_at(tokens, pos)
+    util_mod.emit_error(mutable diags, span, "nesting too deep — expression exceeds the maximum nesting depth", allocator)?
+    let expr = tree_mod.Expr { span: span, kind: tree_mod.ExprKind.error }
+    return (expr, pos)
+}
+
+
+public type BinOpInfo {
+    prec: u32
+    op: ops_mod.BinOp
+}
+
+public function binop_info(tok: kind_mod.Token) -> BinOpInfo {
+    return match tok {
+        case .pipe_pipe       => BinOpInfo { prec: 10, op: ops_mod.BinOp.or }
+        case .amp_amp         => BinOpInfo { prec: 20, op: ops_mod.BinOp.and }
+        case .eq_eq           => BinOpInfo { prec: 30, op: ops_mod.BinOp.eq }
+        case .bang_eq         => BinOpInfo { prec: 30, op: ops_mod.BinOp.ne }
+        case .lt              => BinOpInfo { prec: 30, op: ops_mod.BinOp.lt }
+        case .lt_eq           => BinOpInfo { prec: 30, op: ops_mod.BinOp.le }
+        case .gt              => BinOpInfo { prec: 30, op: ops_mod.BinOp.gt }
+        case .gt_eq           => BinOpInfo { prec: 30, op: ops_mod.BinOp.ge }
+        case .pipe            => BinOpInfo { prec: 40, op: ops_mod.BinOp.bit_or }
+        case .caret           => BinOpInfo { prec: 50, op: ops_mod.BinOp.bit_xor }
+        case .amp             => BinOpInfo { prec: 60, op: ops_mod.BinOp.bit_and }
+        case .lt_lt           => BinOpInfo { prec: 70, op: ops_mod.BinOp.shl }
+        case .gt_gt           => BinOpInfo { prec: 70, op: ops_mod.BinOp.shr }
+        case .plus            => BinOpInfo { prec: 80, op: ops_mod.BinOp.add }
+        case .minus           => BinOpInfo { prec: 80, op: ops_mod.BinOp.sub }
+        case .plus_pct        => BinOpInfo { prec: 80, op: ops_mod.BinOp.wrap_add }
+        case .minus_pct       => BinOpInfo { prec: 80, op: ops_mod.BinOp.wrap_sub }
+        case .plus_sat        => BinOpInfo { prec: 80, op: ops_mod.BinOp.sat_add }
+        case .minus_sat       => BinOpInfo { prec: 80, op: ops_mod.BinOp.sat_sub }
+        case .plus_question   => BinOpInfo { prec: 80, op: ops_mod.BinOp.check_add }
+        case .minus_question  => BinOpInfo { prec: 80, op: ops_mod.BinOp.check_sub }
+        case .star            => BinOpInfo { prec: 90, op: ops_mod.BinOp.mul }
+        case .slash           => BinOpInfo { prec: 90, op: ops_mod.BinOp.div }
+        case .percent         => BinOpInfo { prec: 90, op: ops_mod.BinOp.mod }
+        case .star_pct        => BinOpInfo { prec: 90, op: ops_mod.BinOp.wrap_mul }
+        case .star_sat        => BinOpInfo { prec: 90, op: ops_mod.BinOp.sat_mul }
+        case .star_question   => BinOpInfo { prec: 90, op: ops_mod.BinOp.check_mul }
+        case .percent_question => BinOpInfo { prec: 90, op: ops_mod.BinOp.check_mod }
+        case _                => BinOpInfo { prec: 0, op: ops_mod.BinOp.add }
+    }
+}
+
+function is_comparison_prec(prec: u32) -> bool {
+    return prec == 30
+}
+
+function parse_binary(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    min_prec: u32,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let unary_r = parse_unary(tokens, pos, mutable diags, allocator, depth)?
+    var lhs: tree_mod.Expr = unary_r.0
+    let end_pos = continue_binary(tokens, mutable lhs, unary_r.1, min_prec, mutable diags, allocator, depth)?
+    return (lhs, end_pos)
+}
+
+function continue_binary(
+    tokens: [lexed_mod.Lexed],
+    lhs: mutable tree_mod.Expr,
+    pos: usize,
+    min_prec: u32,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var cur_pos = pos
+    loop {
+        let action = decide_continue_action(tokens, cur_pos, min_prec)
+        match action {
+            case .stop => { break }
+            case .range(let kind, let allow_missing_rhs) => {
+                cur_pos = attach_range_binary(tokens, mutable lhs, cur_pos, kind, allow_missing_rhs, mutable diags, allocator, depth)?
+            }
+            case .binary(let prec, let op) => {
+                cur_pos = attach_binary_op(tokens, mutable lhs, cur_pos, prec, op, mutable diags, allocator, depth)?
+            }
+        }
+    }
+    return cur_pos
+}
+
+
+function parse_unary(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if depth > util_mod.max_parse_depth() {
+        return depth_exceeded_expr(tokens, pos, mutable diags, allocator)?
+    }
+    return match util_mod.peek(tokens, pos) {
+        case .minus => parse_unary_op(tokens, pos, ops_mod.UnOp.neg, mutable diags, allocator, depth)?
+        case .bang => parse_unary_op(tokens, pos, ops_mod.UnOp.not, mutable diags, allocator, depth)?
+        case .tilde => parse_unary_op(tokens, pos, ops_mod.UnOp.bit_not, mutable diags, allocator, depth)?
+        case _ => parse_atom(tokens, pos, mutable diags, allocator, depth)?
+    }
+}
+
+function parse_atom(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let prim_r = parse_primary(tokens, pos, mutable diags, allocator, depth)?
+    return postfix_mod.parse_postfix(tokens, take prim_r.0, prim_r.1, mutable diags, allocator, parse_expr, depth)?
+}
+
+function parse_unary_op(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    op: ops_mod.UnOp,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let op_span = util_mod.span_at(tokens, pos)
+    let inner_r = parse_unary(tokens, pos + 1, mutable diags, allocator, depth + 1)?
+    let inner = inner_r.0
+    let inner_span = inner.span
+    let inner_box = Box_Expr.new(take inner, allocator)?
+    let full_span = merge_spans(op_span, inner_span)
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.unary(op: op, expr: inner_box),
+    }
+    return (expr, inner_r.1)
+}
+
+
+function parse_primary(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let tok = util_mod.peek(tokens, pos)
+    let span = util_mod.span_at(tokens, pos)
+    return match tok {
+        case .int(let value, let base) => primary_literal(span, literal_mod.Literal.int(value: value, base: base), pos + 1)
+        case .float(let sym) => primary_literal(span, literal_mod.Literal.float(sym: sym), pos + 1)
+        case .str(let sym) => primary_literal(span, literal_mod.Literal.str(sym: sym), pos + 1)
+        case .fstr_begin => parse_fstring(tokens, pos, mutable diags, allocator, depth)?
+        case .kw_true => primary_literal(span, literal_mod.Literal.bool(value: true), pos + 1)
+        case .kw_false => primary_literal(span, literal_mod.Literal.bool(value: false), pos + 1)
+
+        case .ident(let sym) => {
+            if is_handle_start(tokens, pos, sym) {
+                flow_mod.parse_handle(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+            } else {
+                parse_path_expr(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+            }
+        }
+        case .kw_result(let sym) => parse_result_expr(sym, span, pos, allocator)?
+
+        case .l_paren => parse_paren_expr(tokens, pos, mutable diags, allocator, depth)?
+
+        case .kw_return => control_mod.parse_return(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_break => control_mod.parse_break(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_continue => control_mod.parse_continue(tokens, pos)
+        case .kw_raise => control_mod.parse_raise(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_panic => control_mod.parse_panic(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+
+        case .kw_if => flow_mod.parse_if(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_loop => flow_mod.parse_loop(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_match => flow_mod.parse_match(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_for => flow_mod.parse_for(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_comptime => flow_mod.parse_comptime(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_scope => flow_mod.parse_scope(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .l_brace => flow_mod.parse_block_expr(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+
+        case .kw_forall => quant_mod.parse_forall(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+        case .kw_exists => quant_mod.parse_exists(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+
+        case .kw_function => closure_mod.parse_closure(tokens, pos, mutable diags, allocator, parse_expr, depth)?
+
+        case .dot_dot => parse_prefix_range(tokens, pos, ops_mod.RangeKind.half_open, true, mutable diags, allocator, depth)?
+        case .dot_dot_lt => parse_prefix_range(tokens, pos, ops_mod.RangeKind.half_open, false, mutable diags, allocator, depth)?
+        case .dot_dot_eq => parse_prefix_range(tokens, pos, ops_mod.RangeKind.closed, false, mutable diags, allocator, depth)?
+
+        case _ => fallback_error(tokens, pos, mutable diags, allocator)?
+    }
+}
+
+function is_handle_start(tokens: [lexed_mod.Lexed], pos: usize, sym: symbol.Symbol) -> bool {
+    if !symbol.is_handle(sym) { return false }
+    let label_is_ident = match util_mod.peek_at(tokens, pos, 1) {
+        case .ident(_) => true
+        case _ => false
+    }
+    if !label_is_ident { return false }
+    return match util_mod.peek_at(tokens, pos, 2) {
+        case .colon => true
+        case _ => false
+    }
+}
+
+function parse_result_expr(
+    sym: symbol.Symbol,
+    span: span_mod.Span,
+    pos: usize,
+    allocator: Allocator,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    Vec_Ident.push(mutable segments, ident_mod.Ident { name: sym, span: span }, allocator)?
+    let path = ident_mod.Path { segments: segments, span: span }
+    let expr = tree_mod.Expr {
+        span: span,
+        kind: tree_mod.ExprKind.path(path: path),
+    }
+    return (expr, pos + 1)
+}
+
+function primary_literal(span: span_mod.Span, value: literal_mod.Literal, next_pos: usize) -> (tree_mod.Expr, usize) {
+    let expr = tree_mod.Expr {
+        span: span,
+        kind: tree_mod.ExprKind.literal(value: value),
+    }
+    return (expr, next_pos)
+}
+
+function parse_fstring(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let begin_span = util_mod.span_at(tokens, pos)
+    uninit segs: Vec_FStringSeg.Vec
+    Vec_FStringSeg.new(init segs, allocator)?
+    var p = pos + 1
+    var end_span = begin_span
+    loop {
+        let tok = util_mod.peek(tokens, p)
+        match tok {
+            case .fstr_text(let sym) => {
+                Vec_FStringSeg.push(mutable segs, tree_mod.FStringSeg.text(sym: sym), allocator)?
+                p = p + 1
+            }
+            case .fstr_expr_begin => {
+                let r = parse_expr(tokens, p + 1, mutable diags, allocator, depth + 1)?
+                let inner = r.0
+                var q = r.1
+                match util_mod.peek(tokens, q) {
+                    case .fstr_expr_end => { q = q + 1 }
+                    case _ => util_mod.emit_error(mutable diags, util_mod.span_at(tokens, q), "expected `}` to close f-string interpolation", allocator)?
+                }
+                let boxed = Box_Expr.new(take inner, allocator)?
+                Vec_FStringSeg.push(mutable segs, tree_mod.FStringSeg.interp(expr: boxed), allocator)?
+                p = q
+            }
+            case .fstr_end => {
+                end_span = util_mod.span_at(tokens, p)
+                p = p + 1
+                break
+            }
+            case .eof => { break }
+            case _ => {
+                util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "malformed f-string", allocator)?
+                p = p + 1
+            }
+        }
+    }
+    let full_span = merge_spans(begin_span, end_span)
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.fstring(segments: segs),
+    }
+    return (expr, p)
+}
+
+
+function parse_path_expr(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    var p = pos
+    let start_span = util_mod.span_at(tokens, p)
+    var last_span = start_span
+    let first = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => ident_mod.Ident { name: sym, span: util_mod.span_at(tokens, p) }
+        case _ => ident_mod.Ident { name: symbol.empty(), span: util_mod.span_at(tokens, p) }
+    }
+    Vec_Ident.push(mutable segments, first, allocator)?
+    p = p + 1
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .dot => ()
+            case _ => break
+        }
+        match util_mod.peek_at(tokens, p, 1) {
+            case .ident(let sym) => {
+                let seg_span = util_mod.span_at(tokens, p + 1)
+                let seg = ident_mod.Ident { name: sym, span: seg_span }
+                Vec_Ident.push(mutable segments, seg, allocator)?
+                last_span = seg_span
+                p = p + 2
+            }
+            case _ => break
+        }
+    }
+    let path_span = merge_spans(start_span, last_span)
+    let path = ident_mod.Path { segments: segments, span: path_span }
+    if spawn_mod.is_spawn_block(tokens, path, p) {
+        return spawn_mod.parse_spawn_tail(tokens, path, p, mutable diags, allocator, parse_expr_fn, depth)?
+    }
+    if looks_like_struct_lit(tokens, p) {
+        return parse_struct_lit(tokens, path, p, mutable diags, allocator, parse_expr_fn, depth)?
+    }
+    let expr = tree_mod.Expr {
+        span: path_span,
+        kind: tree_mod.ExprKind.path(path: path),
+    }
+    return (expr, p)
+}
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}
+
+
+function parse_paren_expr(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let open_span = util_mod.span_at(tokens, pos)
+    let after_open = pos + 1
+    match util_mod.peek(tokens, after_open) {
+        case .r_paren => {
+            let close_span = util_mod.span_at(tokens, after_open)
+            let full_span = merge_spans(open_span, close_span)
+            let unit_expr = tree_mod.Expr {
+                span: full_span,
+                kind: tree_mod.ExprKind.literal(value: literal_mod.Literal.unit),
+            }
+            return (unit_expr, after_open + 1)
+        }
+        case _ => ()
+    }
+    let first = parse_binary(tokens, after_open, 1, mutable diags, allocator, depth + 1)?
+    var p = first.1
+    match util_mod.peek(tokens, p) {
+        case .r_paren => {
+            let close_span = util_mod.span_at(tokens, p)
+            let full_span = merge_spans(open_span, close_span)
+            let wrapped = tree_mod.Expr { span: full_span, kind: first.0.kind }
+            return (wrapped, p + 1)
+        }
+        case .comma => ()
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` or `,` after parenthesized expression", allocator)?
+            return (first.0, p)
+        }
+    }
+    uninit elements: Vec_Expr.Vec
+    Vec_Expr.new(init elements, allocator)?
+    Vec_Expr.push(mutable elements, first.0, allocator)?
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+        let next_r = parse_binary(tokens, p, 1, mutable diags, allocator, depth + 1)?
+        Vec_Expr.push(mutable elements, next_r.0, allocator)?
+        p = next_r.1
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` after tuple literal", allocator)?
+        }
+    }
+    let full_span = merge_spans(open_span, close_span)
+    let tuple_expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.tuple(elements: elements),
+    }
+    return (tuple_expr, p)
+}
+
+
+function looks_like_struct_lit(tokens: [lexed_mod.Lexed], pos: usize) -> bool {
+    return match util_mod.peek(tokens, pos) {
+        case .l_brace => match util_mod.peek_at(tokens, pos, 1) {
+            case .ident(_) => match util_mod.peek_at(tokens, pos, 2) {
+                case .colon => true
+                case _ => false
+            }
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function parse_struct_lit(
+    tokens: [lexed_mod.Lexed],
+    path: ident_mod.Path,
+    pos_at_lbrace: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_span = path.span
+    uninit fields: Vec_StructLitField.Vec
+    Vec_StructLitField.new(init fields, allocator)?
+    var p = pos_at_lbrace + 1
+    loop decreases (tokens.len() - p) {
+        let stop = match util_mod.peek(tokens, p) {
+            case .r_brace => true
+            case .eof => true
+            case _ => false
+        }
+        if stop { break }
+        let iter_start = p
+        let field_r = parse_struct_lit_field(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_StructLitField.push(mutable fields, field_r.0, allocator)?
+        p = field_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => { p = p + 1 }
+            case _ => ()
+        }
+        if p == iter_start { p = p + 1 }
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `}` to close struct literal", allocator)?
+        }
+    }
+    let full_span = merge_spans(path_span, close_span)
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.struct_lit(path: path, fields: fields),
+    }
+    return (expr, p)
+}
+
+function parse_struct_lit_field(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.StructLitField, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    var p = pos
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, start_span, "expected struct-literal field name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: start_span }
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .colon => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `:` after struct-literal field name", allocator)?
+        }
+    }
+    var mode: Option_CallMode.Option = Option_CallMode.none
+    match util_mod.peek(tokens, p) {
+        case .kw_take => {
+            mode = Option_CallMode.some(value: ops_mod.CallMode.take_)
+            p = p + 1
+        }
+        case .kw_mutable => {
+            mode = Option_CallMode.some(value: ops_mod.CallMode.mutable_)
+            p = p + 1
+        }
+        case _ => ()
+    }
+    let value_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+    let full_span = merge_spans(start_span, value_r.0.span)
+    let field = tree_mod.StructLitField {
+        span: full_span,
+        name: name,
+        mode: mode,
+        value: value_r.0,
+    }
+    return (field, value_r.1)
+}
+
+
+function attach_binary_op(
+    tokens: [lexed_mod.Lexed],
+    lhs: mutable tree_mod.Expr,
+    pos: usize,
+    prec: u32,
+    op: ops_mod.BinOp,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let op_span = util_mod.span_at(tokens, pos)
+    let next_min = prec + 1
+    let rhs_r = parse_binary(tokens, pos + 1, next_min, mutable diags, allocator, depth)?
+    let rhs = rhs_r.0
+    let p = rhs_r.1
+    if is_comparison_prec(prec) {
+        let after = binop_info(util_mod.peek(tokens, p))
+        if is_comparison_prec(after.prec) {
+            util_mod.emit_error(mutable diags, op_span, "comparison operators are non-associative; parenthesise to chain", allocator)?
+        }
+    }
+    let placeholder = tree_mod.Expr { span: op_span, kind: tree_mod.ExprKind.error }
+    let old_lhs = Mem_Expr.replace(mutable lhs, take placeholder)
+    let lhs_span = old_lhs.span
+    let rhs_span = rhs.span
+    let lhs_box = Box_Expr.new(take old_lhs, allocator)?
+    let rhs_box = Box_Expr.new(take rhs, allocator)?
+    let full_span = merge_spans(lhs_span, rhs_span)
+    let new_lhs = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.binary(op: op, lhs: lhs_box, rhs: rhs_box),
+    }
+    let _ = Mem_Expr.replace(mutable lhs, take new_lhs)
+    return p
+}
+
+
+function attach_range_binary(
+    tokens: [lexed_mod.Lexed],
+    lhs: mutable tree_mod.Expr,
+    pos: usize,
+    kind: ops_mod.RangeKind,
+    allow_missing_rhs: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let op_span = util_mod.span_at(tokens, pos)
+    let placeholder = tree_mod.Expr { span: op_span, kind: tree_mod.ExprKind.error }
+    let old_lhs = Mem_Expr.replace(mutable lhs, take placeholder)
+    let lhs_span = old_lhs.span
+    let after_op = pos + 1
+    let has_rhs = if allow_missing_rhs { control_mod.can_start_expr(util_mod.peek(tokens, after_op)) } else { true }
+    let lhs_box = Box_Expr.new(take old_lhs, allocator)?
+    if !has_rhs {
+        let full_span = merge_spans(lhs_span, op_span)
+        let expr = tree_mod.Expr {
+            span: full_span,
+            kind: tree_mod.ExprKind.range(lo: Option_Box_Expr.some(value: lhs_box), hi: Option_Box_Expr.none, kind: kind),
+        }
+        let _ = Mem_Expr.replace(mutable lhs, take expr)
+        return after_op
+    }
+    let rhs_r = parse_binary(tokens, after_op, 6, mutable diags, allocator, depth)?
+    let rhs_span = rhs_r.0.span
+    let rhs_box = Box_Expr.new(take rhs_r.0, allocator)?
+    let full_span = merge_spans(lhs_span, rhs_span)
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.range(lo: Option_Box_Expr.some(value: lhs_box), hi: Option_Box_Expr.some(value: rhs_box), kind: kind),
+    }
+    let _ = Mem_Expr.replace(mutable lhs, take expr)
+    return rhs_r.1
+}
+
+function parse_prefix_range(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    kind: ops_mod.RangeKind,
+    allow_missing_rhs: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let op_span = util_mod.span_at(tokens, pos)
+    let after_op = pos + 1
+    let has_rhs = if allow_missing_rhs { control_mod.can_start_expr(util_mod.peek(tokens, after_op)) } else { true }
+    if !has_rhs {
+        let expr = tree_mod.Expr {
+            span: op_span,
+            kind: tree_mod.ExprKind.range(lo: Option_Box_Expr.none, hi: Option_Box_Expr.none, kind: kind),
+        }
+        return (expr, after_op)
+    }
+    let rhs_r = parse_binary(tokens, after_op, 6, mutable diags, allocator, depth)?
+    let rhs_span = rhs_r.0.span
+    let rhs_box = Box_Expr.new(take rhs_r.0, allocator)?
+    let full_span = merge_spans(op_span, rhs_span)
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.range(lo: Option_Box_Expr.none, hi: Option_Box_Expr.some(value: rhs_box), kind: kind),
+    }
+    return (expr, rhs_r.1)
+}
+
+
+function fallback_error(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    util_mod.emit_error(mutable diags, span, "expected expression", allocator)?
+    let expr = tree_mod.Expr { span: span, kind: tree_mod.ExprKind.error }
+    return (expr, pos + 1)
+}

@@ -1,0 +1,213 @@
+
+module query.persist.persist
+
+import std.collections.vec
+import std.mem.alloc
+import cache.addr.hash as hash_mod
+import local.graph.idx.key as key_mod
+import local.graph.idx.node as node_mod
+import local.memo.revision as rev_mod
+import local.graph.graph as graph_mod
+import local.memo.memo as memo_mod
+import local.persist.wire as wire_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(node_mod.QueryNode)
+spec std.collections.vec.Vec(node_mod.NodeId)
+
+
+public type Snapshot {
+    graph: graph_mod.QueryGraph
+    memo: memo_mod.MemoStore
+}
+
+
+public function schema_version() -> u32 {
+    return 1
+}
+
+
+public function encode_snapshot(g: graph_mod.QueryGraph, store: memo_mod.MemoStore, allocator: Allocator) -> [u8]
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    wire_mod.push_u8(mutable buf, 69, allocator)?
+    wire_mod.push_u8(mutable buf, 81, allocator)?
+    wire_mod.push_u8(mutable buf, 67, allocator)?
+    wire_mod.push_u8(mutable buf, 49, allocator)?
+    wire_mod.push_u32_be(mutable buf, schema_version(), allocator)?
+    let cur = graph_mod.current_revision(g)
+    wire_mod.push_u64_be(mutable buf, cur.value, allocator)?
+
+    let ncount = graph_mod.node_count(g)
+    wire_mod.push_u32_be(mutable buf, ncount as u32, allocator)?
+    var i: usize = 0
+    loop decreases ncount - i {
+        if i >= ncount { break }
+        encode_node(mutable buf, graph_mod.node_at(g, i), allocator)?
+        i += 1
+    }
+
+    let mcount = memo_mod.len(store)
+    wire_mod.push_u32_be(mutable buf, mcount as u32, allocator)?
+    var j: usize = 0
+    loop decreases mcount - j {
+        if j >= mcount { break }
+        encode_memo_entry(mutable buf, store, j, allocator)?
+        j += 1
+    }
+
+    let body_len = Vec_u8.len(buf)
+    let digest = hash_mod.hash_bytes(buf.data[0..<body_len], allocator)?
+    wire_mod.push_hash_be(mutable buf, digest, allocator)?
+    return Vec_u8.into_array(take buf, allocator)?
+}
+
+
+public function decode_snapshot(bytes: [u8], allocator: Allocator) -> Snapshot
+    with {allocator, divergence, err: alloc.AllocError, err: wire_mod.DecodeError}
+{
+    verify_integrity(bytes, allocator)?
+
+    let m0 = wire_mod.read_u8(bytes, 0)?
+    let m1 = wire_mod.read_u8(bytes, m0.1)?
+    let m2 = wire_mod.read_u8(bytes, m1.1)?
+    let m3 = wire_mod.read_u8(bytes, m2.1)?
+    if m0.0 != 69 || m1.0 != 81 || m2.0 != 67 || m3.0 != 49 {
+        raise wire_mod.DecodeError.bad_magic
+    }
+    let svr = wire_mod.read_u32_be(bytes, m3.1)?
+    if svr.0 != schema_version() {
+        raise wire_mod.DecodeError.schema_mismatch(found: svr.0, supported: schema_version())
+    }
+    let crr = wire_mod.read_u64_be(bytes, svr.1)?
+    let current = rev_mod.Revision { value: crr.0 }
+
+    let nc = wire_mod.read_u32_be(bytes, crr.1)?
+    uninit nodes: Vec_QueryNode.Vec
+    Vec_QueryNode.new(init nodes, allocator)?
+    var pos: usize = nc.1
+    let ncount = nc.0 as usize
+    var i: usize = 0
+    loop decreases ncount - i {
+        if i >= ncount { break }
+        let rn = decode_node(bytes, pos, allocator)?
+        Vec_QueryNode.push(mutable nodes, take rn.0, allocator)?
+        pos = rn.1
+        i += 1
+    }
+    let g = graph_mod.from_parts(take nodes, current, allocator)?
+
+    let mc = wire_mod.read_u32_be(bytes, pos)?
+    pos = mc.1
+    var store = memo_mod.new_store(allocator)?
+    let mcount = mc.0 as usize
+    var j: usize = 0
+    loop decreases mcount - j {
+        if j >= mcount { break }
+        let kr = wire_mod.read_hash_be(bytes, pos)?
+        let lr = wire_mod.read_u32_be(bytes, kr.1)?
+        pos = lr.1
+        let blen = lr.0 as usize
+        uninit blob: Vec_u8.Vec
+        Vec_u8.new(init blob, allocator)?
+        var b: usize = 0
+        loop decreases blen - b {
+            if b >= blen { break }
+            let br = wire_mod.read_u8(bytes, pos)?
+            Vec_u8.push(mutable blob, br.0, allocator)?
+            pos = br.1
+            b += 1
+        }
+        memo_mod.insert(mutable store, kr.0, take blob, allocator)?
+        j += 1
+    }
+
+    return Snapshot { graph: g, memo: store }
+}
+
+
+function encode_node(buf: mutable Vec_u8.Vec, nd: node_mod.QueryNode, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    wire_mod.push_u32_be(mutable buf, nd.key.kind, allocator)?
+    wire_mod.push_hash_be(mutable buf, nd.key.arg_hash, allocator)?
+    wire_mod.push_hash_be(mutable buf, nd.value_hash, allocator)?
+    wire_mod.push_u8(mutable buf, node_mod.state_to_u8(nd.state), allocator)?
+    wire_mod.push_u64_be(mutable buf, nd.verified_at.value, allocator)?
+    wire_mod.push_u64_be(mutable buf, nd.changed_at.value, allocator)?
+    let dc = node_mod.dep_count(nd)
+    wire_mod.push_u32_be(mutable buf, dc as u32, allocator)?
+    var k: usize = 0
+    loop decreases dc - k {
+        if k >= dc { break }
+        match node_mod.dep_get(nd, k) {
+            case .some(let d) => wire_mod.push_u64_be(mutable buf, d.value as u64, allocator)?
+            case .none        => ()
+        }
+        k += 1
+    }
+}
+
+function encode_memo_entry(buf: mutable Vec_u8.Vec, store: memo_mod.MemoStore, idx: usize where idx < memo_mod.len(store), allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    wire_mod.push_hash_be(mutable buf, memo_mod.key_at(store, idx), allocator)?
+    let blob = memo_mod.blob_at(store, idx)
+    let bl = Vec_u8.len(blob)
+    wire_mod.push_u32_be(mutable buf, bl as u32, allocator)?
+    var k: usize = 0
+    loop decreases bl - k {
+        if k >= bl { break }
+        wire_mod.push_u8(mutable buf, Vec_u8.at(blob, k), allocator)?
+        k += 1
+    }
+}
+
+function decode_node(bytes: [u8], pos: usize, allocator: Allocator) -> (node_mod.QueryNode, usize)
+    with {allocator, divergence, err: alloc.AllocError, err: wire_mod.DecodeError}
+{
+    let kr = wire_mod.read_u32_be(bytes, pos)?
+    let ahr = wire_mod.read_hash_be(bytes, kr.1)?
+    let key = key_mod.new(kr.0, ahr.0)
+    let vhr = wire_mod.read_hash_be(bytes, ahr.1)?
+    let sr = wire_mod.read_u8(bytes, vhr.1)?
+    let vat = wire_mod.read_u64_be(bytes, sr.1)?
+    let chr = wire_mod.read_u64_be(bytes, vat.1)?
+    let dcr = wire_mod.read_u32_be(bytes, chr.1)?
+    var p: usize = dcr.1
+    let dcount = dcr.0 as usize
+    uninit deps: Vec_NodeId.Vec
+    Vec_NodeId.new(init deps, allocator)?
+    var k: usize = 0
+    loop decreases dcount - k {
+        if k >= dcount { break }
+        let dr = wire_mod.read_u64_be(bytes, p)?
+        Vec_NodeId.push(mutable deps, node_mod.node_id(dr.0 as usize), allocator)?
+        p = dr.1
+        k += 1
+    }
+    let nd = node_mod.from_parts(
+        key,
+        vhr.0,
+        node_mod.u8_to_state(sr.0),
+        rev_mod.Revision { value: vat.0 },
+        rev_mod.Revision { value: chr.0 },
+        take deps,
+    )
+    return (nd, p)
+}
+
+function verify_integrity(bytes: [u8], allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError, err: wire_mod.DecodeError}
+{
+    let total = bytes.len()
+    if total < 48 { raise wire_mod.DecodeError.truncated }
+    let body_len = total - 32
+    let digest = hash_mod.hash_bytes(bytes[0..<body_len], allocator)?
+    let stored = wire_mod.read_hash_be(bytes[body_len..<total], 0)?
+    if !key_mod.hash_equals(digest, stored.0) {
+        raise wire_mod.DecodeError.integrity_mismatch
+    }
+}

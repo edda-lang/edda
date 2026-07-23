@@ -1,0 +1,220 @@
+
+module optimize.effect_gvn.analysis.raw
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.hlir.id.value as value_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.tree.node.file as file_mod
+import ir.hlir.attrs as attrs_mod
+
+import local.effect_gvn.analysis.purity as purity_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBody)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.core.option.Option(u32)
+
+
+type LocalVerdict {
+    ok: bool
+    trapfree: bool
+}
+
+
+public function annotate_file(file: mutable file_mod.HlirFile, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_HlirBody.len(file.bodies)
+    if n == 0 { return () }
+    uninit ok: Vec_bool.Vec
+    Vec_bool.new(init ok, allocator)?
+    uninit trapfree: Vec_bool.Vec
+    Vec_bool.new(init trapfree, allocator)?
+    uninit edges: Vec_u32.Vec
+    Vec_u32.new(init edges, allocator)?
+    uninit edge_start: Vec_usize.Vec
+    Vec_usize.new(init edge_start, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_usize.push(mutable edge_start, Vec_u32.len(edges), allocator)?
+        let body = Vec_HlirBody.at(file.bodies, i)
+        let verdict = walk_body(body, file, mutable edges, allocator)?
+        Vec_bool.push(mutable ok, verdict.ok, allocator)?
+        Vec_bool.push(mutable trapfree, verdict.trapfree, allocator)?
+        i += 1
+    }
+    Vec_usize.push(mutable edge_start, Vec_u32.len(edges), allocator)?
+    propagate(mutable ok, mutable trapfree, edges, edge_start, n)
+    write_back(mutable file, ok, trapfree, n)
+}
+
+
+function walk_body(
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+    edges: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> LocalVerdict
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var ok = true
+    var trapfree = true
+    let no = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop decreases no - i {
+        if i >= no { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        match op.kind {
+            case .literal(_) => ()
+            case .aggregate(_, _) => ()
+            case .make_closure(_, _) => ()
+            case .binary(let bop, _, _) => {
+                match purity_mod.classify_binary(bop, op.flags) {
+                    case .pure_total => ()
+                    case _ => { trapfree = false }
+                }
+            }
+            case .unary(let uop, _) => {
+                match purity_mod.classify_unary(uop, op.flags) {
+                    case .pure_total => ()
+                    case _ => { trapfree = false }
+                }
+            }
+            case .cast(_, _, _, let kind) => {
+                match purity_mod.classify_cast(kind, op.flags) {
+                    case .pure_total => ()
+                    case _ => { trapfree = false }
+                }
+            }
+            case .call_(let callee_v, _) => {
+                match call_edge(op.flags, callee_v, body, file) {
+                    case .some(let slot) => Vec_u32.push(mutable edges, slot, allocator)?
+                    case .none => { ok = false }
+                }
+            }
+            case _ => { ok = false }
+        }
+        i += 1
+    }
+    let nb = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop decreases nb - b {
+        if b >= nb { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        match block.terminator.kind {
+            case .goto_(_, _) => ()
+            case .branch(_, _, _, _, _) => ()
+            case .switch_(_, _) => ()
+            case .return_(_) => ()
+            case .unreachable_ => ()
+            case _ => { ok = false }
+        }
+        b += 1
+    }
+    return LocalVerdict { ok: ok, trapfree: trapfree }
+}
+
+
+function call_edge(
+    flags: hlir_op_mod.OpFlags,
+    callee_v: value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    file: file_mod.HlirFile,
+) -> Option_u32.Option
+    with {panic}
+{
+    if flags.extern_call { return Option_u32.Option.none }
+    match flags.intrinsic {
+        case .none => ()
+        case _ => return Option_u32.Option.none
+    }
+    let callee_raw = callee_v.raw
+    if callee_raw == 0 { return Option_u32.Option.none }
+    if (callee_raw as usize) >= Vec_HlirValue.len(body.values) { return Option_u32.Option.none }
+    let value = Vec_HlirValue.at(body.values, callee_raw as usize)
+    let def_op = match value.def {
+        case .op_result(let op_id) => op_id
+        case .block_param(_, _) => return Option_u32.Option.none
+    }
+    if (def_op.raw as usize) >= Vec_HlirOp.len(body.ops) { return Option_u32.Option.none }
+    let defining = Vec_HlirOp.at(body.ops, def_op.raw as usize)
+    return match defining.kind {
+        case .literal(let c) => match c {
+            case .fn_ref(let def) => file_mod.lookup_body_index(file, def)
+            case _ => Option_u32.Option.none
+        }
+        case _ => Option_u32.Option.none
+    }
+}
+
+
+function propagate(
+    ok: mutable Vec_bool.Vec,
+    trapfree: mutable Vec_bool.Vec,
+    edges: Vec_u32.Vec,
+    edge_start: Vec_usize.Vec,
+    n: usize,
+) -> ()
+    with {panic}
+{
+    var fuel = n + 1
+    var changed = true
+    loop decreases fuel {
+        if fuel == 0 { break }
+        if !changed { break }
+        changed = false
+        var i: usize = 0
+        loop decreases n - i {
+            if i >= n { break }
+            let lo = Vec_usize.at(edge_start, i)
+            let hi = Vec_usize.at(edge_start, i + 1)
+            var e = lo
+            loop decreases hi - e {
+                if e >= hi { break }
+                let callee = Vec_u32.at(edges, e) as usize
+                if callee < n {
+                    if Vec_bool.at(ok, i) && !Vec_bool.at(ok, callee) {
+                        Vec_bool.set_at(mutable ok, i, false)
+                        changed = true
+                    }
+                    if Vec_bool.at(trapfree, i) && !Vec_bool.at(trapfree, callee) {
+                        Vec_bool.set_at(mutable trapfree, i, false)
+                        changed = true
+                    }
+                }
+                e += 1
+            }
+            i += 1
+        }
+        fuel -= 1
+    }
+}
+
+
+function write_back(
+    file: mutable file_mod.HlirFile,
+    ok: Vec_bool.Vec,
+    trapfree: Vec_bool.Vec,
+    n: usize,
+) -> ()
+    with {panic}
+{
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        var body = Vec_HlirBody.at(file.bodies, i)
+        body.fn_attrs = attrs_mod.with_raw_witness(body.fn_attrs, Vec_bool.at(ok, i), Vec_bool.at(trapfree, i))
+        Vec_HlirBody.set_at(mutable file.bodies, i, take body)
+        i += 1
+    }
+}

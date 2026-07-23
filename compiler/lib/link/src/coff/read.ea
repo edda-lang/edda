@@ -1,0 +1,316 @@
+
+module link.coff.read
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import object.coff as coff_mod
+import local.coff.cursor as cursor_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffSectionHeader)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(coff_mod.CoffSymbol)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+spec std.collections.hashmap.StringMap(u32)
+
+
+function machine_from_u16(raw: u16) -> coff_mod.CoffMachine {
+    if raw == (0x8664 as u16) { return coff_mod.CoffMachine.amd64 }
+    if raw == (0xAA64 as u16) { return coff_mod.CoffMachine.arm64 }
+    if raw == (0x014C as u16) { return coff_mod.CoffMachine.i386 }
+    return coff_mod.CoffMachine.unknown
+}
+
+
+function digit_value(b: u8) -> u8
+    with {err: cursor_mod.ReadError}
+    ensures result <= 9
+{
+    if b < (0x30 as u8) { raise cursor_mod.ReadError.bad_section_name_digit }
+    if b > (0x39 as u8) { raise cursor_mod.ReadError.bad_section_name_digit }
+    return b - (0x30 as u8)
+}
+
+
+function parse_header(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> coff_mod.CoffHeader
+    with {err: cursor_mod.ReadError}
+{
+    let machine_raw = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let number_of_sections = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let time_date_stamp = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let pointer_to_symbol_table = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let number_of_symbols = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let size_of_optional_header = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let characteristics = cursor_mod.read_u16_le(bytes, mutable cur)?
+    return coff_mod.CoffHeader {
+        machine: machine_from_u16(machine_raw),
+        number_of_sections: number_of_sections,
+        time_date_stamp: time_date_stamp,
+        pointer_to_symbol_table: pointer_to_symbol_table,
+        number_of_symbols: number_of_symbols,
+        size_of_optional_header: size_of_optional_header,
+        characteristics: characteristics,
+    }
+}
+
+
+function parse_section_name(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> coff_mod.CoffSectionName
+    with {err: cursor_mod.ReadError}
+{
+    let packed = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let first = (packed & (0xFF as u64)) as u8
+    if first != (0x2F as u8) {
+        return coff_mod.CoffSectionName.inline_(name: packed)
+    }
+    var offset: u32 = 0
+    var k: usize = 1
+    loop decreases ((8 as usize) - k) {
+        if k >= (8 as usize) { break }
+        let shift = (8 as u64) * (k as u64)
+        let b = ((packed >> shift) & (0xFF as u64)) as u8
+        if b == (0x00 as u8) || b == (0x20 as u8) { break }
+        let d = digit_value(b)?
+        offset = offset * (10 as u32) + (d as u32)
+        k = k + (1 as usize)
+    }
+    return coff_mod.CoffSectionName.string_table_ref(offset: offset)
+}
+
+
+function parse_section_header(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> coff_mod.CoffSectionHeader
+    with {err: cursor_mod.ReadError}
+{
+    let name = parse_section_name(bytes, mutable cur)?
+    let virtual_size = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let virtual_address = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let size_of_raw_data = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let pointer_to_raw_data = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let pointer_to_relocations = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let pointer_to_linenumbers = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let number_of_relocations = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let number_of_linenumbers = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let characteristics = cursor_mod.read_u32_le(bytes, mutable cur)?
+    return coff_mod.CoffSectionHeader {
+        name: name,
+        virtual_size: virtual_size,
+        virtual_address: virtual_address,
+        size_of_raw_data: size_of_raw_data,
+        pointer_to_raw_data: pointer_to_raw_data,
+        pointer_to_relocations: pointer_to_relocations,
+        pointer_to_linenumbers: pointer_to_linenumbers,
+        number_of_relocations: number_of_relocations,
+        number_of_linenumbers: number_of_linenumbers,
+        characteristics: characteristics,
+    }
+}
+
+
+function parse_symbol_name(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> coff_mod.CoffSymbolName
+    with {err: cursor_mod.ReadError}
+{
+    let low = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let high = cursor_mod.read_u32_le(bytes, mutable cur)?
+    if low == (0 as u32) {
+        return coff_mod.CoffSymbolName.string_table_ref(offset: high)
+    }
+    let packed = (low as u64) | ((high as u64) << (32 as u64))
+    return coff_mod.CoffSymbolName.inline_(name: packed)
+}
+
+
+function parse_symbol(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> coff_mod.CoffSymbol
+    with {err: cursor_mod.ReadError}
+{
+    let name = parse_symbol_name(bytes, mutable cur)?
+    let value = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let section_number = cursor_mod.read_i16_le(bytes, mutable cur)?
+    let type_ = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let storage_class = cursor_mod.read_u8(bytes, mutable cur)?
+    let number_of_aux_symbols = cursor_mod.read_u8(bytes, mutable cur)?
+    return coff_mod.CoffSymbol {
+        name: name,
+        value: value,
+        section_number: section_number,
+        type_: type_,
+        storage_class: storage_class,
+        number_of_aux_symbols: number_of_aux_symbols,
+    }
+}
+
+
+function parse_relocation(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> coff_mod.CoffRelocation
+    with {err: cursor_mod.ReadError}
+{
+    let virtual_address = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let symbol_table_index = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let type_ = cursor_mod.read_u16_le(bytes, mutable cur)?
+    return coff_mod.CoffRelocation {
+        virtual_address: virtual_address,
+        symbol_table_index: symbol_table_index,
+        type_: type_,
+    }
+}
+
+
+function read_section_data(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    sh: coff_mod.CoffSectionHeader,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let count = sh.size_of_raw_data as usize
+    uninit out_data: Vec_u8.Vec
+    Vec_u8.new(init out_data, allocator)?
+    if count == (0 as usize) { return out_data }
+    cursor_mod.seek(mutable cur, sh.pointer_to_raw_data as usize)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let b = cursor_mod.read_u8(bytes, mutable cur)?
+        Vec_u8.push(mutable out_data, take b, allocator)?
+        i = i + 1
+    }
+    return out_data
+}
+
+
+function image_scn_lnk_nreloc_ovfl() -> u32 {
+    return 0x01000000 as u32
+}
+
+
+function read_section_relocs(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    sh: coff_mod.CoffSectionHeader,
+    allocator: Allocator,
+) -> Vec_CoffRelocation.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    uninit out_relocs: Vec_CoffRelocation.Vec
+    Vec_CoffRelocation.new(init out_relocs, allocator)?
+    if sh.number_of_relocations == (0 as u16) { return out_relocs }
+    let ovfl_flag = (sh.characteristics & image_scn_lnk_nreloc_ovfl()) != (0 as u32)
+    let overflow: bool = ovfl_flag && (sh.number_of_relocations == (0xFFFF as u16))
+    cursor_mod.seek(mutable cur, sh.pointer_to_relocations as usize)
+    let count = if overflow {
+        let counter = parse_relocation(bytes, mutable cur)?
+        (counter.virtual_address -| (1 as u32)) as usize
+    } else {
+        sh.number_of_relocations as usize
+    }
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let r = parse_relocation(bytes, mutable cur)?
+        Vec_CoffRelocation.push(mutable out_relocs, take r, allocator)?
+        i = i + 1
+    }
+    return out_relocs
+}
+
+
+function parse_string_table(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    allocator: Allocator,
+) -> coff_mod.CoffStringTable
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    let size = cursor_mod.read_u32_le(bytes, mutable cur)?
+    if size < (4 as u32) { raise cursor_mod.ReadError.bad_string_table_size }
+    let payload = (size - (4 as u32)) as usize
+    uninit out_bytes: Vec_u8.Vec
+    Vec_u8.new(init out_bytes, allocator)?
+    var i: usize = 0
+    loop decreases (payload - i) {
+        if i >= payload { break }
+        let b = cursor_mod.read_u8(bytes, mutable cur)?
+        Vec_u8.push(mutable out_bytes, take b, allocator)?
+        i = i + 1
+    }
+    let dedup = StringMap_u32.new(allocator)?
+    return coff_mod.CoffStringTable { bytes: out_bytes, dedup: dedup }
+}
+
+
+public function parse_file(bytes: Vec_u8.Vec, allocator: Allocator) -> coff_mod.CoffFile
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    var cur: cursor_mod.Cursor = cursor_mod.at_start()
+    let header = parse_header(bytes, mutable cur)?
+
+    let n_sections = header.number_of_sections as usize
+    uninit headers: Vec_CoffSectionHeader.Vec
+    Vec_CoffSectionHeader.new(init headers, allocator)?
+    var i: usize = 0
+    loop decreases (n_sections - i) {
+        if i >= n_sections { break }
+        let sh = parse_section_header(bytes, mutable cur)?
+        Vec_CoffSectionHeader.push(mutable headers, take sh, allocator)?
+        i = i + 1
+    }
+
+    uninit sections: Vec_CoffSection.Vec
+    Vec_CoffSection.new(init sections, allocator)?
+    let nh = Vec_CoffSectionHeader.len(headers)
+    var j: usize = 0
+    loop decreases (nh - j) {
+        if j >= nh { break }
+        let sh = Vec_CoffSectionHeader.at(headers, j)
+        let data = read_section_data(bytes, mutable cur, sh, allocator)?
+        let relocs = read_section_relocs(bytes, mutable cur, sh, allocator)?
+        let section = coff_mod.CoffSection {
+            header: sh,
+            data: data,
+            relocations: relocs,
+        }
+        Vec_CoffSection.push(mutable sections, take section, allocator)?
+        j = j + 1
+    }
+
+    let n_symbols = header.number_of_symbols as usize
+    cursor_mod.seek(mutable cur, header.pointer_to_symbol_table as usize)
+    uninit symbols: Vec_CoffSymbol.Vec
+    Vec_CoffSymbol.new(init symbols, allocator)?
+    var s: usize = 0
+    loop decreases (n_symbols - s) {
+        if s >= n_symbols { break }
+        let sym = parse_symbol(bytes, mutable cur)?
+        let naux = sym.number_of_aux_symbols as usize
+        Vec_CoffSymbol.push(mutable symbols, take sym, allocator)?
+        s = s + 1
+        var a: usize = 0
+        loop decreases (naux - a) {
+            if a >= naux { break }
+            if s >= n_symbols { break }
+            let aux_tag = cursor_mod.read_u32_le(bytes, mutable cur)?
+            cursor_mod.seek(mutable cur, cur.pos + (14 as usize))
+            let pad = coff_mod.CoffSymbol {
+                name: coff_mod.CoffSymbolName.inline_(name: 0 as u64),
+                value: aux_tag,
+                section_number: 0 as i16,
+                type_: 0 as u16,
+                storage_class: 0 as u8,
+                number_of_aux_symbols: 0 as u8,
+            }
+            Vec_CoffSymbol.push(mutable symbols, take pad, allocator)?
+            s = s + 1
+            a = a + 1
+        }
+    }
+
+    let string_table = parse_string_table(bytes, mutable cur, allocator)?
+
+    return coff_mod.CoffFile {
+        header: header,
+        sections: sections,
+        symbols: symbols,
+        string_table: string_table,
+    }
+}

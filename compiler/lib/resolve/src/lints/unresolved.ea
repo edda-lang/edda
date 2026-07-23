@@ -1,0 +1,73 @@
+
+module resolve.lints.unresolved
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import local.ctx as ctx_mod
+import local.paths.imports as imports_mod
+import local.paths.modules as mt_mod
+import local.bind.lookup.lookup as lookup_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.core.option.Option(mt_mod.PrefixMatch)
+
+
+public function check_unresolved_imports(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let mt = ctx_mod.module_tree(ctx)
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_file(mutable ctx, mt, interner, Vec_File.at(files, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function check_file(ctx: mutable ctx_mod.ResolveCtx, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, file: ast_file.File, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let mp = lookup_mod.module_path_of(file.items, allocator)?
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .import_(let imp) => check_import(mutable ctx, mt, interner, imp, mp, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function check_import(ctx: mutable ctx_mod.ResolveCtx, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, imp: ast_item.Import, mp: Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let module_path = imports_mod.translate_path(imp.path, mp, mt, interner, allocator)?
+    let len = Vec_Symbol.len(module_path)
+    if len == 0 {
+        return
+    }
+    let resolved = match mt_mod.find_longest_prefix(mt, module_path) {
+        case .some(let pm) => pm.segments_consumed == len
+        case .none => false
+    }
+    if resolved {
+        return
+    }
+    let d = diag_mod.error_at(diag_code_mod.import_resolution_error(), imp.path.span, "failed to resolve import: no such module in this package, its workspace members, or the standard library")
+    ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+}

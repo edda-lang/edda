@@ -1,0 +1,153 @@
+
+module tls.handshake.server.certificate
+
+import std.mem.alloc
+import local.error
+import local.wire
+import local.handshake.kind as hs_kind
+import local.handshake.message as hs_msg
+
+function _max_chain_len() -> usize { return 10 as usize }
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_slice_slots(allocator: Allocator, n: usize) -> [[u8]]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _slice_copy(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    if hi < lo || hi > src.len() { raise error.TlsError.bad_handshake }
+    let n = hi - lo
+    var out = _alloc_bytes(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        out[i] = src[lo + i]
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+unstable public type ParsedCertificateChain {
+    certs: [[u8]]
+    len_box: [usize]
+}
+
+public function chain_len(c: ParsedCertificateChain) -> usize {
+    return c.len_box[0 as usize]
+}
+
+public function chain_at(
+    c: ParsedCertificateChain,
+    i: usize where i < c.certs.len(),
+) -> [u8] {
+    return c.certs[i]
+}
+
+public function decode_certificate(
+    body: [u8],
+    allocator: Allocator,
+) -> ParsedCertificateChain
+    with {allocator, err: error.TlsError}
+{
+    if body.len() < (4 as usize) { raise error.TlsError.bad_handshake }
+    var pos: usize = 0 as usize
+    let ctx_len = wire.read_u8(body, pos)? as usize
+    if ctx_len != (0 as usize) { raise error.TlsError.bad_handshake }
+    pos = pos + (1 as usize)
+    let list_len = wire.read_u24_be(body, pos)? as usize
+    pos = pos + (3 as usize)
+    let list_end = pos + list_len
+    if list_end > body.len() { raise error.TlsError.bad_handshake }
+    var certs = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_slice_slots(allocator, _max_chain_len())?
+    }
+    var len_box = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_usize_slots(allocator, 1 as usize)?
+    }
+    len_box[0 as usize] = 0 as usize
+    var entry_pos = pos
+    loop decreases list_end - entry_pos {
+        if entry_pos >= list_end { break }
+        if len_box[0 as usize] >= _max_chain_len() {
+            raise error.TlsError.certificate_chain_invalid
+        }
+        if entry_pos + (3 as usize) > list_end { raise error.TlsError.bad_handshake }
+        let cert_len = wire.read_u24_be(body, entry_pos)? as usize
+        let cert_lo = entry_pos + (3 as usize)
+        let cert_hi = cert_lo + cert_len
+        if cert_hi > list_end { raise error.TlsError.bad_handshake }
+        certs[len_box[0 as usize]] = _slice_copy(body, cert_lo, cert_hi, allocator)?
+        len_box[0 as usize] = len_box[0 as usize] + (1 as usize)
+        if cert_hi + (2 as usize) > list_end { raise error.TlsError.bad_handshake }
+        let ext_len = wire.read_u16_be(body, cert_hi)? as usize
+        let next = cert_hi + (2 as usize) + ext_len
+        if next > list_end { raise error.TlsError.bad_handshake }
+        entry_pos = next
+    }
+    if len_box[0 as usize] == (0 as usize) {
+        raise error.TlsError.certificate_chain_invalid
+    }
+    return ParsedCertificateChain { certs: certs, len_box: len_box }
+}
+
+public function encode_certificate(
+    chain: [[u8]],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let count = chain.len()
+    if count == (0 as usize) || count > _max_chain_len() {
+        raise error.TlsError.certificate_chain_invalid
+    }
+    var list_len: usize = 0 as usize
+    var i: usize = 0 as usize
+    loop decreases count - i {
+        if i >= count { break }
+        list_len = list_len + (5 as usize) + chain[i].len()
+        i = i + (1 as usize)
+    }
+    let body_len = (4 as usize) + list_len
+    let total = hs_msg.header_len() + body_len
+    var buf = _alloc_bytes(allocator, total)?
+    var pos = hs_msg.write_header(
+        mutable buf,
+        0 as usize,
+        hs_kind.HandshakeKind.certificate,
+        body_len as u32,
+    )?
+    pos = wire.write_u8(mutable buf, pos, 0 as u8)?
+    pos = wire.write_u24_be(mutable buf, pos, list_len as u32)?
+    var j: usize = 0 as usize
+    loop decreases count - j {
+        if j >= count { break }
+        pos = wire.write_u24_be(mutable buf, pos, chain[j].len() as u32)?
+        pos = wire.write_bytes(mutable buf, pos, chain[j])?
+        pos = wire.write_u16_be(mutable buf, pos, 0 as u16)?
+        j = j + (1 as usize)
+    }
+    let _ = pos
+    return buf
+}

@@ -1,0 +1,344 @@
+
+module syntax.parse.stmt.kinds.core
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.kind as kind_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ops as ops_mod
+import local.parse.util as util_mod
+import local.parse.ty.pat.util.core as pat_mod
+import local.parse.ty.core.core as ty_mod
+
+spec std.collections.vec.Vec(tree_mod.Stmt)
+spec std.mem.alloc.Box(tree_mod.Expr)
+spec std.core.option.Option(tree_mod.Ty)
+spec std.core.option.Option(tree_mod.Expr)
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(ops_mod.AssignOp)
+
+derive eq, clone, debug for BlockStep
+
+public type BlockStep {
+    case advance(next_pos: usize)
+    case trailing_expr(value: Box_Expr, next_pos: usize)
+}
+
+
+public function parse_stmt(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Stmt, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match util_mod.peek(tokens, pos) {
+        case .kw_let => parse_let_stmt(tokens, pos, ops_mod.BindingMode.immutable, mutable diags, allocator, parse_expr_fn, depth)?
+        case .kw_var => parse_let_stmt(tokens, pos, ops_mod.BindingMode.mutable_, mutable diags, allocator, parse_expr_fn, depth)?
+        case .kw_uninit => parse_let_stmt(tokens, pos, ops_mod.BindingMode.uninit_, mutable diags, allocator, parse_expr_fn, depth)?
+        case _ => parse_expr_or_assign_stmt(tokens, pos, mutable diags, allocator, parse_expr_fn, depth)?
+    }
+}
+
+
+function parse_let_stmt(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    mode: ops_mod.BindingMode,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Stmt, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    let pat_r = pat_mod.parse_pat(tokens, p, mutable diags, allocator)?
+    p = pat_r.1
+    var ty: Option_Ty.Option = Option_Ty.none
+    var ty_end_span: span_mod.Span = pat_r.0.span
+    match util_mod.peek(tokens, p) {
+        case .colon => {
+            let ty_r = ty_mod.parse_ty(tokens, p + 1, mutable diags, allocator, parse_expr_fn, depth)?
+            ty_end_span = ty_r.0.span
+            ty = Option_Ty.some(value: ty_r.0)
+            p = ty_r.1
+        }
+        case _ => ()
+    }
+    var init_: Option_Expr.Option = Option_Expr.none
+    var init_end_span: span_mod.Span = ty_end_span
+    match util_mod.peek(tokens, p) {
+        case .eq => {
+            let init_r = parse_expr_fn(tokens, p + 1, mutable diags, allocator, depth + 1)?
+            init_end_span = init_r.0.span
+            init_ = Option_Expr.some(value: init_r.0)
+            p = init_r.1
+        }
+        case _ => ()
+    }
+    enforce_binding_invariants(mode, kw_span, ty, init_, mutable diags, allocator)?
+    let full_span = merge_spans(kw_span, init_end_span)
+    let stmt = tree_mod.Stmt {
+        span: full_span,
+        kind: tree_mod.StmtKind.let_(binding: mode, pat: pat_r.0, ty: ty, init_: init_),
+    }
+    return (stmt, p)
+}
+
+function enforce_binding_invariants(
+    mode: ops_mod.BindingMode,
+    kw_span: span_mod.Span,
+    ty: Option_Ty.Option,
+    init_: Option_Expr.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let is_uninit = match mode {
+        case .uninit_ => true
+        case _ => false
+    }
+    if is_uninit {
+        let has_ty = match ty {
+            case .some(_) => true
+            case .none => false
+        }
+        if !has_ty {
+            util_mod.emit_error(mutable diags, kw_span, "`uninit` declaration requires an explicit type annotation", allocator)?
+        }
+        let has_init = match init_ {
+            case .some(_) => true
+            case .none => false
+        }
+        if has_init {
+            util_mod.emit_error(mutable diags, kw_span, "`uninit` declaration must not have an initialiser; use `let` or `var` for initialised bindings", allocator)?
+        }
+        return ()
+    }
+    let has_init = match init_ {
+        case .some(_) => true
+        case .none => false
+    }
+    if !has_init {
+        util_mod.emit_error(mutable diags, kw_span, "`let` / `var` declaration requires an initialiser; use `uninit <name>: <ty>` for an uninitialised slot", allocator)?
+    }
+}
+
+
+function parse_expr_or_assign_stmt(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Stmt, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let expr_r = parse_expr_fn(tokens, pos, mutable diags, allocator, depth + 1)?
+    let p = expr_r.1
+    return match assign_op_for(util_mod.peek(tokens, p)) {
+        case .some(let op) => finish_assign(tokens, expr_r.0, p, op, mutable diags, allocator, parse_expr_fn, depth)?
+        case .none => finish_expr_stmt(expr_r.0, p)
+    }
+}
+
+function finish_assign(
+    tokens: [lexed_mod.Lexed],
+    target: tree_mod.Expr,
+    op_pos: usize,
+    op: ops_mod.AssignOp,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Stmt, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target_span = target.span
+    let rhs_r = parse_expr_fn(tokens, op_pos + 1, mutable diags, allocator, depth + 1)?
+    let full_span = merge_spans(target_span, rhs_r.0.span)
+    let stmt = tree_mod.Stmt {
+        span: full_span,
+        kind: tree_mod.StmtKind.assign(target: target, op: op, rhs: rhs_r.0),
+    }
+    return (stmt, rhs_r.1)
+}
+
+function finish_expr_stmt(value: tree_mod.Expr, next_pos: usize) -> (tree_mod.Stmt, usize) {
+    let span = value.span
+    let stmt = tree_mod.Stmt {
+        span: span,
+        kind: tree_mod.StmtKind.expr(value: value),
+    }
+    return (stmt, next_pos)
+}
+
+
+function assign_op_for(tok: kind_mod.Token) -> Option_AssignOp.Option {
+    return match tok {
+        case .eq => Option_AssignOp.some(value: ops_mod.AssignOp.plain)
+        case .plus_eq => Option_AssignOp.some(value: ops_mod.AssignOp.add)
+        case .minus_eq => Option_AssignOp.some(value: ops_mod.AssignOp.sub)
+        case .star_eq => Option_AssignOp.some(value: ops_mod.AssignOp.mul)
+        case .slash_eq => Option_AssignOp.some(value: ops_mod.AssignOp.div)
+        case .percent_eq => Option_AssignOp.some(value: ops_mod.AssignOp.mod)
+        case .amp_eq => Option_AssignOp.some(value: ops_mod.AssignOp.bit_and)
+        case .pipe_eq => Option_AssignOp.some(value: ops_mod.AssignOp.bit_or)
+        case .caret_eq => Option_AssignOp.some(value: ops_mod.AssignOp.bit_xor)
+        case .lt_lt_eq => Option_AssignOp.some(value: ops_mod.AssignOp.shl)
+        case .gt_gt_eq => Option_AssignOp.some(value: ops_mod.AssignOp.shr)
+        case _ => Option_AssignOp.none
+    }
+}
+
+
+public function parse_block(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Block, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let open_span = util_mod.span_at(tokens, pos)
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .l_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, open_span, "expected `{` to open block", allocator)?
+            uninit empty_stmts: Vec_Stmt.Vec
+            Vec_Stmt.new(init empty_stmts, allocator)?
+            let block = tree_mod.Block {
+                span: open_span,
+                stmts: empty_stmts,
+                trailing: Option_Box_Expr.none,
+            }
+            return (block, p)
+        }
+    }
+    uninit stmts: Vec_Stmt.Vec
+    Vec_Stmt.new(init stmts, allocator)?
+    var trailing: Option_Box_Expr.Option = Option_Box_Expr.none
+    loop decreases (tokens.len() - p) {
+        p = util_mod.skip_doc_trivia(tokens, p)
+        let here = util_mod.peek(tokens, p)
+        let done = match here {
+            case .r_brace => true
+            case .eof => true
+            case _ => false
+        }
+        if done { break }
+        let step = parse_block_step(tokens, p, mutable stmts, mutable diags, allocator, parse_expr_fn, depth)?
+        match step {
+            case .advance(let next_pos) => { p = next_pos }
+            case .trailing_expr(let value, let next_pos) => {
+                trailing = Option_Box_Expr.some(value: value)
+                p = next_pos
+                break
+            }
+        }
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `}` to close block", allocator)?
+        }
+    }
+    let full_span = merge_spans(open_span, close_span)
+    let block = tree_mod.Block {
+        span: full_span,
+        stmts: stmts,
+        trailing: trailing,
+    }
+    return (block, p)
+}
+
+function parse_block_step(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stmts: mutable Vec_Stmt.Vec,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> BlockStep
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let iter_start = pos
+    let leading = util_mod.peek(tokens, pos)
+    let is_binding = match leading {
+        case .kw_let => true
+        case .kw_var => true
+        case .kw_uninit => true
+        case _ => false
+    }
+    if is_binding {
+        let stmt_r = parse_let_stmt(tokens, pos, binding_mode_for(leading), mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_Stmt.push(mutable stmts, stmt_r.0, allocator)?
+        return BlockStep.advance(next_pos: eat_optional_semicolon(tokens, stmt_r.1))
+    }
+    let expr_r = parse_expr_fn(tokens, pos, mutable diags, allocator, depth + 1)?
+    let p = expr_r.1
+    match assign_op_for(util_mod.peek(tokens, p)) {
+        case .some(let op) => {
+            let stmt_r = finish_assign(tokens, expr_r.0, p, op, mutable diags, allocator, parse_expr_fn, depth)?
+            Vec_Stmt.push(mutable stmts, stmt_r.0, allocator)?
+            return BlockStep.advance(next_pos: eat_optional_semicolon(tokens, stmt_r.1))
+        }
+        case .none => ()
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_brace => {
+            let value_box = Box_Expr.new(take expr_r.0, allocator)?
+            return BlockStep.trailing_expr(value: value_box, next_pos: p)
+        }
+        case _ => ()
+    }
+    let stmt = finish_expr_stmt(expr_r.0, p).0
+    Vec_Stmt.push(mutable stmts, stmt, allocator)?
+    let after_semi = eat_optional_semicolon(tokens, p)
+    if after_semi == iter_start {
+        return BlockStep.advance(next_pos: after_semi + 1)
+    }
+    return BlockStep.advance(next_pos: after_semi)
+}
+
+function binding_mode_for(tok: kind_mod.Token) -> ops_mod.BindingMode {
+    return match tok {
+        case .kw_let => ops_mod.BindingMode.immutable
+        case .kw_var => ops_mod.BindingMode.mutable_
+        case .kw_uninit => ops_mod.BindingMode.uninit_
+        case _ => ops_mod.BindingMode.immutable
+    }
+}
+
+function eat_optional_semicolon(tokens: [lexed_mod.Lexed], pos: usize) -> usize {
+    return match util_mod.peek(tokens, pos) {
+        case .semicolon => pos + 1
+        case _ => pos
+    }
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

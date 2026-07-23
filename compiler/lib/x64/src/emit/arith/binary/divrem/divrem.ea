@@ -1,0 +1,178 @@
+
+module x64.emit.arith.binary.divrem.divrem
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.hlir.op as hlir_op_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.control.branch as branch_mod
+import local.emit.regsel as regsel_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_divrem(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    signed_: bool,
+    want_rem: bool,
+    proven_nonzero: bool,
+    div_overflow: hlir_op_mod.DivOverflow,
+    proven_no_overflow: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let divisor = match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => r
+        case .imm32(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: divisor immediate must be materialized into a register by isel",
+        )
+    }
+    let rax = regs_mod.Gp64Reg.rax
+    let rdx = regs_mod.Gp64Reg.rdx
+    let r10 = regs_mod.Gp64Reg.r10
+    let divisor_num = regs_mod.gp64_reg_num(divisor)
+    var divisor_reg = divisor
+    if divisor_num == regs_mod.gp64_reg_num(rax) || divisor_num == regs_mod.gp64_reg_num(rdx) {
+        if regs_mod.gp64_reg_num(lreg) == regs_mod.gp64_reg_num(r10) {
+            regsel_mod.mov_if_diff(mutable code, regs_mod.Gp64Reg.r11, lreg, allocator)?
+            regsel_mod.mov_if_diff(mutable code, r10, divisor, allocator)?
+            alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, rax, regs_mod.Gp64Reg.r11, allocator)?
+        } else {
+            regsel_mod.mov_if_diff(mutable code, r10, divisor, allocator)?
+            alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, rax, lreg, allocator)?
+        }
+        divisor_reg = r10
+    } else {
+        alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, rax, lreg, allocator)?
+    }
+    if signed_ && !want_rem && uses_value_select(div_overflow) {
+        emit_signed_div_value_select(mutable code, divisor_reg, div_overflow, proven_nonzero, allocator)?
+        regsel_mod.mov_if_diff(mutable code, dreg, rax, allocator)?
+        return ()
+    }
+    emit_div_trap_guards(mutable code, divisor_reg, signed_, proven_nonzero, proven_no_overflow, allocator)?
+    if signed_ {
+        alu_mod.encode_cqo(mutable code, allocator)?
+        alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.idiv_, regs_mod.OpSize.qword_, divisor_reg, allocator)?
+    } else {
+        alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.xor_, regs_mod.OpSize.qword_, rdx, rdx, allocator)?
+        alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.div_, regs_mod.OpSize.qword_, divisor_reg, allocator)?
+    }
+    let result_reg = if want_rem { rdx } else { rax }
+    regsel_mod.mov_if_diff(mutable code, dreg, result_reg, allocator)?
+}
+
+function uses_value_select(div_overflow: hlir_op_mod.DivOverflow) -> bool {
+    return match div_overflow {
+        case .trap => false
+        case .wrap => true
+        case .saturate => true
+    }
+}
+
+function emit_signed_div_value_select(
+    code: mutable Vec_u8.Vec,
+    divisor: regs_mod.Gp64Reg,
+    div_overflow: hlir_op_mod.DivOverflow,
+    proven_nonzero: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if !proven_nonzero {
+        alu_mod.encode_test_rm_r(mutable code, regs_mod.OpSize.qword_, divisor, divisor, allocator)?
+        branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.ne_, 2 as i8, allocator)?
+        branch_mod.encode_ud2(mutable code, allocator)?
+    }
+    let neg_one: i32 = -1
+    let int_min: i64 = -9223372036854775807 - 1
+    let int_max: i64 = 9223372036854775807
+    let select_val = match div_overflow {
+        case .saturate => int_max
+        case _ => int_min
+    }
+    alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, divisor, neg_one, allocator)?
+    let jne1_at = Vec_u8.len(code)
+    branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.ne_, 0 as i8, allocator)?
+    alu_mod.encode_mov_r64_imm64(mutable code, regs_mod.Gp64Reg.r11, int_min, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rax, regs_mod.Gp64Reg.r11, allocator)?
+    let jne2_at = Vec_u8.len(code)
+    branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.ne_, 0 as i8, allocator)?
+    alu_mod.encode_mov_r64_imm64(mutable code, regs_mod.Gp64Reg.rax, select_val, allocator)?
+    let jmp_at = Vec_u8.len(code)
+    branch_mod.encode_jmp_rel8(mutable code, 0 as i8, allocator)?
+    patch_skip_rel8(mutable code, jne1_at)?
+    patch_skip_rel8(mutable code, jne2_at)?
+    alu_mod.encode_cqo(mutable code, allocator)?
+    alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.idiv_, regs_mod.OpSize.qword_, divisor, allocator)?
+    patch_skip_rel8(mutable code, jmp_at)?
+}
+
+function emit_div_trap_guards(
+    code: mutable Vec_u8.Vec,
+    divisor: regs_mod.Gp64Reg,
+    signed_: bool,
+    proven_nonzero: bool,
+    proven_no_overflow: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if !proven_nonzero {
+        alu_mod.encode_test_rm_r(mutable code, regs_mod.OpSize.qword_, divisor, divisor, allocator)?
+        branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.ne_, 2 as i8, allocator)?
+        branch_mod.encode_ud2(mutable code, allocator)?
+    }
+    if !signed_ || proven_no_overflow {
+        return ()
+    }
+    let neg_one: i32 = -1
+    let int_min: i64 = -9223372036854775807 - 1
+    alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, divisor, neg_one, allocator)?
+    let opcode_at = Vec_u8.len(code)
+    branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.ne_, 0 as i8, allocator)?
+    alu_mod.encode_mov_r64_imm64(mutable code, regs_mod.Gp64Reg.r11, int_min, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rax, regs_mod.Gp64Reg.r11, allocator)?
+    branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.ne_, 2 as i8, allocator)?
+    branch_mod.encode_ud2(mutable code, allocator)?
+    patch_skip_rel8(mutable code, opcode_at)?
+}
+
+function patch_skip_rel8(
+    code: mutable Vec_u8.Vec,
+    opcode_at: usize,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let site = opcode_at + 1
+    let len = Vec_u8.len(code)
+    if site >= len {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: div-guard skip patch site out of range",
+        )
+    }
+    let rel = len - (site + 1)
+    if rel > 127 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: div-guard skip displacement exceeds signed 8-bit range",
+        )
+    }
+    Vec_u8.set_at(mutable code, site, rel as u8 wrapping)
+}

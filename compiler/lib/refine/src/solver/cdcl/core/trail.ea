@@ -1,0 +1,191 @@
+
+module refine.solver.cdcl.core.trail
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+
+
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(VarData)
+spec std.collections.vec.Vec(usize)
+spec std.core.option.Option(lit_mod.Lit)
+
+
+public type Reason {
+    case decision
+    case propagated(clause: usize)
+}
+
+
+public type VarData {
+    value: lit_mod.LBool
+    level: u32
+    reason: Reason
+}
+
+
+public type Trail {
+    vars: Vec_VarData.Vec
+    stack: Vec_Lit.Vec
+    lim: Vec_usize.Vec
+    level: u32
+}
+
+
+public function new(out: init Trail, n_vars: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit vars: Vec_VarData.Vec
+    Vec_VarData.new(init vars, allocator)?
+    var i: usize = 0
+    loop
+        decreases (n_vars - i)
+    {
+        if i >= n_vars {
+            break
+        }
+        let d = VarData {
+            value: lit_mod.LBool.lundef,
+            level: 0 as u32,
+            reason: Reason.decision,
+        }
+        Vec_VarData.push(mutable vars, take d, allocator)?
+        i = i + 1
+    }
+    uninit stack: Vec_Lit.Vec
+    Vec_Lit.new(init stack, allocator)?
+    uninit lim: Vec_usize.Vec
+    Vec_usize.new(init lim, allocator)?
+    out = Trail {
+        vars: vars,
+        stack: stack,
+        lim: lim,
+        level: 0 as u32,
+    }
+}
+
+
+public function var_value(t: Trail, variable: usize) -> lit_mod.LBool {
+    if variable >= Vec_VarData.len(t.vars) {
+        return lit_mod.LBool.lundef
+    }
+    let d = Vec_VarData.at(t.vars, variable)
+    return d.value
+}
+
+
+public function var_level(t: Trail, variable: usize) -> u32 {
+    if variable >= Vec_VarData.len(t.vars) {
+        return 0 as u32
+    }
+    let d = Vec_VarData.at(t.vars, variable)
+    return d.level
+}
+
+
+public function var_reason(t: Trail, variable: usize) -> Reason {
+    if variable >= Vec_VarData.len(t.vars) {
+        return Reason.decision
+    }
+    let d = Vec_VarData.at(t.vars, variable)
+    return d.reason
+}
+
+
+public function lit_value(t: Trail, l: lit_mod.Lit) -> lit_mod.LBool {
+    let base = var_value(t, lit_mod.lit_var(l))
+    return if lit_mod.lit_negated(l) {
+        lit_mod.lbool_negate(base)
+    } else {
+        base
+    }
+}
+
+
+public function decision_level(t: Trail) -> u32 {
+    return t.level
+}
+
+
+public function stack_len(t: Trail) -> usize {
+    return Vec_Lit.len(t.stack)
+}
+
+
+public function stack_at(t: Trail, i: usize) -> lit_mod.Lit {
+    if i >= Vec_Lit.len(t.stack) {
+        return lit_mod.Lit { code: 0 }
+    }
+    return Vec_Lit.at(t.stack, i)
+}
+
+
+public function new_level(t: mutable Trail, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let mark = Vec_Lit.len(t.stack)
+    Vec_usize.push(mutable t.lim, take mark, allocator)?
+    t.level = t.level + 1 as u32
+}
+
+
+public function assign(
+    t: mutable Trail,
+    l: lit_mod.Lit,
+    reason: Reason,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let variable = lit_mod.lit_var(l)
+    if variable >= Vec_VarData.len(t.vars) {
+        return
+    }
+    let value = lit_mod.lbool_of(!lit_mod.lit_negated(l))
+    let d = VarData {
+        value: value,
+        level: t.level,
+        reason: reason,
+    }
+    Vec_VarData.set_at(mutable t.vars, variable, take d)
+    Vec_Lit.push(mutable t.stack, take l, allocator)?
+}
+
+
+public function backjump_to(t: mutable Trail, level: u32) -> ()
+{
+    loop
+        decreases Vec_Lit.len(t.stack)
+    {
+        let n = Vec_Lit.len(t.stack)
+        if n == 0 {
+            break
+        }
+        let top = Vec_Lit.at(t.stack, n - 1)
+        let v = lit_mod.lit_var(top)
+        if v < Vec_VarData.len(t.vars) {
+            let cur = Vec_VarData.at(t.vars, v)
+            if cur.level <= level {
+                break
+            }
+            let cleared = VarData {
+                value: lit_mod.LBool.lundef,
+                level: 0 as u32,
+                reason: Reason.decision,
+            }
+            Vec_VarData.set_at(mutable t.vars, v, take cleared)
+        }
+        let _ = Vec_Lit.pop(mutable t.stack)
+    }
+    loop
+        decreases Vec_usize.len(t.lim)
+    {
+        if (Vec_usize.len(t.lim) as u32) <= level {
+            break
+        }
+        let _ = Vec_usize.pop(mutable t.lim)
+    }
+    t.level = level
+}

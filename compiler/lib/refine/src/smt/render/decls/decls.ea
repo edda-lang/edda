@@ -1,0 +1,347 @@
+
+module refine.smt.render.decls.decls
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import local.smt.render.render as render_mod
+import local.smt.term as term_mod
+
+
+spec std.mem.alloc.Box(term_mod.SmtSort)
+spec std.mem.alloc.Box(term_mod.SmtTerm)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(term_mod.SmtSort)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+
+
+public function collect_declarations(
+    goal: term_mod.SmtTerm,
+    context_terms: Vec_SmtTerm.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit seen_funs: Vec_Symbol.Vec
+    Vec_Symbol.new(init seen_funs, allocator)?
+    uninit seen_sorts: Vec_Symbol.Vec
+    Vec_Symbol.new(init seen_sorts, allocator)?
+    var acc: String = ""
+    acc = walk_term(goal, mutable seen_funs, mutable seen_sorts, acc, interner, allocator)?
+    let n = Vec_SmtTerm.len(context_terms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let term = Vec_SmtTerm.at(context_terms, i)
+        acc = walk_term(term, mutable seen_funs, mutable seen_sorts, acc, interner, allocator)?
+        i = i + 1
+    }
+    return acc
+}
+
+
+function walk_term(
+    term: term_mod.SmtTerm,
+    seen_funs: mutable Vec_Symbol.Vec,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match term {
+        case .true_ => acc
+        case .false_ => acc
+        case .numeral(_) => acc
+        case .var_(_, let sort) =>
+            scan_sort(sort, mutable seen_sorts, acc, interner, allocator)?
+        case .app(let op, let args) =>
+            walk_app(op, args, mutable seen_funs, mutable seen_sorts, acc, interner, allocator)?
+        case .forall_(_, let binder_sort, let body) =>
+            walk_quant(binder_sort, body, mutable seen_funs, mutable seen_sorts, acc, interner, allocator)?
+        case .exists_(_, let binder_sort, let body) =>
+            walk_quant(binder_sort, body, mutable seen_funs, mutable seen_sorts, acc, interner, allocator)?
+    }
+}
+
+
+function walk_quant(
+    binder_sort: term_mod.SmtSort,
+    body_box: Box_SmtTerm,
+    seen_funs: mutable Vec_Symbol.Vec,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let acc1 = scan_sort(binder_sort, mutable seen_sorts, acc, interner, allocator)?
+    let body = Box_SmtTerm.get(body_box)
+    return walk_term(body, mutable seen_funs, mutable seen_sorts, acc1, interner, allocator)?
+}
+
+
+function walk_app(
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    seen_funs: mutable Vec_Symbol.Vec,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let acc1 = match op {
+        case .udf(let name) =>
+            emit_function(name, args, mutable seen_funs, mutable seen_sorts, acc, interner, allocator)?
+        case _ => acc
+    }
+    return walk_args(args, mutable seen_funs, mutable seen_sorts, acc1, interner, allocator)?
+}
+
+
+function walk_args(
+    args: Vec_SmtTerm.Vec,
+    seen_funs: mutable Vec_Symbol.Vec,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = acc
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        out = walk_term(arg, mutable seen_funs, mutable seen_sorts, out, interner, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function emit_function(
+    name: symbol_mod.Symbol,
+    args: Vec_SmtTerm.Vec,
+    seen_funs: mutable Vec_Symbol.Vec,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if contains_symbol(seen_funs, name) {
+        return acc
+    }
+    let head = render_mod.symbol_text(name, interner, allocator)?
+    Vec_Symbol.push(mutable seen_funs, take name, allocator)?
+    let arg_sorts = sorts_of_args(args, allocator)?
+    let acc1 = scan_arg_sorts(arg_sorts, mutable seen_sorts, acc, interner, allocator)?
+    let sorts_str = render_arg_sorts(arg_sorts, interner, allocator)?
+    let p1 = string.concat(acc1, "(declare-fun ", allocator)?
+    let p2 = string.concat(p1, head, allocator)?
+    let p3 = string.concat(p2, " (", allocator)?
+    let p4 = string.concat(p3, sorts_str, allocator)?
+    let p5 = string.concat(p4, ") Int)\n", allocator)?
+    return p5
+}
+
+
+function render_arg_sorts(
+    arg_sorts: Vec_SmtSort.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = ""
+    let n = Vec_SmtSort.len(arg_sorts)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let sort = Vec_SmtSort.at(arg_sorts, i)
+        let sort_str = render_mod.render_sort(sort, interner, allocator)?
+        let chunk = if i == 0 {
+            sort_str
+        } else {
+            let sep = string.concat(" ", sort_str, allocator)?
+            sep
+        }
+        out = string.concat(out, chunk, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function scan_arg_sorts(
+    arg_sorts: Vec_SmtSort.Vec,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out: String = acc
+    let n = Vec_SmtSort.len(arg_sorts)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let sort = Vec_SmtSort.at(arg_sorts, i)
+        out = scan_sort(sort, mutable seen_sorts, out, interner, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function sorts_of_args(args: Vec_SmtTerm.Vec, allocator: Allocator) -> Vec_SmtSort.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_SmtSort.Vec
+    Vec_SmtSort.new(init out, allocator)?
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        let sort = sort_of_term(arg)
+        Vec_SmtSort.push(mutable out, take sort, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function scan_sort(
+    sort: term_mod.SmtSort,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match sort {
+        case .bool_ => acc
+        case .int_ => acc
+        case .array_(let elem_box) => {
+            let elem = Box_SmtSort.get(elem_box)
+            scan_sort(elem, mutable seen_sorts, acc, interner, allocator)?
+        }
+        case .uninterp(let name) =>
+            emit_sort(name, mutable seen_sorts, acc, interner, allocator)?
+    }
+}
+
+
+function emit_sort(
+    name: symbol_mod.Symbol,
+    seen_sorts: mutable Vec_Symbol.Vec,
+    acc: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if contains_symbol(seen_sorts, name) {
+        return acc
+    }
+    let head = render_mod.symbol_text(name, interner, allocator)?
+    Vec_Symbol.push(mutable seen_sorts, take name, allocator)?
+    let p1 = string.concat(acc, "(declare-sort ", allocator)?
+    let p2 = string.concat(p1, head, allocator)?
+    let p3 = string.concat(p2, " 0)\n", allocator)?
+    return p3
+}
+
+
+function contains_symbol(seen: Vec_Symbol.Vec, name: symbol_mod.Symbol) -> bool {
+    let n = Vec_Symbol.len(seen)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if Vec_Symbol.at(seen, i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function sort_of_term(term: term_mod.SmtTerm) -> term_mod.SmtSort {
+    return match term {
+        case .true_ => term_mod.SmtSort.bool_
+        case .false_ => term_mod.SmtSort.bool_
+        case .numeral(_) => term_mod.SmtSort.int_
+        case .var_(_, let sort) => sort
+        case .app(let op, _) => sort_of_op(op)
+        case .forall_(_, _, _) => term_mod.SmtSort.bool_
+        case .exists_(_, _, _) => term_mod.SmtSort.bool_
+    }
+}
+
+
+function sort_of_op(op: term_mod.SmtOp) -> term_mod.SmtSort {
+    return match op {
+        case .and_ => term_mod.SmtSort.bool_
+        case .or_ => term_mod.SmtSort.bool_
+        case .not_ => term_mod.SmtSort.bool_
+        case .implies_ => term_mod.SmtSort.bool_
+        case .eq_ => term_mod.SmtSort.bool_
+        case .distinct_ => term_mod.SmtSort.bool_
+
+        case .add => term_mod.SmtSort.int_
+        case .sub => term_mod.SmtSort.int_
+        case .mul => term_mod.SmtSort.int_
+        case .neg => term_mod.SmtSort.int_
+        case .div_ => term_mod.SmtSort.int_
+        case .mod_ => term_mod.SmtSort.int_
+
+        case .lt => term_mod.SmtSort.bool_
+        case .le => term_mod.SmtSort.bool_
+        case .gt => term_mod.SmtSort.bool_
+        case .ge => term_mod.SmtSort.bool_
+
+        case .ite => term_mod.SmtSort.int_
+        case .select_ => term_mod.SmtSort.int_
+        case .store_ => term_mod.SmtSort.int_
+        case .udf(_) => term_mod.SmtSort.int_
+    }
+}

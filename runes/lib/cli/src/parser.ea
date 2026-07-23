@@ -1,0 +1,322 @@
+module cli.parser
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import std.core.option
+import cli.error
+
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(Spec)
+spec std.collections.vec.Vec(OptEntry)
+
+
+public type Spec {
+    long: String
+    short: String
+}
+
+public type OptEntry {
+    name: String
+    value: String
+}
+
+public type Parser {
+    flags: Vec_Spec.Vec
+    options: Vec_Spec.Vec
+}
+
+public type Parsed {
+    set_flags: Vec_String.Vec
+    set_options: Vec_OptEntry.Vec
+    positionals: [String]
+}
+
+
+public function new(allocator: Allocator) -> Parser
+    with {allocator, err: alloc.AllocError}
+{
+    uninit flags: Vec_Spec.Vec
+    Vec_Spec.new(init flags, allocator)?
+    uninit options: Vec_Spec.Vec
+    Vec_Spec.new(init options, allocator)?
+    return Parser { flags: flags, options: options }
+}
+
+public function add_flag(
+    p: mutable Parser,
+    long: String,
+    short: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let long_owned = string.clone(long, allocator)?
+    let short_owned = string.clone(short, allocator)?
+    let entry = Spec { long: long_owned, short: short_owned }
+    Vec_Spec.push(mutable p.flags, take entry, allocator)?
+}
+
+public function add_option(
+    p: mutable Parser,
+    long: String,
+    short: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let long_owned = string.clone(long, allocator)?
+    let short_owned = string.clone(short, allocator)?
+    let entry = Spec { long: long_owned, short: short_owned }
+    Vec_Spec.push(mutable p.options, take entry, allocator)?
+}
+
+
+function _to_string(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _find_eq(bytes: [u8]) -> usize
+    ensures result <= bytes.len()
+{
+    let n = bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if bytes[i] == 61 as u8 { return i }
+        i += 1
+    }
+    return n
+}
+
+function _spec_index_by_long(specs: Vec_Spec.Vec, name: String) -> usize
+    ensures result <= Vec_Spec.len(specs)
+{
+    let n = Vec_Spec.len(specs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if string.equals(Vec_Spec.at(specs, i).long, name) { return i }
+        i += 1
+    }
+    return n
+}
+
+function _spec_index_by_short(specs: Vec_Spec.Vec, short: String) -> usize
+    ensures result <= Vec_Spec.len(specs)
+{
+    let n = Vec_Spec.len(specs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if string.equals(Vec_Spec.at(specs, i).short, short) { return i }
+        i += 1
+    }
+    return n
+}
+
+function _set_flag(out: mutable Vec_String.Vec, long: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let owned = string.clone(long, allocator)?
+    Vec_String.push(mutable out, take owned, allocator)?
+}
+
+function _set_option(
+    out: mutable Vec_OptEntry.Vec,
+    name: String,
+    value: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let name_owned = string.clone(name, allocator)?
+    let value_owned = string.clone(value, allocator)?
+    let entry = OptEntry { name: name_owned, value: value_owned }
+    Vec_OptEntry.push(mutable out, take entry, allocator)?
+}
+
+
+function _parse_long(
+    p: Parser,
+    arg: String,
+    argv: [String],
+    idx: usize where idx < argv.len(),
+    set_flags: mutable Vec_String.Vec,
+    set_options: mutable Vec_OptEntry.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, err: error.CliError}
+    ensures result > idx
+{
+    let bytes = arg.bytes()
+    let body = bytes[2 as usize..<bytes.len()]
+    let eq = _find_eq(body)
+    let name = _to_string(body[0 as usize..<eq], allocator)?
+
+    let f_idx = _spec_index_by_long(p.flags, name)
+    if f_idx < Vec_Spec.len(p.flags) {
+        _set_flag(mutable set_flags, name, allocator)?
+        return idx + 1
+    }
+
+    let o_idx = _spec_index_by_long(p.options, name)
+    if o_idx < Vec_Spec.len(p.options) {
+        if eq < body.len() {
+            let value = _to_string(body[eq + 1 as usize..<body.len()], allocator)?
+            _set_option(mutable set_options, name, value, allocator)?
+            return idx + 1
+        }
+        if idx + 1 >= argv.len() {
+            raise error.CliError.missing_value(name: name)
+        }
+        _set_option(mutable set_options, name, argv[idx + 1], allocator)?
+        return idx + 2
+    }
+
+    raise error.CliError.unknown_argument(arg: string.clone(arg, allocator)?)
+}
+
+function _parse_short(
+    p: Parser,
+    arg: String,
+    argv: [String],
+    idx: usize where idx < argv.len(),
+    set_flags: mutable Vec_String.Vec,
+    set_options: mutable Vec_OptEntry.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, err: error.CliError}
+    ensures result > idx
+{
+    let bytes = arg.bytes()
+    let body = bytes[1 as usize..<bytes.len()]
+    let eq = _find_eq(body)
+    let short = _to_string(body[0 as usize..<eq], allocator)?
+
+    let f_idx = _spec_index_by_short(p.flags, short)
+    if f_idx < Vec_Spec.len(p.flags) {
+        let long = Vec_Spec.at(p.flags, f_idx).long
+        _set_flag(mutable set_flags, long, allocator)?
+        return idx + 1
+    }
+
+    let o_idx = _spec_index_by_short(p.options, short)
+    if o_idx < Vec_Spec.len(p.options) {
+        let long = Vec_Spec.at(p.options, o_idx).long
+        if eq < body.len() {
+            let value = _to_string(body[eq + 1 as usize..<body.len()], allocator)?
+            _set_option(mutable set_options, long, value, allocator)?
+            return idx + 1
+        }
+        if idx + 1 >= argv.len() {
+            raise error.CliError.missing_value(name: long)
+        }
+        _set_option(mutable set_options, long, argv[idx + 1], allocator)?
+        return idx + 2
+    }
+
+    raise error.CliError.unknown_argument(arg: string.clone(arg, allocator)?)
+}
+
+function _is_long(arg: String) -> bool {
+    let b = arg.bytes()
+    return b.len() >= 2 as usize && b[0] == 45 as u8 && b[1] == 45 as u8
+}
+
+function _is_terminator(arg: String) -> bool {
+    let b = arg.bytes()
+    return b.len() == 2 as usize && b[0] == 45 as u8 && b[1] == 45 as u8
+}
+
+function _is_short(arg: String) -> bool {
+    let b = arg.bytes()
+    return b.len() >= 2 as usize && b[0] == 45 as u8 && b[1] != 45 as u8
+}
+
+public function parse(p: Parser, argv: [String], allocator: Allocator) -> Parsed
+    with {allocator, err: alloc.AllocError, err: error.CliError}
+{
+    uninit set_flags: Vec_String.Vec
+    Vec_String.new(init set_flags, allocator)?
+    uninit set_options: Vec_OptEntry.Vec
+    Vec_OptEntry.new(init set_options, allocator)?
+    uninit pos: Vec_String.Vec
+    Vec_String.new(init pos, allocator)?
+
+    let n = argv.len()
+    var i: usize = 0
+    var only_positional: bool = false
+    loop decreases n - i {
+        if i >= n { break }
+        let arg = argv[i]
+        if only_positional {
+            _set_flag(mutable pos, arg, allocator)?
+            i += 1
+            continue
+        }
+        if _is_terminator(arg) {
+            only_positional = true
+            i += 1
+            continue
+        }
+        if _is_long(arg) {
+            i = _parse_long(p, arg, argv, i, mutable set_flags, mutable set_options, allocator)?
+            continue
+        }
+        if _is_short(arg) {
+            i = _parse_short(p, arg, argv, i, mutable set_flags, mutable set_options, allocator)?
+            continue
+        }
+        _set_flag(mutable pos, arg, allocator)?
+        i += 1
+    }
+
+    let positionals = Vec_String.into_array(take pos, allocator)?
+    return Parsed {
+        set_flags: set_flags,
+        set_options: set_options,
+        positionals: positionals,
+    }
+}
+
+
+public function flag(parsed: Parsed, long: String) -> bool {
+    let n = Vec_String.len(parsed.set_flags)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if string.equals(Vec_String.at(parsed.set_flags, i), long) { return true }
+        i += 1
+    }
+    return false
+}
+
+public function option(parsed: Parsed, long: String) -> Option_String {
+    let n = Vec_OptEntry.len(parsed.set_options)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let entry = Vec_OptEntry.at(parsed.set_options, i)
+        if string.equals(entry.name, long) {
+            return Option_String.some(value: entry.value)
+        }
+        i += 1
+    }
+    return Option_String.none
+}
+
+public function positionals(parsed: Parsed) -> [String] {
+    return parsed.positionals
+}

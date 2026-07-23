@@ -1,0 +1,162 @@
+module tinysql.parse.parse
+
+import std.mem.alloc
+import tinysql.model.error
+import tinysql.model.schema
+import tinysql.model.ast
+import tinysql.parse.lex
+import tinysql.parse.cursor
+import tinysql.parse.expr
+
+function _alloc_column_slots(allocator: Allocator, n: usize) -> [schema.Column]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_assignment_slots(allocator: Allocator, n: usize) -> [ast.Assignment]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_string_slots(allocator: Allocator, n: usize) -> [String]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _parse_create(p: mutable cursor.Parser, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    cursor.expect_kw(mutable p, "create")?
+    cursor.expect_kw(mutable p, "table")?
+    let name = cursor.expect_ident(mutable p, allocator)?
+    cursor.expect_lparen(mutable p)?
+    let slots = _alloc_column_slots(allocator, p.n + 1 as usize)?
+    let first_name = cursor.expect_ident(mutable p, allocator)?
+    let first_type = cursor.parse_coltype(mutable p)?
+    slots[0 as usize] = schema.Column { name: first_name, col_type: first_type }
+    var count: usize = 1
+    var guard: usize = p.n
+    loop decreases guard {
+        if guard == 0 as usize { break }
+        guard = guard - 1 as usize
+        if !cursor.is_comma(p) { break }
+        cursor.bump(mutable p)
+        let cn = cursor.expect_ident(mutable p, allocator)?
+        let ct = cursor.parse_coltype(mutable p)?
+        slots[count] = schema.Column { name: cn, col_type: ct }
+        count = count + 1 as usize
+    }
+    cursor.expect_rparen(mutable p)?
+    return ast.Statement.create_table(name: name, columns: slots[0 as usize..<count])
+}
+
+function _parse_insert(p: mutable cursor.Parser, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    cursor.expect_kw(mutable p, "insert")?
+    cursor.expect_kw(mutable p, "into")?
+    let name = cursor.expect_ident(mutable p, allocator)?
+    var has_cols: bool = false
+    var cols = _alloc_string_slots(allocator, 1 as usize)?[0 as usize..<0 as usize]
+    if cursor.is_lparen(p) {
+        cursor.bump(mutable p)
+        cols = expr.parse_ident_list(mutable p, allocator)?
+        cursor.expect_rparen(mutable p)?
+        has_cols = true
+    }
+    cursor.expect_kw(mutable p, "values")?
+    cursor.expect_lparen(mutable p)?
+    let vals = expr.parse_value_list(mutable p, allocator)?
+    cursor.expect_rparen(mutable p)?
+    return ast.Statement.insert(table: name, has_columns: has_cols, columns: cols, values: vals)
+}
+
+function _parse_select(p: mutable cursor.Parser, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    cursor.expect_kw(mutable p, "select")?
+    var proj: ast.Projection = ast.Projection.all
+    if cursor.is_star(p) {
+        cursor.bump(mutable p)
+    } else {
+        proj = ast.Projection.named(columns: expr.parse_ident_list(mutable p, allocator)?)
+    }
+    cursor.expect_kw(mutable p, "from")?
+    let name = cursor.expect_ident(mutable p, allocator)?
+    let filter = expr.parse_where(mutable p, allocator)?
+    return ast.Statement.select(table: name, projection: proj, filter: filter)
+}
+
+function _parse_update(p: mutable cursor.Parser, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    cursor.expect_kw(mutable p, "update")?
+    let name = cursor.expect_ident(mutable p, allocator)?
+    cursor.expect_kw(mutable p, "set")?
+    let slots = _alloc_assignment_slots(allocator, p.n + 1 as usize)?
+    let c0 = cursor.expect_ident(mutable p, allocator)?
+    cursor.expect_eq(mutable p)?
+    let v0 = expr.parse_value(mutable p, allocator)?
+    slots[0 as usize] = ast.Assignment { column: c0, operand: v0 }
+    var count: usize = 1
+    var guard: usize = p.n
+    loop decreases guard {
+        if guard == 0 as usize { break }
+        guard = guard - 1 as usize
+        if !cursor.is_comma(p) { break }
+        cursor.bump(mutable p)
+        let cn = cursor.expect_ident(mutable p, allocator)?
+        cursor.expect_eq(mutable p)?
+        let vn = expr.parse_value(mutable p, allocator)?
+        slots[count] = ast.Assignment { column: cn, operand: vn }
+        count = count + 1 as usize
+    }
+    let filter = expr.parse_where(mutable p, allocator)?
+    return ast.Statement.update(table: name, assignments: slots[0 as usize..<count], filter: filter)
+}
+
+function _parse_delete(p: mutable cursor.Parser, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    cursor.expect_kw(mutable p, "delete")?
+    cursor.expect_kw(mutable p, "from")?
+    let name = cursor.expect_ident(mutable p, allocator)?
+    let filter = expr.parse_where(mutable p, allocator)?
+    return ast.Statement.delete(table: name, filter: filter)
+}
+
+function _parse_statement(p: mutable cursor.Parser, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let t = cursor.cur(p)
+    return match t {
+        case .ident(let s, let e) => {
+            if cursor.kw_eq_at(p.src, s, e, "create") {
+                _parse_create(mutable p, allocator)?
+            } else if cursor.kw_eq_at(p.src, s, e, "insert") {
+                _parse_insert(mutable p, allocator)?
+            } else if cursor.kw_eq_at(p.src, s, e, "select") {
+                _parse_select(mutable p, allocator)?
+            } else if cursor.kw_eq_at(p.src, s, e, "update") {
+                _parse_update(mutable p, allocator)?
+            } else if cursor.kw_eq_at(p.src, s, e, "delete") {
+                _parse_delete(mutable p, allocator)?
+            } else {
+                raise error.SqlError.expected_keyword(at: s)
+            }
+        }
+        case .eof(_) => raise error.SqlError.empty_statement
+        case _       => raise error.SqlError.unexpected_token(at: cursor.offset(t))
+    }
+}
+
+public function parse(sql: String, allocator: Allocator) -> ast.Statement
+    with {allocator, err: error.SqlError}
+{
+    return handle err: alloc.AllocError -> { raise error.SqlError.allocation_failed } {
+        let src = sql.bytes()
+        let (toks, ntoks) = lex.lex(src, allocator)?
+        var p = cursor.Parser { toks: toks, n: ntoks, src: src, pos: 0 as usize }
+        let stmt = _parse_statement(mutable p, allocator)?
+        if cursor.is_semicolon(p) { cursor.bump(mutable p) }
+        if !cursor.at_end(p) { raise error.SqlError.trailing_tokens(at: cursor.offset(cursor.cur(p))) }
+        stmt
+    }
+}

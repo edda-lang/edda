@@ -1,0 +1,1359 @@
+
+module ir.hlir.tree.oplower.kind
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.core.fmt as fmt_mod
+import std.text.string
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import mir.layout.table as mir_layout_mod
+
+import local.hlir.tree.body as hlir_body_mod
+import local.hlir.op as hlir_op_mod
+import local.hlir.id.value as hlir_value_mod
+
+import local.lir.tree.body as lir_body_mod
+import local.lir.op as lir_op_mod
+import local.lir.error as lir_error_mod
+import local.lir.tree.reg as lir_reg_mod
+import local.lir.id.vreg as lir_vreg_mod
+import local.lir.id.op as lir_op_id_mod
+
+import local.hlir.lower.ids as lower_ids_mod
+import local.hlir.tree.node.sizing as sizing_mod
+import local.hlir.tree.oplower.scalar.scalar as scalar_mod
+import local.hlir.tree.oplower.wide.wide as wide_mod
+
+
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(u32)
+
+
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+spec std.core.option.Option(mir_layout_mod.AggLayout)
+spec std.core.option.Option(lir_reg_mod.PReg)
+
+
+public type LirOpRun {
+    ids: Vec_LirOpId.Vec
+}
+
+
+public function lower_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    return match hop.kind {
+        case .field(let operand, let index) => lower_field_op(mutable out, hop, operand, index, body, ty_interner, allocator)?
+        case .index(let operand, let index_v) => lower_index_op(mutable out, hop, operand, index_v, body, ty_interner, allocator)?
+        case .slice_subrange(let operand, let lo_v, let hi_v) => lower_slice_subrange_op(mutable out, hop, operand, lo_v, hi_v, body, ty_interner, allocator)?
+        case .len(let operand) => lower_len_op(mutable out, hop, operand, body, ty_interner, allocator)?
+        case .deref_(let operand) => lower_deref_op(mutable out, hop, operand, body, ty_interner, allocator)?
+        case .ref_(_, let operand) => lower_ref_op(mutable out, hop, operand, body, ty_interner, allocator)?
+        case .field_addr(let operand, let index) => lower_field_addr_op(mutable out, hop, operand, index, body, allocator)?
+        case .index_addr(let operand, let index_v) => lower_index_addr_op(mutable out, hop, operand, index_v, body, ty_interner, allocator)?
+        case .subrange_addr(let operand, let lo_v, _) => lower_subrange_addr_op(mutable out, hop, operand, lo_v, body, ty_interner, allocator)?
+        case .deref_addr(let operand) => lower_deref_addr_op(mutable out, hop, operand, allocator)?
+        case .store_(let addr, let value) => lower_store_op(mutable out, hop, addr, value, body, ty_interner, allocator)?
+        case .aggregate(let kind, let elems) => lower_aggregate_op(mutable out, hop, kind, elems, body, ty_interner, allocator)?
+        case .discriminant(let operand) => lower_discriminant_op(mutable out, hop, operand, allocator)?
+        case .literal(let c) => {
+            let result_ty = value_ty(body, hop.result_)?
+            if sizing_mod.int_resize_width(result_ty, ty_interner) == (16 as u32) {
+                let ids = wide_mod.lower_wide_constant(
+                    mutable out,
+                    hop.origin,
+                    c,
+                    result_ty,
+                    lower_ids_mod.vreg_of_value(hop.result_),
+                    allocator,
+                )?
+                LirOpRun { ids: ids }
+            } else {
+                let lkind = scalar_mod.lower_op_kind(hop, body, ty_interner, allocator)?
+                let id = push_lir(mutable out, hop.origin, lkind, hop.flags, allocator)?
+                run_of_one(id, allocator)?
+            }
+        }
+        case .binary(let op, let lhs, let rhs) => {
+            let lhs_ty = value_ty(body, lhs)?
+            if sizing_mod.int_resize_width(lhs_ty, ty_interner) == (16 as u32) {
+                let signed_ = sizing_mod.int_resize_signed(lhs_ty, ty_interner)
+                let rhs_ty = value_ty(body, rhs)?
+                let rhs_wide = sizing_mod.int_resize_width(rhs_ty, ty_interner) == (16 as u32)
+                let ids = wide_mod.lower_wide_binary(
+                    mutable out,
+                    hop.origin,
+                    op,
+                    signed_,
+                    rhs_wide,
+                    lhs_ty,
+                    lower_ids_mod.vreg_of_value(lhs),
+                    lower_ids_mod.vreg_of_value(rhs),
+                    lower_ids_mod.vreg_of_value(hop.result_),
+                    allocator,
+                )?
+                LirOpRun { ids: ids }
+            } else {
+                let lkind = scalar_mod.lower_op_kind(hop, body, ty_interner, allocator)?
+                let id = push_lir(mutable out, hop.origin, lkind, hop.flags, allocator)?
+                run_of_one(id, allocator)?
+            }
+        }
+        case .cast(let value, let from, let to, let kind) => {
+            let from_wide = sizing_mod.int_resize_width(from, ty_interner) == (16 as u32)
+            let to_wide = sizing_mod.int_resize_width(to, ty_interner) == (16 as u32)
+            if is_int_cast(kind) && (from_wide || to_wide) {
+                let wide_ty = if to_wide { to } else { from }
+                let ids = wide_mod.lower_wide_cast(
+                    mutable out,
+                    hop.origin,
+                    lower_ids_mod.vreg_of_value(value),
+                    sizing_mod.int_resize_signed(from, ty_interner),
+                    from_wide,
+                    to_wide,
+                    sizing_mod.int_resize_width(to, ty_interner),
+                    wide_ty,
+                    lower_ids_mod.vreg_of_value(hop.result_),
+                    allocator,
+                )?
+                LirOpRun { ids: ids }
+            } else {
+                let lkind = scalar_mod.lower_op_kind(hop, body, ty_interner, allocator)?
+                let id = push_lir(mutable out, hop.origin, lkind, hop.flags, allocator)?
+                run_of_one(id, allocator)?
+            }
+        }
+        case .unary(let op, let operand) => {
+            let operand_ty = value_ty(body, operand)?
+            if sizing_mod.int_resize_width(operand_ty, ty_interner) == (16 as u32) {
+                let ids = wide_mod.lower_wide_unary(
+                    mutable out,
+                    hop.origin,
+                    op,
+                    operand_ty,
+                    lower_ids_mod.vreg_of_value(operand),
+                    lower_ids_mod.vreg_of_value(hop.result_),
+                    allocator,
+                )?
+                LirOpRun { ids: ids }
+            } else {
+                let lkind = scalar_mod.lower_op_kind(hop, body, ty_interner, allocator)?
+                let id = push_lir(mutable out, hop.origin, lkind, hop.flags, allocator)?
+                run_of_one(id, allocator)?
+            }
+        }
+        case _ => {
+            let lkind = scalar_mod.lower_op_kind(hop, body, ty_interner, allocator)?
+            let id = push_lir(mutable out, hop.origin, lkind, hop.flags, allocator)?
+            run_of_one(id, allocator)?
+        }
+    }
+}
+
+
+function is_int_cast(kind: hlir_op_mod.HCastKind) -> bool {
+    return match kind {
+        case .integer => true
+        case .integer_wrapping => true
+        case .integer_saturating => true
+        case .integer_checked => true
+        case _ => false
+    }
+}
+
+
+public function push_lir(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    kind: lir_op_mod.LirOpKind,
+    flags: hlir_op_mod.OpFlags,
+    allocator: Allocator,
+) -> lir_op_id_mod.LirOpId
+    with {allocator, err: alloc.AllocError}
+{
+    let lop = lir_op_mod.LirOp {
+        origin: origin,
+        kind: kind,
+        flags: flags,
+    }
+    return lir_body_mod.push_op(mutable out, take lop, allocator)?
+}
+
+
+public function run_of_one(
+    id: lir_op_id_mod.LirOpId,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    Vec_LirOpId.push(mutable ids, take id, allocator)?
+    return LirOpRun { ids: ids }
+}
+
+
+function value_ty(
+    body: hlir_body_mod.HlirBody,
+    v: hlir_value_mod.ValueId,
+) -> ty_mod.TyId
+    with {err: lir_error_mod.LirError}
+{
+    if (v.raw as usize) >= Vec_HlirValue.len(body.values) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: value id out of range for aggregate type lookup",
+        )
+    }
+    let value = Vec_HlirValue.at(body.values, v.raw as usize)
+    return value.ty
+}
+
+
+function lookup_layout(
+    body: hlir_body_mod.HlirBody,
+    ty: ty_mod.TyId,
+    what: String,
+) -> mir_layout_mod.AggLayout
+    with {err: lir_error_mod.LirError}
+{
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let l) => l
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: what,
+        )
+    }
+}
+
+
+function lookup_layout_detailed(
+    body: hlir_body_mod.HlirBody,
+    ty: ty_mod.TyId,
+    what: String,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> mir_layout_mod.AggLayout
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let l) => l
+        case .none => raise missing_layout_error(ty, what, ty_interner, allocator)?
+    }
+}
+
+
+function missing_layout_error(
+    ty: ty_mod.TyId,
+    what: String,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> lir_error_mod.LirError
+    with {allocator, err: alloc.AllocError}
+{
+    let kind_tag = if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        "out-of-range"
+    } else {
+        match ty_interner_mod.lookup(ty_interner, ty) {
+            case .record(_) => "record"
+            case .sum_(_) => "sum"
+            case .tuple_(_) => "tuple"
+            case .array(_, _) => "array"
+            case .slice(_) => "slice"
+            case .string_ => "string"
+            case .refined(_, _) => "refined"
+            case .capability(_) => "capability"
+            case .primitive(let pk) => prim_tag(pk)
+            case .fn_(_, _, _) => "fn"
+            case .spec_instance(_, _) => "spec-instance"
+            case .opaque(_) => "opaque"
+            case .error_ => "error"
+        }
+    }
+    let with_kind = string.concat(what, " on ", allocator)?
+    let with_tag = string.concat(with_kind, kind_tag, allocator)?
+    let with_eq = string.concat(with_tag, " ty=", allocator)?
+    let message = string.concat(with_eq, fmt_mod.u32_to_string(ty.raw, allocator)?, allocator)?
+    return lir_error_mod.LirError.internal_lowering_invariant(at: span_mod.dummy(), message: message)
+}
+
+
+function prim_tag(pk: ty_kind_mod.PrimKind) -> String {
+    return match pk {
+        case .heap_ptr => "prim-heap-ptr"
+        case .i64_ => "prim-i64"
+        case .u64_ => "prim-u64"
+        case .usize_ => "prim-usize"
+        case .isize_ => "prim-isize"
+        case .bool_ => "prim-bool"
+        case .unit_ => "prim-unit"
+        case .never_ => "prim-never"
+        case _ => "primitive"
+    }
+}
+
+
+function load_width(sz: u32) -> u32 {
+    if sz >= (8 as u32) { return 8 as u32 }
+    if sz >= (4 as u32) { return 4 as u32 }
+    if sz >= (2 as u32) { return 2 as u32 }
+    return 1 as u32
+}
+
+
+function is_scalar_sum(
+    body: hlir_body_mod.HlirBody,
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool {
+    let peeled = peel_refined(ty, ty_interner, 16 as u32)
+    if (peeled.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return false }
+    let is_sum = match ty_interner_mod.lookup(ty_interner, peeled) {
+        case .sum_(_) => true
+        case _ => false
+    }
+    if !is_sum {
+        return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+            case .some(let l) => l.scalar_wrapper
+            case .none => false
+        }
+    }
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let l) => {
+            if Vec_u32.len(l.field_sizes) < (2 as usize) {
+                true
+            } else {
+                Vec_u32.at(l.field_sizes, 1 as usize) == (0 as u32)
+            }
+        }
+        case .none => true
+    }
+}
+
+
+function fresh_addr_vreg(
+    out: mutable lir_body_mod.LirBody,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError}
+{
+    let vreg = lir_reg_mod.LirVReg {
+        class_: lir_reg_mod.RegClass.gp,
+        pin: Option_PReg.none,
+        ty: ty,
+        size: 8 as u32,
+        int_width: 8 as u32,
+        int_signed: false,
+        is_ref: false,
+    }
+    return lir_body_mod.push_vreg(mutable out, take vreg, allocator)?
+}
+
+
+function lower_field_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    index: u32,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let parent_ty = value_ty(body, operand)?
+    let layout = lookup_layout_detailed(body, parent_ty, "hlir.lower: missing aggregate layout for field op", ty_interner, allocator)?
+    let idx = index as usize
+    if idx >= Vec_u32.len(layout.field_offsets) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: field index out of range for aggregate layout",
+        )
+    }
+    let offset = Vec_u32.at(layout.field_offsets, idx)
+    let base = lower_ids_mod.vreg_of_value(operand)
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let field_ty = value_ty(body, hop.result_)?
+    let by_mem = match mir_layout_mod.lookup(body.agg_layouts, field_ty) {
+        case .some(_) => !is_scalar_sum(body, field_ty, ty_interner)
+        case .none => Vec_u32.at(layout.field_sizes, idx) > (8 as u32)
+    }
+    if by_mem {
+        let id = if offset == (0 as u32) {
+            push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.copy_(src: base, dst: dst), hop.flags, allocator)?
+        } else {
+            push_lir(
+                mutable out,
+                hop.origin,
+                lir_op_mod.LirOpKind.binary(
+                    op: lir_op_mod.LBinOp.add,
+                    lhs: base,
+                    rhs: lir_reg_mod.Operand.imm(value: offset as i64),
+                    dst: dst,
+                ),
+                hlir_op_mod.address_flags(),
+                allocator,
+            )?
+        }
+        return run_of_one(id, allocator)?
+    }
+    let width = load_width(Vec_u32.at(layout.field_sizes, idx))
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: offset as i32 wrapping,
+    }
+    let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: addr, dst: dst, width: width), hop.flags, allocator)?
+    return run_of_one(id, allocator)?
+}
+
+
+function lower_index_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    index_v: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let elem_ty = value_ty(body, hop.result_)?
+    let idx_ty = value_ty(body, index_v)?
+    let operand_ty = value_ty(body, operand)?
+    let stride = match mir_layout_mod.lookup(body.agg_layouts, elem_ty) {
+        case .some(let l) => l.total_size
+        case .none => sizing_mod.int_resize_width(elem_ty, ty_interner)
+    }
+    let by_mem = match mir_layout_mod.lookup(body.agg_layouts, elem_ty) {
+        case .some(_) => !is_scalar_sum(body, elem_ty, ty_interner)
+        case .none => stride > (8 as u32)
+    }
+
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+
+    if !hop.flags.in_bounds {
+        match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+            case .string_ => raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "hlir.lower: index on string operand — bytes() views retype to [u8] before oplower",
+            )
+            case .slice(_) => {
+                let len_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+                let len_addr = lir_reg_mod.MemRef {
+                    base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+                    index: Option_LirVRegId.none,
+                    scale: 1 as u32,
+                    displacement: 8 as i32,
+                }
+                let llid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: len_addr, dst: len_v, width: 8 as u32), hop.flags, allocator)?
+                Vec_LirOpId.push(mutable ids, take llid, allocator)?
+                let bc = push_lir(
+                    mutable out,
+                    hop.origin,
+                    lir_op_mod.LirOpKind.bounds_check(
+                        index: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(index_v)),
+                        len: lir_reg_mod.Operand.vreg(id: len_v),
+                    ),
+                    hop.flags,
+                    allocator,
+                )?
+                Vec_LirOpId.push(mutable ids, take bc, allocator)?
+            }
+            case .array(_, let n) => {
+                let bc = push_lir(
+                    mutable out,
+                    hop.origin,
+                    lir_op_mod.LirOpKind.bounds_check(
+                        index: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(index_v)),
+                        len: lir_reg_mod.Operand.imm(value: n as i64),
+                    ),
+                    hop.flags,
+                    allocator,
+                )?
+                Vec_LirOpId.push(mutable ids, take bc, allocator)?
+            }
+            case _ => ()
+        }
+    }
+
+    let base = match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+        case .string_ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: index on string operand — bytes() views retype to [u8] before oplower",
+        )
+        case .slice(_) => {
+            let ptr_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+            let ptr_addr = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: 0 as i32,
+            }
+            let lid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: ptr_addr, dst: ptr_v, width: 8 as u32), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take lid, allocator)?
+            ptr_v
+        }
+        case _ => lower_ids_mod.vreg_of_value(operand)
+    }
+
+    let stride_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let sc = push_lir(
+        mutable out,
+        hop.origin,
+        lir_op_mod.LirOpKind.constant_(
+            c: lir_op_mod.LConstant.int_(value: stride as i128, ty: idx_ty),
+            dst: stride_v,
+        ),
+        hop.flags,
+        allocator,
+    )?
+    Vec_LirOpId.push(mutable ids, take sc, allocator)?
+
+    let offset_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let mulop = push_lir(
+        mutable out,
+        hop.origin,
+        lir_op_mod.LirOpKind.binary(
+            op: lir_op_mod.LBinOp.mul,
+            lhs: lower_ids_mod.vreg_of_value(index_v),
+            rhs: lir_reg_mod.Operand.vreg(id: stride_v),
+            dst: offset_v,
+        ),
+        hlir_op_mod.address_flags(),
+        allocator,
+    )?
+    Vec_LirOpId.push(mutable ids, take mulop, allocator)?
+
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    if by_mem {
+        let addop = push_lir(
+            mutable out,
+            hop.origin,
+            lir_op_mod.LirOpKind.binary(
+                op: lir_op_mod.LBinOp.add,
+                lhs: base,
+                rhs: lir_reg_mod.Operand.vreg(id: offset_v),
+                dst: dst,
+            ),
+            hlir_op_mod.address_flags(),
+            allocator,
+        )?
+        Vec_LirOpId.push(mutable ids, take addop, allocator)?
+    } else {
+        let elem_addr = lir_reg_mod.MemRef {
+            base: Option_LirVRegId.some(value: base),
+            index: Option_LirVRegId.some(value: offset_v),
+            scale: 1 as u32,
+            displacement: 0 as i32,
+        }
+        let ld = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: elem_addr, dst: dst, width: load_width(stride)), hop.flags, allocator)?
+        Vec_LirOpId.push(mutable ids, take ld, allocator)?
+    }
+    return LirOpRun { ids: ids }
+}
+
+
+function subrange_stride(
+    operand_ty: ty_mod.TyId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+) -> u32
+    with {err: lir_error_mod.LirError}
+{
+    let elem_ty = match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+        case .slice(let elem) => elem
+        case .array(let elem, _) => elem
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: slice_subrange on non-slice/array operand",
+        )
+    }
+    return match mir_layout_mod.lookup(body.agg_layouts, elem_ty) {
+        case .some(let l) => l.total_size
+        case .none => sizing_mod.int_resize_width(elem_ty, ty_interner)
+    }
+}
+
+
+function store_word(
+    out: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    base: lir_vreg_mod.LirVRegId,
+    disp: i32,
+    value: lir_vreg_mod.LirVRegId,
+    flags: hlir_op_mod.OpFlags,
+    allocator: Allocator,
+) -> lir_op_id_mod.LirOpId
+    with {allocator, err: alloc.AllocError}
+{
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: disp,
+    }
+    return push_lir(mutable out, origin, lir_op_mod.LirOpKind.store(value: value, addr: addr, width: 8 as u32), flags, allocator)?
+}
+
+
+function lower_slice_subrange_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    lo_v: hlir_value_mod.ValueId,
+    hi_v: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let operand_ty = value_ty(body, operand)?
+    let idx_ty = value_ty(body, lo_v)?
+    let stride = subrange_stride(operand_ty, body, ty_interner)?
+
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+
+    let base = match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+        case .slice(_) => {
+            let ptr_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+            let ptr_addr = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: 0 as i32,
+            }
+            let lid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: ptr_addr, dst: ptr_v, width: 8 as u32), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take lid, allocator)?
+            ptr_v
+        }
+        case _ => lower_ids_mod.vreg_of_value(operand)
+    }
+
+    let stride_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let sc = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: stride as i128, ty: idx_ty), dst: stride_v), hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take sc, allocator)?
+
+    let offset_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let mulop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.mul, lhs: lower_ids_mod.vreg_of_value(lo_v), rhs: lir_reg_mod.Operand.vreg(id: stride_v), dst: offset_v), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take mulop, allocator)?
+
+    let new_ptr_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let addop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: base, rhs: lir_reg_mod.Operand.vreg(id: offset_v), dst: new_ptr_v), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take addop, allocator)?
+
+    let new_len_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let subop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.sub, lhs: lower_ids_mod.vreg_of_value(hi_v), rhs: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(lo_v)), dst: new_len_v), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take subop, allocator)?
+
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let sa = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.stack_addr(bytes: 16 as u32, dst: dst), hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take sa, allocator)?
+
+    let st_ptr = store_word(mutable out, hop.origin, dst, 0 as i32, new_ptr_v, hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take st_ptr, allocator)?
+    let st_len = store_word(mutable out, hop.origin, dst, 8 as i32, new_len_v, hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take st_len, allocator)?
+
+    return LirOpRun { ids: ids }
+}
+
+
+function peel_refined(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> ty_mod.TyId
+    decreases fuel
+{
+    if fuel == (0 as u32) { return ty }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return ty }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .refined(let base, _) => peel_refined(base, ty_interner, fuel - (1 as u32))
+        case _ => ty
+    }
+}
+
+
+function lower_len_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let operand_ty = value_ty(body, operand)?
+    return match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+        case .slice(_) => lower_field_op(mutable out, hop, operand, 1 as u32, body, ty_interner, allocator)?
+        case .array(_, let n) => {
+            let dst = lower_ids_mod.vreg_of_value(hop.result_)
+            let rty = value_ty(body, hop.result_)?
+            let id = push_lir(
+                mutable out,
+                hop.origin,
+                lir_op_mod.LirOpKind.constant_(
+                    c: lir_op_mod.LConstant.int_(value: n as i128, ty: rty),
+                    dst: dst,
+                ),
+                hop.flags,
+                allocator,
+            )?
+            run_of_one(id, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: len on non-slice/array operand",
+        )
+    }
+}
+
+
+function lower_deref_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let result_ty = value_ty(body, hop.result_)?
+    let base = lower_ids_mod.vreg_of_value(operand)
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let width = match mir_layout_mod.lookup(body.agg_layouts, result_ty) {
+        case .some(let l) => {
+            if is_scalar_sum(body, result_ty, ty_interner) {
+                load_width(l.total_size)
+            } else {
+                let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.copy_(src: base, dst: dst), hop.flags, allocator)?
+                return run_of_one(id, allocator)?
+            }
+        }
+        case .none => {
+            let bytes = sizing_mod.int_resize_width(result_ty, ty_interner)
+            if bytes > (8 as u32) {
+                let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.copy_(src: base, dst: dst), hop.flags, allocator)?
+                return run_of_one(id, allocator)?
+            }
+            load_width(bytes)
+        }
+    }
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: addr, dst: dst, width: width), hop.flags, allocator)?
+    return run_of_one(id, allocator)?
+}
+
+
+function lower_ref_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let operand_ty = value_ty(body, operand)?
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let src = lower_ids_mod.vreg_of_value(operand)
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    return match mir_layout_mod.lookup(body.agg_layouts, operand_ty) {
+        case .some(let l) => {
+            let sa = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.stack_addr(bytes: l.total_size, dst: dst), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take sa, allocator)?
+            if is_scalar_sum(body, operand_ty, ty_interner) {
+                let memref = lir_reg_mod.MemRef {
+                    base: Option_LirVRegId.some(value: dst),
+                    index: Option_LirVRegId.none,
+                    scale: 1 as u32,
+                    displacement: 0 as i32,
+                }
+                let st = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.store(value: src, addr: memref, width: load_width(l.total_size)), hop.flags, allocator)?
+                Vec_LirOpId.push(mutable ids, take st, allocator)?
+                return LirOpRun { ids: ids }
+            }
+            let cb = emit_copy_bytes(mutable out, hop, dst, src, operand_ty, l.total_size, allocator)?
+            let nc = Vec_LirOpId.len(cb.ids)
+            var k: usize = 0
+            loop decreases nc - k {
+                if k >= nc { break }
+                Vec_LirOpId.push(mutable ids, Vec_LirOpId.at(cb.ids, k), allocator)?
+                k += 1
+            }
+            LirOpRun { ids: ids }
+        }
+        case .none => {
+            let bytes = sizing_mod.int_resize_width(operand_ty, ty_interner)
+            let sa = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.stack_addr(bytes: bytes, dst: dst), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take sa, allocator)?
+            if bytes > (8 as u32) {
+                let cb = emit_copy_bytes(mutable out, hop, dst, src, operand_ty, bytes, allocator)?
+                let nc = Vec_LirOpId.len(cb.ids)
+                var k: usize = 0
+                loop decreases nc - k {
+                    if k >= nc { break }
+                    Vec_LirOpId.push(mutable ids, Vec_LirOpId.at(cb.ids, k), allocator)?
+                    k += 1
+                }
+                return LirOpRun { ids: ids }
+            }
+            let memref = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: dst),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: 0 as i32,
+            }
+            let st = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.store(value: src, addr: memref, width: load_width(bytes)), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take st, allocator)?
+            LirOpRun { ids: ids }
+        }
+    }
+}
+
+
+function lower_aggregate_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    kind: hlir_op_mod.HAggregateKind,
+    elems: Vec_ValueId.Vec,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let agg_ty = value_ty(body, hop.result_)?
+    let layout = lookup_layout_detailed(body, agg_ty, "hlir.lower: missing aggregate layout for aggregate op", ty_interner, allocator)?
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    let sa = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.stack_addr(bytes: layout.total_size, dst: dst), hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take sa, allocator)?
+
+    match kind {
+        case .sum_variant(let variant) => {
+            store_discriminant(mutable out, mutable ids, hop, variant, agg_ty, dst, layout, allocator)?
+            lower_variant_payload(mutable out, mutable ids, hop, variant, agg_ty, dst, elems, body, ty_interner, allocator)?
+        }
+        case _ => {
+            let n = Vec_ValueId.len(elems)
+            let nf = Vec_u32.len(layout.field_offsets)
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                if i >= nf { break }
+                place_elem(mutable out, mutable ids, hop, agg_ty, dst, Vec_ValueId.at(elems, i), Vec_u32.at(layout.field_offsets, i), Vec_u32.at(layout.field_sizes, i), body, ty_interner, allocator)?
+                i += 1
+            }
+        }
+    }
+    return LirOpRun { ids: ids }
+}
+
+
+function lower_variant_payload(
+    out: mutable lir_body_mod.LirBody,
+    ids: mutable Vec_LirOpId.Vec,
+    hop: hlir_op_mod.HlirOp,
+    variant: u32,
+    agg_ty: ty_mod.TyId,
+    dst: lir_vreg_mod.LirVRegId,
+    elems: Vec_ValueId.Vec,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_ValueId.len(elems)
+    if n == (0 as usize) { return }
+    let vlayout = match mir_layout_mod.lookup_variant(body.agg_layouts, agg_ty, variant) {
+        case .some(let l) => l
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: missing variant payload layout for sum construction",
+        )
+    }
+    let nf = Vec_u32.len(vlayout.field_offsets)
+    if n == (1 as usize) && nf > (1 as usize) {
+        let off = Vec_u32.at(vlayout.field_offsets, 0 as usize)
+        if vlayout.total_size > off {
+            place_elem(mutable out, mutable ids, hop, agg_ty, dst, Vec_ValueId.at(elems, 0 as usize), off, vlayout.total_size - off, body, ty_interner, allocator)?
+        }
+        return
+    }
+    if n != nf {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: sum variant element count does not match payload layout",
+        )
+    }
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        place_elem(mutable out, mutable ids, hop, agg_ty, dst, Vec_ValueId.at(elems, i), Vec_u32.at(vlayout.field_offsets, i), Vec_u32.at(vlayout.field_sizes, i), body, ty_interner, allocator)?
+        i += 1
+    }
+}
+
+
+function place_elem(
+    out: mutable lir_body_mod.LirBody,
+    ids: mutable Vec_LirOpId.Vec,
+    hop: hlir_op_mod.HlirOp,
+    agg_ty: ty_mod.TyId,
+    dst: lir_vreg_mod.LirVRegId,
+    elem: hlir_value_mod.ValueId,
+    offset: u32,
+    fsize: u32,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let ev = lower_ids_mod.vreg_of_value(elem)
+    let elem_ty = value_ty(body, elem)?
+    let by_mem = match mir_layout_mod.lookup(body.agg_layouts, elem_ty) {
+        case .some(_) => !is_scalar_sum(body, elem_ty, ty_interner)
+        case .none => fsize > (8 as u32)
+    }
+    if by_mem {
+        let field_base = if offset == (0 as u32) {
+            dst
+        } else {
+            let fb = fresh_addr_vreg(mutable out, agg_ty, allocator)?
+            let add = push_lir(
+                mutable out,
+                hop.origin,
+                lir_op_mod.LirOpKind.binary(
+                    op: lir_op_mod.LBinOp.add,
+                    lhs: dst,
+                    rhs: lir_reg_mod.Operand.imm(value: offset as i64),
+                    dst: fb,
+                ),
+                hlir_op_mod.address_flags(),
+                allocator,
+            )?
+            Vec_LirOpId.push(mutable ids, take add, allocator)?
+            fb
+        }
+        let cb = emit_copy_bytes(mutable out, hop, field_base, ev, agg_ty, fsize, allocator)?
+        let nc = Vec_LirOpId.len(cb.ids)
+        var k: usize = 0
+        loop decreases nc - k {
+            if k >= nc { break }
+            Vec_LirOpId.push(mutable ids, Vec_LirOpId.at(cb.ids, k), allocator)?
+            k += 1
+        }
+        return
+    }
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: dst),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: offset as i32 wrapping,
+    }
+    let st = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.store(value: ev, addr: addr, width: load_width(fsize)), hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take st, allocator)?
+}
+
+
+function store_discriminant(
+    out: mutable lir_body_mod.LirBody,
+    ids: mutable Vec_LirOpId.Vec,
+    hop: hlir_op_mod.HlirOp,
+    variant: u32,
+    agg_ty: ty_mod.TyId,
+    base: lir_vreg_mod.LirVRegId,
+    layout: mir_layout_mod.AggLayout,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if Vec_u32.len(layout.field_offsets) == (0 as usize) { return }
+    let disc_off = Vec_u32.at(layout.field_offsets, 0 as usize)
+    let disc_width = load_width(Vec_u32.at(layout.field_sizes, 0 as usize))
+    let disc_vreg = lir_body_mod.push_vreg(
+        mutable out,
+        take lir_reg_mod.LirVReg {
+            class_: lir_reg_mod.RegClass.gp,
+            pin: Option_PReg.none,
+            ty: agg_ty,
+            size: lir_reg_mod.register_width(),
+            int_width: disc_width,
+            int_signed: false,
+            is_ref: false,
+        },
+        allocator,
+    )?
+    let c = push_lir(
+        mutable out,
+        hop.origin,
+        lir_op_mod.LirOpKind.constant_(
+            c: lir_op_mod.LConstant.int_(value: variant as i128, ty: agg_ty),
+            dst: disc_vreg,
+        ),
+        hop.flags,
+        allocator,
+    )?
+    Vec_LirOpId.push(mutable ids, take c, allocator)?
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: disc_off as i32 wrapping,
+    }
+    let st = push_lir(
+        mutable out,
+        hop.origin,
+        lir_op_mod.LirOpKind.store(value: disc_vreg, addr: addr, width: disc_width),
+        hop.flags,
+        allocator,
+    )?
+    Vec_LirOpId.push(mutable ids, take st, allocator)?
+}
+
+
+function lower_discriminant_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: addr, dst: dst, width: 4 as u32), hop.flags, allocator)?
+    return run_of_one(id, allocator)?
+}
+
+
+function lower_field_addr_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    index: u32,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let parent_ty = value_ty(body, operand)?
+    let layout = lookup_layout(body, parent_ty, "hlir.lower: missing aggregate layout for field-addr op")?
+    let idx = index as usize
+    if idx >= Vec_u32.len(layout.field_offsets) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "hlir.lower: field index out of range for aggregate layout",
+        )
+    }
+    let offset = Vec_u32.at(layout.field_offsets, idx)
+    let base = lower_ids_mod.vreg_of_value(operand)
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let id = if offset == (0 as u32) {
+        push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.copy_(src: base, dst: dst), hop.flags, allocator)?
+    } else {
+        push_lir(
+            mutable out,
+            hop.origin,
+            lir_op_mod.LirOpKind.binary(
+                op: lir_op_mod.LBinOp.add,
+                lhs: base,
+                rhs: lir_reg_mod.Operand.imm(value: offset as i64),
+                dst: dst,
+            ),
+            hlir_op_mod.address_flags(),
+            allocator,
+        )?
+    }
+    return run_of_one(id, allocator)?
+}
+
+
+function lower_index_addr_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    index_v: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let idx_ty = value_ty(body, index_v)?
+    let operand_ty = value_ty(body, operand)?
+    let stride = subrange_stride(operand_ty, body, ty_interner)?
+
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+
+    if !hop.flags.in_bounds {
+        match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+            case .slice(_) => {
+                let len_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+                let len_addr = lir_reg_mod.MemRef {
+                    base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+                    index: Option_LirVRegId.none,
+                    scale: 1 as u32,
+                    displacement: 8 as i32,
+                }
+                let llid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: len_addr, dst: len_v, width: 8 as u32), hop.flags, allocator)?
+                Vec_LirOpId.push(mutable ids, take llid, allocator)?
+                let bc = push_lir(
+                    mutable out,
+                    hop.origin,
+                    lir_op_mod.LirOpKind.bounds_check(
+                        index: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(index_v)),
+                        len: lir_reg_mod.Operand.vreg(id: len_v),
+                    ),
+                    hop.flags,
+                    allocator,
+                )?
+                Vec_LirOpId.push(mutable ids, take bc, allocator)?
+            }
+            case .array(_, let n) => {
+                let bc = push_lir(
+                    mutable out,
+                    hop.origin,
+                    lir_op_mod.LirOpKind.bounds_check(
+                        index: lir_reg_mod.Operand.vreg(id: lower_ids_mod.vreg_of_value(index_v)),
+                        len: lir_reg_mod.Operand.imm(value: n as i64),
+                    ),
+                    hop.flags,
+                    allocator,
+                )?
+                Vec_LirOpId.push(mutable ids, take bc, allocator)?
+            }
+            case _ => ()
+        }
+    }
+
+    let base = match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+        case .slice(_) => {
+            let ptr_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+            let ptr_addr = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: 0 as i32,
+            }
+            let lid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: ptr_addr, dst: ptr_v, width: 8 as u32), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take lid, allocator)?
+            ptr_v
+        }
+        case _ => lower_ids_mod.vreg_of_value(operand)
+    }
+
+    let stride_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let sc = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: stride as i128, ty: idx_ty), dst: stride_v), hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take sc, allocator)?
+
+    let offset_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let mulop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.mul, lhs: lower_ids_mod.vreg_of_value(index_v), rhs: lir_reg_mod.Operand.vreg(id: stride_v), dst: offset_v), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take mulop, allocator)?
+
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let addop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: base, rhs: lir_reg_mod.Operand.vreg(id: offset_v), dst: dst), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take addop, allocator)?
+
+    return LirOpRun { ids: ids }
+}
+
+
+function lower_subrange_addr_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    lo_v: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let operand_ty = value_ty(body, operand)?
+    let idx_ty = value_ty(body, lo_v)?
+    let stride = subrange_stride(operand_ty, body, ty_interner)?
+
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+
+    let base = match ty_interner_mod.lookup(ty_interner, peel_refined(operand_ty, ty_interner, 16 as u32)) {
+        case .slice(_) => {
+            let ptr_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+            let ptr_addr = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: 0 as i32,
+            }
+            let lid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: ptr_addr, dst: ptr_v, width: 8 as u32), hop.flags, allocator)?
+            Vec_LirOpId.push(mutable ids, take lid, allocator)?
+            ptr_v
+        }
+        case _ => lower_ids_mod.vreg_of_value(operand)
+    }
+
+    let stride_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let sc = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.int_(value: stride as i128, ty: idx_ty), dst: stride_v), hop.flags, allocator)?
+    Vec_LirOpId.push(mutable ids, take sc, allocator)?
+
+    let offset_v = fresh_addr_vreg(mutable out, idx_ty, allocator)?
+    let mulop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.mul, lhs: lower_ids_mod.vreg_of_value(lo_v), rhs: lir_reg_mod.Operand.vreg(id: stride_v), dst: offset_v), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take mulop, allocator)?
+
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let addop = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: base, rhs: lir_reg_mod.Operand.vreg(id: offset_v), dst: dst), hlir_op_mod.address_flags(), allocator)?
+    Vec_LirOpId.push(mutable ids, take addop, allocator)?
+
+    return LirOpRun { ids: ids }
+}
+
+
+function lower_deref_addr_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    operand: hlir_value_mod.ValueId,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dst = lower_ids_mod.vreg_of_value(hop.result_)
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: lower_ids_mod.vreg_of_value(operand)),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: addr, dst: dst, width: 8 as u32), hop.flags, allocator)?
+    return run_of_one(id, allocator)?
+}
+
+
+function lower_store_op(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    addr: hlir_value_mod.ValueId,
+    value: hlir_value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let val_ty = value_ty(body, value)?
+    let dst_base = lower_ids_mod.vreg_of_value(addr)
+    return match mir_layout_mod.lookup(body.agg_layouts, val_ty) {
+        case .some(let l) => {
+            if is_scalar_sum(body, val_ty, ty_interner) {
+                let memref = lir_reg_mod.MemRef {
+                    base: Option_LirVRegId.some(value: dst_base),
+                    index: Option_LirVRegId.none,
+                    scale: 1 as u32,
+                    displacement: 0 as i32,
+                }
+                let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.store(value: lower_ids_mod.vreg_of_value(value), addr: memref, width: load_width(l.total_size)), hop.flags, allocator)?
+                run_of_one(id, allocator)?
+            } else {
+                emit_copy_bytes(mutable out, hop, dst_base, lower_ids_mod.vreg_of_value(value), val_ty, l.total_size, allocator)?
+            }
+        }
+        case .none => {
+            let bytes = sizing_mod.int_resize_width(val_ty, ty_interner)
+            if bytes > (8 as u32) {
+                emit_copy_bytes(mutable out, hop, dst_base, lower_ids_mod.vreg_of_value(value), val_ty, bytes, allocator)?
+            } else {
+                let memref = lir_reg_mod.MemRef {
+                    base: Option_LirVRegId.some(value: dst_base),
+                    index: Option_LirVRegId.none,
+                    scale: 1 as u32,
+                    displacement: 0 as i32,
+                }
+                let id = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.store(value: lower_ids_mod.vreg_of_value(value), addr: memref, width: load_width(bytes)), hop.flags, allocator)?
+                run_of_one(id, allocator)?
+            }
+        }
+    }
+}
+
+
+function emit_copy_bytes(
+    out: mutable lir_body_mod.LirBody,
+    hop: hlir_op_mod.HlirOp,
+    dst_base: lir_vreg_mod.LirVRegId,
+    src_base: lir_vreg_mod.LirVRegId,
+    chunk_ty: ty_mod.TyId,
+    size: u32,
+    allocator: Allocator,
+) -> LirOpRun
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ids, allocator)?
+    var off: u32 = 0
+    loop decreases (size - off)
+    {
+        if off >= size { break }
+        let rem = size - off
+        let chunk = if rem >= (8 as u32) { 8 as u32 } else { if rem >= (4 as u32) { 4 as u32 } else { if rem >= (2 as u32) { 2 as u32 } else { 1 as u32 } } }
+        let tmp = fresh_addr_vreg(mutable out, chunk_ty, allocator)?
+        let load_addr = lir_reg_mod.MemRef {
+            base: Option_LirVRegId.some(value: src_base),
+            index: Option_LirVRegId.none,
+            scale: 1 as u32,
+            displacement: off as i32 wrapping,
+        }
+        let lid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.load(addr: load_addr, dst: tmp, width: chunk), hop.flags, allocator)?
+        Vec_LirOpId.push(mutable ids, take lid, allocator)?
+        let store_addr = lir_reg_mod.MemRef {
+            base: Option_LirVRegId.some(value: dst_base),
+            index: Option_LirVRegId.none,
+            scale: 1 as u32,
+            displacement: off as i32 wrapping,
+        }
+        let sid = push_lir(mutable out, hop.origin, lir_op_mod.LirOpKind.store(value: tmp, addr: store_addr, width: chunk), hop.flags, allocator)?
+        Vec_LirOpId.push(mutable ids, take sid, allocator)?
+        off += chunk
+    }
+    return LirOpRun { ids: ids }
+}

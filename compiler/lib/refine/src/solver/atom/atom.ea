@@ -1,0 +1,105 @@
+
+module refine.solver.atom.atom
+
+import std.collections.vec
+import std.collections.hashmap
+import std.mem.alloc
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(usize)
+
+
+public type AtomTable {
+    terms: Vec_SmtTerm.Vec
+    bucket_head: IntMap_usize.IntMap
+    chain: Vec_usize.Vec
+}
+
+
+public function new_table(out: init AtomTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit terms: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init terms, allocator)?
+    uninit chain: Vec_usize.Vec
+    Vec_usize.new(init chain, allocator)?
+    let bucket_head = IntMap_usize.new(allocator)?
+    out = AtomTable { terms: terms, bucket_head: bucket_head, chain: chain }
+}
+
+
+public function atom_count(tab: AtomTable) -> usize {
+    return Vec_SmtTerm.len(tab.terms)
+}
+
+
+public function fresh(tab: mutable AtomTable, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    let id = Vec_SmtTerm.len(tab.terms)
+    let placeholder = term_mod.SmtTerm.true_
+    Vec_SmtTerm.push(mutable tab.terms, take placeholder, allocator)?
+    let no_chain: usize = 0
+    Vec_usize.push(mutable tab.chain, take no_chain, allocator)?
+    return id
+}
+
+
+public function term_at(tab: AtomTable, variable: usize) -> term_mod.SmtTerm {
+    if variable >= Vec_SmtTerm.len(tab.terms) {
+        return term_mod.SmtTerm.false_
+    }
+    return Vec_SmtTerm.at(tab.terms, variable)
+}
+
+
+public function intern(
+    tab: mutable AtomTable,
+    term: take term_mod.SmtTerm,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let h: i64 = term_mod.term_hash(term) as i64 wrapping
+    var cur = match IntMap_usize.get(tab.bucket_head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    var fuel = Vec_SmtTerm.len(tab.terms)
+    loop
+        decreases fuel
+    {
+        if cur == 0 {
+            break
+        }
+        if fuel == 0 {
+            break
+        }
+        fuel = fuel - 1
+        let cand = cur -% 1
+        if cand >= Vec_SmtTerm.len(tab.terms) {
+            break
+        }
+        let existing = Vec_SmtTerm.at(tab.terms, cand)
+        if existing == term {
+            return cand
+        }
+        if cand >= Vec_usize.len(tab.chain) {
+            break
+        }
+        cur = Vec_usize.at(tab.chain, cand)
+    }
+    let id = Vec_SmtTerm.len(tab.terms)
+    let prev_head = match IntMap_usize.get(tab.bucket_head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable tab.chain, take prev_head, allocator)?
+    Vec_SmtTerm.push(mutable tab.terms, take term, allocator)?
+    let new_head = id +% 1
+    let _ = IntMap_usize.insert(mutable tab.bucket_head, h, take new_head, allocator)?
+    return id
+}

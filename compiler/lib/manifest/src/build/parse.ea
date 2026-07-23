@@ -1,0 +1,601 @@
+
+module manifest.build.parse
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.code
+import diagnostics.emit.collection as collection_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.emit.lint.config as lint_config_mod
+import diagnostics.emit.severity as severity_mod
+import diagnostics.known as known_mod
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import local.lex.assemble as assemble_mod
+import local.build.deps.deps as deps_mod
+import local.model.codegen.gc_schedule as gc_schedule_mod
+import local.model.dependency.dependency as dep_mod
+import local.manifest as manifest_mod
+import local.model.package.package as pkg_mod
+import local.lex.toml.toml as toml_mod
+import local.lex.toml.val.values as values_mod
+import local.model.workspace.workspace as ws_mod
+import link.emit.image.output as output_mod
+
+spec std.collections.vec.Vec(dep_mod.Dependency)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(toml_mod.TomlToken)
+spec std.core.option.Option(bool)
+spec std.core.option.Option(diag_mod.Diagnostic)
+spec std.core.option.Option(String)
+spec std.core.option.Option(gc_schedule_mod.GcScheduleMode)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(output_mod.OutputKind)
+spec std.core.option.Option(pkg_mod.SemVer)
+spec std.core.option.Option(severity_mod.Severity)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(ws_mod.WorkspaceDiscover)
+
+
+public function parse_manifest(content: String, file: file_mod.FileId, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> Option_LoadedManifest
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = content.bytes()
+
+    uninit tokens: Vec_TomlToken.Vec
+    Vec_TomlToken.new(init tokens, allocator)?
+    toml_mod.tokenize(bytes, file, mutable tokens, allocator)?
+
+    uninit f: Fields
+    new_fields(init f, allocator)?
+
+    parse_token_stream(tokens, bytes, file, mutable f, mutable diags, allocator)?
+
+    if collection_mod.has_errors(diags) {
+        return Option_LoadedManifest.none
+    }
+
+    let pkg_name_opt: Option_String.Option = f.pkg_name
+    let pkg_version_opt: Option_SemVer.Option = f.pkg_version
+    let pkg_ns_opt: Option_String.Option = f.pkg_ns
+    let pkg_ns_span: span_mod.Span = f.pkg_ns_span
+    let pkg_kind_opt: Option_OutputKind.Option = f.pkg_kind
+    let pkg_license_opt: Option_String.Option = f.pkg_license
+    let pkg_edition_opt: Option_String.Option = f.pkg_edition
+    let pkg_authors_vec: Vec_String.Vec = f.pkg_authors
+    let pkg_description_opt: Option_String.Option = f.pkg_description
+    let pkg_max_trust_opt: Option_u32.Option = f.pkg_max_trust
+    let ws_members_vec: Vec_String.Vec = f.ws_members
+    let ws_discover_opt: Option_WorkspaceDiscover.Option = f.ws_discover
+    let build_target_opt: Option_String.Option = f.build_target
+    let build_profile_opt: Option_String.Option = f.build_profile
+    let build_emit_opt: Option_bool.Option = f.build_emit
+    let structmap_descendant_tree_opt: Option_bool.Option = f.structmap_descendant_tree
+    let gc_schedule_mode_opt: Option_GcScheduleMode.Option = f.gc_schedule_mode
+    let deps_vec: Vec_Dependency.Vec = f.deps
+    let has_pkg: bool = f.has_package
+    let has_ws: bool = f.has_workspace
+    let lints_config: lint_config_mod.LintConfig = f.lints
+
+    return assemble_mod.assemble_parts(
+        take pkg_name_opt,
+        pkg_version_opt,
+        take pkg_ns_opt,
+        pkg_ns_span,
+        pkg_kind_opt,
+        take pkg_license_opt,
+        take pkg_edition_opt,
+        pkg_authors_vec,
+        take pkg_description_opt,
+        pkg_max_trust_opt,
+        ws_members_vec,
+        ws_discover_opt,
+        build_target_opt,
+        take build_profile_opt,
+        build_emit_opt,
+        structmap_descendant_tree_opt,
+        gc_schedule_mode_opt,
+        deps_vec,
+        has_pkg,
+        has_ws,
+        lints_config,
+        file,
+        mutable diags,
+        allocator,
+    )?
+}
+
+
+type Fields {
+    pkg_name: Option_String.Option
+    pkg_version: Option_SemVer.Option
+    pkg_ns: Option_String.Option
+    pkg_ns_span: span_mod.Span
+    pkg_kind: Option_OutputKind.Option
+    pkg_license: Option_String.Option
+    pkg_edition: Option_String.Option
+    pkg_authors: Vec_String.Vec
+    pkg_description: Option_String.Option
+    pkg_max_trust: Option_u32.Option
+    ws_members: Vec_String.Vec
+    ws_discover: Option_WorkspaceDiscover.Option
+    build_target: Option_String.Option
+    build_profile: Option_String.Option
+    build_emit: Option_bool.Option
+    structmap_descendant_tree: Option_bool.Option
+    gc_schedule_mode: Option_GcScheduleMode.Option
+    deps: Vec_Dependency.Vec
+    lints: lint_config_mod.LintConfig
+    has_package: bool
+    has_workspace: bool
+}
+
+function new_fields(out: init Fields, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit members_vec: Vec_String.Vec
+    Vec_String.new(init members_vec, allocator)?
+    uninit deps_vec: Vec_Dependency.Vec
+    Vec_Dependency.new(init deps_vec, allocator)?
+    uninit authors_vec: Vec_String.Vec
+    Vec_String.new(init authors_vec, allocator)?
+    uninit lints_v: lint_config_mod.LintConfig
+    lint_config_mod.new_lint_config(init lints_v, allocator)?
+    out = Fields {
+        pkg_name: Option_String.none,
+        pkg_version: Option_SemVer.none,
+        pkg_ns: Option_String.none,
+        pkg_ns_span: span_mod.dummy(),
+        pkg_kind: Option_OutputKind.none,
+        pkg_license: Option_String.none,
+        pkg_edition: Option_String.none,
+        pkg_authors: authors_vec,
+        pkg_description: Option_String.none,
+        pkg_max_trust: Option_u32.none,
+        ws_members: members_vec,
+        ws_discover: Option_WorkspaceDiscover.none,
+        build_target: Option_String.none,
+        build_profile: Option_String.none,
+        build_emit: Option_bool.none,
+        structmap_descendant_tree: Option_bool.none,
+        gc_schedule_mode: Option_GcScheduleMode.none,
+        deps: deps_vec,
+        lints: lints_v,
+        has_package: false,
+        has_workspace: false,
+    }
+}
+
+
+function parse_token_stream(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_TomlToken.len(tokens)
+    var pos: usize = 0
+    loop decreases (n - pos) {
+        if pos >= n { break }
+        pos = step(tokens, source, file, mutable fields, mutable diags, pos, allocator)?
+    }
+}
+
+function step(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let tok = Vec_TomlToken.at(tokens, pos)
+    if toml_mod.is_eof(tok) { return n }
+    if toml_mod.is_newline(tok) { return pos + 1 }
+    if toml_mod.is_lex_error(tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "manifest tokenizer rejected this input", allocator)?
+        return pos + 1
+    }
+    if toml_mod.is_lbracket(tok) {
+        return parse_header_and_block(tokens, source, file, mutable fields, mutable diags, pos, allocator)?
+    }
+    values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected `[block-name]` header at top level", allocator)?
+    return values_mod.skip_to_newline(tokens, pos)
+}
+
+
+function parse_header_and_block(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    if pos + 1 >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, pos)), "unterminated `[...]` header", allocator)?
+        return n
+    }
+    let key_tok = Vec_TomlToken.at(tokens, pos + 1)
+    if toml_mod.is_lbracket(key_tok) {
+        return deps_mod.parse_array_header(tokens, source, file, mutable fields.deps, mutable diags, pos, allocator)?
+    }
+    if !toml_mod.is_bare_key(key_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(key_tok), "expected a bare-key block name after `[`", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    if pos + 2 >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(key_tok), "unterminated `[...]` header", allocator)?
+        return n
+    }
+    let rbr_tok = Vec_TomlToken.at(tokens, pos + 2)
+    if !toml_mod.is_rbracket(rbr_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(rbr_tok), "expected `]` to close the block header", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let key_sp = toml_mod.token_span(key_tok)
+    let block_name = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    let body_start = pos + 3
+
+    if string.equals(block_name, "package") {
+        fields.has_package = true
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 1, allocator)?
+    }
+    if string.equals(block_name, "workspace") {
+        fields.has_workspace = true
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 2, allocator)?
+    }
+    if string.equals(block_name, "build") {
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 3, allocator)?
+    }
+    if string.equals(block_name, "dependencies") {
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 4, allocator)?
+    }
+    if string.equals(block_name, "lints") {
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 5, allocator)?
+    }
+    if string.equals(block_name, "structmap") {
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 6, allocator)?
+    }
+    if string.equals(block_name, "codegen.gc_schedule") {
+        return parse_block_body(tokens, source, file, mutable fields, mutable diags, body_start, 7, allocator)?
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown block — entries skipped", allocator)?
+    return values_mod.skip_block_body(tokens, body_start)
+}
+
+function parse_block_body(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, pos: usize, kind: i32, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos <= Vec_TomlToken.len(tokens)
+    ensures result > pos || result == Vec_TomlToken.len(tokens)
+{
+    let n = Vec_TomlToken.len(tokens)
+    var p = pos
+    loop decreases (n - p) {
+        if p >= n { return n }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_eof(tok) { return n }
+        if toml_mod.is_newline(tok) { p = p + 1; continue }
+        if toml_mod.is_lbracket(tok) { return p }
+        if toml_mod.is_lex_error(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "manifest tokenizer rejected this input", allocator)?
+            return p + 1
+        }
+        if !toml_mod.is_bare_key(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a key=value pair inside the block", allocator)?
+            p = values_mod.skip_to_newline(tokens, p)
+            continue
+        }
+        p = parse_key_value(tokens, source, file, mutable fields, mutable diags, p, kind, allocator)?
+    }
+    return n
+}
+
+function parse_key_value(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, pos: usize, kind: i32, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let key_tok = Vec_TomlToken.at(tokens, pos)
+    let key_sp = toml_mod.token_span(key_tok)
+    let key_str = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    if pos + 1 >= n {
+        values_mod.emit_error_at(mutable diags, key_sp, "expected `=` after key", allocator)?
+        return n
+    }
+    let eq_tok = Vec_TomlToken.at(tokens, pos + 1)
+    if !toml_mod.is_equals(eq_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected `=` after key", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let value_pos = pos + 2
+    if value_pos >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected a value after `=`", allocator)?
+        return n
+    }
+    if kind == 1 {
+        return handle_package_key(tokens, source, file, mutable fields, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    if kind == 2 {
+        return handle_workspace_key(tokens, source, file, mutable fields, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    if kind == 3 {
+        return handle_build_key(tokens, source, file, mutable fields, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    if kind == 4 {
+        return handle_dependencies_key(tokens, source, file, mutable fields.deps, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    if kind == 5 {
+        return handle_lints_key(tokens, source, file, mutable fields.lints, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    if kind == 6 {
+        return handle_structmap_key(tokens, source, file, mutable fields, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    if kind == 7 {
+        return handle_gc_schedule_key(tokens, source, file, mutable fields, mutable diags, key_sp, key_str, value_pos, allocator)?
+    }
+    values_mod.emit_error_at(mutable diags, key_sp, "internal: unrecognised block kind", allocator)?
+    return values_mod.skip_to_newline(tokens, pos)
+}
+
+
+function handle_package_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    if string.equals(key, "name") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.pkg_name = Option_String.some(value: r.text)
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "version") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        let parsed_ver = pkg_mod.parse_semver(r.text)
+        let ver_ok = match parsed_ver {
+            case .some(_) => true
+            case .none    => false
+        }
+        if ver_ok {
+            fields.pkg_version = parsed_ver
+        } else {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, value_pos)), "`version` must be a SemVer `<major>.<minor>.<patch>` string", allocator)?
+        }
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "root_namespace") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.pkg_ns = Option_String.some(value: r.text)
+        fields.pkg_ns_span = toml_mod.token_span(Vec_TomlToken.at(tokens, value_pos))
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "kind") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        if string.equals(r.text, "executable") {
+            fields.pkg_kind = Option_OutputKind.some(value: output_mod.OutputKind.executable)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        if string.equals(r.text, "static_library") {
+            fields.pkg_kind = Option_OutputKind.some(value: output_mod.OutputKind.static_library)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        if string.equals(r.text, "dynamic_library") {
+            fields.pkg_kind = Option_OutputKind.some(value: output_mod.OutputKind.dynamic_library)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, value_pos)), "`kind` must be one of `executable`, `static_library`, `dynamic_library`", allocator)?
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "license") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.pkg_license = Option_String.some(value: r.text)
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "edition") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.pkg_edition = Option_String.some(value: r.text)
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "authors") {
+        let after = values_mod.parse_string_array_into(tokens, source, value_pos, mutable fields.pkg_authors, mutable diags, allocator)?
+        return values_mod.after_value_newline(tokens, after)
+    }
+    if string.equals(key, "description") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.pkg_description = Option_String.some(value: r.text)
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "max_trust") {
+        let tok = Vec_TomlToken.at(tokens, value_pos)
+        if !toml_mod.is_int_lit(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "`max_trust` must be a non-negative integer", allocator)?
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        let int_sp = toml_mod.token_span(tok)
+        let parsed = pkg_mod.parse_u32_bytes(source[int_sp.start..<int_sp.end])
+        let parsed_ok = match parsed {
+            case .some(_) => true
+            case .none    => false
+        }
+        if parsed_ok {
+            fields.pkg_max_trust = parsed
+        } else {
+            values_mod.emit_error_at(mutable diags, int_sp, "`max_trust` must fit in a 32-bit unsigned integer", allocator)?
+        }
+        return values_mod.after_value_newline(tokens, value_pos + 1)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[package]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+function handle_workspace_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    if string.equals(key, "members") {
+        let after = values_mod.parse_string_array_into(tokens, source, value_pos, mutable fields.ws_members, mutable diags, allocator)?
+        return values_mod.after_value_newline(tokens, after)
+    }
+    if string.equals(key, "discover") {
+        let value_tok = Vec_TomlToken.at(tokens, value_pos)
+        if toml_mod.is_bool_true(value_tok) {
+            fields.ws_discover = Option_WorkspaceDiscover.some(value: ws_mod.WorkspaceDiscover.lib_root)
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        if toml_mod.is_bool_false(value_tok) {
+            fields.ws_discover = Option_WorkspaceDiscover.none
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        if toml_mod.is_string_lit(value_tok) {
+            let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+            fields.ws_discover = Option_WorkspaceDiscover.some(value: ws_mod.WorkspaceDiscover.path(rel: r.text))
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(value_tok), "`discover` must be `true`, `false`, or a relative-path string", allocator)?
+        return values_mod.skip_to_newline(tokens, value_pos)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[workspace]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+function handle_build_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    if string.equals(key, "default_target") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.build_target = Option_String.some(value: r.text)
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "default_profile") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        fields.build_profile = Option_String.some(value: r.text)
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.equals(key, "emit_structmap") {
+        let value_tok = Vec_TomlToken.at(tokens, value_pos)
+        if toml_mod.is_bool_true(value_tok) {
+            fields.build_emit = Option_bool.some(value: true)
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        if toml_mod.is_bool_false(value_tok) {
+            fields.build_emit = Option_bool.some(value: false)
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(value_tok), "`emit_structmap` must be `true` or `false`", allocator)?
+        return values_mod.skip_to_newline(tokens, value_pos)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[build]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+function handle_structmap_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    if string.equals(key, "descendant_tree") {
+        let value_tok = Vec_TomlToken.at(tokens, value_pos)
+        if toml_mod.is_bool_true(value_tok) {
+            fields.structmap_descendant_tree = Option_bool.some(value: true)
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        if toml_mod.is_bool_false(value_tok) {
+            fields.structmap_descendant_tree = Option_bool.some(value: false)
+            return values_mod.after_value_newline(tokens, value_pos + 1)
+        }
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(value_tok), "`descendant_tree` must be `true` or `false`", allocator)?
+        return values_mod.skip_to_newline(tokens, value_pos)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[structmap]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+function handle_gc_schedule_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, fields: mutable Fields, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    if string.equals(key, "mode") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        if string.equals(r.text, "never") {
+            fields.gc_schedule_mode = Option_GcScheduleMode.some(value: gc_schedule_mod.GcScheduleMode.never)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        if string.equals(r.text, "on_ci") {
+            fields.gc_schedule_mode = Option_GcScheduleMode.some(value: gc_schedule_mod.GcScheduleMode.on_ci)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        if string.equals(r.text, "daily") {
+            fields.gc_schedule_mode = Option_GcScheduleMode.some(value: gc_schedule_mod.GcScheduleMode.daily)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        if string.equals(r.text, "weekly") {
+            fields.gc_schedule_mode = Option_GcScheduleMode.some(value: gc_schedule_mod.GcScheduleMode.weekly)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        if string.equals(r.text, "on_promote_revoke") {
+            fields.gc_schedule_mode = Option_GcScheduleMode.some(value: gc_schedule_mod.GcScheduleMode.on_promote_revoke)
+            return values_mod.after_value_newline(tokens, r.after)
+        }
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, value_pos)), "`mode` must be one of `never`, `on_ci`, `daily`, `weekly`, `on_promote_revoke`", allocator)?
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[codegen.gc_schedule]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}
+
+function handle_dependencies_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, deps: mutable Vec_Dependency.Vec, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+    if deps_mod.dep_name_exists(deps, key) {
+        values_mod.emit_error_at(mutable diags, key_sp, "duplicate dependency name in `[dependencies]`", allocator)?
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    let source_decoded = values_mod.decode_dep_source(r.text, allocator)?
+    let dep = dep_mod.dependency_of(key, source_decoded.version_req, source_decoded.source)
+    Vec_Dependency.push(mutable deps, take dep, allocator)?
+    return values_mod.after_value_newline(tokens, r.after)
+}
+
+
+function handle_lints_key(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, lints: mutable lint_config_mod.LintConfig, diags: mutable collection_mod.Diagnostics, key_sp: span_mod.Span, key: String, value_pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires value_pos < Vec_TomlToken.len(tokens)
+    ensures result > value_pos
+{
+    let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+
+    if !known_mod.is_known(key) {
+        let msg = f"unknown diagnostic class `{key}` in `[lints]`"
+        let reported = diag_mod.lint_at(lints, code.unknown_manifest_key(), key_sp, msg, severity_mod.Severity.error)
+        match reported {
+            case .some(let d) => collection_mod.emit(mutable diags, take d, allocator)?
+            case .none        => ()
+        }
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+
+    var sev: Option_Severity.Option = Option_Severity.none
+    var valid = true
+    if string.equals(r.text, "error") {
+        sev = Option_Severity.some(value: severity_mod.Severity.error)
+    } else if string.equals(r.text, "deny") {
+        sev = Option_Severity.some(value: severity_mod.Severity.error)
+    } else if string.equals(r.text, "warn") {
+        sev = Option_Severity.some(value: severity_mod.Severity.warn)
+    } else {
+        valid = false
+    }
+
+    if !valid {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, value_pos)), "lint severity must be one of `warn`, `deny`, `error`", allocator)?
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+
+    let entry = lint_config_mod.lint_override_of(take key, sev)
+    lint_config_mod.push_override(mutable lints, take entry, allocator)?
+    return values_mod.after_value_newline(tokens, r.after)
+}
+

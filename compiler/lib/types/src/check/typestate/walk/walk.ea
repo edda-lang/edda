@@ -1,0 +1,575 @@
+
+module types.check.typestate.walk.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.check.typestate.typestate as surface_mod
+import local.check.typestate.state as state_mod
+import local.check.diverge.diverge as diverge_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(def_mod.DefId)
+
+
+public function check_typestate(
+    file: hir_file.HirFile,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_items(file, file.items, local_types, ty_interner, mutable diags, allocator)?
+}
+
+
+function walk_items(
+    file: hir_file.HirFile,
+    items: Vec_HItem.Vec,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .function_(let sig_box, let body) => {
+                let sig = Box_HFnSignature.get(sig_box)
+                check_function(file, sig, body, local_types, ty_interner, mutable diags, allocator)?
+            }
+            case .spec_decl(_, let inner) => {
+                walk_items(file, inner, local_types, ty_interner, mutable diags, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function check_function(
+    file: hir_file.HirFile,
+    sig: hir_item.HFnSignature,
+    body: hir_tree.HBlock,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit states: state_mod.TsTable
+    state_mod.new_table(init states, allocator)?
+    seed_params(sig, local_types, ty_interner, mutable states, allocator)?
+    walk_block(file, body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+}
+
+
+function seed_params(
+    sig: hir_item.HFnSignature,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let pn = Vec_HParam.len(sig.params)
+    var pi: usize = 0 as usize
+    loop decreases (pn - pi) {
+        if pi >= pn { break }
+        let p = Vec_HParam.at(sig.params, pi)
+        seed_if_tracked(p.def_id, local_types, ty_interner, mutable states, allocator)?
+        pi = pi + 1 as usize
+    }
+}
+
+
+function seed_if_tracked(
+    def: def_mod.DefId,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let ty = state_mod.type_of_local(local_types, def)
+    match state_mod.tracked_automaton(ty, ty_interner) {
+        case .some(let a) => state_mod.seed(mutable states, def, surface_mod.initial_state(a), allocator)?
+        case .none => ()
+    }
+}
+
+
+function walk_block(
+    file: hir_file.HirFile,
+    block: hir_tree.HBlock,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let s = Vec_HStmt.at(block.stmts, i)
+        walk_stmt(file, s, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+    match block.trailing {
+        case .some(let box_e) => {
+            let inner = Box_HExpr.get(box_e)
+            walk_expr(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function walk_stmt(
+    file: hir_file.HirFile,
+    stmt: hir_tree.HStmt,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match stmt.kind {
+        case .let_(_, _, let bindings, _, let init_) => {
+            walk_expr(file, init_, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            seed_bindings(bindings, local_types, ty_interner, mutable states, allocator)?
+        }
+        case .uninit_(_, let bindings, _) => {
+            seed_bindings(bindings, local_types, ty_interner, mutable states, allocator)?
+        }
+        case .assign(let target, _, let rhs) => {
+            walk_expr(file, rhs, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            match assign_target_def(target) {
+                case .some(let d) => seed_if_tracked(d, local_types, ty_interner, mutable states, allocator)?
+                case .none => {
+                    walk_expr(file, target, local_types, ty_interner, mutable states, mutable diags, allocator)?
+                }
+            }
+        }
+    }
+}
+
+
+function seed_bindings(
+    bindings: Vec_HBinding.Vec,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HBinding.len(bindings)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = Vec_HBinding.at(bindings, i)
+        seed_if_tracked(b.def_id, local_types, ty_interner, mutable states, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function assign_target_def(target: hir_tree.HExpr) -> Option_DefId.Option {
+    return match target.kind {
+        case .use_(let d) => Option_DefId.some(value: d)
+        case _ => Option_DefId.none
+    }
+}
+
+
+function walk_expr(
+    file: hir_file.HirFile,
+    expr: hir_tree.HExpr,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match expr.kind {
+        case .use_(let def) => {
+            check_use(file, expr.node_id, def, states, mutable diags, allocator)?
+        }
+        case .binary(_, let lhs, let rhs) => {
+            walk_boxed(file, lhs, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_boxed(file, rhs, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .unary(_, let inner) => {
+            walk_boxed(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .call(_, let args) => {
+            walk_args(file, args, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .variant_ctor(_, _, let args) => {
+            walk_args(file, args, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .dyn_call(let callee, let args) => {
+            walk_boxed(file, callee, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_args(file, args, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .field(let recv, _) => {
+            walk_boxed(file, recv, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .index(let recv, let idx) => {
+            walk_boxed(file, recv, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_boxed(file, idx, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .if_(let cond, let then_b, let else_opt) => {
+            walk_boxed(file, cond, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_if_merge(file, then_b, else_opt, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .match_(let scrut, let arms) => {
+            walk_boxed(file, scrut, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_match_merge(file, arms, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .block_(let body) => {
+            walk_block(file, body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .loop_(let body, _, let dec_opt) => {
+            walk_block(file, body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_opt_boxed(file, dec_opt, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .cast(let inner, _, _) => {
+            walk_boxed(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .tuple(let elements) => {
+            walk_exprs(file, elements, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .struct_lit(_, let fields) => {
+            walk_args(file, fields, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .raise_(let inner) => {
+            walk_boxed(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .panic_(let inner) => {
+            walk_boxed(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .return_(let opt) => {
+            walk_opt_boxed(file, opt, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .break_(_, let opt) => {
+            walk_opt_boxed(file, opt, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .comptime_(let inner) => {
+            walk_boxed(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .comptime_block(let body) => {
+            walk_block(file, body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .scope_(_, _, let body) => {
+            walk_block(file, body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case .handle_(_, _, let recovery, let body) => {
+            walk_block(file, body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            walk_boxed(file, recovery, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function walk_if_merge(
+    file: hir_file.HirFile,
+    then_b: hir_tree.HBlock,
+    else_opt: Option_HBlock.Option,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let pre = state_mod.clone_slots(states, allocator)?
+    walk_block(file, then_b, local_types, ty_interner, mutable states, mutable diags, allocator)?
+    let then_state = state_mod.clone_slots(states, allocator)?
+    let then_ft = diverge_mod.block_falls_through(then_b)
+
+    state_mod.overwrite_slots(mutable states, pre, allocator)?
+    let else_ft = match else_opt {
+        case .some(let eb) => {
+            walk_block(file, eb, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            diverge_mod.block_falls_through(eb)
+        }
+        case .none => true
+    }
+    let else_state = state_mod.clone_slots(states, allocator)?
+
+    state_mod.merge_into(mutable states, then_state, then_ft, else_state, else_ft, allocator)?
+}
+
+
+function walk_match_merge(
+    file: hir_file.HirFile,
+    arms: Vec_HArm.Vec,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let pre = state_mod.clone_slots(states, allocator)?
+    let n = Vec_HArm.len(arms)
+    uninit acc: state_mod.TsTable
+    state_mod.new_table(init acc, allocator)?
+    var have_acc: bool = false
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        state_mod.overwrite_slots(mutable states, pre, allocator)?
+        match arm.guard {
+            case .some(let g) => {
+                walk_expr(file, g, local_types, ty_interner, mutable states, mutable diags, allocator)?
+            }
+            case .none => ()
+        }
+        walk_expr(file, arm.body, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        if !diverge_mod.expr_diverges(arm.body) {
+            if have_acc {
+                state_mod.merge_accumulate(mutable acc, states, allocator)?
+            } else {
+                state_mod.overwrite_slots(mutable acc, states, allocator)?
+                have_acc = true
+            }
+        }
+        i = i + 1 as usize
+    }
+    if have_acc {
+        state_mod.overwrite_slots(mutable states, acc, allocator)?
+    } else {
+        state_mod.overwrite_slots(mutable states, pre, allocator)?
+    }
+}
+
+
+function check_use(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    def: def_mod.DefId,
+    states: state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let slot = state_mod.get(states, def)
+    if slot.tracked && surface_mod.is_terminal(slot.state) {
+        emit_ts(file, node_id, "use of a capability after it was closed: this `Allocator` was passed by `take` to a consuming operation and is no longer valid", mutable diags, allocator)?
+    }
+}
+
+
+function walk_args(
+    file: hir_file.HirFile,
+    args: Vec_HArg.Vec,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        walk_arg(file, a, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_arg(
+    file: hir_file.HirFile,
+    a: hir_tree.HArg,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match arg_take_def(a) {
+        case .some(let d) => {
+            if state_mod.get(states, d).tracked {
+                apply_close(file, a.expr.node_id, d, mutable states, mutable diags, allocator)?
+                return
+            }
+        }
+        case .none => ()
+    }
+    walk_expr(file, a.expr, local_types, ty_interner, mutable states, mutable diags, allocator)?
+}
+
+
+function apply_close(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    def: def_mod.DefId,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let slot = state_mod.get(states, def)
+    if surface_mod.legal_in(surface_mod.StateOp.alloc_close, slot.state) {
+        match surface_mod.transition(surface_mod.StateOp.alloc_close, slot.state) {
+            case .some(let to) => state_mod.set_state(mutable states, def, to, allocator)?
+            case .none => ()
+        }
+    } else {
+        emit_ts(file, node_id, "operation on an already-closed `Allocator`: this capability was previously consumed by `take` and cannot be closed or used again", mutable diags, allocator)?
+    }
+}
+
+
+function arg_take_def(a: hir_tree.HArg) -> Option_DefId.Option {
+    return match a.mode {
+        case .some(let m) => match m {
+            case .take_ => use_def_of(a.expr)
+            case _ => Option_DefId.none
+        }
+        case .none => Option_DefId.none
+    }
+}
+
+
+function use_def_of(e: hir_tree.HExpr) -> Option_DefId.Option {
+    return match e.kind {
+        case .use_(let d) => Option_DefId.some(value: d)
+        case _ => Option_DefId.none
+    }
+}
+
+
+function walk_boxed(
+    file: hir_file.HirFile,
+    boxed: Box_HExpr,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_HExpr.get(boxed)
+    walk_expr(file, inner, local_types, ty_interner, mutable states, mutable diags, allocator)?
+}
+
+
+function walk_opt_boxed(
+    file: hir_file.HirFile,
+    opt: Option_Box_HExpr.Option,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match opt {
+        case .some(let b) => walk_boxed(file, b, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        case .none => ()
+    }
+}
+
+
+function walk_exprs(
+    file: hir_file.HirFile,
+    exprs: Vec_HExpr.Vec,
+    local_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    states: mutable state_mod.TsTable,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_HExpr.at(exprs, i)
+        walk_expr(file, e, local_types, ty_interner, mutable states, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function emit_ts(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    message: String,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match hir_file.span_of_opt(file, node_id) {
+        case .some(let span) => {
+            let d = diag_mod.error_at(code_mod.typestate_violation(), span, message)
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}

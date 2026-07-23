@@ -1,0 +1,112 @@
+
+module cache.blob.mir.place.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import mir.place as place_mod
+import mir.id.local as local_mod
+import types.pass.ty as ty_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(place_mod.Projection)
+spec std.core.option.Option(Vec_Projection)
+
+
+public function write_place(p: place_mod.Place, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prim_mod.push_u32_le(mutable out, p.local.raw, allocator)?
+    let n = place_mod.proj_len(p)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_projection(place_mod.proj_at(p, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function read_place(bytes: [u8], cur: mutable prim_mod.Reader, allocator: Allocator) -> place_mod.Place
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let local_raw = prim_mod.read_u32_le(bytes, mutable cur)?
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    var p = place_mod.bare(local_mod.LocalId { raw: local_raw })
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = read_projection(bytes, mutable cur)?
+        place_mod.push_projection(mutable p, take proj, allocator)?
+        i += 1
+    }
+    return p
+}
+
+public function write_projection(proj: place_mod.Projection, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    write_projection_kind(proj.kind, mutable out, allocator)?
+    prim_mod.push_u32_le(mutable out, proj.result_ty.raw, allocator)?
+}
+
+public function read_projection(bytes: [u8], cur: mutable prim_mod.Reader) -> place_mod.Projection
+    with {err: error_mod.CacheError}
+{
+    let kind = read_projection_kind(bytes, mutable cur)?
+    let result_ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    return place_mod.Projection { kind: kind, result_ty: result_ty }
+}
+
+public function write_projection_kind(k: place_mod.ProjectionKind, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match k {
+        case .field(let idx) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            prim_mod.push_u32_le(mutable out, idx, allocator)?
+        }
+        case .index(let idx_local, let proven) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            prim_mod.push_u32_le(mutable out, idx_local.raw, allocator)?
+            prim_mod.push_bool(mutable out, proven, allocator)?
+        }
+        case .deref_ => prim_mod.push_u8(mutable out, 2, allocator)?
+        case .variant_payload(let variant_idx) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            prim_mod.push_u32_le(mutable out, variant_idx, allocator)?
+        }
+        case .slice_subrange(let lo_local, let hi_local, let proven) => {
+            prim_mod.push_u8(mutable out, 4, allocator)?
+            prim_mod.push_u32_le(mutable out, lo_local.raw, allocator)?
+            prim_mod.push_u32_le(mutable out, hi_local.raw, allocator)?
+            prim_mod.push_bool(mutable out, proven, allocator)?
+        }
+    }
+}
+
+public function read_projection_kind(bytes: [u8], cur: mutable prim_mod.Reader) -> place_mod.ProjectionKind
+    with {err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => place_mod.ProjectionKind.field(idx: prim_mod.read_u32_le(bytes, mutable cur)?)
+        case 1 => {
+            let idx_local = local_mod.LocalId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let proven = prim_mod.read_bool(bytes, mutable cur)?
+            place_mod.ProjectionKind.index(idx_local: idx_local, proven: proven)
+        }
+        case 2 => place_mod.ProjectionKind.deref_
+        case 3 => place_mod.ProjectionKind.variant_payload(variant_idx: prim_mod.read_u32_le(bytes, mutable cur)?)
+        case 4 => {
+            let lo_local = local_mod.LocalId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let hi_local = local_mod.LocalId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let proven = prim_mod.read_bool(bytes, mutable cur)?
+            place_mod.ProjectionKind.slice_subrange(lo_local: lo_local, hi_local: hi_local, proven: proven)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown ProjectionKind tag")
+    }
+}

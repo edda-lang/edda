@@ -1,0 +1,290 @@
+
+module arm64.ops.arith
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.hlir.op as hlir_op_mod
+
+import local.gen.regs as regs_mod
+import local.encoding.instr.dp.dp as dp_move_mod
+import local.encoding.instr.dp.reg.reg as dp_reg_mod
+import local.encoding.instr.dp.imm.imm as dp_imm_mod
+import local.encoding.instr.dp.muldiv.muldiv as dp_muldiv_mod
+import local.encoding.instr.dp.multiply.multiply as dp_multiply_mod
+import local.encoding.instr.fp.dataproc.dataproc as fp_dataproc_mod
+import local.encoding.instr.fp.cmpcsel.cmpcsel as fp_cmpcsel_mod
+import local.encoding.branch as branch_mod
+import local.ops.divrem as divrem_mod
+import local.abi.misc.regutil as regutil_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_binary(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    flags: hlir_op_mod.OpFlags,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    if is_compare(op) {
+        if regutil_mod.vreg_is_fp(body, lhs)? {
+            emit_fcmp(mutable code, body, op, lhs, rhs, dst, allocator)?
+        } else {
+            emit_icmp(mutable code, body, op, lhs, rhs, dst, allocator)?
+        }
+        return ()
+    }
+    if regutil_mod.vreg_is_fp(body, dst)? {
+        emit_binary_fp(mutable code, body, op, lhs, rhs, dst, allocator)?
+        return ()
+    }
+    let dreg = regutil_mod.gp_of_pinned_vreg(body, dst)?
+    let lreg = regutil_mod.gp_of_pinned_vreg(body, lhs)?
+    match op {
+        case .add => apply_addsub(mutable code, body, true, dreg, lreg, rhs, allocator)?
+        case .sub => apply_addsub(mutable code, body, false, dreg, lreg, rhs, allocator)?
+        case .bit_and => { regutil_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?; dp_reg_mod.encode_and_reg(mutable code, true, dreg, dreg, regutil_mod.rhs_reg(body, rhs)?, allocator)? }
+        case .bit_or => { regutil_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?; dp_reg_mod.encode_orr_reg(mutable code, true, dreg, dreg, regutil_mod.rhs_reg(body, rhs)?, allocator)? }
+        case .bit_xor => { regutil_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?; dp_reg_mod.encode_eor_reg(mutable code, true, dreg, dreg, regutil_mod.rhs_reg(body, rhs)?, allocator)? }
+        case .mul => dp_muldiv_mod.encode_mul_reg(mutable code, true, dreg, lreg, regutil_mod.rhs_reg(body, rhs)?, allocator)?
+        case .umulhi => dp_multiply_mod.encode_umulh(mutable code, dreg, lreg, regutil_mod.rhs_reg(body, rhs)?, allocator)?
+        case .smulhi => dp_multiply_mod.encode_smulh(mutable code, dreg, lreg, regutil_mod.rhs_reg(body, rhs)?, allocator)?
+        case .sdiv => divrem_mod.emit_div(mutable code, dreg, lreg, regutil_mod.rhs_reg(body, rhs)?, true, flags.div_overflow, allocator)?
+        case .udiv => divrem_mod.emit_div(mutable code, dreg, lreg, regutil_mod.rhs_reg(body, rhs)?, false, flags.div_overflow, allocator)?
+        case _ => raise regutil_mod.unsupported()
+    }
+}
+
+function ftype_of_bytes(w: u32) -> u8 {
+    return if w >= (8 as u32) { 1 as u8 } else { 0 as u8 }
+}
+
+function emit_binary_fp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let rd = regutil_mod.fp_num_of_pinned_vreg(body, dst)?
+    let rn = regutil_mod.fp_num_of_pinned_vreg(body, lhs)?
+    let rm = regutil_mod.fp_rhs_num(body, rhs)?
+    let dst_vreg = regutil_mod.vreg_at(body, dst)?
+    let ftype = ftype_of_bytes(dst_vreg.size)
+    match op {
+        case .add => fp_dataproc_mod.encode_fadd(mutable code, ftype, rd, rn, rm, allocator)?
+        case .sub => fp_dataproc_mod.encode_fsub(mutable code, ftype, rd, rn, rm, allocator)?
+        case .mul => fp_dataproc_mod.encode_fmul(mutable code, ftype, rd, rn, rm, allocator)?
+        case .sdiv | .udiv => fp_dataproc_mod.encode_fdiv(mutable code, ftype, rd, rn, rm, allocator)?
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: binary op not valid on floating-point operands",
+        )
+    }
+}
+
+function apply_addsub(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    is_add: bool,
+    dreg: regs_mod.GpReg,
+    lreg: regs_mod.GpReg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    regutil_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+    match regutil_mod.operand_imm(rhs) {
+        case .some(let v) => {
+            if v < (0 as i64) || v > (4095 as i64) {
+                raise regutil_mod.unsupported()
+            }
+            let imm12: u16 = v as u16
+            if is_add {
+                dp_imm_mod.encode_add_imm(mutable code, true, dreg, dreg, imm12, false, allocator)?
+            } else {
+                dp_imm_mod.encode_sub_imm(mutable code, true, dreg, dreg, imm12, false, allocator)?
+            }
+        }
+        case .none => {
+            let rreg = regutil_mod.rhs_reg(body, rhs)?
+            if is_add {
+                dp_reg_mod.encode_add_reg(mutable code, true, dreg, dreg, rreg, allocator)?
+            } else {
+                dp_reg_mod.encode_sub_reg(mutable code, true, dreg, dreg, rreg, allocator)?
+            }
+        }
+    }
+}
+
+function emit_icmp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let lreg = regutil_mod.gp_of_pinned_vreg(body, lhs)?
+    let rreg = regutil_mod.rhs_reg(body, rhs)?
+    dp_reg_mod.encode_cmp_reg(mutable code, true, lreg, rreg, allocator)?
+    let dreg = regutil_mod.gp_of_pinned_vreg(body, dst)?
+    let cond = cond_for(op)?
+    dp_move_mod.encode_movz_x(mutable code, dreg, 1 as u16, 0 as u8, allocator)?
+    branch_mod.encode_b_cond(mutable code, cond, 2 as i32, allocator)?
+    dp_move_mod.encode_movz_x(mutable code, dreg, 0 as u16, 0 as u8, allocator)?
+}
+
+function emit_fcmp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let rn = regutil_mod.fp_num_of_pinned_vreg(body, lhs)?
+    let rm = regutil_mod.fp_rhs_num(body, rhs)?
+    let lhs_vreg = regutil_mod.vreg_at(body, lhs)?
+    let ftype = ftype_of_bytes(lhs_vreg.size)
+    fp_cmpcsel_mod.encode_fcmp(mutable code, ftype, rn, rm, allocator)?
+    let dreg = regutil_mod.gp_of_pinned_vreg(body, dst)?
+    let cond = fcmp_cond(op)?
+    dp_move_mod.encode_movz_x(mutable code, dreg, 1 as u16, 0 as u8, allocator)?
+    branch_mod.encode_b_cond(mutable code, cond, 2 as i32, allocator)?
+    dp_move_mod.encode_movz_x(mutable code, dreg, 0 as u16, 0 as u8, allocator)?
+}
+
+function cond_for(op: lir_op_mod.LBinOp) -> branch_mod.ArmCond
+    with {err: lir_error_mod.LirError}
+{
+    return match op {
+        case .icmp_eq => branch_mod.ArmCond.eq_
+        case .icmp_ne => branch_mod.ArmCond.ne_
+        case .icmp_slt => branch_mod.ArmCond.lt_
+        case .icmp_sle => branch_mod.ArmCond.le_
+        case .icmp_sgt => branch_mod.ArmCond.gt_
+        case .icmp_sge => branch_mod.ArmCond.ge_
+        case .icmp_ult => branch_mod.ArmCond.lo_
+        case .icmp_ule => branch_mod.ArmCond.ls_
+        case .icmp_ugt => branch_mod.ArmCond.hi_
+        case .icmp_uge => branch_mod.ArmCond.hs_
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: non-comparison op routed to icmp path",
+        )
+    }
+}
+
+function fcmp_cond(op: lir_op_mod.LBinOp) -> branch_mod.ArmCond
+    with {err: lir_error_mod.LirError}
+{
+    return match op {
+        case .icmp_eq => branch_mod.ArmCond.eq_
+        case .icmp_ne => branch_mod.ArmCond.ne_
+        case .icmp_slt | .icmp_ult => branch_mod.ArmCond.lt_
+        case .icmp_sle | .icmp_ule => branch_mod.ArmCond.le_
+        case .icmp_sgt | .icmp_ugt => branch_mod.ArmCond.gt_
+        case .icmp_sge | .icmp_uge => branch_mod.ArmCond.ge_
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: non-comparison op routed to fcmp path",
+        )
+    }
+}
+
+function is_compare(op: lir_op_mod.LBinOp) -> bool {
+    return match op {
+        case .icmp_eq => true
+        case .icmp_ne => true
+        case .icmp_slt => true
+        case .icmp_sle => true
+        case .icmp_sgt => true
+        case .icmp_sge => true
+        case .icmp_ult => true
+        case .icmp_ule => true
+        case .icmp_ugt => true
+        case .icmp_uge => true
+        case _ => false
+    }
+}
+
+public function emit_unary(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LUnOp,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    if regutil_mod.vreg_is_fp(body, dst)? {
+        emit_fp_unary(mutable code, body, op, operand, dst, allocator)?
+        return ()
+    }
+    let dreg = regutil_mod.gp_of_pinned_vreg(body, dst)?
+    let sreg = regutil_mod.gp_of_pinned_vreg(body, operand)?
+    match op {
+        case .neg => {
+            dp_reg_mod.encode_mvn_reg(mutable code, true, dreg, sreg, allocator)?
+            dp_imm_mod.encode_add_imm(mutable code, true, dreg, dreg, 1 as u16, false, allocator)?
+        }
+        case .bit_not => dp_reg_mod.encode_mvn_reg(mutable code, true, dreg, sreg, allocator)?
+        case .logical_not => raise regutil_mod.unsupported()
+        case _ => raise regutil_mod.unsupported()
+    }
+}
+
+function emit_fp_unary(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LUnOp,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+{
+    let rd = regutil_mod.fp_num_of_pinned_vreg(body, dst)?
+    let rn = regutil_mod.fp_num_of_pinned_vreg(body, operand)?
+    let dst_vreg = regutil_mod.vreg_at(body, dst)?
+    let ftype = ftype_of_bytes(dst_vreg.size)
+    match op {
+        case .neg => fp_dataproc_mod.encode_fneg(mutable code, ftype, rd, rn, allocator)?
+        case .fsqrt => fp_dataproc_mod.encode_fsqrt(mutable code, ftype, rd, rn, allocator)?
+        case .ffloor => fp_dataproc_mod.encode_frintm(mutable code, ftype, rd, rn, allocator)?
+        case .fceil => fp_dataproc_mod.encode_frintp(mutable code, ftype, rd, rn, allocator)?
+        case .ftrunc => fp_dataproc_mod.encode_frintz(mutable code, ftype, rd, rn, allocator)?
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: integer unary routed to floating-point unary path",
+        )
+    }
+}

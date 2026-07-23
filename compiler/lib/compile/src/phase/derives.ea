@@ -1,0 +1,253 @@
+
+module compile.phase.derives
+
+import std.collections.vec
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import syntax.ast.attr as attr_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree_mod
+
+
+spec std.mem.alloc.Box(ast_item_mod.SpecInvocation)
+spec std.mem.alloc.Box(ast_item_mod.Derive)
+
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+
+
+type DeriveSpecTable {
+    name_eq: sym_mod.Symbol
+    name_ord: sym_mod.Symbol
+    name_hash: sym_mod.Symbol
+    name_debug: sym_mod.Symbol
+    name_clone: sym_mod.Symbol
+    name_properties: sym_mod.Symbol
+    name_serialize: sym_mod.Symbol
+    name_deserialize: sym_mod.Symbol
+    seg_std: sym_mod.Symbol
+    seg_core: sym_mod.Symbol
+    seg_compare: sym_mod.Symbol
+    seg_fmt: sym_mod.Symbol
+    seg_copy: sym_mod.Symbol
+    seg_testing: sym_mod.Symbol
+    seg_serde: sym_mod.Symbol
+}
+
+
+public function expand_derives(files: take Vec_File.Vec, interner: mutable interner_mod.Interner, allocator: Allocator) -> Vec_File.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let table = new_table(mutable interner, allocator)?
+    uninit out: Vec_File.Vec
+    Vec_File.new(init out, allocator)?
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        let expanded = expand_file(take f, table, allocator)?
+        Vec_File.push(mutable out, take expanded, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function new_table(interner: mutable interner_mod.Interner, allocator: Allocator) -> DeriveSpecTable
+    with {allocator, err: alloc.AllocError}
+{
+    let s_eq = interner_mod.intern(mutable interner, "eq", allocator)?
+    let s_ord = interner_mod.intern(mutable interner, "ord", allocator)?
+    let s_hash = interner_mod.intern(mutable interner, "hash", allocator)?
+    let s_debug = interner_mod.intern(mutable interner, "debug", allocator)?
+    let s_clone = interner_mod.intern(mutable interner, "clone", allocator)?
+    let s_properties = interner_mod.intern(mutable interner, "properties", allocator)?
+    let s_serialize = interner_mod.intern(mutable interner, "serialize", allocator)?
+    let s_deserialize = interner_mod.intern(mutable interner, "deserialize", allocator)?
+    let s_std = interner_mod.intern(mutable interner, "std", allocator)?
+    let s_core = interner_mod.intern(mutable interner, "core", allocator)?
+    let s_compare = interner_mod.intern(mutable interner, "compare", allocator)?
+    let s_fmt = interner_mod.intern(mutable interner, "fmt", allocator)?
+    let s_copy = interner_mod.intern(mutable interner, "copy", allocator)?
+    let s_testing = interner_mod.intern(mutable interner, "testing", allocator)?
+    let s_serde = interner_mod.intern(mutable interner, "serde", allocator)?
+    return DeriveSpecTable {
+        name_eq: s_eq,
+        name_ord: s_ord,
+        name_hash: s_hash,
+        name_debug: s_debug,
+        name_clone: s_clone,
+        name_properties: s_properties,
+        name_serialize: s_serialize,
+        name_deserialize: s_deserialize,
+        seg_std: s_std,
+        seg_core: s_core,
+        seg_compare: s_compare,
+        seg_fmt: s_fmt,
+        seg_copy: s_copy,
+        seg_testing: s_testing,
+        seg_serde: s_serde,
+    }
+}
+
+
+function expand_file(f: take ast_file_mod.File, table: DeriveSpecTable, allocator: Allocator) -> ast_file_mod.File
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if !file_has_derive(f) {
+        return f
+    }
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    let n = Vec_Item.len(f.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(f.items, i)
+        Vec_Item.push(mutable items, take item, allocator)?
+        match Vec_Item.at(f.items, i).kind {
+            case .derive_(let d_box) => append_derive_invocations(mutable items, Box_Derive.get(d_box), table, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return ast_file_mod.File { span: f.span, items: items }
+}
+
+
+function file_has_derive(f: ast_file_mod.File) -> bool {
+    let n = Vec_Item.len(f.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(f.items, i).kind {
+            case .derive_(_) => { return true }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function append_derive_invocations(items: mutable Vec_Item.Vec, d: ast_item_mod.Derive, table: DeriveSpecTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Ident.len(d.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let name = Vec_Ident.at(d.items, i).name
+        let segs = spec_segments_for(table, name, allocator)?
+        if Vec_Symbol.len(segs) != 0 {
+            let inv_item = build_invocation_item(segs, d, allocator)?
+            Vec_Item.push(mutable items, take inv_item, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function spec_segments_for(table: DeriveSpecTable, name: sym_mod.Symbol, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    if name.raw == table.name_eq.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_compare, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_eq, allocator)?
+        return segs
+    }
+    if name.raw == table.name_ord.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_compare, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_ord, allocator)?
+        return segs
+    }
+    if name.raw == table.name_hash.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_hash, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_hash, allocator)?
+        return segs
+    }
+    if name.raw == table.name_debug.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_fmt, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_debug, allocator)?
+        return segs
+    }
+    if name.raw == table.name_clone.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_copy, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_clone, allocator)?
+        return segs
+    }
+    if name.raw == table.name_properties.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_testing, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_properties, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_properties, allocator)?
+        return segs
+    }
+    if name.raw == table.name_serialize.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_serde, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_serialize, allocator)?
+        return segs
+    }
+    if name.raw == table.name_deserialize.raw {
+        Vec_Symbol.push(mutable segs, table.seg_std, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_serde, allocator)?
+        Vec_Symbol.push(mutable segs, table.seg_core, allocator)?
+        Vec_Symbol.push(mutable segs, table.name_deserialize, allocator)?
+        return segs
+    }
+    return segs
+}
+
+
+function build_invocation_item(segs: Vec_Symbol.Vec, d: ast_item_mod.Derive, allocator: Allocator) -> ast_item_mod.Item
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit path_segs: Vec_Ident.Vec
+    Vec_Ident.new(init path_segs, allocator)?
+    let n = Vec_Symbol.len(segs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Ident.push(mutable path_segs, ast_ident_mod.Ident { name: Vec_Symbol.at(segs, i), span: d.span }, allocator)?
+        i = i + 1
+    }
+    let spec_path = ast_ident_mod.Path { segments: path_segs, span: d.span }
+
+    uninit args: Vec_Expr.Vec
+    Vec_Expr.new(init args, allocator)?
+    let target_expr = ast_tree_mod.Expr { span: d.target.span, kind: ast_tree_mod.ExprKind.path(path: d.target) }
+    Vec_Expr.push(mutable args, take target_expr, allocator)?
+
+    let inv = ast_item_mod.SpecInvocation { span: d.span, path: spec_path, args: args }
+    let boxed = Box_SpecInvocation.new(take inv, allocator)?
+
+    uninit attrs: Vec_Attribute.Vec
+    Vec_Attribute.new(init attrs, allocator)?
+    return ast_item_mod.Item {
+        span: d.span,
+        attributes: attrs,
+        kind: ast_item_mod.ItemKind.spec_invocation(invocation: boxed),
+    }
+}

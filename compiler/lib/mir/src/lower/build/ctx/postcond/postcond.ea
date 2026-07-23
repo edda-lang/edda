@@ -1,0 +1,81 @@
+
+module mir.lower.build.ctx.postcond.postcond
+
+import std.mem.alloc
+import std.collections.vec
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ops as ast_ops_mod
+import syntax.ast.ident as ident_mod
+import intern.symbol as symbol_mod
+import span.loc.pos.span as span_mod
+import local.lower.build.ctx.subst.subst as subst_mod
+
+
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ident_mod.Ident)
+
+
+public function result_ident_expr(allocator: Allocator) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    return subst_mod.named_ident_expr(symbol_mod.from_raw(symbol_mod.result_raw()), allocator)?
+}
+
+
+public function mentions_result(e: ast_tree_mod.Expr) -> bool
+    with {divergence}
+{
+    return match e.kind {
+        case .literal(_) => false
+        case .path(let p) => path_is_result(p)
+        case .binary(_, let lhs, let rhs) => mentions_result(Box_Expr.get(lhs)) || mentions_result(Box_Expr.get(rhs))
+        case .unary(_, let inner) => mentions_result(Box_Expr.get(inner))
+        case .field(let receiver, _) => mentions_result(Box_Expr.get(receiver))
+        case _ => true
+    }
+}
+
+
+function path_is_result(p: ident_mod.Path) -> bool {
+    if Vec_Ident.len(p.segments) != 1 as usize {
+        return false
+    }
+    return symbol_mod.is_result(Vec_Ident.at(p.segments, 0 as usize).name)
+}
+
+
+public function negated_expr(
+    inner: take ast_tree_mod.Expr,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    let inner_box = Box_Expr.new(take inner, allocator)?
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.unary(
+            op: ast_ops_mod.UnOp.not,
+            expr: inner_box,
+        ),
+    }
+}
+
+
+public function result_equals_expr(
+    value_expr: take ast_tree_mod.Expr,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    let result_expr = result_ident_expr(allocator)?
+    let lhs = Box_Expr.new(take result_expr, allocator)?
+    let rhs = Box_Expr.new(take value_expr, allocator)?
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.binary(
+            op: ast_ops_mod.BinOp.eq,
+            lhs: lhs,
+            rhs: rhs,
+        ),
+    }
+}

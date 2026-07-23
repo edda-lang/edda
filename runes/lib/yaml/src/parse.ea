@@ -1,0 +1,242 @@
+
+module yaml.parse
+
+import std.mem.alloc
+
+import yaml.error
+import yaml.value.core as value
+import yaml.parse.scan
+import yaml.parse.scalar
+import yaml.parse.flow
+
+spec alloc.Box(value.YamlValue)
+
+
+function _count_mapping_entries_at(src: [u8], p: usize, ind: usize) -> usize
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    var c: usize = p
+    var count: usize = 0
+    loop decreases n - c + 1 as usize {
+        c = scan.skip_blanks_and_comments(src, c)
+        if c >= n { break }
+        let line_ind = scan.line_indent(src, c)?
+        if line_ind < ind { break }
+        if line_ind == ind {
+            let first = src[c + line_ind]
+            if first == 45 as u8 { break }
+            count = count + 1 as usize
+        }
+        c = scan.advance_past_newline(src, scan.line_end(src, c))
+    }
+    return count
+}
+
+function _count_sequence_items_at(src: [u8], p: usize, ind: usize) -> usize
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    var c: usize = p
+    var count: usize = 0
+    loop decreases n - c + 1 as usize {
+        c = scan.skip_blanks_and_comments(src, c)
+        if c >= n { break }
+        let line_ind = scan.line_indent(src, c)?
+        if line_ind < ind { break }
+        if line_ind == ind {
+            let first = src[c + line_ind]
+            if first != 45 as u8 { break }
+            count = count + 1 as usize
+        }
+        c = scan.advance_past_newline(src, scan.line_end(src, c))
+    }
+    return count
+}
+
+
+function _parse_inline_or_block(
+    src: [u8],
+    value_lo: usize,
+    line_hi: usize,
+    parent_ind: usize,
+    after_line: usize,
+    allocator: Allocator,
+) -> (value.YamlValue, usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError, divergence}
+{
+    let trimmed_hi = scan.trim_right_ws(src, value_lo, line_hi)
+    if value_lo < trimmed_hi {
+        if src[value_lo] == 91 as u8 || src[value_lo] == 123 as u8 {
+            let (v, _after) = flow.parse_value(src, value_lo, trimmed_hi, allocator)?
+            return (v, after_line)
+        }
+        let v = scalar.classify(src, value_lo, line_hi, allocator)?
+        return (v, after_line)
+    }
+    let n = src.len()
+    let next = scan.skip_blanks_and_comments(src, after_line)
+    if next >= n {
+        return (value.YamlValue.null_value, after_line)
+    }
+    let next_ind = scan.line_indent(src, next)?
+    if next_ind <= parent_ind {
+        return (value.YamlValue.null_value, after_line)
+    }
+    let first = src[next + next_ind]
+    if first == 45 as u8 {
+        let (sq, after) = _parse_sequence_at(src, next, next_ind, allocator)?
+        return (value.YamlValue.sequence(sq), after)
+    }
+    let (mp, after) = _parse_mapping_at(src, next, next_ind, allocator)?
+    return (value.YamlValue.mapping(mp), after)
+}
+
+function _parse_mapping_at(
+    src: [u8],
+    p: usize,
+    ind: usize,
+    allocator: Allocator,
+) -> (value.Mapping, usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError, divergence}
+{
+    let n = src.len()
+    let count = _count_mapping_entries_at(src, p, ind)?
+    let slots = scan.alloc_entry_slots(allocator, count)?
+    var n_filled: usize = 0
+    var c: usize = p
+    loop decreases n - c + 1 as usize {
+        c = scan.skip_blanks_and_comments(src, c)
+        if c >= n { break }
+        let line_ind = scan.line_indent(src, c)?
+        if line_ind < ind { break }
+        if line_ind > ind {
+            raise error.ParseError.bad_indentation(at: c + line_ind)
+        }
+        let key_start = c + line_ind
+        if src[key_start] == 45 as u8 {
+            raise error.ParseError.mixed_indicators(at: key_start)
+        }
+        let line_hi = scan.line_end(src, c)
+        let colon_pos = _find_block_colon(src, key_start, line_hi)?
+        let key_hi = scan.trim_right_ws(src, key_start, colon_pos)
+        if key_start >= key_hi { raise error.ParseError.empty_key(at: c) }
+        let key_str = scalar.flow_key(src, key_start, key_hi, allocator)?
+        let value_lo = _skip_inline_ws(src, colon_pos + 1 as usize, line_hi)
+        let after_line = scan.advance_past_newline(src, line_hi)
+        let (v, next_c) = _parse_inline_or_block(
+            src, value_lo, line_hi, ind, after_line, allocator,
+        )?
+        slots[n_filled] = value.MappingEntry {
+            key: key_str,
+            value: Box_YamlValue.new(take v, allocator)?,
+        }
+        n_filled = n_filled + 1 as usize
+        c = next_c
+    }
+    return (value.Mapping { entries: slots[0 as usize..<n_filled] }, c)
+}
+
+function _parse_sequence_at(
+    src: [u8],
+    p: usize,
+    ind: usize,
+    allocator: Allocator,
+) -> (value.Sequence, usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError, divergence}
+{
+    let n = src.len()
+    let count = _count_sequence_items_at(src, p, ind)?
+    let slots = scan.alloc_item_slots(allocator, count)?
+    var n_filled: usize = 0
+    var c: usize = p
+    loop decreases n - c + 1 as usize {
+        c = scan.skip_blanks_and_comments(src, c)
+        if c >= n { break }
+        let line_ind = scan.line_indent(src, c)?
+        if line_ind < ind { break }
+        if line_ind > ind {
+            raise error.ParseError.bad_indentation(at: c + line_ind)
+        }
+        let dash_pos = c + line_ind
+        if src[dash_pos] != 45 as u8 { break }
+        let line_hi = scan.line_end(src, c)
+        let after_dash = dash_pos + 1 as usize
+        if after_dash < line_hi && !scan.is_ws(src[after_dash]) {
+            raise error.ParseError.unexpected_byte(at: after_dash)
+        }
+        let value_lo = _skip_inline_ws(src, after_dash, line_hi)
+        let after_line = scan.advance_past_newline(src, line_hi)
+        let (v, next_c) = _parse_inline_or_block(
+            src, value_lo, line_hi, ind, after_line, allocator,
+        )?
+        slots[n_filled] = Box_YamlValue.new(take v, allocator)?
+        n_filled = n_filled + 1 as usize
+        c = next_c
+    }
+    return (value.Sequence { items: slots[0 as usize..<n_filled] }, c)
+}
+
+function _find_block_colon(src: [u8], key_start: usize, line_hi: usize) -> usize
+    with {err: error.ParseError}
+{
+    var i: usize = key_start
+    loop decreases line_hi - i + 1 as usize {
+        if i >= line_hi { break }
+        let c = src[i]
+        if c == 58 as u8 { return i }
+        if c == 39 as u8 {
+            i = scalar.find_squote_end(src, i, line_hi)?
+        } else if c == 34 as u8 {
+            i = scalar.find_dquote_end(src, i, line_hi)?
+        } else {
+            i = i + 1 as usize
+        }
+    }
+    raise error.ParseError.missing_colon(at: key_start)
+}
+
+function _skip_inline_ws(src: [u8], lo: usize, line_hi: usize) -> usize {
+    var i: usize = lo
+    loop decreases line_hi - i + 1 as usize {
+        if i >= line_hi { break }
+        if !scan.is_ws(src[i]) { break }
+        i = i + 1 as usize
+    }
+    return i
+}
+
+
+public function parse_bytes(src: [u8], allocator: Allocator) -> value.YamlValue
+    with {allocator, err: error.ParseError, divergence}
+{
+    return handle err: alloc.AllocError -> { raise error.ParseError.allocation_failed } {
+        let n = src.len()
+        if n == 0 as usize { raise error.ParseError.empty_input }
+        let p = scan.skip_blanks_and_comments(src, 0 as usize)
+        if p >= n { raise error.ParseError.empty_input }
+        let ind = scan.line_indent(src, p)?
+        if ind != 0 as usize {
+            raise error.ParseError.bad_indentation(at: p)
+        }
+        let first = src[p]
+        if first == 91 as u8 || first == 123 as u8 {
+            let line_hi = scan.line_end(src, p)
+            let trimmed_hi = scan.trim_right_ws(src, p, line_hi)
+            let (v, _after) = flow.parse_value(src, p, trimmed_hi, allocator)?
+            v
+        } else if first == 45 as u8 {
+            let (sq, _end) = _parse_sequence_at(src, p, 0 as usize, allocator)?
+            value.YamlValue.sequence(sq)
+        } else {
+            let (mp, _end) = _parse_mapping_at(src, p, 0 as usize, allocator)?
+            value.YamlValue.mapping(mp)
+        }
+    }
+}
+
+public function parse(src: String, allocator: Allocator) -> value.YamlValue
+    with {allocator, err: error.ParseError, divergence}
+{
+    return parse_bytes(src.bytes(), allocator)?
+}

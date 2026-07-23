@@ -1,0 +1,154 @@
+
+module compile.setup.env.load.incremental
+
+import std.collections.vec
+import std.mem.alloc
+import cache.addr.hash as hash_mod
+import query.graph.idx.key as qkey_mod
+import query.graph.idx.node as qnode_mod
+import query.graph.graph as qgraph_mod
+
+spec std.collections.vec.Vec(qnode_mod.NodeId)
+
+
+public type PipelinePlan {
+    parse_nodes: Vec_NodeId.Vec
+    resolve: qnode_mod.NodeId
+    typecheck: qnode_mod.NodeId
+    cteval: qnode_mod.NodeId
+    specs: qnode_mod.NodeId
+    mir: qnode_mod.NodeId
+    refine: qnode_mod.NodeId
+    validate: qnode_mod.NodeId
+    backend: qnode_mod.NodeId
+}
+
+public type PhaseMask {
+    resolve: bool
+    typecheck: bool
+    cteval: bool
+    specs: bool
+    mir: bool
+    refine: bool
+    validate: bool
+    backend: bool
+}
+
+
+public function kind_parse() -> u32 { return 1 }
+public function kind_resolve() -> u32 { return 2 }
+public function kind_typecheck() -> u32 { return 3 }
+public function kind_cteval() -> u32 { return 4 }
+public function kind_specs() -> u32 { return 5 }
+public function kind_mir() -> u32 { return 6 }
+public function kind_refine() -> u32 { return 7 }
+public function kind_validate() -> u32 { return 8 }
+public function kind_backend() -> u32 { return 9 }
+
+
+public function plan(graph: mutable qgraph_mod.QueryGraph, file_ids: [hash_mod.ArtifactHash], allocator: Allocator) -> PipelinePlan
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit parse_nodes: Vec_NodeId.Vec
+    Vec_NodeId.new(init parse_nodes, allocator)?
+    let nf = file_ids.len()
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        let k = qkey_mod.new(kind_parse(), file_ids[i])
+        let id = qgraph_mod.intern(mutable graph, k, allocator)?
+        Vec_NodeId.push(mutable parse_nodes, id, allocator)?
+        i += 1
+    }
+
+    let resolve = intern_singleton(mutable graph, kind_resolve(), allocator)?
+    link_all(mutable graph, resolve, parse_nodes, allocator)?
+
+    let typecheck = intern_singleton(mutable graph, kind_typecheck(), allocator)?
+    qgraph_mod.add_edge(mutable graph, typecheck, resolve, allocator)?
+
+    let cteval = intern_singleton(mutable graph, kind_cteval(), allocator)?
+    qgraph_mod.add_edge(mutable graph, cteval, typecheck, allocator)?
+
+    let specs = intern_singleton(mutable graph, kind_specs(), allocator)?
+    qgraph_mod.add_edge(mutable graph, specs, typecheck, allocator)?
+    qgraph_mod.add_edge(mutable graph, specs, cteval, allocator)?
+
+    let mir = intern_singleton(mutable graph, kind_mir(), allocator)?
+    qgraph_mod.add_edge(mutable graph, mir, specs, allocator)?
+    qgraph_mod.add_edge(mutable graph, mir, typecheck, allocator)?
+
+    let refine = intern_singleton(mutable graph, kind_refine(), allocator)?
+    qgraph_mod.add_edge(mutable graph, refine, mir, allocator)?
+
+    let validate = intern_singleton(mutable graph, kind_validate(), allocator)?
+    qgraph_mod.add_edge(mutable graph, validate, typecheck, allocator)?
+
+    let backend = intern_singleton(mutable graph, kind_backend(), allocator)?
+    qgraph_mod.add_edge(mutable graph, backend, mir, allocator)?
+    qgraph_mod.add_edge(mutable graph, backend, refine, allocator)?
+
+    return PipelinePlan {
+        parse_nodes: parse_nodes,
+        resolve: resolve,
+        typecheck: typecheck,
+        cteval: cteval,
+        specs: specs,
+        mir: mir,
+        refine: refine,
+        validate: validate,
+        backend: backend,
+    }
+}
+
+
+public function refresh_inputs(graph: mutable qgraph_mod.QueryGraph, plan: PipelinePlan, content_hashes: [hash_mod.ArtifactHash]) -> usize {
+    let np = Vec_NodeId.len(plan.parse_nodes)
+    let nh = content_hashes.len()
+    let n = if np < nh { np } else { nh }
+    var changed: usize = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let pid = Vec_NodeId.at(plan.parse_nodes, i)
+        if qgraph_mod.note_input(mutable graph, pid, content_hashes[i]) {
+            changed = changed + 1
+        }
+        i += 1
+    }
+    return changed
+}
+
+
+public function recompute_mask(graph: qgraph_mod.QueryGraph, plan: PipelinePlan) -> PhaseMask {
+    return PhaseMask {
+        resolve: qgraph_mod.needs_recompute(graph, plan.resolve),
+        typecheck: qgraph_mod.needs_recompute(graph, plan.typecheck),
+        cteval: qgraph_mod.needs_recompute(graph, plan.cteval),
+        specs: qgraph_mod.needs_recompute(graph, plan.specs),
+        mir: qgraph_mod.needs_recompute(graph, plan.mir),
+        refine: qgraph_mod.needs_recompute(graph, plan.refine),
+        validate: qgraph_mod.needs_recompute(graph, plan.validate),
+        backend: qgraph_mod.needs_recompute(graph, plan.backend),
+    }
+}
+
+
+function intern_singleton(graph: mutable qgraph_mod.QueryGraph, kind: u32, allocator: Allocator) -> qnode_mod.NodeId
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = qkey_mod.new(kind, hash_mod.zero())
+    return qgraph_mod.intern(mutable graph, k, allocator)?
+}
+
+function link_all(graph: mutable qgraph_mod.QueryGraph, from: qnode_mod.NodeId, deps: Vec_NodeId.Vec, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_NodeId.len(deps)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        qgraph_mod.add_edge(mutable graph, from, Vec_NodeId.at(deps, i), allocator)?
+        i += 1
+    }
+}

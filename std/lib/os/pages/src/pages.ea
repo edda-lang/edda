@@ -1,0 +1,88 @@
+
+module std.os.pages
+
+import std.os.raw
+
+public type PageError {
+    case exhausted
+    case rejected
+}
+
+
+public stable function page_bytes() -> usize {
+    return 4096
+}
+
+public stable function max_map_bytes() -> usize {
+    return 0x1000000000000
+}
+
+
+function virtual_alloc(lp: u64, size: u64, alloc_type: u64, protect: u64) -> u64
+    extern "VirtualAlloc" from "kernel32.dll"
+
+function virtual_free(lp: u64, size: u64, free_type: u64) -> i32
+    extern "VirtualFree" from "kernel32.dll"
+
+
+public function map(
+    byte_count: usize where byte_count >= 4096 && byte_count % 4096 == 0 && byte_count <= max_map_bytes(),
+) -> u64
+    with {err: PageError}
+    ensures result != 0
+    ensures result % 4096 == 0
+{
+    comptime if target_has("windows") {
+        let addr: u64 = virtual_alloc(0, byte_count as u64, 0x3000, 0x04)
+        if addr == 0 { raise PageError.exhausted }
+        if addr % 4096 != 0 { raise PageError.rejected }
+        return addr
+    } else {
+        let r: i64 = raw.syscall6(9, 0, byte_count as u64, 3, 0x22, 0xFFFFFFFFFFFFFFFF, 0)
+        if r == -12 { raise PageError.exhausted }
+        if r <= 0 { raise PageError.rejected }
+        let addr: u64 = r as u64
+        if addr % 4096 != 0 { raise PageError.rejected }
+        return addr
+    }
+}
+
+public function map_at(
+    addr: u64 where addr != 0 && addr % 4096 == 0,
+    byte_count: usize where byte_count >= 4096 && byte_count % 4096 == 0 && byte_count <= max_map_bytes(),
+) -> ()
+    with {err: PageError}
+{
+    comptime if target_has("windows") {
+        let got: u64 = virtual_alloc(addr, byte_count as u64, 0x3000, 0x04)
+        if got == 0 { raise PageError.rejected }
+        if got != addr {
+            let _ = virtual_free(got, 0, 0x8000)
+            raise PageError.rejected
+        }
+    } else {
+        let r: i64 = raw.syscall6(9, addr, byte_count as u64, 3, 0x22, 0xFFFFFFFFFFFFFFFF, 0)
+        if r == -12 { raise PageError.exhausted }
+        if r <= 0 { raise PageError.rejected }
+        let got: u64 = r as u64
+        if got != addr {
+            let _ = raw.syscall6(11, got, byte_count as u64, 0, 0, 0, 0)
+            raise PageError.rejected
+        }
+    }
+}
+
+public function unmap(
+    addr: u64 where addr != 0 && addr % 4096 == 0,
+    byte_count: usize where byte_count >= 4096 && byte_count % 4096 == 0 && byte_count <= max_map_bytes(),
+) -> ()
+    with {err: PageError}
+{
+    comptime if target_has("windows") {
+        let ok: i32 = virtual_free(addr, 0, 0x8000)
+        if ok == 0 { raise PageError.rejected }
+    } else {
+        let r: i64 = raw.syscall6(11, addr, byte_count as u64, 0, 0, 0, 0)
+        if r != 0 { raise PageError.rejected }
+    }
+}

@@ -1,0 +1,252 @@
+module website.server.route
+
+import std.mem.alloc
+import std.os.fs
+import std.text.htmlescape
+import html.markup
+import hermod.error
+import hermod.message.request as request_mod
+import hermod.message.response as response_mod
+import hermod.message.body as body_mod
+import hermod.proto.headers as headers_mod
+import hermod.proto.status as status_mod
+import hermod.uri.types as uri_mod
+import local.layout
+import local.server.backnav
+import local.server.agent
+import local.pages.home.page as home_page
+import local.pages.design.page as design_page
+import local.pages.language.page as language_page
+import local.pages.language.ref as language_ref
+import local.pages.verification.page as verification_page
+import local.pages.concurrency.page as concurrency_page
+import local.pages.tooling.page as tooling_page
+import local.pages.distribution.page as distribution_page
+import local.pages.start.page as start_page
+import local.pages.docs.page as docs_page
+import local.pages.build.servers.page as servers_page
+import local.pages.build.cli.page as cli_page
+import local.pages.build.embedded.page as embedded_page
+import local.pages.build.wasm.page as wasm_page
+import local.pages.contribute.page as contribute_page
+import local.pages.notfound.page as notfound_page
+import local.pages.agent.page as agent_page
+spec std.core.option.Option(String)
+
+function _alloc_u8(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+    extern "__edda_alloc_array"
+
+public function dispatch(req: request_mod.Request, rfs: ReadOnlyFilesystem, css: String, allocator: mutable Allocator) -> response_mod.Response
+    with {rfs, allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        handle err: htmlescape.HtmlEscapeError -> (raise error.CodecError.buffer_overflow) {
+            let raw_target = uri_mod.uri_target(request_mod.request_uri(req))
+            let target = backnav.path_only(raw_target)
+            let fid = _font_id(target)
+            if fid < 4 as usize {
+                return _respond_font(fid, rfs, mutable allocator)?
+            }
+            let aid = agent.match_route(target)
+            if aid < agent.count() {
+                return _respond_agent(aid, rfs, mutable allocator)?
+            }
+            let back = backnav.of(req, target, raw_target, allocator)?
+            let back_trail = backnav.back_trail(raw_target, target, allocator)?
+            let fwd_trail = backnav.forward_trail(raw_target, target, allocator)?
+            let id = _route_id(target)
+            let code: u16 = if id < 21 as usize { 200 as u16 } else { 404 as u16 }
+            let page_back = if id == 0 as usize { Option_String.Option.none } else { back }
+            var h = markup.new(allocator)?
+            h = layout.open_page(take h, _title_for(id), css, id != 0 as usize, page_back, allocator)?
+            h = _render_page(take h, id, allocator)?
+            h = layout.close_page(take h, allocator)?
+            _respond(h, code, back_trail, fwd_trail, mutable allocator)?
+        }
+    }
+}
+
+function _route_id(target: [u8]) -> usize {
+    if _path_eq(target, "/".bytes()) { return 0 as usize }
+    if _path_eq(target, "/get-started".bytes()) { return 1 as usize }
+    if _path_eq(target, "/design".bytes()) { return 2 as usize }
+    if _path_eq(target, "/language".bytes()) { return 3 as usize }
+    if _path_eq(target, "/language/functions".bytes()) { return 4 as usize }
+    if _path_eq(target, "/language/types".bytes()) { return 5 as usize }
+    if _path_eq(target, "/language/modes".bytes()) { return 6 as usize }
+    if _path_eq(target, "/language/effects".bytes()) { return 7 as usize }
+    if _path_eq(target, "/language/refinements".bytes()) { return 8 as usize }
+    if _path_eq(target, "/language/specs".bytes()) { return 9 as usize }
+    if _path_eq(target, "/verification".bytes()) { return 10 as usize }
+    if _path_eq(target, "/concurrency".bytes()) { return 11 as usize }
+    if _path_eq(target, "/tooling".bytes()) { return 12 as usize }
+    if _path_eq(target, "/distribution".bytes()) { return 13 as usize }
+    if _path_eq(target, "/build/servers".bytes()) { return 14 as usize }
+    if _path_eq(target, "/build/cli".bytes()) { return 15 as usize }
+    if _path_eq(target, "/build/embedded".bytes()) { return 16 as usize }
+    if _path_eq(target, "/build/wasm".bytes()) { return 17 as usize }
+    if _path_eq(target, "/docs".bytes()) { return 18 as usize }
+    if _path_eq(target, "/contribute".bytes()) { return 19 as usize }
+    if _path_eq(target, "/get-started/agent".bytes()) { return 20 as usize }
+    return 21 as usize
+}
+
+function _title_for(id: usize) -> String {
+    return match id {
+        case 0  => "edda programming language"
+        case 1  => "Get started — edda"
+        case 2  => "Design — edda"
+        case 3  => "Language — edda"
+        case 4  => "Functions — language — edda"
+        case 5  => "Types — language — edda"
+        case 6  => "Modes — language — edda"
+        case 7  => "Effects — language — edda"
+        case 8  => "Refinements — language — edda"
+        case 9  => "Specs — language — edda"
+        case 10 => "Verification — edda"
+        case 11 => "Concurrency — edda"
+        case 12 => "Tooling — edda"
+        case 13 => "Distribution — edda"
+        case 14 => "Network services — edda"
+        case 15 => "Command-line tools — edda"
+        case 16 => "Embedded — edda"
+        case 17 => "WebAssembly — edda"
+        case 18 => "All pages — edda"
+        case 19 => "Contribute — edda"
+        case 20 => "For your agent — edda"
+        case _  => "Not found — edda"
+    }
+}
+
+function _render_page(h: take markup.Html, id: usize, allocator: Allocator) -> markup.Html
+    with {allocator, err: alloc.AllocError, err: htmlescape.HtmlEscapeError}
+{
+    return match id {
+        case 0  => home_page.render(take h, allocator)?
+        case 1  => start_page.render(take h, allocator)?
+        case 2  => design_page.render(take h, allocator)?
+        case 3  => language_page.render(take h, allocator)?
+        case 4  => language_ref.render_functions(take h, allocator)?
+        case 5  => language_ref.render_types(take h, allocator)?
+        case 6  => language_ref.render_modes(take h, allocator)?
+        case 7  => language_ref.render_effects(take h, allocator)?
+        case 8  => language_ref.render_refinements(take h, allocator)?
+        case 9  => language_ref.render_specs(take h, allocator)?
+        case 10 => verification_page.render(take h, allocator)?
+        case 11 => concurrency_page.render(take h, allocator)?
+        case 12 => tooling_page.render(take h, allocator)?
+        case 13 => distribution_page.render(take h, allocator)?
+        case 14 => servers_page.render(take h, allocator)?
+        case 15 => cli_page.render(take h, allocator)?
+        case 16 => embedded_page.render(take h, allocator)?
+        case 17 => wasm_page.render(take h, allocator)?
+        case 18 => docs_page.render(take h, allocator)?
+        case 19 => contribute_page.render(take h, allocator)?
+        case 20 => agent_page.render(take h, allocator)?
+        case _  => notfound_page.render(take h, allocator)?
+    }
+}
+
+function _font_id(target: [u8]) -> usize {
+    if _path_eq(target, "/fonts/instrument-sans-latin.woff2".bytes()) { return 0 as usize }
+    if _path_eq(target, "/fonts/instrument-sans-latin-ext.woff2".bytes()) { return 1 as usize }
+    if _path_eq(target, "/fonts/fragment-mono-latin.woff2".bytes()) { return 2 as usize }
+    if _path_eq(target, "/fonts/fragment-mono-latin-ext.woff2".bytes()) { return 3 as usize }
+    return 4 as usize
+}
+
+function _font_disk_path(fid: usize) -> String {
+    return match fid {
+        case 0 => "lib/website/assets/fonts/instrument-sans-latin.woff2"
+        case 1 => "lib/website/assets/fonts/instrument-sans-latin-ext.woff2"
+        case 2 => "lib/website/assets/fonts/fragment-mono-latin.woff2"
+        case _ => "lib/website/assets/fonts/fragment-mono-latin-ext.woff2"
+    }
+}
+
+function _respond_font(fid: usize, rfs: ReadOnlyFilesystem, allocator: mutable Allocator) -> response_mod.Response
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let data = handle err: fs.FsError as e -> "".bytes() {
+        fs.read_bytes(rfs, _font_disk_path(fid), allocator)?
+    }
+    let code: u16 = if data.len() == 0 as usize { 404 as u16 } else { 200 as u16 }
+    let body = body_mod.body_from(data)
+    let headers = headers_mod.headers_with_capacity(4 as usize, mutable allocator)?
+    var resp = response_mod.response_new(status_mod.status_from(code), headers, body)
+    headers_mod.headers_append(mutable resp.headers, "Content-Type".bytes(), "font/woff2".bytes())?
+    headers_mod.headers_append(mutable resp.headers, "Cache-Control".bytes(), "public, max-age=31536000, immutable".bytes())?
+    let cl = _format_decimal(body_mod.body_len(body), allocator)?
+    headers_mod.headers_append(mutable resp.headers, "Content-Length".bytes(), cl)?
+    return resp
+}
+
+function _respond_agent(aid: usize, rfs: ReadOnlyFilesystem, allocator: mutable Allocator) -> response_mod.Response
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let data = agent.body(aid, rfs, allocator)?
+    let code: u16 = if data.len() == 0 as usize { 404 as u16 } else { 200 as u16 }
+    let body = body_mod.body_from(data)
+    let headers = headers_mod.headers_with_capacity(4 as usize, mutable allocator)?
+    var resp = response_mod.response_new(status_mod.status_from(code), headers, body)
+    headers_mod.headers_append(mutable resp.headers, "Content-Type".bytes(), agent.ctype(aid).bytes())?
+    let cl = _format_decimal(body_mod.body_len(body), allocator)?
+    headers_mod.headers_append(mutable resp.headers, "Content-Length".bytes(), cl)?
+    return resp
+}
+
+function _respond(h: markup.Html, code: u16 where code >= 100 && code < 600, back_trail: String, fwd_trail: String, allocator: mutable Allocator) -> response_mod.Response
+    with {allocator, err: alloc.AllocError}
+{
+    let rendered = markup.render(h, allocator)?
+    let doc = backnav.inject_trails(rendered, back_trail, fwd_trail, allocator)?
+    let body = body_mod.body_from(doc)
+    let headers = headers_mod.headers_with_capacity(4 as usize, mutable allocator)?
+    var resp = response_mod.response_new(status_mod.status_from(code), headers, body)
+    headers_mod.headers_append(mutable resp.headers, "Content-Type".bytes(), "text/html; charset=utf-8".bytes())?
+    let cl = _format_decimal(body_mod.body_len(body), allocator)?
+    headers_mod.headers_append(mutable resp.headers, "Content-Length".bytes(), cl)?
+    return resp
+}
+
+function _path_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function _usize_digits(n: usize) -> usize {
+    if n == 0 as usize { return 1 as usize }
+    var work: usize = n
+    var k: usize = 0
+    loop decreases work + (1 as usize) {
+        if work == 0 as usize { break }
+        work = work / (10 as usize)
+        k += 1
+    }
+    return k
+}
+
+function _format_decimal(n: usize, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let k = _usize_digits(n)
+    let out = _alloc_u8(allocator, k)?
+    var remaining: usize = n
+    var i: usize = k
+    loop decreases i + (1 as usize) {
+        if i == 0 as usize { break }
+        i = i - (1 as usize)
+        let d = (remaining % (10 as usize)) as u8
+        out[i] = (48 as u8) + d
+        remaining = remaining / (10 as usize)
+    }
+    return out
+}

@@ -1,0 +1,192 @@
+
+module std.compress.zstd.block
+
+import std.mem.alloc
+import local.fse
+import local.huffman
+import local.fault
+
+spec std.mem.alloc.Array(u8)
+spec std.mem.alloc.Array(usize)
+
+
+public type Ctx {
+    huf_valid: bool
+    huf: huffman.Table
+    ll_valid: bool
+    ll: fse.Table
+    ml_valid: bool
+    ml: fse.Table
+    of_valid: bool
+    of: fse.Table
+    rep0: usize
+    rep1: usize
+    rep2: usize
+}
+
+public type Lits {
+    data: [u8]
+    len: usize where len <= data.len()
+    consumed: usize
+}
+
+
+public function new_ctx(allocator: Allocator) -> Ctx
+    with {allocator, err: alloc.AllocError}
+{
+    let hs: [u8] = Array_u8.alloc(allocator, 0)?
+    let hl: [u8] = Array_u8.alloc(allocator, 0)?
+    return Ctx {
+        huf_valid: false,
+        huf: huffman.Table { max_bits: 0, symbol: hs, lengths: hl },
+        ll_valid: false,
+        ll: empty_fse(allocator)?,
+        ml_valid: false,
+        ml: empty_fse(allocator)?,
+        of_valid: false,
+        of: empty_fse(allocator)?,
+        rep0: 1,
+        rep1: 4,
+        rep2: 8,
+    }
+}
+
+function empty_fse(allocator: Allocator) -> fse.Table
+    with {allocator, err: alloc.AllocError}
+{
+    let s: [u8] = Array_u8.alloc(allocator, 0)?
+    let b: [u8] = Array_u8.alloc(allocator, 0)?
+    let base: [usize] = Array_usize.alloc(allocator, 0)?
+    return fse.Table { al: 0, size: 0, symbol: s, bits: b, base: base }
+}
+
+
+public function decode_literals(
+    block: [u8],
+    ctx: mutable Ctx,
+    allocator: Allocator,
+) -> Lits
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    if block.len() == 0 { raise fault.Fault.bad_literals }
+    let b0: usize = block[0] as usize
+    let ltype: usize = b0 & 3
+    let sf: usize = (b0 >> 2) & 3
+    if ltype == 0 || ltype == 1 {
+        return plain_literals(block, ltype, sf, allocator)?
+    }
+    var rs: usize = 0
+    var cs: usize = 0
+    var hdr: usize = 0
+    var four: bool = true
+    if sf == 0 || sf == 1 {
+        four = sf == 1
+        if block.len() < 3 { raise fault.Fault.bad_literals }
+        let b1: usize = block[1] as usize
+        let b2: usize = block[2] as usize
+        rs = (b0 >> 4) | ((b1 & 0x3F) << 4)
+        cs = (b1 >> 6) | (b2 << 2)
+        hdr = 3
+    } else if sf == 2 {
+        if block.len() < 4 { raise fault.Fault.bad_literals }
+        let b1: usize = block[1] as usize
+        let b2: usize = block[2] as usize
+        let b3: usize = block[3] as usize
+        rs = (b0 >> 4) | (b1 << 4) | ((b2 & 0x03) << 12)
+        cs = (b2 >> 2) | (b3 << 6)
+        hdr = 4
+    } else {
+        if block.len() < 5 { raise fault.Fault.bad_literals }
+        let b1: usize = block[1] as usize
+        let b2: usize = block[2] as usize
+        let b3: usize = block[3] as usize
+        let b4: usize = block[4] as usize
+        rs = (b0 >> 4) | (b1 << 4) | ((b2 & 0x3F) << 12)
+        cs = (b2 >> 6) | (b3 << 2) | (b4 << 10)
+        hdr = 5
+    }
+    if hdr +| cs > block.len() { raise fault.Fault.bad_literals }
+    let payload: [u8] = block[hdr ..< hdr + cs]
+    var poff: usize = 0
+    if ltype == 2 {
+        let parsed: huffman.Parsed = huffman.read_table(payload, allocator)?
+        ctx.huf = parsed.table
+        ctx.huf_valid = true
+        poff = parsed.consumed
+    } else {
+        if !ctx.huf_valid { raise fault.Fault.bad_literals }
+    }
+    if poff > payload.len() { raise fault.Fault.bad_literals }
+    let streams: [u8] = payload[poff ..]
+    var buf: [u8] = Array_u8.alloc(allocator, rs)?
+    if !four {
+        huffman.decode_stream(streams, ctx.huf, mutable buf, 0, rs)?
+        return Lits { data: buf, len: rs, consumed: hdr + cs }
+    }
+    if streams.len() < 6 { raise fault.Fault.bad_literals }
+    let s1: usize = (streams[0] as usize) | ((streams[1] as usize) << 8)
+    let s2: usize = (streams[2] as usize) | ((streams[3] as usize) << 8)
+    let s3: usize = (streams[4] as usize) | ((streams[5] as usize) << 8)
+    let per: usize = (rs + 3) / 4
+    if per *| 3 > rs { raise fault.Fault.bad_literals }
+    let last: usize = rs - per * 3
+    let o1: usize = 6
+    let o2: usize = o1 +| s1
+    let o3: usize = o2 +| s2
+    let o4: usize = o3 +| s3
+    if o4 > streams.len() { raise fault.Fault.bad_literals }
+    huffman.decode_stream(streams[o1 ..< o2], ctx.huf, mutable buf, 0, per)?
+    huffman.decode_stream(streams[o2 ..< o3], ctx.huf, mutable buf, per, per)?
+    huffman.decode_stream(streams[o3 ..< o4], ctx.huf, mutable buf, per * 2, per)?
+    huffman.decode_stream(streams[o4 ..], ctx.huf, mutable buf, per * 3, last)?
+    return Lits { data: buf, len: rs, consumed: hdr + cs }
+}
+
+function plain_literals(
+    block: [u8] where block.len() >= 1,
+    ltype: usize,
+    sf: usize,
+    allocator: Allocator,
+) -> Lits
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    let b0: usize = block[0] as usize
+    var rs: usize = 0
+    var hdr: usize = 1
+    if sf == 0 || sf == 2 {
+        rs = b0 >> 3
+        hdr = 1
+    } else if sf == 1 {
+        if block.len() < 2 { raise fault.Fault.bad_literals }
+        rs = (b0 >> 4) | ((block[1] as usize) << 4)
+        hdr = 2
+    } else {
+        if block.len() < 3 { raise fault.Fault.bad_literals }
+        rs = (b0 >> 4) | ((block[1] as usize) << 4) | ((block[2] as usize) << 12)
+        hdr = 3
+    }
+    var buf: [u8] = Array_u8.alloc(allocator, rs)?
+    if ltype == 0 {
+        if hdr +| rs > block.len() { raise fault.Fault.bad_literals }
+        var i: usize = 0
+        loop
+            decreases rs - i
+        {
+            if i >= rs { break }
+            buf[i] = block[hdr + i]
+            i += 1
+        }
+        return Lits { data: buf, len: rs, consumed: hdr + rs }
+    }
+    if hdr >= block.len() { raise fault.Fault.bad_literals }
+    let fill: u8 = block[hdr]
+    var j: usize = 0
+    loop
+        decreases rs - j
+    {
+        if j >= rs { break }
+        buf[j] = fill
+        j += 1
+    }
+    return Lits { data: buf, len: rs, consumed: hdr + 1 }
+}

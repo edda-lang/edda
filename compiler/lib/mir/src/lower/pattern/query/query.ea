@@ -1,0 +1,258 @@
+module mir.lower.pattern.query.query
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as ast_pat_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import local.id.local as local_mod
+import local.lower.build.ctx.builder as builder_mod
+
+
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(ast_pat_mod.StructPatField)
+spec std.mem.alloc.Box(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(ast_pat_mod.SliceRest)
+
+
+public function variant_name_of_path(path: ident_mod.Path) -> symbol_mod.Symbol
+    with {panic}
+{
+    let n = Vec_Ident.len(path.segments)
+    if n == 0 as usize {
+        panic("walker.variant_name_of_path: empty variant pattern path")
+    }
+    return Vec_Ident.at(path.segments, n - 1 as usize).name
+}
+
+public function resolve_variant_idx(
+    types_out: check_mod.TypeOutput,
+    sum_def: def_mod.DefId,
+    path: ident_mod.Path,
+) -> u32
+    with {panic}
+{
+    return match check_mod.variant_index_of(types_out, sum_def, variant_name_of_path(path)) {
+        case .some(let idx) => idx
+        case .none => panic("walker.resolve_variant_idx: variant pattern not found in scrutinee sum type — typecheck should have rejected")
+    }
+}
+
+public function tuple_elem_ty(
+    ty_interner: ty_interner_mod.Interner,
+    t: ty_mod.TyId,
+    idx: usize,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    if (t.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return ty_mod.error()
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .tuple_(let elems) => if idx >= Vec_TyId.len(elems) {
+            ty_mod.error()
+        } else {
+            Vec_TyId.at(elems, idx)
+        }
+        case _ => ty_mod.error()
+    }
+}
+
+public function slice_elem_ty(
+    ty_interner: ty_interner_mod.Interner,
+    t: ty_mod.TyId,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    if (t.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return ty_mod.error()
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .slice(let elem) => elem
+        case .array(let elem, _) => elem
+        case _ => ty_mod.error()
+    }
+}
+
+public function record_def_of_ty(
+    ty_interner: ty_interner_mod.Interner,
+    t: ty_mod.TyId,
+) -> Option_DefId.Option
+    with {divergence}
+{
+    if (t.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return Option_DefId.none
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .record(let def) => Option_DefId.some(value: def)
+        case _ => Option_DefId.none
+    }
+}
+
+public function resolve_field_index(
+    types_out: check_mod.TypeOutput,
+    def: def_mod.DefId,
+    row_idx: u32,
+    name: symbol_mod.Symbol,
+) -> u32
+    with {panic}
+{
+    return match check_mod.field_name_index(types_out, def, row_idx, name) {
+        case .some(let idx) => idx
+        case .none => panic("walker.resolve_field_index: struct field pattern not found in declared fields — typecheck should have rejected")
+    }
+}
+
+
+public function find_binding_def(
+    bindings: Vec_HBinding.Vec,
+    sym: symbol_mod.Symbol,
+) -> Option_DefId.Option
+{
+    let n = Vec_HBinding.len(bindings)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let b = Vec_HBinding.at(bindings, i)
+        if b.name.raw == sym.raw {
+            return Option_DefId.some(value: b.def_id)
+        }
+        i = i + 1
+    }
+    return Option_DefId.none
+}
+
+public function bind_name(
+    builder: mutable builder_mod.LowerCtx,
+    bindings: Vec_HBinding.Vec,
+    sym: symbol_mod.Symbol,
+    value_local: local_mod.LocalId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match find_binding_def(bindings, sym) {
+        case .some(let def_id) => builder_mod.bind_local(mutable builder, def_id, value_local, allocator)?
+        case .none => ()
+    }
+}
+
+public function pat_is_irrefutable(pat: ast_pat_mod.Pat) -> bool
+    with {divergence}
+{
+    return match pat.kind {
+        case .wildcard => true
+        case .binding(_) => true
+        case .at_binding(_, let inner_box) => pat_is_irrefutable(Box_Pat.get(inner_box))
+        case .tuple(let elems) => vec_pat_all_irrefutable(elems)
+        case _ => false
+    }
+}
+
+public function vec_pat_all_irrefutable(pats: Vec_Pat.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if !pat_is_irrefutable(Vec_Pat.at(pats, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+public function pat_binds_any(pat: ast_pat_mod.Pat) -> bool
+    with {divergence}
+{
+    return match pat.kind {
+        case .binding(_) => true
+        case .at_binding(_, _) => true
+        case .tuple(let elems) => vec_pat_any_binds(elems)
+        case .or_(let alts) => vec_pat_any_binds(alts)
+        case .slice(let prefix, let rest, let suffix) => vec_pat_any_binds(prefix) || slice_rest_binds(rest) || vec_pat_any_binds(suffix)
+        case .variant(_, let payload) => variant_payload_binds(payload)
+        case .struct_(_, let fields, _) => struct_fields_bind(fields)
+        case .guard(let inner_box, _) => pat_binds_any(Box_Pat.get(inner_box))
+        case _ => false
+    }
+}
+
+public function vec_pat_any_binds(pats: Vec_Pat.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if pat_binds_any(Vec_Pat.at(pats, i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+public function variant_payload_binds(payload: ast_pat_mod.VariantPatPayload) -> bool
+    with {divergence}
+{
+    return match payload {
+        case .none => false
+        case .tuple(let elems) => vec_pat_any_binds(elems)
+        case .struct_(let fields) => struct_fields_bind(fields)
+    }
+}
+
+public function struct_fields_bind(fields: Vec_StructPatField.Vec) -> bool
+    with {divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if pat_binds_any(Vec_StructPatField.at(fields, i).pat) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+public function slice_rest_binds(rest: Option_SliceRest.Option) -> bool {
+    return match rest {
+        case .none => false
+        case .some(let r) => match r.binding {
+            case .some(_) => true
+            case .none => false
+        }
+    }
+}
+

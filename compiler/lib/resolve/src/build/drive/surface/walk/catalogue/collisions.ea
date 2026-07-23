@@ -1,0 +1,74 @@
+
+module resolve.build.drive.surface.walk.catalogue.collisions
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import local.ctx as ctx_mod
+import local.bind.lookup.lookup as lookup_mod
+import local.paths.imports as imports_mod
+import local.paths.modules as mt_mod
+import local.build.drive.surface.walk.catalogue.specsurface as specsurface_mod
+import local.build.drive.surface.walk.catalogue.disambig as disambig_mod
+
+spec std.mem.alloc.Box(ast_item.SpecInvocation)
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.hashmap.IntMap(symbol.Symbol)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public function detect_collisions(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: mutable interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var seen = IntMap_Symbol.new(allocator)?
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        let mp = lookup_mod.module_path_of(f.items, allocator)?
+        let file_mod_id = ctx_mod.module_id_of(ctx, mp)
+        let imports = imports_mod.build(f.items, mp, ctx_mod.module_tree(ctx), interner, allocator)?
+        detect_file(mutable ctx, f.items, file_mod_id, mp, imports, mutable seen, mutable interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function detect_file(ctx: mutable ctx_mod.ResolveCtx, items: Vec_Item.Vec, file_mod_id: mt_mod.ModuleId, file_segs: Vec_Symbol.Vec, imports: imports_mod.ImportScope, seen: mutable IntMap_Symbol.IntMap, interner: mutable interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .spec_invocation(let inv_box) => {
+                let inv = Box_SpecInvocation.get(inv_box)
+                let short = specsurface_mod.mangle(inv.path, inv.args, mutable interner, allocator)?
+                let full = disambig_mod.disambiguated_full(ctx, file_mod_id, file_segs, imports, inv, short, mutable interner, allocator)?
+                if full.raw != short.raw {
+                    match IntMap_Symbol.get(seen, short.raw as i64) {
+                        case .some(let prev) => {
+                            if prev.raw != full.raw {
+                                ctx_mod.mark_colliding(mutable ctx, short, allocator)?
+                            }
+                        }
+                        case .none => {
+                            let _ = IntMap_Symbol.insert(mutable seen, short.raw as i64, full, allocator)?
+                        }
+                    }
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}

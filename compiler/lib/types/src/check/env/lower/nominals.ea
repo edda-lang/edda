@@ -1,0 +1,383 @@
+
+module types.check.env.lower.nominals
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.collections.slice
+import std.core.option
+import intern.symbol
+import intern.interner as interner_mod
+import hir.item as hir_item
+import hir.def as def_mod
+import syntax.ast.ident as ast_ident
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+
+
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(NominalEntry)
+spec std.collections.vec.Vec(AliasEntry)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.hashmap.IntMap(usize)
+
+
+spec std.core.option.Option(ty_mod.TyId)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.core.option.Option(Vec_Ident)
+
+
+derive eq, clone, debug for NominalEntry
+derive eq, clone, debug for AliasEntry
+derive eq, clone, debug for NominalMap
+
+
+public type NominalEntry {
+    name: symbol.Symbol
+    module_leaf: symbol.Symbol
+    module_path: Vec_Symbol.Vec
+    ty: ty_mod.TyId
+}
+
+public type AliasEntry {
+    name: symbol.Symbol
+    path: Vec_Symbol.Vec
+}
+
+public type NominalMap {
+    entries: Vec_NominalEntry.Vec
+    aliases: Vec_AliasEntry.Vec
+    by_name: IntMap_usize.IntMap
+    by_qual: IntMap_usize.IntMap
+    by_ty: IntMap_usize.IntMap
+}
+
+
+public function empty(allocator: Allocator) -> NominalMap
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_NominalEntry.Vec
+    Vec_NominalEntry.new(init entries, allocator)?
+    uninit aliases: Vec_AliasEntry.Vec
+    Vec_AliasEntry.new(init aliases, allocator)?
+    let by_name = IntMap_usize.new(allocator)?
+    let by_qual = IntMap_usize.new(allocator)?
+    let by_ty = IntMap_usize.new(allocator)?
+    return NominalMap { entries: entries, aliases: aliases, by_name: by_name, by_qual: by_qual, by_ty: by_ty }
+}
+
+
+public function qual_key(leaf_raw: u32, name_raw: u32) -> i64 {
+    let hi = (leaf_raw as u64) << 32
+    let lo = name_raw as u64
+    return (hi | lo) as i64 wrapping
+}
+
+
+function insert_if_absent(m: mutable IntMap_usize.IntMap, key: i64, id: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if !IntMap_usize.contains(m, key) {
+        let _ = IntMap_usize.insert(mutable m, key, take id, allocator)?
+    }
+}
+
+
+function reindex(map: mutable NominalMap, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_NominalEntry.len(map.entries)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_NominalEntry.at(map.entries, i)
+        insert_if_absent(mutable map.by_name, e.name.raw as i64, i, allocator)?
+        insert_if_absent(mutable map.by_qual, qual_key(e.module_leaf.raw, e.name.raw), i, allocator)?
+        insert_if_absent(mutable map.by_ty, e.ty.raw as i64, i, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+public function from_parts(entries: Vec_NominalEntry.Vec, aliases: Vec_AliasEntry.Vec, allocator: Allocator) -> NominalMap
+    with {allocator, err: alloc.AllocError}
+{
+    let by_name = IntMap_usize.new(allocator)?
+    let by_qual = IntMap_usize.new(allocator)?
+    let by_ty = IntMap_usize.new(allocator)?
+    var map = NominalMap { entries: entries, aliases: aliases, by_name: by_name, by_qual: by_qual, by_ty: by_ty }
+    reindex(mutable map, allocator)?
+    return map
+}
+
+
+public function build_nominals(
+    items: Vec_HItem.Vec,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> NominalMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit entries: Vec_NominalEntry.Vec
+    Vec_NominalEntry.new(init entries, allocator)?
+    let leaf = file_module_leaf(items)
+    let mod_path = file_module_path(items, allocator)?
+    collect(items, leaf, mod_path, mutable entries, mutable ty_interner, allocator)?
+    let root = module_root(mod_path)
+    let aliases = build_import_aliases(items, root, interner, allocator)?
+    return from_parts(entries, aliases, allocator)?
+}
+
+
+
+public function module_root(mod_path: Vec_Symbol.Vec) -> symbol.Symbol {
+    if Vec_Symbol.len(mod_path) == 0 as usize {
+        return symbol.empty()
+    }
+    return Vec_Symbol.at(mod_path, 0 as usize)
+}
+
+
+function file_module_leaf(items: Vec_HItem.Vec) -> symbol.Symbol
+    with {divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let segs = decl.path.segments
+                        let sn = Vec_Ident.len(segs)
+                        if sn != 0 as usize {
+                            return Vec_Ident.at(segs, sn - 1 as usize).name
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return symbol.empty()
+}
+
+
+public function file_module_path(items: Vec_HItem.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let segs = decl.path.segments
+                        let sn = Vec_Ident.len(segs)
+                        var s: usize = 0 as usize
+                        loop decreases (sn - s) {
+                            if s >= sn { break }
+                            Vec_Symbol.push(mutable out, Vec_Ident.at(segs, s).name, allocator)?
+                            s = s + 1 as usize
+                        }
+                        return out
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return out
+}
+
+
+function collect(
+    items: Vec_HItem.Vec,
+    module_leaf: symbol.Symbol,
+    module_path: Vec_Symbol.Vec,
+    entries: mutable Vec_NominalEntry.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                let sig = Box_HTypeSignature.get(sig_box)
+                let nominal_ty = intern_nominal(sig, item.def_id, mutable ty_interner, allocator)?
+                Vec_NominalEntry.push(mutable entries, NominalEntry { name: sig.name, module_leaf: module_leaf, module_path: module_path, ty: nominal_ty }, allocator)?
+            }
+            case .spec_decl(_, let inner) => {
+                collect(inner, module_leaf, module_path, mutable entries, mutable ty_interner, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+public function intern_nominal(
+    sig: hir_item.HTypeSignature,
+    def_id: def_mod.DefId,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let cty = match sig.kind {
+        case .product(_) => ty_kind_mod.CTy.record(def: def_id)
+        case .sum_(_) => ty_kind_mod.CTy.sum_(def: def_id)
+    }
+    return ty_interner_mod.intern(mutable ty_interner, take cty, allocator)?
+}
+
+
+public function nominal_ty_of(
+    sig: hir_item.HTypeSignature,
+    def_id: def_mod.DefId,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return intern_nominal(sig, def_id, mutable ty_interner, allocator)?
+}
+
+
+public function with_entry(
+    map: mutable NominalMap,
+    name: symbol.Symbol,
+    module_leaf: symbol.Symbol,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit mp: Vec_Symbol.Vec
+    Vec_Symbol.new(init mp, allocator)?
+    Vec_Symbol.push(mutable mp, module_leaf, allocator)?
+    let id = Vec_NominalEntry.len(map.entries)
+    Vec_NominalEntry.push(mutable map.entries, NominalEntry { name: name, module_leaf: module_leaf, module_path: mp, ty: ty }, allocator)?
+    insert_if_absent(mutable map.by_name, name.raw as i64, id, allocator)?
+    insert_if_absent(mutable map.by_qual, qual_key(module_leaf.raw, name.raw), id, allocator)?
+    insert_if_absent(mutable map.by_ty, ty.raw as i64, id, allocator)?
+}
+
+
+public function extend(
+    map: mutable NominalMap,
+    extra: NominalMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_NominalEntry.len(extra.entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_NominalEntry.at(extra.entries, i)
+        let name = e.name
+        let module_leaf = e.module_leaf
+        let ty = e.ty
+        let id = Vec_NominalEntry.len(map.entries)
+        Vec_NominalEntry.push(mutable map.entries, take e, allocator)?
+        insert_if_absent(mutable map.by_name, name.raw as i64, id, allocator)?
+        insert_if_absent(mutable map.by_qual, qual_key(module_leaf.raw, name.raw), id, allocator)?
+        insert_if_absent(mutable map.by_ty, ty.raw as i64, id, allocator)?
+        i = i + 1
+    }
+}
+
+
+function build_import_aliases(items: Vec_HItem.Vec, root: symbol.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> Vec_AliasEntry.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_AliasEntry.Vec
+    Vec_AliasEntry.new(init out, allocator)?
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .import_decl => {
+                match item.ast_item.kind {
+                    case .import_(let imp) => {
+                        match imp.selection {
+                            case .some(_) => ()
+                            case .none => {
+                                let bound = match imp.alias {
+                                    case .some(let a) => a.name
+                                    case .none => import_last_segment(imp.path)
+                                }
+                                let path = copy_path_segments_rooted(imp.path, root, interner, allocator)?
+                                Vec_AliasEntry.push(mutable out, AliasEntry { name: bound, path: path }, allocator)?
+                            }
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return out
+}
+
+
+function is_local_segment(s: symbol.Symbol, interner: interner_mod.Interner) -> bool {
+    return slice.eq_u8(interner_mod.lookup(interner, s), "local".bytes())
+}
+
+
+public function import_last_segment(p: ast_ident.Path) -> symbol.Symbol {
+    let n = Vec_Ident.len(p.segments)
+    if n == 0 as usize {
+        return symbol.empty()
+    }
+    return Vec_Ident.at(p.segments, n - 1 as usize).name
+}
+
+
+public function copy_path_segments_rooted(p: ast_ident.Path, root: symbol.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let seg = Vec_Ident.at(p.segments, i).name
+        if i == 0 as usize && is_local_segment(seg, interner) {
+            Vec_Symbol.push(mutable out, root, allocator)?
+        } else {
+            Vec_Symbol.push(mutable out, seg, allocator)?
+        }
+        i = i + 1 as usize
+    }
+    return out
+}

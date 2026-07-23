@@ -1,0 +1,197 @@
+
+module link.driver.plan
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import target.os as os_mod
+import target.triple as triple_mod
+import local.driver.archiver as archiver_mod
+import local.argv.coff as coff_mod
+import local.argv.unix as unix_mod
+import local.error as error_mod
+import local.driver.linker as linker_mod
+import local.emit.image.output as output_mod
+import local.driver.tool as tool_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(output_mod.LibSpec)
+
+
+public type LinkPlan {
+    target: triple_mod.TargetTriple
+    host: os_mod.Os
+    inputs: [String] where inputs.len() > 0
+    output: String
+    kind: output_mod.OutputKind
+    libs: Vec_LibSpec.Vec
+    lib_search_paths: Vec_String.Vec
+    extra_args: Vec_String.Vec
+}
+
+
+public function tool(plan: LinkPlan) -> tool_mod.Tool
+    with {err: error_mod.LinkError}
+{
+    return match plan.kind {
+        case .executable      => tool_mod.Tool.link_tool(linker: linker_mod.for_target(plan.target, plan.host)?)
+        case .dynamic_library => tool_mod.Tool.link_tool(linker: linker_mod.for_target(plan.target, plan.host)?)
+        case .static_library  => tool_mod.Tool.archive_tool(archiver: archiver_mod.for_target(plan.target)?)
+    }
+}
+
+
+public function argv(plan: LinkPlan, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: error_mod.LinkError, err: alloc.AllocError}
+{
+    let selected = tool(plan)?
+    if tool_mod.is_linker(selected) {
+        reject_framework_on_non_macos(selected, plan.libs)?
+    }
+    return match selected {
+        case .link_tool(let l) => dispatch_linker(l, plan, allocator)?
+        case .archive_tool(let a) => dispatch_archiver(a, plan, allocator)?
+    }
+}
+
+function dispatch_linker(l: linker_mod.Linker, plan: LinkPlan, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: error_mod.LinkError, err: alloc.AllocError}
+{
+    let cap = default_capacity(plan)
+    return match l {
+        case .mold     => unix_mod.argv_elf(
+            plan.output, plan.kind, plan.inputs, plan.libs,
+            plan.lib_search_paths, plan.extra_args, cap, allocator,
+        )?
+        case .ld_lld   => unix_mod.argv_elf(
+            plan.output, plan.kind, plan.inputs, plan.libs,
+            plan.lib_search_paths, plan.extra_args, cap, allocator,
+        )?
+        case .ld64_lld => unix_mod.argv_ld64_lld(
+            plan.output, plan.kind, plan.inputs, plan.libs,
+            plan.lib_search_paths, plan.extra_args, cap, allocator,
+        )?
+        case .lld_link => coff_mod.argv_lld_link(
+            plan.output, plan.kind, plan.inputs, plan.libs,
+            plan.lib_search_paths, plan.extra_args, cap, allocator,
+        )?
+        case .wasm_ld  => unix_mod.argv_wasm_ld(
+            plan.output, plan.kind, plan.inputs, plan.libs,
+            plan.lib_search_paths, plan.extra_args, cap, allocator,
+        )?
+    }
+}
+
+function dispatch_archiver(a: archiver_mod.Archiver, plan: LinkPlan, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    return match a {
+        case .llvm_ar  => argv_llvm_ar(plan, allocator)?
+        case .llvm_lib => argv_llvm_lib(plan, allocator)?
+    }
+}
+
+
+function reject_framework_on_non_macos(t: tool_mod.Tool, libs: Vec_LibSpec.Vec) -> ()
+    with {err: error_mod.LinkError}
+{
+    if is_macos_linker(t) { return }
+    let n = Vec_LibSpec.len(libs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let entry = Vec_LibSpec.at(libs, i)
+        if is_framework(entry.kind) {
+            raise error_mod.LinkError.unsupported_kind_for_tool(tool_name: tool_mod.tool_name(t), kind: output_mod.OutputKind.dynamic_library)
+        }
+        i += 1
+    }
+}
+
+function is_macos_linker(t: tool_mod.Tool) -> bool {
+    return match t {
+        case .link_tool(let l) => match l {
+            case .ld64_lld => true
+            case _         => false
+        }
+        case _ => false
+    }
+}
+
+function is_framework(k: output_mod.LibKind) -> bool {
+    return match k {
+        case .framework => true
+        case _          => false
+    }
+}
+
+
+function argv_llvm_ar(plan: LinkPlan, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit argv: Vec_String.Vec
+    let cap: usize = 2 + plan.inputs.len() + Vec_String.len(plan.extra_args)
+    Vec_String.with_capacity(init argv, cap, allocator)?
+    Vec_String.push(mutable argv, "crs", allocator)?
+    Vec_String.push(mutable argv, clone_string(plan.output, allocator)?, allocator)?
+    append_inputs(mutable argv, plan.inputs, allocator)?
+    append_extra_args(mutable argv, plan.extra_args, allocator)?
+    return argv
+}
+
+function argv_llvm_lib(plan: LinkPlan, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit argv: Vec_String.Vec
+    let cap: usize = 1 + plan.inputs.len() + Vec_String.len(plan.extra_args)
+    Vec_String.with_capacity(init argv, cap, allocator)?
+    Vec_String.push(mutable argv, string.concat("/OUT:", plan.output, allocator)?, allocator)?
+    append_inputs(mutable argv, plan.inputs, allocator)?
+    append_extra_args(mutable argv, plan.extra_args, allocator)?
+    return argv
+}
+
+
+function append_inputs(argv: mutable Vec_String.Vec, inputs: [String], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = inputs.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_String.push(mutable argv, clone_string(inputs[i], allocator)?, allocator)?
+        i += 1
+    }
+}
+
+function append_extra_args(argv: mutable Vec_String.Vec, extra: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(extra)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let arg = Vec_String.at(extra, i)
+        Vec_String.push(mutable argv, clone_string(arg, allocator)?, allocator)?
+        i += 1
+    }
+}
+
+function clone_string(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(s, "", allocator)?
+}
+
+function default_capacity(plan: LinkPlan) -> usize {
+    let n_libs = Vec_LibSpec.len(plan.libs)
+    let n_paths = Vec_String.len(plan.lib_search_paths)
+    let n_extra = Vec_String.len(plan.extra_args)
+    return 8 + plan.inputs.len() + n_libs + n_paths + n_extra
+}

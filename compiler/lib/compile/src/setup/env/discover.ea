@@ -1,0 +1,165 @@
+
+module compile.setup.env.discover
+
+import std.mem.alloc
+import std.os.fs
+import std.collections.vec
+import std.text.string
+import manifest.manifest as manifest_mod
+import manifest.model.workspace.workspace as ws_mod
+
+
+spec std.collections.vec.Vec(String)
+
+
+public function workspace_sources(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit results: Vec_String.Vec
+    Vec_String.new(init results, allocator)?
+    match manifest {
+        case .package(_, _, _, let ws_opt, _, _, _) => match ws_opt {
+            case .some(let ws) =>
+                walk_workspace_members(rfs, workspace_root, ws, mutable results, allocator)?
+            case .none => {
+                let src_dir = string.concat(workspace_root, "/src", allocator)?
+                walk_dir(rfs, src_dir, mutable results, allocator)?
+            }
+        }
+        case .workspace_only(let ws, _, _, _, _) =>
+            walk_workspace_members(rfs, workspace_root, ws, mutable results, allocator)?
+    }
+    return results
+}
+
+
+public function stdlib_sources(
+    rfs: ReadOnlyFilesystem,
+    stdlib_lib_root: String,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit results: Vec_String.Vec
+    Vec_String.new(init results, allocator)?
+    walk_packages(rfs, stdlib_lib_root, mutable results, allocator)?
+    return results
+}
+
+
+function walk_packages(
+    rfs: ReadOnlyFilesystem,
+    dir: String,
+    results: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let entries = fs.read_dir(rfs, dir, allocator)?
+    let n = entries.len()
+    var has_manifest = false
+    var has_src = false
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let entry = entries[i]
+        if string.equals(entry, "package.toml") {
+            has_manifest = true
+        }
+        if string.equals(entry, "src") {
+            has_src = true
+        }
+        i = i + 1 as usize
+    }
+    if has_manifest && has_src {
+        let src_dir = string.concat(dir, "/src", allocator)?
+        walk_dir(rfs, src_dir, mutable results, allocator)?
+        return
+    }
+    var j: usize = 0
+    loop decreases (n - j + 1) as usize {
+        if j >= n {
+            break
+        }
+        let entry = entries[j]
+        if !string.starts_with(entry, ".") && !string.ends_with(entry, ".ea") {
+            let part = string.concat(dir, "/", allocator)?
+            let full = string.concat(part, entry, allocator)?
+            handle err: fs.FsError as e -> match e {
+                case .not_a_directory(_) => ()
+                case _ => raise e
+            } {
+                walk_packages(rfs, full, mutable results, allocator)?
+            }
+        }
+        j = j + 1 as usize
+    }
+}
+
+
+function walk_workspace_members(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    ws: ws_mod.Workspace,
+    results: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let root_segment = ws_mod.discover_root_of(ws)
+    let n = ws_mod.member_count(ws)
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let member = ws_mod.member_at(ws, i)
+        let part0 = string.concat(workspace_root, "/", allocator)?
+        let part1 = string.concat(part0, root_segment, allocator)?
+        let part1b = string.concat(part1, "/", allocator)?
+        let part2 = string.concat(part1b, member, allocator)?
+        let src_dir = string.concat(part2, "/src", allocator)?
+        walk_dir(rfs, src_dir, mutable results, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+public function walk_dir(
+    rfs: ReadOnlyFilesystem,
+    dir: String,
+    results: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let entries = fs.read_dir(rfs, dir, allocator)?
+    let n = entries.len()
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let entry = entries[i]
+        let part = string.concat(dir, "/", allocator)?
+        let full = string.concat(part, entry, allocator)?
+        if string.ends_with(entry, ".ea") {
+            Vec_String.push(mutable results, take full, allocator)?
+        } else {
+            handle err: fs.FsError as e -> match e {
+                case .not_a_directory(_) => ()
+                case _ => raise e
+            } {
+                walk_dir(rfs, full, mutable results, allocator)?
+            }
+        }
+        i = i + 1 as usize
+    }
+}

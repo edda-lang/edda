@@ -1,0 +1,219 @@
+
+module x64.abi.returns
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import target.triple as triple_mod
+import hir.node as node_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.term as lir_term_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import local.gen.sel.regs as regs_mod
+import local.abi.shared as shared_mod
+import local.abi.sret as sret_mod
+
+
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+
+
+spec std.core.option.Option(lir_reg_mod.PReg)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+type ReturnPinKind {
+    case none
+    case one(vreg_raw: u32)
+}
+
+
+public function pin_return_values(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    sret_ptr: Option_LirVRegId.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let block_count = Vec_LirBlock.len(body.blocks)
+    var b: usize = 1
+    loop decreases block_count - b {
+        if b >= block_count { break }
+        match sret_ptr {
+            case .some(let ptr) => sret_mod.apply_sret_at(mutable body, b, ptr, allocator)?
+            case .none => {
+                let pin_kind = classify_return_pin(body, b)?
+                match pin_kind {
+                    case .one(let vreg_raw) => apply_return_pin(mutable body, target, b, vreg_raw, allocator)?
+                    case .none => ()
+                }
+            }
+        }
+        b += 1
+    }
+}
+
+
+public function returns_by_memory(body: lir_body_mod.LirBody) -> bool {
+    let n = Vec_LirBlock.len(body.blocks)
+    var b: usize = 1
+    loop decreases n - b {
+        if b >= n { break }
+        match Vec_LirBlock.at(body.blocks, b).terminator.kind {
+            case .return_(let values) => return values_are_by_memory(body, values)
+            case _ => ()
+        }
+        b += 1
+    }
+    return false
+}
+
+function values_are_by_memory(body: lir_body_mod.LirBody, values: Vec_LirVRegId.Vec) -> bool {
+    let nv = Vec_LirVRegId.len(values)
+    if nv == 0 { return false }
+    if nv > 1 { return true }
+    return lir_reg_mod.is_by_memory(shared_mod.vreg_size_at(body, Vec_LirVRegId.at(values, 0).raw as usize))
+}
+
+
+function classify_return_pin(
+    body: lir_body_mod.LirBody,
+    block_idx: usize,
+) -> ReturnPinKind
+    with {err: lir_error_mod.LirError}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    return match Vec_LirBlock.at(body.blocks, block_idx).terminator.kind {
+        case .return_(let values) => classify_return_values(values)?
+        case _ => ReturnPinKind.none
+    }
+}
+
+function classify_return_values(values: Vec_LirVRegId.Vec) -> ReturnPinKind
+    with {err: lir_error_mod.LirError}
+{
+    let nv = Vec_LirVRegId.len(values)
+    if nv == 0 { return ReturnPinKind.none }
+    if nv > 1 {
+        raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+    return ReturnPinKind.one(vreg_raw: Vec_LirVRegId.at(values, 0).raw)
+}
+
+function apply_return_pin(
+    body: mutable lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    block_idx: usize,
+    vreg_raw: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let idx = vreg_raw as usize
+    if idx == 0 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.abi: return value references sentinel vreg id 0",
+        )
+    }
+    if idx >= Vec_LirVReg.len(body.vregs) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.abi: return value vreg id out of range",
+        )
+    }
+    let current = Vec_LirVReg.at(body.vregs, idx)
+    let rp = ret_preg(target, current.class_)
+    match current.pin {
+        case .none => copy_return_value(mutable body, block_idx, idx, current.class_, rp, allocator)?
+        case .some(let existing) => {
+            if existing.raw != rp.raw {
+                copy_return_value(mutable body, block_idx, idx, current.class_, rp, allocator)?
+            }
+        }
+    }
+}
+
+function copy_return_value(
+    body: mutable lir_body_mod.LirBody,
+    block_idx: usize,
+    src_idx: usize,
+    class_: lir_reg_mod.RegClass,
+    rp: lir_reg_mod.PReg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let w = lir_body_mod.push_vreg(mutable body, take shared_mod.pinned_vreg(class_, rp), allocator)?
+    let src_id = lir_vreg_mod.LirVRegId { raw: src_idx as u32 }
+    let cp = lir_op_mod.LirOp {
+        origin: node_mod.error(),
+        kind: lir_op_mod.LirOpKind.copy_(src: src_id, dst: w),
+        flags: shared_mod.stack_flags(),
+    }
+    let cp_id = lir_body_mod.push_op(mutable body, take cp, allocator)?
+
+    if block_idx >= Vec_LirBlock.len(body.blocks) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.abi: return block index out of range",
+        )
+    }
+    let block = Vec_LirBlock.at(body.blocks, block_idx)
+
+    uninit new_ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init new_ops, allocator)?
+    let no = Vec_LirOpId.len(block.ops)
+    var q: usize = 0
+    loop decreases no - q {
+        if q >= no { break }
+        Vec_LirOpId.push(mutable new_ops, Vec_LirOpId.at(block.ops, q), allocator)?
+        q += 1
+    }
+    Vec_LirOpId.push(mutable new_ops, cp_id, allocator)?
+
+    uninit new_vals: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init new_vals, allocator)?
+    Vec_LirVRegId.push(mutable new_vals, w, allocator)?
+
+    let new_block = lir_body_mod.LirBlock {
+        node_id_origin: block.node_id_origin,
+        params: block.params,
+        ops: new_ops,
+        terminator: lir_term_mod.LirTerminator {
+            origin: block.terminator.origin,
+            kind: lir_term_mod.LirTermKind.return_(values: new_vals),
+        },
+        coherence_region: block.coherence_region,
+    }
+    Vec_LirBlock.set_at(mutable body.blocks, block_idx, take new_block)
+}
+
+function ret_preg(
+    target: triple_mod.TargetTriple,
+    class_: lir_reg_mod.RegClass,
+) -> lir_reg_mod.PReg
+{
+    return match class_ {
+        case .fp => regs_mod.xmm_preg_of(regs_mod.XmmReg.xmm0)
+        case _ => gp_return_preg(target)
+    }
+}
+
+function gp_return_preg(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    let _ = target
+    return regs_mod.preg_of(regs_mod.Gp64Reg.rax)
+}

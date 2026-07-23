@@ -1,0 +1,167 @@
+module x64.emit.arith.sat.wide
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.integer.shift.shift as shift_mod
+import local.encoding.control.branch as branch_mod
+import local.emit.regsel as regsel_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_sat64_gp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    signed_: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match op {
+        case .add_sat => {
+            if signed_ {
+                emit_signed_addsub_sat(mutable code, body, alu_mod.AluOp.add_, dreg, lreg, rhs, allocator)?
+                return ()
+            }
+            regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+            apply_alu_rhs(mutable code, alu_mod.AluOp.add_, dreg, rhs, body, allocator)?
+            let neg_one: i64 = 0 - 1
+            alu_mod.encode_mov_r64_imm64(mutable code, regs_mod.Gp64Reg.r11, neg_one, allocator)?
+            branch_mod.encode_cmovcc_r_rm(mutable code, branch_mod.Cond.b_, dreg, regs_mod.Gp64Reg.r11, allocator)?
+        }
+        case .sub_sat => {
+            if signed_ {
+                emit_signed_addsub_sat(mutable code, body, alu_mod.AluOp.sub_, dreg, lreg, rhs, allocator)?
+                return ()
+            }
+            regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+            apply_alu_rhs(mutable code, alu_mod.AluOp.sub_, dreg, rhs, body, allocator)?
+            alu_mod.encode_mov_r64_imm64(mutable code, regs_mod.Gp64Reg.r11, 0, allocator)?
+            branch_mod.encode_cmovcc_r_rm(mutable code, branch_mod.Cond.b_, dreg, regs_mod.Gp64Reg.r11, allocator)?
+        }
+        case .mul_sat => {
+            if signed_ {
+                emit_signed_mul_sat(mutable code, body, dreg, lreg, rhs, allocator)?
+                return ()
+            }
+            emit_unsigned_mul_sat(mutable code, body, dreg, lreg, rhs, allocator)?
+        }
+        case _ => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.emit.sat64: non-saturating op routed to 64-bit saturating lowering",
+        )
+    }
+}
+
+
+function emit_signed_addsub_sat(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    aop: alu_mod.AluOp,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let r10 = regs_mod.Gp64Reg.r10
+    let r11 = regs_mod.Gp64Reg.r11
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, r10, lreg, allocator)?
+    shift_mod.encode_shift_imm(mutable code, shift_mod.ShiftOp.sar_, regs_mod.OpSize.qword_, r10, 63 as u8, allocator)?
+    alu_mod.encode_mov_r64_imm64(mutable code, r11, 9223372036854775807, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.xor_, regs_mod.OpSize.qword_, r10, r11, allocator)?
+    regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+    apply_alu_rhs(mutable code, aop, dreg, rhs, body, allocator)?
+    branch_mod.encode_cmovcc_r_rm(mutable code, branch_mod.Cond.o_, dreg, r10, allocator)?
+}
+
+
+function emit_signed_mul_sat(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let r10 = regs_mod.Gp64Reg.r10
+    let r11 = regs_mod.Gp64Reg.r11
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, r10, lreg, allocator)?
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.xor_, regs_mod.OpSize.qword_, r10, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.xor_, regs_mod.OpSize.qword_, r10, v, allocator)?
+    }
+    shift_mod.encode_shift_imm(mutable code, shift_mod.ShiftOp.sar_, regs_mod.OpSize.qword_, r10, 63 as u8, allocator)?
+    alu_mod.encode_mov_r64_imm64(mutable code, r11, 9223372036854775807, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.xor_, regs_mod.OpSize.qword_, r10, r11, allocator)?
+    regsel_mod.mov_if_diff(mutable code, dreg, lreg, allocator)?
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_imul_r_rm(mutable code, regs_mod.OpSize.qword_, dreg, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_imul_r_rm_imm32(mutable code, regs_mod.OpSize.qword_, dreg, dreg, v, allocator)?
+    }
+    branch_mod.encode_cmovcc_r_rm(mutable code, branch_mod.Cond.o_, dreg, r10, allocator)?
+}
+
+
+function emit_unsigned_mul_sat(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    dreg: regs_mod.Gp64Reg,
+    lreg: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let rax = regs_mod.Gp64Reg.rax
+    let r10 = regs_mod.Gp64Reg.r10
+    let r11 = regs_mod.Gp64Reg.r11
+    let multiplier = match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => r
+        case .imm32(let v) => {
+            alu_mod.encode_mov_r64_imm64(mutable code, r11, v as i64, allocator)?
+            r11
+        }
+    }
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, rax, lreg, allocator)?
+    alu_mod.encode_grp3_rm(mutable code, alu_mod.Grp3Op.mul_, regs_mod.OpSize.qword_, multiplier, allocator)?
+    regsel_mod.mov_if_diff(mutable code, dreg, rax, allocator)?
+    let neg_one: i64 = 0 - 1
+    alu_mod.encode_mov_r64_imm64(mutable code, r10, neg_one, allocator)?
+    branch_mod.encode_cmovcc_r_rm(mutable code, branch_mod.Cond.b_, dreg, r10, allocator)?
+}
+
+
+function apply_alu_rhs(
+    code: mutable Vec_u8.Vec,
+    op: alu_mod.AluOp,
+    dst: regs_mod.Gp64Reg,
+    rhs: lir_reg_mod.Operand,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match regsel_mod.resolve_gp_operand(body, rhs)? {
+        case .reg(let r) => alu_mod.encode_alu_rm_r(mutable code, op, regs_mod.OpSize.qword_, dst, r, allocator)?
+        case .imm32(let v) => alu_mod.encode_alu_rm_imm(mutable code, op, regs_mod.OpSize.qword_, dst, v, allocator)?
+    }
+}

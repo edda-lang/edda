@@ -1,0 +1,158 @@
+
+module lower.term.support.flags
+
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+
+import ir.hlir.op as hlir_op_mod
+
+
+public function default_flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+public function intrinsic_flags(intr: hlir_op_mod.Intrinsic, extern_call: bool, extern_ret_size: u32) -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: intr,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: extern_call,
+        extern_ret_size: extern_ret_size,
+    }
+}
+
+
+public function flags_for_rvalue(value: mir_rvalue_mod.Rvalue) -> hlir_op_mod.OpFlags {
+    return match value {
+        case .binary(let op, _, _) => binop_flags(op)
+        case .cast(_, _, _, let kind) => cast_flags(kind)
+        case .use_(let operand) => use_operand_flags(operand)
+        case _ => default_flags()
+    }
+}
+
+function use_operand_flags(operand: mir_rvalue_mod.Operand) -> hlir_op_mod.OpFlags {
+    return match operand {
+        case .copy_(let place, _) => place_read_flags(place)
+        case .move_(let place, _) => place_read_flags(place)
+        case _ => default_flags()
+    }
+}
+
+public function in_bounds_flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: true,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+public function proj_proven(proj: mir_place_mod.Projection) -> bool {
+    return match proj.kind {
+        case .index(_, let p) => p
+        case .slice_subrange(_, _, let p) => p
+        case _ => false
+    }
+}
+
+function place_read_flags(place: mir_place_mod.Place) -> hlir_op_mod.OpFlags {
+    let n = mir_place_mod.proj_len(place)
+    if n == (0 as usize) { return default_flags() }
+    let last = mir_place_mod.proj_at(place, n - (1 as usize))
+    if proj_proven(last) { return in_bounds_flags() }
+    return default_flags()
+}
+
+function overflow_mode_safe(mode: mir_rvalue_mod.OverflowMode) -> bool {
+    return match mode {
+        case .trapping => false
+        case .checked_ => false
+        case .wrapping_ => true
+        case .saturating_ => true
+    }
+}
+
+function div_overflow_of_mode(mode: mir_rvalue_mod.OverflowMode) -> hlir_op_mod.DivOverflow {
+    return match mode {
+        case .trapping => hlir_op_mod.DivOverflow.trap
+        case .checked_ => hlir_op_mod.DivOverflow.trap
+        case .wrapping_ => hlir_op_mod.DivOverflow.wrap
+        case .saturating_ => hlir_op_mod.DivOverflow.saturate
+    }
+}
+
+function binop_flags(op: mir_rvalue_mod.MBinOp) -> hlir_op_mod.OpFlags {
+    let safe = match op {
+        case .add(let m) => overflow_mode_safe(m)
+        case .sub(let m) => overflow_mode_safe(m)
+        case .mul(let m) => overflow_mode_safe(m)
+        case .div(let m, _, _) => overflow_mode_safe(m)
+        case .mod_(let m, _, _) => overflow_mode_safe(m)
+        case _ => false
+    }
+    let nonzero = match op {
+        case .div(_, let p, _) => p
+        case .mod_(_, let p, _) => p
+        case _ => false
+    }
+    let no_overflow = match op {
+        case .div(_, _, let p) => p
+        case .mod_(_, _, let p) => p
+        case _ => false
+    }
+    let div_ov = match op {
+        case .div(let m, _, _) => div_overflow_of_mode(m)
+        case .mod_(let m, _, _) => div_overflow_of_mode(m)
+        case _ => hlir_op_mod.DivOverflow.trap
+    }
+    return hlir_op_mod.OpFlags {
+        overflow_safe: safe,
+        in_bounds: false,
+        nonzero_divisor: nonzero,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: div_ov,
+        div_overflow_safe: no_overflow,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+function cast_flags(kind: mir_rvalue_mod.CastKind) -> hlir_op_mod.OpFlags {
+    let safe = match kind {
+        case .int_to_int(let m) => overflow_mode_safe(m)
+        case .float_to_int(let m) => overflow_mode_safe(m)
+        case _ => false
+    }
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: safe,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}

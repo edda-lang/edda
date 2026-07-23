@@ -1,0 +1,510 @@
+
+module resolve.ctx
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import diagnostics.emit.collection as diag_collection
+import diagnostics.emit.diagnostic as diag_mod
+import intern.symbol
+import intern.interner as interner_mod
+import span.loc.pos.span as span_mod
+import hir.def as def_mod
+import local.bind.bindings as bindings_mod
+import local.build.builtins as builtins_mod
+import local.cteval.builtins as cbi_mod
+import local.paths.modules as mt_mod
+import local.primitives.defs as primitives_mod
+import local.capabilities.defs as capabilities_mod
+import local.build.drive.surface.registry as registry_mod
+import local.map.resmap as resmap_mod
+import local.paths.imports as imports_mod
+
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.hashmap.IntMap(usize)
+spec std.collections.hashmap.IntMap(Vec_DefId)
+spec std.core.option.Option(mt_mod.PrefixMatch)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(Vec_DefId)
+
+
+public linear type ResolveCtx {
+    next_def_id: u32
+    next_module_id: u32
+    registry: registry_mod.Registry
+    module_tree: mt_mod.ModuleTree
+    diags: diag_collection.Diagnostics
+    uses: resmap_mod.ResolveMap
+    local_uses: resmap_mod.ResolveMap
+    use_counts: IntMap_usize.IntMap
+    self_use_counts: IntMap_usize.IntMap
+    current_module: mt_mod.ModuleId
+    current_module_path: Vec_Symbol.Vec
+    current_imports: imports_mod.ImportScope
+    quiet: bool
+    instance_mode: bool
+    current_def: def_mod.DefId
+    spec_depth: usize
+    call_edges: IntMap_Vec_DefId.IntMap
+    extra_roots: Vec_DefId.Vec
+    track_edges: bool
+}
+
+public type ResolveOutput {
+    registry: registry_mod.Registry
+    module_tree: mt_mod.ModuleTree
+    diags: diag_collection.Diagnostics
+    next_def_id: u32
+    next_module_id: u32
+    uses: resmap_mod.ResolveMap
+    local_uses: resmap_mod.ResolveMap
+}
+
+
+public function new_ctx(out: init ResolveCtx, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let builtins_seed = builtins_mod.seed(1)
+    let prims_seed = primitives_mod.seed(builtins_seed.next_def_id)
+    let cbi_seed = cbi_mod.seed(prims_seed.next_def_id)
+    let caps_seed = capabilities_mod.seed(cbi_seed.next_def_id)
+    uninit reg: registry_mod.Registry
+    registry_mod.new_registry(
+        init reg,
+        builtins_seed.builtins,
+        prims_seed.primitives,
+        cbi_seed.comptime_builtins,
+        caps_seed.capabilities,
+        allocator,
+    )?
+    uninit mt: mt_mod.ModuleTree
+    mt_mod.new_tree(init mt, allocator)?
+    uninit diags_buf: diag_collection.Diagnostics
+    diag_collection.new_diagnostics(init diags_buf, allocator)?
+    let uses_map = resmap_mod.new_map(allocator)?
+    let local_uses_map = resmap_mod.new_map(allocator)?
+    let use_counts_map = IntMap_usize.new(allocator)?
+    let self_use_counts_map = IntMap_usize.new(allocator)?
+    let call_edges_map = IntMap_Vec_DefId.new(allocator)?
+    uninit extra_roots_vec: Vec_DefId.Vec
+    Vec_DefId.new(init extra_roots_vec, allocator)?
+    uninit empty_imports: imports_mod.ImportScope
+    imports_mod.new_scope(init empty_imports, allocator)?
+    uninit empty_mod_path: Vec_Symbol.Vec
+    Vec_Symbol.new(init empty_mod_path, allocator)?
+    out = ResolveCtx {
+        next_def_id: caps_seed.next_def_id,
+        next_module_id: 1,
+        registry: reg,
+        module_tree: mt,
+        diags: diags_buf,
+        uses: uses_map,
+        local_uses: local_uses_map,
+        use_counts: use_counts_map,
+        self_use_counts: self_use_counts_map,
+        current_module: mt_mod.ModuleId { raw: 0 },
+        current_module_path: empty_mod_path,
+        current_imports: empty_imports,
+        quiet: false,
+        instance_mode: false,
+        current_def: def_mod.DefId { raw: 0 },
+        spec_depth: 0 as usize,
+        call_edges: call_edges_map,
+        extra_roots: extra_roots_vec,
+        track_edges: false,
+    }
+}
+
+
+public function alloc_def(ctx: mutable ResolveCtx) -> def_mod.DefId
+    requires ctx.next_def_id < 4294967295
+{
+    let id = def_mod.DefId { raw: ctx.next_def_id }
+    ctx.next_def_id = ctx.next_def_id + 1
+    return id
+}
+
+public function alloc_module_id(ctx: mutable ResolveCtx) -> mt_mod.ModuleId
+    requires ctx.next_module_id < 4294967295
+{
+    let id = mt_mod.ModuleId { raw: ctx.next_module_id }
+    ctx.next_module_id = ctx.next_module_id + 1
+    return id
+}
+
+
+public stable function builtins(ctx: ResolveCtx) -> builtins_mod.BuiltinDefs {
+    return registry_mod.builtins(ctx.registry)
+}
+
+public stable function primitives(ctx: ResolveCtx) -> primitives_mod.PrimitiveDefs {
+    return registry_mod.primitives(ctx.registry)
+}
+
+public stable function comptime_builtins(ctx: ResolveCtx) -> cbi_mod.ComptimeBuiltinDefs {
+    return registry_mod.comptime_builtins(ctx.registry)
+}
+
+public stable function capabilities(ctx: ResolveCtx) -> capabilities_mod.CapabilityDefs {
+    return registry_mod.capabilities(ctx.registry)
+}
+
+
+public function register_module(ctx: mutable ResolveCtx, mod_id: mt_mod.ModuleId, table: take bindings_mod.SymbolTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.register_module(mutable ctx.registry, mod_id, table, allocator)?
+}
+
+public stable function lookup_in_module(ctx: ResolveCtx, mod_id: mt_mod.ModuleId, name: symbol.Symbol) -> def_mod.DefId {
+    return registry_mod.lookup_in_module(ctx.registry, mod_id, name)
+}
+
+public function register_module_variants(ctx: mutable ResolveCtx, mod_id: mt_mod.ModuleId, table: take bindings_mod.SymbolTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.register_module_variants(mutable ctx.registry, mod_id, table, allocator)?
+}
+
+public stable function lookup_variant_in_module(ctx: ResolveCtx, mod_id: mt_mod.ModuleId, name: symbol.Symbol) -> def_mod.DefId {
+    return registry_mod.lookup_variant_in_module(ctx.registry, mod_id, name)
+}
+
+public function register_invoked_spec(ctx: mutable ResolveCtx, file_mod_id: mt_mod.ModuleId, mangled: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.register_invoked_spec(mutable ctx.registry, file_mod_id, mangled, allocator)?
+}
+
+public function file_invoked_spec(ctx: ResolveCtx, file_mod_id: mt_mod.ModuleId, mangled: symbol.Symbol) -> bool {
+    return registry_mod.file_invoked_spec(ctx.registry, file_mod_id, mangled)
+}
+
+public function register_instance_full(ctx: mutable ResolveCtx, file_mod_id: mt_mod.ModuleId, short: symbol.Symbol, full: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.register_instance_full(mutable ctx.registry, file_mod_id, short, full, allocator)?
+}
+
+public function instance_full(ctx: ResolveCtx, file_mod_id: mt_mod.ModuleId, short: symbol.Symbol) -> symbol.Symbol {
+    return registry_mod.instance_full(ctx.registry, file_mod_id, short)
+}
+
+public function register_inst_bare(ctx: mutable ResolveCtx, full: symbol.Symbol, bare: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.register_inst_bare(mutable ctx.registry, full, bare, allocator)?
+}
+
+public function register_inst_primary(ctx: mutable ResolveCtx, full: symbol.Symbol, primary: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.register_inst_primary(mutable ctx.registry, full, primary, allocator)?
+}
+
+public function inst_primary_of(ctx: ResolveCtx, full: symbol.Symbol) -> symbol.Symbol {
+    return registry_mod.inst_primary_of(ctx.registry, full)
+}
+
+public function record_synthetic_nominal(ctx: mutable ResolveCtx, module_name: symbol.Symbol, item_name: symbol.Symbol, def: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.record_synthetic_nominal(mutable ctx.registry, module_name, item_name, def, allocator)?
+}
+
+public function mark_colliding(ctx: mutable ResolveCtx, short: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    registry_mod.mark_colliding(mutable ctx.registry, short, allocator)?
+}
+
+public function is_colliding(ctx: ResolveCtx, short: symbol.Symbol) -> bool {
+    return registry_mod.is_colliding(ctx.registry, short)
+}
+
+public function current_module(ctx: ResolveCtx) -> mt_mod.ModuleId {
+    return ctx.current_module
+}
+
+public function output_file_invoked_spec(output: ResolveOutput, file_mod_id: mt_mod.ModuleId, mangled: symbol.Symbol) -> bool {
+    return registry_mod.file_invoked_spec(output.registry, file_mod_id, mangled)
+}
+
+public function output_instance_full(output: ResolveOutput, file_mod_id: mt_mod.ModuleId, short: symbol.Symbol) -> symbol.Symbol {
+    return registry_mod.instance_full(output.registry, file_mod_id, short)
+}
+
+public function output_inst_bare_of(output: ResolveOutput, full: symbol.Symbol) -> symbol.Symbol {
+    return registry_mod.inst_bare_of(output.registry, full)
+}
+
+public function output_inst_primary_of(output: ResolveOutput, full: symbol.Symbol) -> symbol.Symbol {
+    return registry_mod.inst_primary_of(output.registry, full)
+}
+
+public function output_module_id_of(output: ResolveOutput, segments: Vec_Symbol.Vec) -> mt_mod.ModuleId {
+    return match mt_mod.find_longest_prefix(output.module_tree, segments) {
+        case .some(let pm) => if pm.segments_consumed == Vec_Symbol.len(segments) {
+            pm.mod_id
+        } else {
+            mt_mod.ModuleId { raw: 0 }
+        }
+        case .none => mt_mod.ModuleId { raw: 0 }
+    }
+}
+
+public function lookup_single(ctx: ResolveCtx, name: symbol.Symbol, interner: interner_mod.Interner) -> def_mod.DefId {
+    return registry_mod.lookup_single_segment(ctx.registry, name, interner)
+}
+
+public stable function lookup_in_current_module(ctx: ResolveCtx, name: symbol.Symbol) -> def_mod.DefId {
+    return registry_mod.lookup_in_module(ctx.registry, ctx.current_module, name)
+}
+
+public stable function lookup_path(ctx: ResolveCtx, segments: Vec_Symbol.Vec) -> def_mod.DefId {
+    return registry_mod.lookup_path(ctx.registry, segments, ctx.module_tree)
+}
+
+public stable function module_id_of(ctx: ResolveCtx, segments: Vec_Symbol.Vec) -> mt_mod.ModuleId {
+    return match mt_mod.find_longest_prefix(ctx.module_tree, segments) {
+        case .some(let pm) => if pm.segments_consumed == Vec_Symbol.len(segments) {
+            pm.mod_id
+        } else {
+            mt_mod.ModuleId { raw: 0 }
+        }
+        case .none => mt_mod.ModuleId { raw: 0 }
+    }
+}
+
+public function current_imports(ctx: ResolveCtx) -> imports_mod.ImportScope {
+    return ctx.current_imports
+}
+
+public function enter_file(ctx: mutable ResolveCtx, mod_id: mt_mod.ModuleId, mp: take Vec_Symbol.Vec, imports: take imports_mod.ImportScope) -> () {
+    ctx.current_module = mod_id
+    ctx.current_module_path = mp
+    ctx.current_imports = imports
+}
+
+public function current_module_path(ctx: ResolveCtx) -> Vec_Symbol.Vec {
+    return ctx.current_module_path
+}
+
+
+public function register_module_path(ctx: mutable ResolveCtx, segments: take Vec_Symbol.Vec, mod_id: mt_mod.ModuleId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    mt_mod.register_module_path(mutable ctx.module_tree, segments, mod_id, allocator)?
+}
+
+public stable function module_tree(ctx: ResolveCtx) -> mt_mod.ModuleTree {
+    return ctx.module_tree
+}
+
+
+public function set_quiet(ctx: mutable ResolveCtx, v: bool) -> () {
+    ctx.quiet = v
+}
+
+public stable function is_quiet(ctx: ResolveCtx) -> bool {
+    return ctx.quiet
+}
+
+public function set_instance_mode(ctx: mutable ResolveCtx, v: bool) -> () {
+    ctx.instance_mode = v
+}
+
+public function in_instance_mode(ctx: ResolveCtx) -> bool {
+    return ctx.instance_mode
+}
+
+
+public function emit_diagnostic(ctx: mutable ResolveCtx, d: take diag_mod.Diagnostic, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    diag_collection.emit(mutable ctx.diags, d, allocator)?
+}
+
+
+public function record_use(ctx: mutable ResolveCtx, at: span_mod.Span, def: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    resmap_mod.record(mutable ctx.uses, at, def, allocator)?
+    bump_use_count(mutable ctx, def, allocator)?
+    record_call_edge(mutable ctx, def, allocator)?
+}
+
+public stable function lookup_use(output: ResolveOutput, at: span_mod.Span) -> def_mod.DefId {
+    return resmap_mod.lookup(output.uses, at)
+}
+
+
+public function record_local_use(ctx: mutable ResolveCtx, at: span_mod.Span, def: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    resmap_mod.record(mutable ctx.local_uses, at, def, allocator)?
+    bump_use_count(mutable ctx, def, allocator)?
+}
+
+public stable function lookup_local_use(output: ResolveOutput, at: span_mod.Span) -> def_mod.DefId {
+    return resmap_mod.lookup(output.local_uses, at)
+}
+
+
+function bump_use_count(ctx: mutable ResolveCtx, def: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let cur = use_count_of(ctx, def)
+    let _ = IntMap_usize.insert(mutable ctx.use_counts, def.raw as i64, cur + 1, allocator)?
+}
+
+public stable function use_count_of(ctx: ResolveCtx, def: def_mod.DefId) -> usize {
+    return match IntMap_usize.get(ctx.use_counts, def.raw as i64) {
+        case .some(let v) => v
+        case .none => 0
+    }
+}
+
+
+public function add_self_uses(ctx: mutable ResolveCtx, def: def_mod.DefId, delta: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let cur = self_use_count_of(ctx, def)
+    let _ = IntMap_usize.insert(mutable ctx.self_use_counts, def.raw as i64, cur + delta, allocator)?
+}
+
+public stable function self_use_count_of(ctx: ResolveCtx, def: def_mod.DefId) -> usize {
+    return match IntMap_usize.get(ctx.self_use_counts, def.raw as i64) {
+        case .some(let v) => v
+        case .none => 0
+    }
+}
+
+
+public function set_current_def(ctx: mutable ResolveCtx, def: def_mod.DefId) -> () {
+    ctx.current_def = def
+}
+
+public function clear_current_def(ctx: mutable ResolveCtx) -> () {
+    ctx.current_def = def_mod.DefId { raw: 0 }
+}
+
+public function enter_spec(ctx: mutable ResolveCtx) -> () {
+    ctx.spec_depth = ctx.spec_depth + 1
+}
+
+public function exit_spec(ctx: mutable ResolveCtx) -> () {
+    if ctx.spec_depth > 0 as usize {
+        ctx.spec_depth = ctx.spec_depth - 1
+    }
+}
+
+public function set_track_edges(ctx: mutable ResolveCtx, v: bool) -> () {
+    ctx.track_edges = v
+}
+
+function record_call_edge(ctx: mutable ResolveCtx, callee: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if !ctx.track_edges {
+        return
+    }
+    if ctx.current_def.raw != 0 && ctx.spec_depth == 0 as usize {
+        let caller_key = ctx.current_def.raw as i64
+        match IntMap_Vec_DefId.get(ctx.call_edges, caller_key) {
+            case .some(let existing) => {
+                var lst = existing
+                Vec_DefId.push(mutable lst, callee, allocator)?
+                let _ = IntMap_Vec_DefId.insert(mutable ctx.call_edges, caller_key, lst, allocator)?
+            }
+            case .none => {
+                uninit lst: Vec_DefId.Vec
+                Vec_DefId.new(init lst, allocator)?
+                Vec_DefId.push(mutable lst, callee, allocator)?
+                let _ = IntMap_Vec_DefId.insert(mutable ctx.call_edges, caller_key, lst, allocator)?
+            }
+        }
+    } else {
+        Vec_DefId.push(mutable ctx.extra_roots, callee, allocator)?
+    }
+}
+
+public stable function callees_of(ctx: ResolveCtx, def: def_mod.DefId) -> Option_Vec_DefId.Option {
+    return IntMap_Vec_DefId.get(ctx.call_edges, def.raw as i64)
+}
+
+public function extra_roots_of(ctx: ResolveCtx) -> Vec_DefId.Vec {
+    return ctx.extra_roots
+}
+
+public stable function def_id_bound(ctx: ResolveCtx) -> usize {
+    return ctx.next_def_id as usize
+}
+
+
+public function finish(ctx: take ResolveCtx) -> ResolveOutput {
+    return ResolveOutput {
+        registry: ctx.registry,
+        module_tree: ctx.module_tree,
+        diags: ctx.diags,
+        next_def_id: ctx.next_def_id,
+        next_module_id: ctx.next_module_id,
+        uses: ctx.uses,
+        local_uses: ctx.local_uses,
+    }
+}
+
+
+public function reopen(output: take ResolveOutput, allocator: Allocator) -> ResolveCtx
+    with {allocator, err: alloc.AllocError}
+{
+    uninit empty_imports: imports_mod.ImportScope
+    imports_mod.new_scope(init empty_imports, allocator)?
+    uninit empty_mod_path: Vec_Symbol.Vec
+    Vec_Symbol.new(init empty_mod_path, allocator)?
+    let use_counts_map = IntMap_usize.new(allocator)?
+    let self_use_counts_map = IntMap_usize.new(allocator)?
+    let call_edges_map = IntMap_Vec_DefId.new(allocator)?
+    uninit extra_roots_vec: Vec_DefId.Vec
+    Vec_DefId.new(init extra_roots_vec, allocator)?
+    return ResolveCtx {
+        next_def_id: output.next_def_id,
+        next_module_id: output.next_module_id,
+        registry: output.registry,
+        module_tree: output.module_tree,
+        diags: output.diags,
+        uses: output.uses,
+        local_uses: output.local_uses,
+        use_counts: use_counts_map,
+        self_use_counts: self_use_counts_map,
+        current_module: mt_mod.ModuleId { raw: 0 },
+        current_module_path: empty_mod_path,
+        current_imports: empty_imports,
+        quiet: false,
+        instance_mode: false,
+        current_def: def_mod.DefId { raw: 0 },
+        spec_depth: 0 as usize,
+        call_edges: call_edges_map,
+        extra_roots: extra_roots_vec,
+        track_edges: false,
+    }
+}
+
+
+public stable function output_builtins(output: ResolveOutput) -> builtins_mod.BuiltinDefs {
+    return registry_mod.builtins(output.registry)
+}
+
+public stable function output_primitives(output: ResolveOutput) -> primitives_mod.PrimitiveDefs {
+    return registry_mod.primitives(output.registry)
+}
+
+public stable function output_comptime_builtins(output: ResolveOutput) -> cbi_mod.ComptimeBuiltinDefs {
+    return registry_mod.comptime_builtins(output.registry)
+}
+
+public stable function output_capabilities(output: ResolveOutput) -> capabilities_mod.CapabilityDefs {
+    return registry_mod.capabilities(output.registry)
+}

@@ -1,0 +1,348 @@
+
+module compile.phase.emit.symbols.symbols
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.core.fmt
+import std.text.string
+
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.item as ast_item_mod
+import hir.build.file as hir_file_mod
+import hir.def as def_mod
+import hir.item as hir_item_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as mir_body_mod
+import mir.id.hir as hirid_mod
+import symname.lib as symname_mod
+import local.phase.emit.symbols.attr as symattr_mod
+import local.phase.emit.symbols.reserved as reserved_mod
+
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.collections.hashmap.IntMap(String)
+spec std.collections.hashmap.StringMap(u32)
+spec std.collections.hashmap.StringMap(bool)
+
+
+public function build_global_symbols(
+    files: Vec_MirFile.Vec,
+    rt_provided: StringMap_bool.StringMap,
+    interner: interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> IntMap_String.IntMap
+    with {allocator, err: alloc.AllocError}
+{
+    var map = IntMap_String.new(allocator)?
+    var seen_defs = StringMap_u32.new(allocator)?
+    var seen_syms = StringMap_u32.new(allocator)?
+    let n = Vec_MirFile.len(files)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let file = Vec_MirFile.at(files, i)
+        var overrides = IntMap_String.new(allocator)?
+        collect_abi_overrides(file, mutable overrides, mutable seen_defs, rt_provided, mutable diags, interner, allocator)?
+        collect_file_symbols(file, mutable map, overrides, mutable seen_syms, mutable diags, interner, allocator)?
+        collect_extern_symbols(file, mutable map, interner, allocator)?
+        i += 1
+    }
+    reserved_mod.insert_reserved_symbols(mutable map, allocator)?
+    return map
+}
+
+
+function collect_file_symbols(
+    file: mir_file_mod.MirFile,
+    map: mutable IntMap_String.IntMap,
+    overrides: IntMap_String.IntMap,
+    seen_syms: mutable StringMap_u32.StringMap,
+    diags: mutable diags_mod.Diagnostics,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit prefixes: Vec_String.Vec
+    Vec_String.new(init prefixes, allocator)?
+    let nf = Vec_HirFile.len(file.hir_files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        let pfx = module_prefix_of(Vec_HirFile.at(file.hir_files, fi), interner, allocator)?
+        Vec_String.push(mutable prefixes, take pfx, allocator)?
+        fi = fi + 1 as usize
+    }
+    var local_counts = StringMap_u32.new(allocator)?
+    let n = Vec_MirBody.len(file.bodies)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        let body = Vec_MirBody.at(file.bodies, j)
+        let key = body.def_id.raw as i64
+        match IntMap_String.get(overrides, key) {
+            case .some(let over) => {
+                let _ = IntMap_String.insert(mutable map, key, take over, allocator)?
+            }
+            case .none => {
+                if def_mod.is_error(body.def_id) {
+                    let leaf = symname_mod.extern_symbol(body.name, interner, allocator)?
+                    let head = string.concat("body reached symbol emission with unresolved DefId 0 (would mangle to '", leaf, allocator)?
+                    let msg = string.concat(head, "_00000000'); instance def-allocation invariant violated", allocator)?
+                    diags_mod.emit(mutable diags, diag_mod.error_at(diag_code_mod.codegen_error(), span_mod.dummy(), msg), allocator)?
+                }
+                let oi = hirid_mod.index(body.origin_file)
+                var prefix = ""
+                if oi < Vec_String.len(prefixes) {
+                    prefix = Vec_String.at(prefixes, oi)
+                }
+                var sym = symname_mod.qualified_symbol(prefix, body.name, body.def_id, interner, allocator)?
+                match StringMap_u32.get(local_counts, sym) {
+                    case .some(let c) => {
+                        let next: u32 = if c < (4294967294 as u32) { c + (1 as u32) } else { c }
+                        let _ = StringMap_u32.insert(mutable local_counts, sym, next, allocator)?
+                        let dotted = string.concat(sym, ".", allocator)?
+                        sym = string.concat(dotted, fmt.u64_to_string(next as u64, allocator)?, allocator)?
+                    }
+                    case .none => {
+                        let _ = StringMap_u32.insert(mutable local_counts, sym, 1 as u32, allocator)?
+                    }
+                }
+                match StringMap_u32.get(seen_syms, sym) {
+                    case .some(let prev_raw) => {
+                        if prev_raw != body.def_id.raw {
+                            emit_symbol_collision(mutable diags, sym, prev_raw, body.def_id.raw, allocator)?
+                        }
+                    }
+                    case .none => {
+                        let _ = StringMap_u32.insert(mutable seen_syms, sym, body.def_id.raw, allocator)?
+                    }
+                }
+                let _ = IntMap_String.insert(mutable map, key, take sym, allocator)?
+            }
+        }
+        j += 1
+    }
+}
+
+
+function module_prefix_of(
+    hf: hir_file_mod.HirFile,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(hf.source.items)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        match Vec_Item.at(hf.source.items, i).kind {
+            case .module_(let decl) => {
+                let segs = decl.path.segments
+                let sn = Vec_Ident.len(segs)
+                var out = ""
+                var k: usize = 0
+                loop decreases sn - k {
+                    if k >= sn { break }
+                    let part = symname_mod.extern_symbol(Vec_Ident.at(segs, k).name, interner, allocator)?
+                    if k == 0 as usize {
+                        out = part
+                    } else {
+                        let sep = string.concat(out, ".", allocator)?
+                        out = string.concat(sep, part, allocator)?
+                    }
+                    k = k + 1 as usize
+                }
+                return out
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+    return ""
+}
+
+
+function emit_symbol_collision(
+    diags: mutable diags_mod.Diagnostics,
+    sym: String,
+    prev: u32,
+    cur: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("duplicate function symbol '", sym, allocator)?
+    let with_open = string.concat(head, "': two bodies in distinct files mangle to the same qualified name (def_id ", allocator)?
+    let with_prev = string.concat(with_open, fmt.u64_to_string(prev as u64, allocator)?, allocator)?
+    let with_sep = string.concat(with_prev, " and def_id ", allocator)?
+    let with_cur = string.concat(with_sep, fmt.u64_to_string(cur as u64, allocator)?, allocator)?
+    let msg = string.concat(with_cur, ") — duplicate module paths in the closure; the link would bind both to one definition.", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.codegen_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function collect_abi_overrides(
+    file: mir_file_mod.MirFile,
+    overrides: mutable IntMap_String.IntMap,
+    seen_defs: mutable StringMap_u32.StringMap,
+    rt_provided: StringMap_bool.StringMap,
+    diags: mutable diags_mod.Diagnostics,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(file.hir_files)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let hf = Vec_HirFile.at(file.hir_files, i)
+        collect_abi_override_items(hf.items, mutable overrides, mutable seen_defs, rt_provided, mutable diags, interner, allocator)?
+        i += 1
+    }
+}
+
+
+function collect_abi_override_items(
+    items: Vec_HItem.Vec,
+    overrides: mutable IntMap_String.IntMap,
+    seen_defs: mutable StringMap_u32.StringMap,
+    rt_provided: StringMap_bool.StringMap,
+    diags: mutable diags_mod.Diagnostics,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        let item = Vec_HItem.at(items, j)
+        match symattr_mod.abi_override_sym(item, interner) {
+            case .some(let abi_sym) => {
+                let sym = symname_mod.extern_symbol(abi_sym, interner, allocator)?
+                record_abi_override(take sym, item.def_id.raw, mutable overrides, mutable seen_defs, rt_provided, mutable diags, allocator)?
+            }
+            case .none => ()
+        }
+        j += 1
+    }
+}
+
+
+function record_abi_override(
+    sym: take String,
+    raw: u32,
+    overrides: mutable IntMap_String.IntMap,
+    seen_defs: mutable StringMap_u32.StringMap,
+    rt_provided: StringMap_bool.StringMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if StringMap_bool.contains(rt_provided, sym) {
+        return
+    }
+    match StringMap_u32.get(seen_defs, sym) {
+        case .some(let prev_raw) => {
+            if prev_raw != raw {
+                emit_extern_collision(mutable diags, sym, prev_raw, raw, allocator)?
+            }
+        }
+        case .none => {
+            let _ = StringMap_u32.insert(mutable seen_defs, sym, raw, allocator)?
+        }
+    }
+    let _ = IntMap_String.insert(mutable overrides, raw as i64, take sym, allocator)?
+}
+
+
+function emit_extern_collision(
+    diags: mutable diags_mod.Diagnostics,
+    leaf: String,
+    prev: u32,
+    cur: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("duplicate extern symbol '", leaf, allocator)?
+    let with_open = string.concat(head, "': defined by two distinct items (def_id ", allocator)?
+    let with_prev = string.concat(with_open, fmt.u64_to_string(prev as u64, allocator)?, allocator)?
+    let with_sep = string.concat(with_prev, " and def_id ", allocator)?
+    let with_cur = string.concat(with_sep, fmt.u64_to_string(cur as u64, allocator)?, allocator)?
+    let msg = string.concat(with_cur, ") — both emit the same object symbol via @abi; the linker rejects duplicate definitions. Give each a distinct @abi name.", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.codegen_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+
+
+function collect_extern_symbols(
+    file: mir_file_mod.MirFile,
+    map: mutable IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(file.hir_files)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let hf = Vec_HirFile.at(file.hir_files, i)
+        collect_extern_items(hf.items, mutable map, interner, allocator)?
+        i += 1
+    }
+}
+
+
+function collect_extern_items(
+    items: Vec_HItem.Vec,
+    map: mutable IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        let item = Vec_HItem.at(items, j)
+        match item.kind {
+            case .function_extern(_, let extern_name, _, _) => {
+                if !symbol_mod.is_empty(extern_name) {
+                    let sym = symname_mod.extern_symbol(extern_name, interner, allocator)?
+                    let _ = IntMap_String.insert(mutable map, item.def_id.raw as i64, take sym, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        j += 1
+    }
+}
+

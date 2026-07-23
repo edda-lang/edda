@@ -1,0 +1,133 @@
+
+module refine.smt.encode.atom.atom
+
+import std.collections.vec
+import std.mem.alloc
+import syntax.ast.ident as ident_mod
+import syntax.ast.literal as literal_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.render.sort as sort_mod
+import local.smt.term as term_mod
+import local.smt.encode.encres as result_mod
+
+
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function encode_path(
+    path: ident_mod.Path,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n_segments = Vec_Ident.len(path.segments)
+    if n_segments == 0 {
+        return result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "empty path in refinement",
+            ),
+        )
+    }
+    let head = Vec_Ident.at(path.segments, 0)
+    let lookup = ctx_mod.lookup_variable(vars, head.name)
+    return match lookup {
+        case .none => if n_segments == 1 {
+            result_mod.EncodeResult.unsupported(
+                fragment: err_mod.UnsupportedFragment.other(
+                    message: "unbound name in refinement",
+                ),
+            )
+        } else {
+            result_mod.EncodeResult.unsupported(
+                fragment: err_mod.UnsupportedFragment.other(
+                    message: "multi-segment path in refinement",
+                ),
+            )
+        }
+        case .some(let ty) => {
+            let sort_result = sort_mod.sort_of(ty, ty_interner, allocator)?
+            match sort_result {
+                case .unsupported(let fragment) =>
+                    result_mod.EncodeResult.unsupported(fragment: fragment)
+                case .ok(let sort) => {
+                    let head_term = term_mod.SmtTerm.var_(name: head.name, sort: sort)
+                    fold_field_chain(path, n_segments, take head_term, 1, allocator)?
+                }
+            }
+        }
+    }
+}
+
+
+function fold_field_chain(
+    path: ident_mod.Path,
+    n_segments: usize,
+    acc: take term_mod.SmtTerm,
+    i: usize,
+    allocator: Allocator,
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError}
+    requires n_segments <= Vec_Ident.len(path.segments)
+    requires i <= n_segments
+    decreases (n_segments - i)
+{
+    if i >= n_segments {
+        return result_mod.EncodeResult.encoded(term: acc)
+    }
+    let seg = Vec_Ident.at(path.segments, i)
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take acc, allocator)?
+    let wrapped = term_mod.SmtTerm.app(op: term_mod.SmtOp.udf(name: seg.name), args: args)
+    return fold_field_chain(path, n_segments, take wrapped, i + 1, allocator)?
+}
+
+
+function i128_max_bits() -> u128 {
+    let p63 = (9223372036854775807 as u128) + (1 as u128)
+    let p64 = p63 + p63
+    return p63 * p64 - (1 as u128)
+}
+
+
+public function encode_literal(lit: literal_mod.Literal) -> result_mod.EncodeResult {
+    return match lit {
+        case .bool(let value) =>
+            if value {
+                result_mod.EncodeResult.encoded(term: term_mod.SmtTerm.true_)
+            } else {
+                result_mod.EncodeResult.encoded(term: term_mod.SmtTerm.false_)
+            }
+        case .int(let value, _) =>
+            if value > i128_max_bits() {
+                result_mod.EncodeResult.unsupported(
+                    fragment: err_mod.UnsupportedFragment.other(
+                        message: "integer literal exceeds i128 range",
+                    ),
+                )
+            } else {
+                result_mod.EncodeResult.encoded(
+                    term: term_mod.SmtTerm.numeral(value: value as i128 wrapping),
+                )
+            }
+        case .float(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "float literal in refinement (deferred to a later phase)",
+            ),
+        )
+        case .str(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.string_content,
+        )
+        case .unit => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "unit literal in refinement",
+            ),
+        )
+    }
+}

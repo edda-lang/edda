@@ -1,0 +1,371 @@
+
+module cache.blob.mir.item.leaf.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.attr as ast_attr_mod
+import syntax.ast.item as ast_item_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.literal as ast_literal_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+
+
+spec std.mem.alloc.Box(ast_attr_mod.AttrArg)
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_attr_mod.AttrArg)
+spec std.collections.vec.Vec(ast_attr_mod.Attribute)
+
+
+spec std.core.option.Option(symbol.Symbol)
+spec std.core.option.Option(ast_item_mod.Stability)
+spec std.core.option.Option(ast_item_mod.Linearity)
+
+
+public function write_visibility(
+    v: ast_item_mod.Visibility,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match v {
+        case .public_ => prim_mod.push_u8(mutable out, 0, allocator)?
+        case .module_ => prim_mod.push_u8(mutable out, 1, allocator)?
+    }
+}
+
+public function read_visibility(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+) -> ast_item_mod.Visibility
+    with {err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_item_mod.Visibility.public_
+        case 1 => ast_item_mod.Visibility.module_
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown Visibility tag")
+    }
+}
+
+public function write_option_linearity(
+    l: Option_Linearity,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match l {
+        case .some(let value) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            match value {
+                case .affine_ => prim_mod.push_u8(mutable out, 0, allocator)?
+                case .linear_ => prim_mod.push_u8(mutable out, 1, allocator)?
+            }
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_option_linearity(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+) -> Option_Linearity
+    with {err: error_mod.CacheError}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if !present { return Option_Linearity.none }
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => Option_Linearity.some(value: ast_item_mod.Linearity.affine_)
+        case 1 => Option_Linearity.some(value: ast_item_mod.Linearity.linear_)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown Linearity tag")
+    }
+}
+
+public function write_option_symbol(
+    it: interner_mod.Interner,
+    s: Option_Symbol,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match s {
+        case .some(let value) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            symbol_codec_mod.write_symbol(it, value, mutable out, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_option_symbol(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Symbol
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_Symbol.some(value: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+    }
+    return Option_Symbol.none
+}
+
+public function write_option_stability(
+    it: interner_mod.Interner,
+    s: Option_Stability,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match s {
+        case .some(let value) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            match value {
+                case .stable_(let since) => {
+                    prim_mod.push_u8(mutable out, 0, allocator)?
+                    write_option_symbol(it, since, mutable out, allocator)?
+                }
+                case .unstable_ => prim_mod.push_u8(mutable out, 1, allocator)?
+            }
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_option_stability(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Stability
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if !present { return Option_Stability.none }
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => {
+            let since = read_option_symbol(bytes, mutable cur, mutable it, allocator)?
+            Option_Stability.some(value: ast_item_mod.Stability.stable_(since: since))
+        }
+        case 1 => Option_Stability.some(value: ast_item_mod.Stability.unstable_)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown Stability tag")
+    }
+}
+
+public function write_attr_lit(
+    it: interner_mod.Interner,
+    lit: ast_attr_mod.AttrLit,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match lit {
+        case .str(let sym) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            symbol_codec_mod.write_symbol(it, sym, mutable out, allocator)?
+        }
+        case .int(let value, let base) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            prim_mod.push_u128_le(mutable out, value, allocator)?
+            ast_literal_mod.write_int_base(base, mutable out, allocator)?
+        }
+        case .bool(let value) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            prim_mod.push_bool(mutable out, value, allocator)?
+        }
+    }
+}
+
+public function read_attr_lit(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_attr_mod.AttrLit
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_attr_mod.AttrLit.str(sym: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => {
+            let value = prim_mod.read_u128_le(bytes, mutable cur)?
+            let base = ast_literal_mod.read_int_base(bytes, mutable cur)?
+            ast_attr_mod.AttrLit.int(value: value, base: base)
+        }
+        case 2 => ast_attr_mod.AttrLit.bool(value: prim_mod.read_bool(bytes, mutable cur)?)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown AttrLit tag")
+    }
+}
+
+public function write_attr_arg(
+    it: interner_mod.Interner,
+    arg: ast_attr_mod.AttrArg,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match arg {
+        case .ident(let name) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            ast_codec_mod.write_ident(it, name, mutable out, allocator)?
+        }
+        case .lit(let span, let value) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            ast_codec_mod.write_span(span, mutable out, allocator)?
+            write_attr_lit(it, value, mutable out, allocator)?
+        }
+        case .named(let span, let key, let value) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            ast_codec_mod.write_span(span, mutable out, allocator)?
+            ast_codec_mod.write_ident(it, key, mutable out, allocator)?
+            write_attr_arg(it, Box_AttrArg.get(value), mutable out, allocator)?
+        }
+    }
+}
+
+public function read_attr_arg(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_attr_mod.AttrArg
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_attr_mod.AttrArg.ident(ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => {
+            let span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let value = read_attr_lit(bytes, mutable cur, mutable it, allocator)?
+            ast_attr_mod.AttrArg.lit(span: span, value: value)
+        }
+        case 2 => {
+            let span = ast_codec_mod.read_span(bytes, mutable cur)?
+            let key = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let value = read_attr_arg(bytes, mutable cur, mutable it, allocator)?
+            ast_attr_mod.AttrArg.named(span: span, key: key, value: Box_AttrArg.new(take value, allocator)?)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown AttrArg tag")
+    }
+}
+
+public function write_attr_arg_vec(
+    args: Vec_AttrArg.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_AttrArg.len(args)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_attr_arg(it, Vec_AttrArg.at(args, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function read_attr_arg_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_AttrArg.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit args: Vec_AttrArg.Vec
+    Vec_AttrArg.new(init args, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = read_attr_arg(bytes, mutable cur, mutable it, allocator)?
+        Vec_AttrArg.push(mutable args, take a, allocator)?
+        i += 1
+    }
+    return args
+}
+
+public function write_attribute(
+    it: interner_mod.Interner,
+    attribute: ast_attr_mod.Attribute,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    ast_codec_mod.write_span(attribute.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, attribute.name, mutable out, allocator)?
+    write_attr_arg_vec(attribute.args, it, mutable out, allocator)?
+}
+
+public function read_attribute(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_attr_mod.Attribute
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let args = read_attr_arg_vec(bytes, mutable cur, mutable it, allocator)?
+    return ast_attr_mod.Attribute { span: span, name: name, args: args }
+}
+
+public function write_attribute_vec(
+    attributes: Vec_Attribute.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Attribute.len(attributes)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_attribute(it, Vec_Attribute.at(attributes, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function read_attribute_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Attribute.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit attributes: Vec_Attribute.Vec
+    Vec_Attribute.new(init attributes, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = read_attribute(bytes, mutable cur, mutable it, allocator)?
+        Vec_Attribute.push(mutable attributes, take a, allocator)?
+        i += 1
+    }
+    return attributes
+}

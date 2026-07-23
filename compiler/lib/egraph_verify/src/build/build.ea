@@ -1,0 +1,183 @@
+
+module egraph_verify.build.build
+
+import std.mem.alloc
+import std.collections.vec
+import egraph.eclass as eclass_mod
+import egraph.graph.enode as enode_mod
+import egraph.graph.graph as graph_mod
+import egraph.sat.saturate as sat_mod
+import ir.hlir.op as hlir_op_mod
+import types.pass.ty as ty_mod
+import local.reference.reference as reference_mod
+
+
+spec std.collections.vec.Vec(u32)
+
+
+function flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+
+public function leaf_node(value: i128) -> enode_mod.ENode {
+    return enode_mod.ENode {
+        kind: enode_mod.EnodeKind.literal(c: hlir_op_mod.HConstant.int_(value: value, ty: ty_mod.TyId { raw: 1 })),
+        flags: flags(),
+    }
+}
+
+
+function un_op_of(opk: usize) -> hlir_op_mod.HUnOp {
+    let k = opk % (3 as usize)
+    if k == (0 as usize) { return hlir_op_mod.HUnOp.neg }
+    if k == (1 as usize) { return hlir_op_mod.HUnOp.bit_not }
+    return hlir_op_mod.HUnOp.logical_not
+}
+
+
+function bin_op_of(opk: usize) -> hlir_op_mod.HBinOp {
+    let k = opk % (5 as usize)
+    if k == (0 as usize) { return hlir_op_mod.HBinOp.add }
+    if k == (1 as usize) { return hlir_op_mod.HBinOp.sub }
+    if k == (2 as usize) { return hlir_op_mod.HBinOp.mul }
+    if k == (3 as usize) { return hlir_op_mod.HBinOp.eq }
+    return hlir_op_mod.HBinOp.lt
+}
+
+
+function leaf_tag(value: i128) -> u64 {
+    return (4096 as u64) +% (value as u64 wrapping)
+}
+
+
+function unary_tag(opk: usize) -> u64 {
+    return (536870912 as u64) +% ((opk % (3 as usize)) as u64)
+}
+
+
+function binary_tag(opk: usize) -> u64 {
+    return (805306368 as u64) +% ((opk % (5 as usize)) as u64)
+}
+
+
+function unary_node(opk: usize, child: eclass_mod.EClassId) -> enode_mod.ENode {
+    return enode_mod.ENode {
+        kind: enode_mod.EnodeKind.unary(op: un_op_of(opk), operand: child),
+        flags: flags(),
+    }
+}
+
+
+function binary_node(opk: usize, lhs: eclass_mod.EClassId, rhs: eclass_mod.EClassId) -> enode_mod.ENode {
+    return enode_mod.ENode {
+        kind: enode_mod.EnodeKind.binary(op: bin_op_of(opk), lhs: lhs, rhs: rhs),
+        flags: flags(),
+    }
+}
+
+
+public function rng_next(s: u64) -> u64 {
+    var x: u64 = s
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    return x
+}
+
+
+public function pick(s: u64, total: usize) -> usize {
+    if total == (0 as usize) { return 0 }
+    return (s % (total as u64)) as usize
+}
+
+
+public function mk_leaf(
+    g: mutable graph_mod.EGraph,
+    sat: mutable sat_mod.Saturator,
+    e_ids: mutable Vec_u32.Vec,
+    refc: mutable reference_mod.Reference,
+    value: i128,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let node = leaf_node(value)
+    let eid = sat_mod.add(mutable g, mutable sat, take node, allocator)?
+    let _ = reference_mod.add_term(mutable refc, leaf_tag(value), 0 as u32, 0 as u32, 0 as u32, allocator)?
+    Vec_u32.push(mutable e_ids, eid.raw, allocator)?
+}
+
+
+public function mk_unary(
+    g: mutable graph_mod.EGraph,
+    sat: mutable sat_mod.Saturator,
+    e_ids: mutable Vec_u32.Vec,
+    refc: mutable reference_mod.Reference,
+    opk: usize,
+    child: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_u32.len(e_ids)
+    if child >= n { return }
+    let craw = Vec_u32.at(e_ids, child)
+    let node = unary_node(opk, eclass_mod.EClassId { raw: craw })
+    let eid = sat_mod.add(mutable g, mutable sat, take node, allocator)?
+    let _ = reference_mod.add_term(mutable refc, unary_tag(opk), 1 as u32, child as u32, 0 as u32, allocator)?
+    Vec_u32.push(mutable e_ids, eid.raw, allocator)?
+}
+
+
+public function mk_binary(
+    g: mutable graph_mod.EGraph,
+    sat: mutable sat_mod.Saturator,
+    e_ids: mutable Vec_u32.Vec,
+    refc: mutable reference_mod.Reference,
+    opk: usize,
+    lhs: usize,
+    rhs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_u32.len(e_ids)
+    if lhs >= n || rhs >= n { return }
+    let lraw = Vec_u32.at(e_ids, lhs)
+    let rraw = Vec_u32.at(e_ids, rhs)
+    let node = binary_node(opk, eclass_mod.EClassId { raw: lraw }, eclass_mod.EClassId { raw: rraw })
+    let eid = sat_mod.add(mutable g, mutable sat, take node, allocator)?
+    let _ = reference_mod.add_term(mutable refc, binary_tag(opk), 2 as u32, lhs as u32, rhs as u32, allocator)?
+    Vec_u32.push(mutable e_ids, eid.raw, allocator)?
+}
+
+
+public function mk_merge(
+    g: mutable graph_mod.EGraph,
+    sat: mutable sat_mod.Saturator,
+    e_ids: Vec_u32.Vec,
+    refc: mutable reference_mod.Reference,
+    a: usize,
+    b: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_u32.len(e_ids)
+    if a >= n || b >= n { return }
+    let ea = Vec_u32.at(e_ids, a)
+    let eb = Vec_u32.at(e_ids, b)
+    let _ = sat_mod.merge(mutable g, mutable sat, eclass_mod.EClassId { raw: ea }, eclass_mod.EClassId { raw: eb }, allocator)?
+    reference_mod.union(mutable refc, a, b)
+}

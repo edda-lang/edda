@@ -1,0 +1,403 @@
+
+module regex.engine.exec.vm
+
+import std.mem.alloc
+import std.core.option
+import regex.syntax.grammar.ast
+import regex.syntax.grammar.charset
+import regex.syntax.grammar.mode
+import regex.engine.exec.program
+import regex.engine.exec.utf8
+
+spec std.core.option.Option(Match)
+spec std.core.option.Option(u64)
+
+
+public type Match {
+    start: usize
+    end: usize
+    captures: [usize]
+}
+
+public type ExecError {
+    case lookaround_not_supported
+    case backref_not_supported
+    case allocation_failed
+}
+
+public function unset_slot() -> usize {
+    return 0xFFFFFFFFFFFFFFFF as usize
+}
+
+
+function _raw_u32_slots(allocator: Allocator, n: usize) -> [u32]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _raw_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_u32_slots(allocator: Allocator, n: usize) -> [u32]
+    with {allocator, err: ExecError}
+{
+    return handle err: alloc.AllocError -> { raise ExecError.allocation_failed } {
+        _raw_u32_slots(allocator, n)?
+    }
+}
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: ExecError}
+{
+    return handle err: alloc.AllocError -> { raise ExecError.allocation_failed } {
+        _raw_usize_slots(allocator, n)?
+    }
+}
+
+
+public type ThreadList {
+    pc: [u32]
+    caps: [usize]
+    count: [u32]
+    cap_count: usize
+}
+
+function _make_list(
+    capacity: usize,
+    cap_count: usize,
+    allocator: Allocator,
+) -> ThreadList
+    with {allocator, err: ExecError}
+{
+    let pc = _alloc_u32_slots(allocator, capacity)?
+    let caps_total = capacity * cap_count
+    let caps = _alloc_usize_slots(allocator, caps_total)?
+    let count = _alloc_u32_slots(allocator, 1 as usize)?
+    count[0 as usize] = 0 as u32
+    return ThreadList {
+        pc: pc,
+        caps: caps,
+        count: count,
+        cap_count: cap_count,
+    }
+}
+
+function _clear_list(list: ThreadList) -> () {
+    list.count[0 as usize] = 0 as u32
+}
+
+function _list_len(list: ThreadList) -> usize {
+    return list.count[0 as usize] as usize
+}
+
+function _store_caps(list: ThreadList, idx: usize, src: [usize]) -> () {
+    let cc = list.cap_count
+    let base = idx * cc
+    var k: usize = 0 as usize
+    loop decreases cc - k + 1 as usize {
+        if k >= cc { break }
+        list.caps[base + k] = src[k]
+        k = k + 1 as usize
+    }
+    return ()
+}
+
+function _load_caps(list: ThreadList, idx: usize, dst: [usize]) -> () {
+    let cc = list.cap_count
+    let base = idx * cc
+    var k: usize = 0 as usize
+    loop decreases cc - k + 1 as usize {
+        if k >= cc { break }
+        dst[k] = list.caps[base + k]
+        k = k + 1 as usize
+    }
+    return ()
+}
+
+
+function _is_word_byte(b: u8) -> bool {
+    if b >= 48 as u8 && b <= 57 as u8 { return true }
+    if b >= 65 as u8 && b <= 90 as u8 { return true }
+    if b >= 97 as u8 && b <= 122 as u8 { return true }
+    if b == 95 as u8 { return true }
+    return false
+}
+
+function _eval_anchor(a: ast.Anchor, input: [u8], pos: usize, flags: mode.Flags) -> bool {
+    return match a {
+        case .start_of_text => pos == 0 as usize
+        case .end_of_text   => pos == input.len()
+        case .start_of_line => {
+            if pos == 0 as usize { return true }
+            if !flags.multiline { return false }
+            input[pos - 1 as usize] == 10 as u8
+        }
+        case .end_of_line => {
+            if pos == input.len() { return true }
+            if !flags.multiline { return false }
+            input[pos] == 10 as u8
+        }
+        case .word_boundary => {
+            let left = if pos == 0 as usize { false } else { _is_word_byte(input[pos - 1 as usize]) }
+            let right = if pos >= input.len() { false } else { _is_word_byte(input[pos]) }
+            left != right
+        }
+        case .not_word_boundary => {
+            let left = if pos == 0 as usize { false } else { _is_word_byte(input[pos - 1 as usize]) }
+            let right = if pos >= input.len() { false } else { _is_word_byte(input[pos]) }
+            left == right
+        }
+    }
+}
+
+
+function _add_thread(
+    list: ThreadList,
+    seen_marks: [u32],
+    gen: u32,
+    prog: program.Program,
+    pc: u32,
+    pos: usize,
+    input: [u8],
+    caps: [usize],
+) -> ()
+    with {divergence}
+{
+    let pc_us = pc as usize
+    if pc_us >= prog.instructions.len() { return () }
+    if seen_marks[pc_us] == gen { return () }
+    seen_marks[pc_us] = gen
+    let ins = prog.instructions[pc_us]
+    return match ins {
+        case .jump(let t) =>
+            _add_thread(list, seen_marks, gen, prog, t, pos, input, caps)
+        case .split(let a, let b) => {
+            _add_thread(list, seen_marks, gen, prog, a, pos, input, caps)
+            _add_thread(list, seen_marks, gen, prog, b, pos, input, caps)
+        }
+        case .save(let slot) => {
+            let slot_us = slot as usize
+            let prev = caps[slot_us]
+            caps[slot_us] = pos
+            _add_thread(list, seen_marks, gen, prog, pc +% (1 as u32), pos, input, caps)
+            caps[slot_us] = prev
+        }
+        case .anchor_op(let a) => {
+            if _eval_anchor(a, input, pos, prog.flags) {
+                _add_thread(list, seen_marks, gen, prog, pc +% (1 as u32), pos, input, caps)
+            }
+        }
+        case _ => _enqueue_real(list, pc, caps)
+    }
+}
+
+function _enqueue_real(list: ThreadList, pc: u32, caps: [usize]) -> () {
+    let n = list.count[0 as usize] as usize
+    list.pc[n] = pc
+    _store_caps(list, n, caps)
+    list.count[0 as usize] = (n as u32) +% (1 as u32)
+    return ()
+}
+
+
+function _codepoint_consumes(ins: program.Instruction, cp: u32, prog: program.Program) -> bool {
+    return match ins {
+        case .literal(let lit_cp) => lit_cp == cp
+        case .range(let lo, let hi) => cp >= lo && cp <= hi
+        case .class_ref(let idx) =>
+            charset.charset_contains(prog.class_table[idx as usize], cp)
+        case .any => true
+        case .any_no_nl => cp != (10 as u32)
+        case _ => false
+    }
+}
+
+function _step(
+    prog: program.Program,
+    current: ThreadList,
+    next: ThreadList,
+    seen_marks: [u32],
+    gen: u32,
+    pos: usize,
+    input: [u8],
+    cp: u32,
+    byte_len: usize,
+    best_caps: [usize],
+    best_found: [u32],
+    scratch: [usize],
+) -> ()
+    with {divergence}
+{
+    let n = _list_len(current)
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let pc = current.pc[i]
+        let ins = prog.instructions[pc as usize]
+        let is_match = match ins {
+            case .match_op => true
+            case _         => false
+        }
+        if is_match {
+            _load_caps(current, i, best_caps)
+            best_found[0 as usize] = 1 as u32
+            break
+        }
+        if _codepoint_consumes(ins, cp, prog) {
+            _load_caps(current, i, scratch)
+            _add_thread(next, seen_marks, gen, prog, pc +% (1 as u32), pos + byte_len, input, scratch)
+        }
+        i = i + 1 as usize
+    }
+    return ()
+}
+
+
+public function exec(
+    prog: program.Program,
+    input: [u8],
+    start: usize,
+    allocator: mutable Allocator,
+) -> Option_Match
+    with {allocator, err: ExecError, divergence}
+{
+    if prog.has_lookaround { raise ExecError.lookaround_not_supported }
+    if prog.has_backref    { raise ExecError.backref_not_supported }
+
+    let cap_count = program.save_slot_count(prog)
+    let n_instr = prog.instructions.len()
+
+    let current = _make_list(n_instr, cap_count, allocator)?
+    let next    = _make_list(n_instr, cap_count, allocator)?
+    let seen_marks = _alloc_u32_slots(allocator, n_instr)?
+    var k: usize = 0 as usize
+    loop decreases n_instr - k + 1 as usize {
+        if k >= n_instr { break }
+        seen_marks[k] = 0 as u32
+        k = k + 1 as usize
+    }
+    let scratch = _alloc_usize_slots(allocator, cap_count)?
+    let initial = _alloc_usize_slots(allocator, cap_count)?
+    let best_caps = _alloc_usize_slots(allocator, cap_count)?
+    let best_found = _alloc_u32_slots(allocator, 1 as usize)?
+    best_found[0 as usize] = 0 as u32
+    var j: usize = 0 as usize
+    loop decreases cap_count - j + 1 as usize {
+        if j >= cap_count { break }
+        initial[j] = unset_slot()
+        scratch[j] = unset_slot()
+        best_caps[j] = unset_slot()
+        j = j + 1 as usize
+    }
+
+    let gen_box = _alloc_u32_slots(allocator, 1 as usize)?
+    gen_box[0 as usize] = 0 as u32
+
+    let n_input = input.len()
+    var pos: usize = start
+
+    loop decreases n_input - pos + 2 as usize {
+        if pos > n_input { break }
+        _clear_list(current)
+        _clear_list(next)
+        gen_box[0 as usize] = gen_box[0 as usize] +% (1 as u32)
+        _add_thread(current, seen_marks, gen_box[0 as usize], prog, 0 as u32, pos, input, initial)
+
+        var cursor: usize = pos
+        loop decreases n_input - cursor + 2 as usize {
+            if _list_len(current) == 0 as usize { break }
+            if cursor >= n_input { break }
+            let (cp, byte_len) = utf8.decode_at(input, cursor)
+            gen_box[0 as usize] = gen_box[0 as usize] +% (1 as u32)
+            _clear_list(next)
+            _step(prog, current, next, seen_marks, gen_box[0 as usize], cursor, input, cp, byte_len, best_caps, best_found, scratch)
+            _copy_list(next, current)
+            cursor = cursor + byte_len
+        }
+
+        _drain_final(prog, current, best_caps, best_found)
+
+        if best_found[0 as usize] != 0 as u32 {
+            let m_start = best_caps[0 as usize]
+            let m_end   = best_caps[1 as usize]
+            if m_start != unset_slot() && m_end != unset_slot() {
+                let final_caps = _copy_usize_slice(best_caps, allocator)?
+                return Option_Match.some(value: Match {
+                    start: m_start,
+                    end: m_end,
+                    captures: final_caps,
+                })
+            }
+        }
+
+        if prog.start_anchored { break }
+        pos = pos + 1 as usize
+    }
+    return Option_Match.none
+}
+
+function _copy_usize_slice(src: [usize], allocator: Allocator) -> [usize]
+    with {allocator, err: ExecError}
+{
+    let n = src.len()
+    let out = _alloc_usize_slots(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        out[i] = src[i]
+        i = i + 1 as usize
+    }
+    return out
+}
+
+function _copy_list(src: ThreadList, dst: ThreadList) -> () {
+    let n = _list_len(src)
+    dst.count[0 as usize] = n as u32
+    let cc = src.cap_count
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        dst.pc[i] = src.pc[i]
+        let base = i * cc
+        var k: usize = 0 as usize
+        loop decreases cc - k + 1 as usize {
+            if k >= cc { break }
+            dst.caps[base + k] = src.caps[base + k]
+            k = k + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+    return ()
+}
+
+function _drain_final(
+    prog: program.Program,
+    list: ThreadList,
+    best_caps: [usize],
+    best_found: [u32],
+) -> () {
+    let n = _list_len(list)
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let pc = list.pc[i]
+        let is_match = match prog.instructions[pc as usize] {
+            case .match_op => true
+            case _         => false
+        }
+        if is_match {
+            let cc = list.cap_count
+            let base = i * cc
+            var k: usize = 0 as usize
+            loop decreases cc - k + 1 as usize {
+                if k >= cc { break }
+                best_caps[k] = list.caps[base + k]
+                k = k + 1 as usize
+            }
+            best_found[0 as usize] = 1 as u32
+            break
+        }
+        i = i + 1 as usize
+    }
+    return ()
+}

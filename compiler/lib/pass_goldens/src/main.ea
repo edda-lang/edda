@@ -1,0 +1,415 @@
+
+module pass_goldens.main
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.fmt as fmt_mod
+import std.core.option
+import std.io.stream as stream
+import std.os.fs
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import hir.build.file as hir_file_mod
+import hir.item as hir_item
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import mir.file.store as mir_file_mod
+import mir.render as mir_render_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import target.triple as triple_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.name as ty_name_mod
+import types.effect.interner as effect_interner_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as resolve_specsurface_mod
+import resolve.bind.lookup.env.walk.uses as resolve_uses_mod
+import resolve.build.drive.surface.walk.binding.walker as resolve_walker_mod
+import compile.phase.pipeline.parse as parse_mod
+import compile.phase.pipeline.lower as lower_mod
+import compile.setup.env.load.triple as triple_phase_mod
+import compile.phase.analyze.analyze as analyze_mod
+import compile.trace.trace as trace_mod
+import driver.render.render as render_mod
+import specs.cachectx as cachectx_mod
+
+
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(diag_mod.Diagnostic)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+spec std.mem.alloc.Box(hir_tree.HExpr)
+
+spec std.core.option.Option(triple_mod.TargetTriple)
+
+
+public function main(rfs: ReadOnlyFilesystem, wfs: Filesystem, clock: MonotonicClock, errout: Stderr, allocator: Allocator) -> i32
+    with {rfs, wfs, clock, errout, allocator, panic, divergence}
+{
+    let code = handle err: fs.FsError as fe -> { let _ = fe; fail_fs(errout) } {
+        handle err: alloc.AllocError as ae -> { let _ = ae; fail_alloc(errout) } {
+            run(rfs, wfs, clock, errout, allocator)?
+        }
+    }
+    return code
+}
+
+
+function fixture_source() -> String {
+    return """
+    module fixture.main
+
+    function dbl(x: i64) -> i64 {
+        return x * 2
+    }
+
+    function use_dbl(x: i64) -> i64 {
+        return x.dbl()
+    }
+
+    function slice_len(a: [u8]) -> usize {
+        return a.len()
+    }
+    """
+}
+
+
+function run(rfs: ReadOnlyFilesystem, wfs: Filesystem, clock: MonotonicClock, errout: Stderr, allocator: Allocator) -> i32
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit map: source_map_mod.SourceMap
+    source_map_mod.new_map(init map, allocator)?
+    uninit diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init diags, allocator)?
+
+    let fixture_name = string.clone("pass_goldens_fixture/main.ea", allocator)?
+    let fixture_text = string.clone(fixture_source(), allocator)?
+    let _ = source_map_mod.add_file(mutable map, take fixture_name, take fixture_text, allocator)?
+
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    let files = parse_mod.parse_sources(map, mutable interner, mutable diags, allocator)?
+    if diags_mod.has_errors(diags) {
+        render_mod.render_diagnostics(errout, diags, map, allocator)?
+        stream.eprint_line(errout, "pass-goldens: FAIL - fixture parse produced errors")
+        return 1
+    }
+
+    uninit ctx: resolve_ctx_mod.ResolveCtx
+    resolve_ctx_mod.new_ctx(init ctx, allocator)?
+    let wl = resolve_walker_mod.new_derive_whitelist(mutable interner, allocator)?
+    let cat = resolve_specsurface_mod.walk_package_with_catalogue(mutable ctx, files, wl, interner, allocator)?
+    resolve_specsurface_mod.register_invocations(mutable ctx, cat, files, mutable interner, allocator)?
+    resolve_uses_mod.walk_uses(mutable ctx, files, interner, allocator)?
+    drain_diagnostics(mutable diags, ctx.diags.items, allocator)?
+    let output = resolve_ctx_mod.finish(take ctx)
+    let hir_files = lower_mod.lower_to_hir(take files, output, output.next_def_id, mutable interner, allocator, allocator)?
+
+    let triple_opt = triple_phase_mod.resolve_triple_from_string("x86-64-windows-msvc", mutable diags, allocator)?
+    let triple = match triple_opt {
+        case .some(let t) => t
+        case .none => {
+            render_mod.render_diagnostics(errout, diags, map, allocator)?
+            return 1
+        }
+    }
+
+    uninit ty_interner: ty_interner_mod.Interner
+    ty_interner_mod.new_interner(init ty_interner, allocator)?
+    uninit effect_interner: effect_interner_mod.Interner
+    effect_interner_mod.new_interner(init effect_interner, allocator)?
+    uninit dep_hir_files: Vec_HirFile.Vec
+    Vec_HirFile.new(init dep_hir_files, allocator)?
+    uninit dep_ast: Vec_File.Vec
+    Vec_File.new(init dep_ast, allocator)?
+    let dep_def_base = output.next_def_id
+    var spec_cache_ctx = cachectx_mod.disabled()
+
+    let analysis = analyze_mod.analyze_seed(
+        take hir_files, take dep_hir_files, take dep_ast, dep_def_base, allocator, take output, cat, triple, true, rfs, wfs, trace_mod.off(), clock, errout, mutable spec_cache_ctx,
+        mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable map, allocator,
+    )?
+    if diags_mod.has_errors(diags) {
+        render_mod.render_diagnostics(errout, diags, map, allocator)?
+        stream.eprint_line(errout, "pass-goldens: FAIL - fixture typecheck produced errors")
+        return 1
+    }
+
+    var total: usize = 0
+    var passed: usize = 0
+
+    let hf = Vec_HirFile.at(analysis.hir_files, 0 as usize)
+    let ty_out = Vec_TypeOutput.at(analysis.type_outputs, 0 as usize)
+    let dbl_sym = interner_mod.intern(mutable interner, "dbl", allocator)?
+    let use_dbl_sym = interner_mod.intern(mutable interner, "use_dbl", allocator)?
+    let len_sym = interner_mod.intern(mutable interner, "len", allocator)?
+    let slice_len_sym = interner_mod.intern(mutable interner, "slice_len", allocator)?
+
+    let dbl_node = find_method_call(hf, use_dbl_sym, dbl_sym)
+    total = total + 1
+    let h1 = !node_mod.is_error(dbl_node)
+    report(errout, h1, "hir: x.dbl() lowers to method_call(dbl)", allocator)?
+    if h1 { passed = passed + 1 }
+
+    total = total + 1
+    let h2 = h1 && hir_file_mod.is_method_call(hf, dbl_node)
+    report(errout, h2, "hir: method-call side table records dbl node", allocator)?
+    if h2 { passed = passed + 1 }
+
+    total = total + 1
+    let t1 = h1 && ty_name_is(ty_out, dbl_node, "i64", ty_interner, allocator)?
+    report(errout, t1, "types: x.dbl() types to i64", allocator)?
+    if t1 { passed = passed + 1 }
+
+    total = total + 1
+    let t2 = h1 && !def_mod.is_error(types_check_mod.call_method_of(ty_out, dbl_node))
+    report(errout, t2, "types: x.dbl() resolves to a method def", allocator)?
+    if t2 { passed = passed + 1 }
+
+    let len_node = find_method_call(hf, slice_len_sym, len_sym)
+    total = total + 1
+    let h3 = !node_mod.is_error(len_node)
+    report(errout, h3, "hir: a.len() lowers to method_call(len)", allocator)?
+    if h3 { passed = passed + 1 }
+
+    total = total + 1
+    let t3 = h3 && types_check_mod.is_len_intrinsic(types_check_mod.call_method_of(ty_out, len_node))
+    report(errout, t3, "types: a.len() resolves to the len intrinsic", allocator)?
+    if t3 { passed = passed + 1 }
+
+    total = total + 1
+    let t4 = h3 && ty_name_is(ty_out, len_node, "usize", ty_interner, allocator)?
+    report(errout, t4, "types: a.len() types to usize", allocator)?
+    if t4 { passed = passed + 1 }
+
+    let lowered = analyze_mod.lower_instances_build(
+        take analysis, triple, trace_mod.off(), clock, errout,
+        interner, mutable ty_interner, mutable effect_interner, mutable diags, allocator,
+    )?
+    if diags_mod.has_errors(diags) {
+        render_mod.render_diagnostics(errout, diags, map, allocator)?
+        stream.eprint_line(errout, "pass-goldens: FAIL - fixture mir lowering produced errors")
+        return 1
+    }
+
+    let mir_text = mir_render_mod.render_file(Vec_MirFile.at(lowered.mir_files, 0 as usize), interner, allocator)?
+
+    total = total + 1
+    let m1 = string.contains(mir_text, "len _")
+    report(errout, m1, "mir: a.len() lowers to Rvalue.len", allocator)?
+    if m1 { passed = passed + 1 }
+
+    total = total + 1
+    let m2 = string.contains(mir_text, " = call ")
+    report(errout, m2, "mir: x.dbl() lowers to a call terminator", allocator)?
+    if m2 { passed = passed + 1 }
+
+    ty_interner_mod.dispose(take ty_interner)
+    effect_interner_mod.dispose(take effect_interner)
+
+    let summary = build_summary(passed, total, allocator)?
+    stream.eprint_line(errout, summary)
+    interner_mod.dispose(take interner)
+    return if passed == total { 0 } else { 1 }
+}
+
+
+function ty_name_is(
+    ty_out: types_check_mod.TypeOutput,
+    node: node_mod.NodeId,
+    expected: String,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let ty = types_check_mod.type_of_node(ty_out, node)
+    let name = ty_name_mod.name_of(ty, ty_interner, allocator)?
+    return string.equals(name, expected)
+}
+
+
+function find_method_call(hf: hir_file_mod.HirFile, fn_name: sym_mod.Symbol, method: sym_mod.Symbol) -> node_mod.NodeId
+    with {divergence}
+{
+    let n = Vec_HItem.len(hf.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(hf.items, i)
+        match item.kind {
+            case .function_(let sig, let body) => {
+                if Box_HFnSignature.get(sig).name == fn_name {
+                    return search_block(body, method)
+                }
+            }
+            case _ => { let _ = 0 }
+        }
+        i = i + 1
+    }
+    return node_mod.error()
+}
+
+
+function search_block(b: hir_tree.HBlock, method: sym_mod.Symbol) -> node_mod.NodeId
+    with {divergence}
+{
+    let n = Vec_HStmt.len(b.stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let s = Vec_HStmt.at(b.stmts, i)
+        let found = match s.kind {
+            case .let_(_, _, _, _, let init_) => search_expr(init_, method)
+            case .uninit_(_, _, _) => node_mod.error()
+            case .assign(let target, _, let rhs) => {
+                let lhs_hit = search_expr(target, method)
+                if node_mod.is_error(lhs_hit) { search_expr(rhs, method) } else { lhs_hit }
+            }
+        }
+        if !node_mod.is_error(found) {
+            return found
+        }
+        i = i + 1
+    }
+    return match b.trailing {
+        case .some(let bx) => search_expr(Box_HExpr.get(bx), method)
+        case .none => node_mod.error()
+    }
+}
+
+
+function search_expr(e: hir_tree.HExpr, method: sym_mod.Symbol) -> node_mod.NodeId
+    with {divergence}
+{
+    return match e.kind {
+        case .method_call(let name, let args) => {
+            if name == method { e.node_id } else { search_args(args, method) }
+        }
+        case .call(_, let args) => search_args(args, method)
+        case .variant_ctor(_, _, let args) => search_args(args, method)
+        case .struct_lit(_, let args) => search_args(args, method)
+        case .dyn_call(let callee, let args) => {
+            let hit = search_expr(Box_HExpr.get(callee), method)
+            if node_mod.is_error(hit) { search_args(args, method) } else { hit }
+        }
+        case .binary(_, let lhs, let rhs) => {
+            let hit = search_expr(Box_HExpr.get(lhs), method)
+            if node_mod.is_error(hit) { search_expr(Box_HExpr.get(rhs), method) } else { hit }
+        }
+        case .unary(_, let inner) => search_expr(Box_HExpr.get(inner), method)
+        case .return_(let value) => match value {
+            case .some(let bx) => search_expr(Box_HExpr.get(bx), method)
+            case .none => node_mod.error()
+        }
+        case .raise_(let inner) => search_expr(Box_HExpr.get(inner), method)
+        case .panic_(let inner) => search_expr(Box_HExpr.get(inner), method)
+        case .block_(let body) => search_block(body, method)
+        case .if_(let cond, let then_block, let else_block) => {
+            let c = search_expr(Box_HExpr.get(cond), method)
+            if !node_mod.is_error(c) {
+                c
+            } else {
+                let t = search_block(then_block, method)
+                if !node_mod.is_error(t) {
+                    t
+                } else {
+                    match else_block {
+                        case .some(let eb) => search_block(eb, method)
+                        case .none => node_mod.error()
+                    }
+                }
+            }
+        }
+        case _ => node_mod.error()
+    }
+}
+
+
+function search_args(args: Vec_HArg.Vec, method: sym_mod.Symbol) -> node_mod.NodeId
+    with {divergence}
+{
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        let hit = search_expr(a.expr, method)
+        if !node_mod.is_error(hit) {
+            return hit
+        }
+        i = i + 1
+    }
+    return node_mod.error()
+}
+
+
+function report(
+    errout: Stderr,
+    ok: bool,
+    label: String,
+    allocator: Allocator,
+) -> ()
+    with {errout, allocator, err: alloc.AllocError}
+{
+    let tag = if ok { "pass: " } else { "fail: " }
+    let line = string.concat(tag, label, allocator)?
+    stream.eprint_line(errout, line)
+}
+
+
+function build_summary(passed: usize, total: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p = fmt_mod.usize_to_string(passed, allocator)?
+    let t = fmt_mod.usize_to_string(total, allocator)?
+    let s1 = string.concat("passtest: ", p, allocator)?
+    let s2 = string.concat(s1, "/", allocator)?
+    let s3 = string.concat(s2, t, allocator)?
+    return string.concat(s3, " pass goldens passed", allocator)?
+}
+
+
+function drain_diagnostics(
+    target: mutable diags_mod.Diagnostics,
+    source: Vec_Diagnostic.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Diagnostic.len(source)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let d = Vec_Diagnostic.at(source, i)
+        diags_mod.emit(mutable target, take d, allocator)?
+        i = i + 1
+    }
+}
+
+
+function fail_fs(errout: Stderr) -> i32
+    with {errout}
+{
+    stream.eprint_line(errout, "pass-goldens: fatal filesystem error")
+    return 74
+}
+
+
+function fail_alloc(errout: Stderr) -> i32
+    with {errout}
+{
+    stream.eprint_line(errout, "pass-goldens: fatal allocation error")
+    return 71
+}

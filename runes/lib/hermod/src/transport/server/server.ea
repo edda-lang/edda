@@ -1,0 +1,231 @@
+
+module hermod.transport.server.server
+
+import std.mem.alloc
+import std.net.socket
+import std.text.string
+import local.error
+import local.message.body as body_mod
+import local.proto.headers as headers_mod
+import local.message.request as request_mod
+import local.message.response as response_mod
+import local.codec.wire.encode.encode as codec_encode
+import local.codec.wire.decode.decode as codec_decode
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public affine type Server {
+    listener: socket.Listener
+    bound_port: u16
+}
+
+function _max_request_bytes() -> usize { return 262144 as usize }
+
+function _read_timeout_millis() -> u32 { return 30000 as u32 }
+
+function _sock_err(e: socket.SocketError) -> error.TransportError {
+    return match e {
+        case .connection_refused    => error.TransportError.connection_refused
+        case .connection_reset      => error.TransportError.connection_reset
+        case .connection_aborted    => error.TransportError.connection_reset
+        case .host_unreachable      => error.TransportError.accept_failed
+        case .network_unreachable   => error.TransportError.accept_failed
+        case .timeout               => error.TransportError.timed_out
+        case .address_in_use        => error.TransportError.bind_failed
+        case .address_not_available => error.TransportError.bind_failed
+        case .dns_lookup_failed(_)  => error.TransportError.bind_failed
+        case .broken_pipe           => error.TransportError.write_failed
+        case .would_block           => error.TransportError.timed_out
+        case .not_connected         => error.TransportError.connection_reset
+        case .unexpected_eof        => error.TransportError.read_failed
+        case .out_of_memory         => error.TransportError.read_failed
+        case .os_error(_)           => error.TransportError.accept_failed
+    }
+}
+
+public function server_bind(net: Network, fs: ReadOnlyFilesystem, host: [u8], port: u16, allocator: Allocator) -> Server
+    with {net, fs, allocator, err: error.TransportError, err: alloc.AllocError}
+{
+    if port == 0 as u16 {
+        raise error.TransportError.bind_failed
+    }
+    let host_s = string.bytes_slice_to_string(host, 0, host.len(), allocator)?
+    let lis = handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+        socket.listen(net, fs, host_s, port)?
+    }
+    return Server { listener: lis, bound_port: port }
+}
+
+public function server_port(s: Server) -> u16 { return s.bound_port }
+
+public function server_close(s: take Server) -> () {
+    socket.close_listener(take s.listener)
+}
+
+function _config(conn: mutable socket.Connection) -> ()
+    with {err: error.TransportError}
+{
+    handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+        socket.set_read_timeout(mutable conn, _read_timeout_millis())?
+    }
+}
+
+function _write_all(conn: mutable socket.Connection, data: [u8]) -> ()
+    with {err: error.TransportError}
+{
+    var remaining: [u8] = data
+    loop decreases remaining.len() {
+        if remaining.len() == 0 as usize { break }
+        let wrote = handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+            socket.write(mutable conn, remaining)?
+        }
+        if wrote == 0 as usize { raise error.TransportError.write_failed }
+        let adv = if wrote > remaining.len() { remaining.len() } else { wrote }
+        remaining = remaining[adv..]
+    }
+}
+
+function _read_request(conn: mutable socket.Connection, allocator: Allocator) -> [u8]
+    with {allocator, err: error.TransportError, err: alloc.AllocError}
+{
+    let cap = _max_request_bytes()
+    let buf: [u8] = _alloc_u8_slots(allocator, cap)?
+    var filled: usize = 0 as usize
+    loop decreases cap - filled {
+        if filled >= cap { break }
+        let got = handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+            socket.read(mutable conn, mutable buf[filled..<cap])?
+        }
+        if got == 0 as usize { break }
+        let adv = if got > cap - filled { cap - filled } else { got }
+        filled = filled + adv
+    }
+    return buf[0..<filled]
+}
+
+function _accept(s: mutable Server) -> socket.Connection
+    with {err: error.TransportError}
+{
+    return handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+        socket.accept(mutable s.listener)?
+    }
+}
+
+function _serve_conn(
+    conn: take socket.Connection,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: error.CodecError},
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    _config(mutable conn)?
+    let req_bytes = _read_request(mutable conn, allocator)?
+    let req = codec_decode.decode_request(req_bytes, mutable allocator)?
+    let resp = handler(req, mutable allocator)?
+    let wire = codec_encode.encode_response(resp, mutable allocator)?
+    _write_all(mutable conn, wire)?
+    socket.close(take conn)
+}
+
+public function serve_n(
+    s: mutable Server,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: error.CodecError},
+    allocator: mutable Allocator,
+    n: usize,
+) -> ()
+    with {allocator, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    var i: usize = n
+    loop decreases i {
+        if i == 0 as usize { break }
+        let conn = _accept(mutable s)?
+        _serve_conn(take conn, handler, mutable allocator)?
+        i = i - (1 as usize)
+    }
+}
+
+public function serve_forever(
+    s: mutable Server,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: error.CodecError},
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, divergence, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    loop {
+        let conn = _accept(mutable s)?
+        _serve_conn(take conn, handler, mutable allocator)?
+    }
+}
+
+function _usize_digits(n: usize) -> usize {
+    if n == 0 as usize { return 1 as usize }
+    var work: usize = n
+    var k: usize = 0
+    loop decreases work + (1 as usize) {
+        if work == 0 as usize { break }
+        work = work / (10 as usize)
+        k += 1
+    }
+    return k
+}
+
+function _format_decimal(n: usize, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let k = _usize_digits(n)
+    let out = _alloc_u8_slots(allocator, k)?
+    var remaining: usize = n
+    var i: usize = k
+    loop decreases i + (1 as usize) {
+        if i == 0 as usize { break }
+        i = i - (1 as usize)
+        let d = (remaining % (10 as usize)) as u8
+        out[i] = (48 as u8) + d
+        remaining = remaining / (10 as usize)
+    }
+    return out
+}
+
+public function handler_echo(
+    req: request_mod.Request,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        let b = request_mod.request_body(req)
+        var resp = response_mod.response_ok(b, 4 as usize, mutable allocator)?
+        let cl_bytes = _format_decimal(body_mod.body_len(b), allocator)?
+        headers_mod.headers_append(
+            mutable resp.headers,
+            "Content-Length".bytes(),
+            cl_bytes,
+        )?
+        resp
+    }
+}
+
+public function handler_not_found(
+    req: request_mod.Request,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {allocator, err: error.CodecError}
+{
+    let _ = req
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        response_mod.response_not_found(8 as usize, mutable allocator)?
+    }
+}
+
+public function serve_one_echo(
+    request_bytes: [u8],
+    allocator: mutable Allocator,
+) -> [u8]
+    with {allocator, err: error.CodecError}
+{
+    let req = codec_decode.decode_request(request_bytes, mutable allocator)?
+    let resp = handler_echo(req, mutable allocator)?
+    return codec_encode.encode_response(resp, mutable allocator)?
+}

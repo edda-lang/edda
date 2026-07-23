@@ -1,0 +1,378 @@
+module compile.instantiate.unroll.clone.clone
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import hir.tree as hir_tree
+import hir.def as def_mod
+import hir.node as node_mod
+import hir.build.file as hir_file_mod
+import syntax.tokens.kind as kind_mod
+
+
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(DefPair)
+
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(u32)
+
+
+public type DefPair {
+    old_raw: u32
+    new_raw: u32
+}
+
+
+function remap_lookup(remap: Vec_DefPair.Vec, raw: u32) -> Option_u32.Option {
+    let n = Vec_DefPair.len(remap)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let p = Vec_DefPair.at(remap, i)
+        if p.old_raw == raw {
+            return Option_u32.some(value: p.new_raw)
+        }
+        i = i + 1
+    }
+    return Option_u32.none
+}
+
+
+function fresh_expr(
+    file: mutable hir_file_mod.HirFile,
+    src: node_mod.NodeId,
+    kind: hir_tree.HExprKind,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let sp = hir_file_mod.span_of(file, src)
+    let nid = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    if hir_file_mod.is_try_at(file, src) {
+        hir_file_mod.set_try_flag(mutable file, nid.raw)
+    }
+    return hir_tree.HExpr { node_id: nid, kind: kind }
+}
+
+
+public function clone_block(
+    file: mutable hir_file_mod.HirFile,
+    block: hir_tree.HBlock,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> hir_tree.HBlock
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit new_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init new_stmts, allocator)?
+    let n = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let s = clone_stmt(mutable file, Vec_HStmt.at(block.stmts, i), loop_def, k, mutable remap, allocator)?
+        Vec_HStmt.push(mutable new_stmts, take s, allocator)?
+        i = i + 1
+    }
+    let new_trailing = clone_opt_box(mutable file, block.trailing, loop_def, k, mutable remap, allocator)?
+    let sp = hir_file_mod.span_of(file, block.node_id)
+    let nid = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    return hir_tree.HBlock { node_id: nid, stmts: new_stmts, trailing: new_trailing }
+}
+
+
+function clone_stmt(
+    file: mutable hir_file_mod.HirFile,
+    stmt: hir_tree.HStmt,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> hir_tree.HStmt
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kind = match stmt.kind {
+        case .let_(let binding, let pat, let bindings, let ty, let init_) => {
+            let new_init = clone_expr(mutable file, init_, loop_def, k, mutable remap, allocator)?
+            let new_bindings = fresh_bindings(mutable file, bindings, mutable remap, allocator)?
+            hir_tree.HStmtKind.let_(binding: binding, pat: pat, bindings: new_bindings, ty: ty, init_: new_init)
+        }
+        case .uninit_(let pat, let bindings, let ty) => {
+            let new_bindings = fresh_bindings(mutable file, bindings, mutable remap, allocator)?
+            hir_tree.HStmtKind.uninit_(pat: pat, bindings: new_bindings, ty: ty)
+        }
+        case .assign(let target, let op, let rhs) => {
+            let new_target = clone_expr(mutable file, target, loop_def, k, mutable remap, allocator)?
+            let new_rhs = clone_expr(mutable file, rhs, loop_def, k, mutable remap, allocator)?
+            hir_tree.HStmtKind.assign(target: new_target, op: op, rhs: new_rhs)
+        }
+    }
+    let sp = hir_file_mod.span_of(file, stmt.node_id)
+    let nid = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    return hir_tree.HStmt { node_id: nid, kind: kind }
+}
+
+
+function fresh_bindings(
+    file: mutable hir_file_mod.HirFile,
+    bindings: Vec_HBinding.Vec,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Vec_HBinding.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HBinding.Vec
+    Vec_HBinding.new(init out, allocator)?
+    let n = Vec_HBinding.len(bindings)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = Vec_HBinding.at(bindings, i)
+        let new_def = hir_file_mod.alloc_def_id(mutable file)
+        Vec_DefPair.push(mutable remap, take DefPair { old_raw: b.def_id.raw, new_raw: new_def.raw }, allocator)?
+        Vec_HBinding.push(mutable out, take hir_tree.HBinding { name: b.name, def_id: new_def }, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function clone_expr(
+    file: mutable hir_file_mod.HirFile,
+    e: hir_tree.HExpr,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kind = match e.kind {
+        case .literal(let v) => hir_tree.HExprKind.literal(value: v)
+        case .use_(let def) => clone_use(def, loop_def, k, remap)
+        case .ident_literal(let name) => hir_tree.HExprKind.ident_literal(name: name)
+        case .binary(let op, let lhs, let rhs) =>
+            hir_tree.HExprKind.binary(op: op, lhs: clone_boxed(mutable file, lhs, loop_def, k, mutable remap, allocator)?, rhs: clone_boxed(mutable file, rhs, loop_def, k, mutable remap, allocator)?)
+        case .unary(let op, let inner) =>
+            hir_tree.HExprKind.unary(op: op, expr: clone_boxed(mutable file, inner, loop_def, k, mutable remap, allocator)?)
+        case .call(let callee, let args) =>
+            hir_tree.HExprKind.call(callee: callee, args: clone_args(mutable file, args, loop_def, k, mutable remap, allocator)?)
+        case .variant_ctor(let def, let variant, let args) =>
+            hir_tree.HExprKind.variant_ctor(def: def, variant: variant, args: clone_args(mutable file, args, loop_def, k, mutable remap, allocator)?)
+        case .dyn_call(let callee, let args) =>
+            hir_tree.HExprKind.dyn_call(callee: clone_boxed(mutable file, callee, loop_def, k, mutable remap, allocator)?, args: clone_args(mutable file, args, loop_def, k, mutable remap, allocator)?)
+        case .field(let recv, let accessor) =>
+            hir_tree.HExprKind.field(receiver: clone_boxed(mutable file, recv, loop_def, k, mutable remap, allocator)?, accessor: accessor)
+        case .positional(let recv, let idx) =>
+            hir_tree.HExprKind.positional(receiver: clone_boxed(mutable file, recv, loop_def, k, mutable remap, allocator)?, index: clone_boxed(mutable file, idx, loop_def, k, mutable remap, allocator)?)
+        case .index(let recv, let idx) =>
+            hir_tree.HExprKind.index(receiver: clone_boxed(mutable file, recv, loop_def, k, mutable remap, allocator)?, idx: clone_boxed(mutable file, idx, loop_def, k, mutable remap, allocator)?)
+        case .range(let lo, let hi, let inclusive) =>
+            hir_tree.HExprKind.range(lo: clone_boxed(mutable file, lo, loop_def, k, mutable remap, allocator)?, hi: clone_boxed(mutable file, hi, loop_def, k, mutable remap, allocator)?, inclusive: inclusive)
+        case .subrange(let receiver, let lo, let hi, let inclusive) =>
+            hir_tree.HExprKind.subrange(receiver: clone_boxed(mutable file, receiver, loop_def, k, mutable remap, allocator)?, lo: clone_opt_box(mutable file, lo, loop_def, k, mutable remap, allocator)?, hi: clone_opt_box(mutable file, hi, loop_def, k, mutable remap, allocator)?, inclusive: inclusive)
+        case .if_(let cond, let then_block, let else_block) =>
+            hir_tree.HExprKind.if_(cond: clone_boxed(mutable file, cond, loop_def, k, mutable remap, allocator)?, then_block: clone_block(mutable file, then_block, loop_def, k, mutable remap, allocator)?, else_block: clone_opt_block(mutable file, else_block, loop_def, k, mutable remap, allocator)?)
+        case .match_(let scrut, let arms) =>
+            hir_tree.HExprKind.match_(scrutinee: clone_boxed(mutable file, scrut, loop_def, k, mutable remap, allocator)?, arms: clone_arms(mutable file, arms, loop_def, k, mutable remap, allocator)?)
+        case .block_(let body) =>
+            hir_tree.HExprKind.block_(body: clone_block(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        case .loop_(let body, let label, let dec) =>
+            hir_tree.HExprKind.loop_(body: clone_block(mutable file, body, loop_def, k, mutable remap, allocator)?, label: label, decreases_: clone_opt_box(mutable file, dec, loop_def, k, mutable remap, allocator)?)
+        case .cast(let inner, let ty, let mode) =>
+            hir_tree.HExprKind.cast(expr: clone_boxed(mutable file, inner, loop_def, k, mutable remap, allocator)?, ty: ty, mode: mode)
+        case .tuple(let elements) =>
+            hir_tree.HExprKind.tuple(elements: clone_exprs(mutable file, elements, loop_def, k, mutable remap, allocator)?)
+        case .struct_lit(let def, let fields) =>
+            hir_tree.HExprKind.struct_lit(def: def, fields: clone_args(mutable file, fields, loop_def, k, mutable remap, allocator)?)
+        case .raise_(let inner) =>
+            hir_tree.HExprKind.raise_(expr: clone_boxed(mutable file, inner, loop_def, k, mutable remap, allocator)?)
+        case .panic_(let inner) =>
+            hir_tree.HExprKind.panic_(expr: clone_boxed(mutable file, inner, loop_def, k, mutable remap, allocator)?)
+        case .return_(let value) =>
+            hir_tree.HExprKind.return_(value: clone_opt_box(mutable file, value, loop_def, k, mutable remap, allocator)?)
+        case .break_(let label, let value) =>
+            hir_tree.HExprKind.break_(label: label, value: clone_opt_box(mutable file, value, loop_def, k, mutable remap, allocator)?)
+        case .continue_(let label) => hir_tree.HExprKind.continue_(label: label)
+        case .comptime_(let inner) =>
+            hir_tree.HExprKind.comptime_(expr: clone_boxed(mutable file, inner, loop_def, k, mutable remap, allocator)?)
+        case .comptime_block(let body) =>
+            hir_tree.HExprKind.comptime_block(body: clone_block(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        case .comptime_for(let binding, let lo, let hi, let inclusive, let body) => {
+            let new_binding = hir_file_mod.alloc_def_id(mutable file)
+            Vec_DefPair.push(mutable remap, take DefPair { old_raw: binding.raw, new_raw: new_binding.raw }, allocator)?
+            hir_tree.HExprKind.comptime_for(binding: new_binding, lo: clone_boxed(mutable file, lo, loop_def, k, mutable remap, allocator)?, hi: clone_boxed(mutable file, hi, loop_def, k, mutable remap, allocator)?, inclusive: inclusive, body: clone_block(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        }
+        case .scope_(let skind, let name, let body) =>
+            hir_tree.HExprKind.scope_(kind: skind, name: name, body: clone_block(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        case .handle_(let caught_ty, let binder, let recovery, let body) => {
+            let new_binder = hir_file_mod.alloc_def_id(mutable file)
+            Vec_DefPair.push(mutable remap, take DefPair { old_raw: binder.raw, new_raw: new_binder.raw }, allocator)?
+            hir_tree.HExprKind.handle_(caught_ty: caught_ty, binder: new_binder, recovery: clone_boxed(mutable file, recovery, loop_def, k, mutable remap, allocator)?, body: clone_block(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        }
+        case .closure(let c) => hir_tree.HExprKind.closure(closure: c)
+        case .spawn_(let sp) => hir_tree.HExprKind.spawn_(spawn: sp)
+        case .forall_(let bound, let iter, let body) =>
+            hir_tree.HExprKind.forall_(bound: bound, iter: clone_boxed(mutable file, iter, loop_def, k, mutable remap, allocator)?, body: clone_boxed(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        case .exists_(let bound, let iter, let body) =>
+            hir_tree.HExprKind.exists_(bound: bound, iter: clone_boxed(mutable file, iter, loop_def, k, mutable remap, allocator)?, body: clone_boxed(mutable file, body, loop_def, k, mutable remap, allocator)?)
+        case .method_call(let name, let args) =>
+            hir_tree.HExprKind.method_call(name: name, args: clone_args(mutable file, args, loop_def, k, mutable remap, allocator)?)
+        case .error => hir_tree.HExprKind.error
+    }
+    return fresh_expr(mutable file, e.node_id, kind, allocator)?
+}
+
+
+function clone_use(def: def_mod.DefId, loop_def: def_mod.DefId, k: u128, remap: Vec_DefPair.Vec) -> hir_tree.HExprKind {
+    if def.raw == loop_def.raw {
+        return hir_tree.HExprKind.literal(value: hir_tree.HLiteral.int(value: k, base: kind_mod.IntBase.dec))
+    }
+    return match remap_lookup(remap, def.raw) {
+        case .some(let nr) => hir_tree.HExprKind.use_(def: def_mod.from_raw(nr))
+        case .none => hir_tree.HExprKind.use_(def: def)
+    }
+}
+
+
+function clone_boxed(
+    file: mutable hir_file_mod.HirFile,
+    box: Box_HExpr,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Box_HExpr
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_HExpr.get(box)
+    let c = clone_expr(mutable file, inner, loop_def, k, mutable remap, allocator)?
+    return Box_HExpr.new(take c, allocator)?
+}
+
+
+function clone_opt_box(
+    file: mutable hir_file_mod.HirFile,
+    opt: Option_Box_HExpr.Option,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Option_Box_HExpr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let b) => Option_Box_HExpr.some(value: clone_boxed(mutable file, b, loop_def, k, mutable remap, allocator)?)
+        case .none => Option_Box_HExpr.none
+    }
+}
+
+
+function clone_opt_block(
+    file: mutable hir_file_mod.HirFile,
+    opt: Option_HBlock.Option,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Option_HBlock.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let b) => Option_HBlock.some(value: clone_block(mutable file, b, loop_def, k, mutable remap, allocator)?)
+        case .none => Option_HBlock.none
+    }
+}
+
+
+function clone_exprs(
+    file: mutable hir_file_mod.HirFile,
+    exprs: Vec_HExpr.Vec,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Vec_HExpr.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HExpr.Vec
+    Vec_HExpr.new(init out, allocator)?
+    let n = Vec_HExpr.len(exprs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let c = clone_expr(mutable file, Vec_HExpr.at(exprs, i), loop_def, k, mutable remap, allocator)?
+        Vec_HExpr.push(mutable out, take c, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function clone_args(
+    file: mutable hir_file_mod.HirFile,
+    args: Vec_HArg.Vec,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Vec_HArg.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HArg.Vec
+    Vec_HArg.new(init out, allocator)?
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        let new_expr = clone_expr(mutable file, a.expr, loop_def, k, mutable remap, allocator)?
+        Vec_HArg.push(mutable out, take hir_tree.HArg { mode: a.mode, name: a.name, expr: new_expr }, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function clone_arms(
+    file: mutable hir_file_mod.HirFile,
+    arms: Vec_HArm.Vec,
+    loop_def: def_mod.DefId,
+    k: u128,
+    remap: mutable Vec_DefPair.Vec,
+    allocator: Allocator,
+) -> Vec_HArm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HArm.Vec
+    Vec_HArm.new(init out, allocator)?
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_HArm.at(arms, i)
+        let new_bindings = fresh_bindings(mutable file, arm.bindings, mutable remap, allocator)?
+        let new_guard = match arm.guard {
+            case .some(let g) => Option_HExpr.some(value: clone_expr(mutable file, g, loop_def, k, mutable remap, allocator)?)
+            case .none => Option_HExpr.none
+        }
+        let new_body = clone_expr(mutable file, arm.body, loop_def, k, mutable remap, allocator)?
+        let sp = hir_file_mod.span_of(file, arm.node_id)
+        let nid = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.arm, allocator)?
+        Vec_HArm.push(mutable out, take hir_tree.HArm { node_id: nid, pat: arm.pat, bindings: new_bindings, guard: new_guard, body: new_body }, allocator)?
+        i = i + 1
+    }
+    return out
+}

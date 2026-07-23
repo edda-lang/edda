@@ -1,0 +1,385 @@
+module x64.emit.value.convert.emit
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.integer.shift.shift as shift_mod
+import local.encoding.control.branch as branch_mod
+import local.encoding.simd.vector as vector_mod
+import local.emit.regsel as regsel_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_convert(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    to_signed: bool,
+    kind: lir_op_mod.LCastKind,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match kind {
+        case .integer => emit_int_resize(mutable code, body, src, dst, to_width, to_signed, allocator)?
+        case .integer_wrapping => emit_int_resize(mutable code, body, src, dst, to_width, to_signed, allocator)?
+        case .integer_saturating => {
+            emit_sat_clamp(mutable code, body, src, dst, to_width, to_signed, allocator)?
+            emit_int_resize(mutable code, body, dst, dst, to_width, to_signed, allocator)?
+        }
+        case .integer_checked => emit_int_resize(mutable code, body, src, dst, to_width, to_signed, allocator)?
+        case .integer_to_float => emit_int_to_float(mutable code, body, src, to_width, dst, allocator)?
+        case .float_to_integer => emit_float_to_int(mutable code, body, src, to_width, dst, allocator)?
+        case .float => emit_float_to_float(mutable code, body, src, to_width, dst, allocator)?
+        case .reinterpret => emit_reinterpret(mutable code, body, src, to_width, dst, allocator)?
+    }
+}
+
+function emit_int_to_float(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dx = regsel_mod.vreg_xmm(body, dst)?
+    let sg = regsel_mod.vreg_gp(body, src)?
+    let src_vreg = regsel_mod.vreg_at(body, src)?
+    let to_f32 = to_width == (4 as u32)
+    if src_vreg.int_signed {
+        emit_cvtsi2f(mutable code, to_f32, src_vreg.int_width >= (8 as u32), dx, sg, allocator)?
+        return ()
+    }
+    if src_vreg.int_width >= (8 as u32) {
+        emit_u64_to_float(mutable code, to_f32, dx, sg, allocator)?
+        return ()
+    }
+    emit_unsigned_narrow_to_float(mutable code, src_vreg.int_width, to_f32, dx, sg, allocator)?
+}
+
+function emit_cvtsi2f(
+    code: mutable Vec_u8.Vec,
+    to_f32: bool,
+    src64: bool,
+    dx: regs_mod.XmmReg,
+    sg: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if to_f32 {
+        vector_mod.encode_cvtsi2ss(mutable code, src64, dx, sg, allocator)?
+        return ()
+    }
+    vector_mod.encode_cvtsi2sd(mutable code, src64, dx, sg, allocator)?
+}
+
+function emit_fadd_self(
+    code: mutable Vec_u8.Vec,
+    to_f32: bool,
+    dx: regs_mod.XmmReg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if to_f32 {
+        vector_mod.encode_addss(mutable code, dx, dx, allocator)?
+        return ()
+    }
+    vector_mod.encode_addsd(mutable code, dx, dx, allocator)?
+}
+
+function emit_unsigned_narrow_to_float(
+    code: mutable Vec_u8.Vec,
+    width: u32,
+    to_f32: bool,
+    dx: regs_mod.XmmReg,
+    sg: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let zx = regs_mod.Gp64Reg.r11
+    if width == (1 as u32) {
+        alu_mod.encode_movzx_r_rm8(mutable code, regs_mod.OpSize.qword_, zx, sg, allocator)?
+        emit_cvtsi2f(mutable code, to_f32, true, dx, zx, allocator)?
+        return ()
+    }
+    if width == (2 as u32) {
+        alu_mod.encode_movzx_r_rm16(mutable code, regs_mod.OpSize.qword_, zx, sg, allocator)?
+        emit_cvtsi2f(mutable code, to_f32, true, dx, zx, allocator)?
+        return ()
+    }
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.dword_, zx, sg, allocator)?
+    emit_cvtsi2f(mutable code, to_f32, true, dx, zx, allocator)?
+}
+
+function emit_u64_to_float(
+    code: mutable Vec_u8.Vec,
+    to_f32: bool,
+    dx: regs_mod.XmmReg,
+    sg: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let half = regs_mod.Gp64Reg.r11
+    let lsb = regs_mod.Gp64Reg.r10
+    alu_mod.encode_test_rm_r(mutable code, regs_mod.OpSize.qword_, sg, sg, allocator)?
+    let to_high = Vec_u8.len(code)
+    branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.s_, 0 as i8, allocator)?
+    emit_cvtsi2f(mutable code, to_f32, true, dx, sg, allocator)?
+    let to_done = Vec_u8.len(code)
+    branch_mod.encode_jmp_rel8(mutable code, 0 as i8, allocator)?
+    patch_fwd_rel8(mutable code, to_high)?
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, half, sg, allocator)?
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, lsb, sg, allocator)?
+    alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.and_, regs_mod.OpSize.qword_, lsb, 1 as i32, allocator)?
+    shift_mod.encode_shift_imm(mutable code, shift_mod.ShiftOp.shr_, regs_mod.OpSize.qword_, half, 1 as u8, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.or_, regs_mod.OpSize.qword_, half, lsb, allocator)?
+    emit_cvtsi2f(mutable code, to_f32, true, dx, half, allocator)?
+    emit_fadd_self(mutable code, to_f32, dx, allocator)?
+    patch_fwd_rel8(mutable code, to_done)?
+}
+
+function patch_fwd_rel8(
+    code: mutable Vec_u8.Vec,
+    opcode_at: usize,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let site = opcode_at + 1
+    let len = Vec_u8.len(code)
+    if site >= len {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.emit_convert: u64->float jump patch site out of range",
+        )
+    }
+    let rel = len - (site + 1)
+    if rel > 127 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.emit_convert: u64->float jump displacement exceeds signed 8-bit range",
+        )
+    }
+    Vec_u8.set_at(mutable code, site, rel as u8 wrapping)
+}
+
+function emit_float_to_int(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let sx = regsel_mod.vreg_xmm(body, src)?
+    let src_vreg = regsel_mod.vreg_at(body, src)?
+    let dst64 = to_width >= (8 as u32)
+    if src_vreg.size == (4 as u32) {
+        vector_mod.encode_cvttss2si(mutable code, dst64, dg, sx, allocator)?
+        return ()
+    }
+    vector_mod.encode_cvttsd2si(mutable code, dst64, dg, sx, allocator)?
+}
+
+function emit_float_to_float(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dx = regsel_mod.vreg_xmm(body, dst)?
+    let sx = regsel_mod.vreg_xmm(body, src)?
+    let src_vreg = regsel_mod.vreg_at(body, src)?
+    if src_vreg.size != to_width {
+        if to_width == (8 as u32) {
+            vector_mod.encode_cvtss2sd(mutable code, dx, sx, allocator)?
+            return ()
+        }
+        vector_mod.encode_cvtsd2ss(mutable code, dx, sx, allocator)?
+        return ()
+    }
+    if regs_mod.xmm_reg_num(dx) == regs_mod.xmm_reg_num(sx) { return () }
+    if to_width == (4 as u32) {
+        vector_mod.encode_movss(mutable code, dx, sx, allocator)?
+        return ()
+    }
+    vector_mod.encode_movsd(mutable code, dx, sx, allocator)?
+}
+
+function emit_reinterpret(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let src_fp = regsel_mod.vreg_is_fp(body, src)?
+    let dst_fp = regsel_mod.vreg_is_fp(body, dst)?
+    if src_fp && !dst_fp {
+        let dg = regsel_mod.vreg_gp(body, dst)?
+        let sx = regsel_mod.vreg_xmm(body, src)?
+        if to_width == (4 as u32) {
+            vector_mod.encode_movd_r32_xmm(mutable code, dg, sx, allocator)?
+        } else {
+            vector_mod.encode_movq_r64_xmm(mutable code, dg, sx, allocator)?
+        }
+        return ()
+    }
+    if dst_fp && !src_fp {
+        let dx = regsel_mod.vreg_xmm(body, dst)?
+        let sg = regsel_mod.vreg_gp(body, src)?
+        if to_width == (4 as u32) {
+            vector_mod.encode_movd_xmm_r32(mutable code, dx, sg, allocator)?
+        } else {
+            vector_mod.encode_movq_xmm_r64(mutable code, dx, sg, allocator)?
+        }
+        return ()
+    }
+    if !src_fp && !dst_fp {
+        let dg = regsel_mod.vreg_gp(body, dst)?
+        let sg = regsel_mod.vreg_gp(body, src)?
+        if regs_mod.gp64_reg_num(dg) != regs_mod.gp64_reg_num(sg) {
+            let sz = if to_width == (4 as u32) { regs_mod.OpSize.dword_ } else { regs_mod.OpSize.qword_ }
+            alu_mod.encode_mov_rm_r(mutable code, sz, dg, sg, allocator)?
+        }
+        return ()
+    }
+    raise lir_error_mod.LirError.internal_lowering_invariant(
+        at: span_mod.dummy(),
+        message: "x64.emit_convert: reinterpret requires exactly one fp and one gp operand",
+    )
+}
+
+function emit_sat_clamp(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    to_signed: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let sv = regsel_mod.vreg_at(body, src)?
+    let src_signed = sv.int_signed
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let sg = regsel_mod.vreg_gp(body, src)?
+    regsel_mod.mov_if_diff(mutable code, dg, sg, allocator)?
+    if to_width >= (8 as u32) {
+        if to_signed == src_signed {
+            return ()
+        }
+        if src_signed {
+            clamp_bound(mutable code, dg, 0, branch_mod.Cond.l_, allocator)?
+        } else {
+            clamp_bound(mutable code, dg, 9223372036854775807, branch_mod.Cond.a_, allocator)?
+        }
+        return ()
+    }
+    let one: i64 = 1
+    let bits = (to_width as i64) * 8
+    if to_signed {
+        let hi = (one << (bits - 1)) - 1
+        let lo = 0 - (one << (bits - 1))
+        if src_signed {
+            clamp_bound(mutable code, dg, hi, branch_mod.Cond.g_, allocator)?
+            clamp_bound(mutable code, dg, lo, branch_mod.Cond.l_, allocator)?
+        } else {
+            clamp_bound(mutable code, dg, hi, branch_mod.Cond.a_, allocator)?
+        }
+        return ()
+    }
+    let hi = (one << bits) - 1
+    if src_signed {
+        clamp_bound(mutable code, dg, hi, branch_mod.Cond.g_, allocator)?
+        clamp_bound(mutable code, dg, 0, branch_mod.Cond.l_, allocator)?
+    } else {
+        clamp_bound(mutable code, dg, hi, branch_mod.Cond.a_, allocator)?
+    }
+}
+
+public function clamp_bound(
+    code: mutable Vec_u8.Vec,
+    dg: regs_mod.Gp64Reg,
+    bound: i64,
+    beyond: branch_mod.Cond,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let scratch = regs_mod.Gp64Reg.r11
+    alu_mod.encode_mov_r64_imm64(mutable code, scratch, bound, allocator)?
+    alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, dg, scratch, allocator)?
+    branch_mod.encode_cmovcc_r_rm(mutable code, beyond, dg, scratch, allocator)?
+}
+
+function emit_int_resize(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    src: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    to_signed: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    let sg = regsel_mod.vreg_gp(body, src)?
+    if to_width == (1 as u32) {
+        if to_signed {
+            alu_mod.encode_movsx_r_rm8(mutable code, regs_mod.OpSize.qword_, dg, sg, allocator)?
+        } else {
+            alu_mod.encode_movzx_r_rm8(mutable code, regs_mod.OpSize.qword_, dg, sg, allocator)?
+        }
+        return ()
+    }
+    if to_width == (2 as u32) {
+        if to_signed {
+            alu_mod.encode_movsx_r_rm16(mutable code, regs_mod.OpSize.qword_, dg, sg, allocator)?
+        } else {
+            alu_mod.encode_movzx_r_rm16(mutable code, regs_mod.OpSize.qword_, dg, sg, allocator)?
+        }
+        return ()
+    }
+    if to_width == (4 as u32) {
+        if to_signed {
+            alu_mod.encode_movsxd_r_rm32(mutable code, dg, sg, allocator)?
+        } else {
+            alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.dword_, dg, sg, allocator)?
+        }
+        return ()
+    }
+    if regs_mod.gp64_reg_num(dg) != regs_mod.gp64_reg_num(sg) {
+        alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, dg, sg, allocator)?
+    }
+}

@@ -1,0 +1,92 @@
+
+module refine.solver.cnf.divmod
+
+import std.collections.vec
+import std.mem.alloc
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function divmod_lemma_terms(term: term_mod.SmtTerm, allocator: Allocator) -> Vec_SmtTerm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init out, allocator)?
+    collect_lemmas(term, mutable out, allocator)?
+    return out
+}
+
+
+function collect_lemmas(t: term_mod.SmtTerm, out: mutable Vec_SmtTerm.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match t {
+        case .app(let op, let args) => {
+            if is_divmod(op) && Vec_SmtTerm.len(args) == 2 {
+                let dividend = Vec_SmtTerm.at(args, 0)
+                let divisor = Vec_SmtTerm.at(args, 1)
+                if divisor_value(divisor) > (0 as i128) {
+                    let lemma = build_lemma(dividend, divisor, allocator)?
+                    Vec_SmtTerm.push(mutable out, take lemma, allocator)?
+                }
+            }
+            let n = Vec_SmtTerm.len(args)
+            var i: usize = 0
+            loop
+                decreases (n - i)
+            {
+                if i >= n {
+                    break
+                }
+                collect_lemmas(Vec_SmtTerm.at(args, i), mutable out, allocator)?
+                i = i + 1
+            }
+        }
+        case _ => {}
+    }
+}
+
+
+function is_divmod(op: term_mod.SmtOp) -> bool {
+    return match op {
+        case .div_ => true
+        case .mod_ => true
+        case _ => false
+    }
+}
+
+
+function divisor_value(t: term_mod.SmtTerm) -> i128 {
+    return match t {
+        case .numeral(let v) => v
+        case _ => 0 as i128
+    }
+}
+
+
+function build_lemma(dividend: term_mod.SmtTerm, divisor: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    let div_app = mk2(term_mod.SmtOp.div_, dividend, divisor, allocator)?
+    let mod_app = mk2(term_mod.SmtOp.mod_, dividend, divisor, allocator)?
+    let scaled = mk2(term_mod.SmtOp.mul, divisor, div_app, allocator)?
+    let recomposed = mk2(term_mod.SmtOp.add, scaled, mod_app, allocator)?
+    let link = mk2(term_mod.SmtOp.eq_, dividend, recomposed, allocator)?
+    let nonneg = mk2(term_mod.SmtOp.ge, mod_app, term_mod.SmtTerm.numeral(value: 0 as i128), allocator)?
+    let below = mk2(term_mod.SmtOp.lt, mod_app, divisor, allocator)?
+    let bounds = mk2(term_mod.SmtOp.and_, nonneg, below, allocator)?
+    return mk2(term_mod.SmtOp.and_, link, bounds, allocator)?
+}
+
+
+function mk2(op: term_mod.SmtOp, lhs: term_mod.SmtTerm, rhs: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take lhs, allocator)?
+    Vec_SmtTerm.push(mutable args, take rhs, allocator)?
+    return term_mod.SmtTerm.app(op: op, args: args)
+}

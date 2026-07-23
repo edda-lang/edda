@@ -1,0 +1,140 @@
+
+module target.triple
+
+import std.collections.slice
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import local.abi as abi_mod
+import local.arch as arch_mod
+import local.os as os_mod
+
+spec std.core.option.Option(abi_mod.AbiVariant)
+spec std.core.option.Option(ArchStripped)
+spec std.core.option.Option(OsStripped)
+
+derive eq, hash, ord, clone, debug for TargetTriple
+derive eq, hash, ord, clone, debug for TripleParseError
+
+
+public type TargetTriple {
+    arch: arch_mod.Arch
+    os: os_mod.Os
+    abi: abi_mod.AbiVariant
+}
+
+public type TripleParseError {
+    case empty
+    case unknown_arch(input: String)
+    case unknown_os(input: String)
+    case unknown_abi(input: String)
+}
+
+
+public stable function triple_of(a: arch_mod.Arch, o: os_mod.Os, ab: abi_mod.AbiVariant) -> TargetTriple {
+    return TargetTriple { arch: a, os: o, abi: ab }
+}
+
+public stable function arch(t: TargetTriple) -> arch_mod.Arch {
+    return t.arch
+}
+
+public stable function os(t: TargetTriple) -> os_mod.Os {
+    return t.os
+}
+
+public stable function abi(t: TargetTriple) -> abi_mod.AbiVariant {
+    return t.abi
+}
+
+
+public function parse(s: take String) -> TargetTriple
+    with {err: TripleParseError}
+{
+    if string.is_empty(s) {
+        raise TripleParseError.empty
+    }
+    return match match_layout(s) {
+        case .ok(let t) => t
+        case .arch_miss => raise TripleParseError.unknown_arch(input: s)
+        case .os_miss   => raise TripleParseError.unknown_os(input: s)
+        case .abi_miss  => raise TripleParseError.unknown_abi(input: s)
+    }
+}
+
+
+public function to_string(t: TargetTriple, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let arch_name = arch_mod.name(t.arch)
+    let os_name = os_mod.name(t.os)
+    let abi_name = abi_mod.name(t.abi)
+    let with_dash1 = string.concat(arch_name, "-", allocator)?
+    let with_os = string.concat(with_dash1, os_name, allocator)?
+    let with_dash2 = string.concat(with_os, "-", allocator)?
+    return string.concat(with_dash2, abi_name, allocator)?
+}
+
+
+public type LayoutMatch {
+    case ok(triple: TargetTriple)
+    case arch_miss
+    case os_miss
+    case abi_miss
+}
+
+public type ArchStripped {
+    arch: arch_mod.Arch
+    rest: [u8]
+}
+
+public type OsStripped {
+    os: os_mod.Os
+    rest: [u8]
+}
+
+function match_layout(s: String) -> LayoutMatch {
+    let b = s.bytes()
+    let ar = match strip_arch_prefix(b) {
+        case .none      => return LayoutMatch.arch_miss
+        case .some(let m) => m
+    }
+    let osr = match strip_os_prefix(ar.rest) {
+        case .none      => return LayoutMatch.os_miss
+        case .some(let m) => m
+    }
+    return match abi_from_bytes(osr.rest) {
+        case .none      => LayoutMatch.abi_miss
+        case .some(let ab) => LayoutMatch.ok(triple: triple_of(ar.arch, osr.os, ab))
+    }
+}
+
+function strip_arch_prefix(b: [u8]) -> Option_ArchStripped {
+    if slice.starts_with_u8(b, "x86-64-".bytes())  { return Option_ArchStripped.some(value: ArchStripped { arch: arch_mod.Arch.x86_64,  rest: b[7..] }) }
+    if slice.starts_with_u8(b, "aarch64-".bytes()) { return Option_ArchStripped.some(value: ArchStripped { arch: arch_mod.Arch.aarch64, rest: b[8..] }) }
+    if slice.starts_with_u8(b, "riscv64-".bytes()) { return Option_ArchStripped.some(value: ArchStripped { arch: arch_mod.Arch.riscv64, rest: b[8..] }) }
+    if slice.starts_with_u8(b, "wasm32-".bytes())  { return Option_ArchStripped.some(value: ArchStripped { arch: arch_mod.Arch.wasm32,  rest: b[7..] }) }
+    if slice.starts_with_u8(b, "wasm64-".bytes())  { return Option_ArchStripped.some(value: ArchStripped { arch: arch_mod.Arch.wasm64,  rest: b[7..] }) }
+    return Option_ArchStripped.none
+}
+
+function strip_os_prefix(b: [u8]) -> Option_OsStripped {
+    if slice.starts_with_u8(b, "linux-".bytes())      { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.linux,      rest: b[6..] }) }
+    if slice.starts_with_u8(b, "windows-".bytes())    { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.windows,    rest: b[8..] }) }
+    if slice.starts_with_u8(b, "macos-".bytes())      { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.macos,      rest: b[6..] }) }
+    if slice.starts_with_u8(b, "freebsd-".bytes())    { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.freebsd,    rest: b[8..] }) }
+    if slice.starts_with_u8(b, "bare-metal-".bytes()) { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.bare_metal, rest: b[11..] }) }
+    if slice.starts_with_u8(b, "wasi-".bytes())       { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.wasi,       rest: b[5..] }) }
+    if slice.starts_with_u8(b, "browser-".bytes())    { return Option_OsStripped.some(value: OsStripped { os: os_mod.Os.browser,    rest: b[8..] }) }
+    return Option_OsStripped.none
+}
+
+function abi_from_bytes(b: [u8]) -> Option_AbiVariant {
+    if slice.eq_u8(b, "gnu".bytes())           { return Option_AbiVariant.some(value: abi_mod.AbiVariant.gnu) }
+    if slice.eq_u8(b, "musl".bytes())          { return Option_AbiVariant.some(value: abi_mod.AbiVariant.musl) }
+    if slice.eq_u8(b, "msvc".bytes())          { return Option_AbiVariant.some(value: abi_mod.AbiVariant.msvc) }
+    if slice.eq_u8(b, "darwin".bytes())        { return Option_AbiVariant.some(value: abi_mod.AbiVariant.darwin) }
+    if slice.eq_u8(b, "none".bytes())          { return Option_AbiVariant.some(value: abi_mod.AbiVariant.none) }
+    if slice.eq_u8(b, "wasi-preview1".bytes()) { return Option_AbiVariant.some(value: abi_mod.AbiVariant.wasi_preview1) }
+    return Option_AbiVariant.none
+}

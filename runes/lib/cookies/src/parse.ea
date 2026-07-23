@@ -1,0 +1,246 @@
+
+module cookies.parse
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import cookies.error
+import cookies.value
+
+spec option.Option(String)
+spec option.Option(i64)
+spec option.Option(value.SameSite)
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+function _is_ows(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+function _is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+function _is_upper(c: u8) -> bool {
+    return c >= 65 as u8 && c <= 90 as u8
+}
+
+function _to_lower(c: u8) -> u8 {
+    if _is_upper(c) {
+        return c +% (32 as u8)
+    }
+    return c
+}
+
+
+function _trim_ows(src: [u8], lo: usize, hi: usize) -> (usize, usize) {
+    var a: usize = lo
+    var b: usize = hi
+    loop decreases b - a + 1 as usize {
+        if a >= b { break }
+        if !_is_ows(src[a]) { break }
+        a = a + 1 as usize
+    }
+    loop decreases b - a + 1 as usize {
+        if b <= a { break }
+        if !_is_ows(src[b - 1 as usize]) { break }
+        b = b - 1 as usize
+    }
+    return (a, b)
+}
+
+function _find_byte(src: [u8], lo: usize, hi: usize, target: u8) -> (usize, bool) {
+    var i: usize = lo
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        if src[i] == target { return (i, true) }
+        i = i + 1 as usize
+    }
+    return (hi, false)
+}
+
+function _substring(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = hi - lo
+    let buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[i] = src[lo + i]
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _substring_lower(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = hi - lo
+    let buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[i] = _to_lower(src[lo + i])
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _ieq(src: [u8], lo: usize, hi: usize, needle: [u8]) -> bool {
+    let n = hi - lo
+    if n != needle.len() { return false }
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if _to_lower(src[lo + i]) != _to_lower(needle[i]) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+
+function _parse_max_age(src: [u8], lo: usize, hi: usize) -> Option_i64 {
+    if lo >= hi { return Option_i64.none }
+    var i: usize = lo
+    var negative: bool = false
+    if src[i] == 45 as u8 {
+        negative = true
+        i = i + 1 as usize
+        if i >= hi { return Option_i64.none }
+    } else if !_is_digit(src[i]) {
+        return Option_i64.none
+    }
+    let digit_count = hi - i
+    if digit_count == 0 as usize { return Option_i64.none }
+    if digit_count > 18 as usize { return Option_i64.none }
+    var acc: i64 = 0 as i64
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        let c = src[i]
+        if !_is_digit(c) { return Option_i64.none }
+        acc = acc * (10 as i64) + ((c - 48 as u8) as i64)
+        i = i + 1 as usize
+    }
+    if negative { return Option_i64.some(value: (0 as i64) - acc) }
+    return Option_i64.some(value: acc)
+}
+
+function _parse_same_site(src: [u8], lo: usize, hi: usize) -> Option_SameSite {
+    if _ieq(src, lo, hi, "strict".bytes()) {
+        return Option_SameSite.some(value: value.SameSite.strict)
+    }
+    if _ieq(src, lo, hi, "lax".bytes()) {
+        return Option_SameSite.some(value: value.SameSite.lax)
+    }
+    if _ieq(src, lo, hi, "none".bytes()) {
+        return Option_SameSite.some(value: value.SameSite.none)
+    }
+    return Option_SameSite.none
+}
+
+function _canonical_domain(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var a: usize = lo
+    if a < hi && src[a] == 46 as u8 {
+        a = a + 1 as usize
+    }
+    return _substring_lower(src, a, hi, allocator)?
+}
+
+
+public function parse_set_cookie_bytes(src: [u8], allocator: Allocator) -> value.Cookie
+    with {allocator, err: error.ParseError}
+{
+    return handle err: alloc.AllocError -> { raise error.ParseError.allocation_failed } {
+        let n = src.len()
+        if n == 0 as usize { raise error.ParseError.empty_input }
+
+        let (semi_pos, has_semi) = _find_byte(src, 0 as usize, n, 59 as u8)
+        let pair_hi = if has_semi { semi_pos } else { n }
+        let attrs_start = if has_semi { semi_pos + 1 as usize } else { n }
+
+        let (eq_pos, has_eq) = _find_byte(src, 0 as usize, pair_hi, 61 as u8)
+        if !has_eq { raise error.ParseError.missing_equals(at: 0 as usize) }
+
+        let (name_lo, name_hi) = _trim_ows(src, 0 as usize, eq_pos)
+        let (val_lo, val_hi)   = _trim_ows(src, eq_pos + 1 as usize, pair_hi)
+
+        if name_lo >= name_hi { raise error.ParseError.empty_name(at: name_lo) }
+
+        let name_str  = _substring(src, name_lo, name_hi, allocator)?
+        let value_str = _substring(src, val_lo, val_hi, allocator)?
+
+        var expires: Option_String     = Option_String.none
+        var max_age: Option_i64        = Option_i64.none
+        var domain: Option_String      = Option_String.none
+        var path: Option_String        = Option_String.none
+        var secure: bool               = false
+        var http_only: bool            = false
+        var same_site: Option_SameSite = Option_SameSite.none
+
+        var c: usize = attrs_start
+        loop decreases n - c + 1 as usize {
+            if c >= n { break }
+            let (s, has_s) = _find_byte(src, c, n, 59 as u8)
+            let av_hi = if has_s { s } else { n }
+            let (av_lo_t, av_hi_t) = _trim_ows(src, c, av_hi)
+            if av_lo_t < av_hi_t {
+                let (aeq, has_aeq) = _find_byte(src, av_lo_t, av_hi_t, 61 as u8)
+                let an_hi = if has_aeq { aeq } else { av_hi_t }
+                let av_v_lo = if has_aeq { aeq + 1 as usize } else { av_hi_t }
+                let (n_lo, n_hi) = _trim_ows(src, av_lo_t, an_hi)
+                let (v_lo, v_hi) = _trim_ows(src, av_v_lo, av_hi_t)
+
+                if _ieq(src, n_lo, n_hi, "Expires".bytes()) {
+                    if v_lo < v_hi {
+                        let s2 = _substring(src, v_lo, v_hi, allocator)?
+                        expires = Option_String.some(value: s2)
+                    }
+                } else if _ieq(src, n_lo, n_hi, "Max-Age".bytes()) {
+                    max_age = _parse_max_age(src, v_lo, v_hi)
+                } else if _ieq(src, n_lo, n_hi, "Domain".bytes()) {
+                    if v_lo < v_hi {
+                        let d = _canonical_domain(src, v_lo, v_hi, allocator)?
+                        domain = Option_String.some(value: d)
+                    }
+                } else if _ieq(src, n_lo, n_hi, "Path".bytes()) {
+                    if v_lo < v_hi {
+                        let p = _substring(src, v_lo, v_hi, allocator)?
+                        path = Option_String.some(value: p)
+                    }
+                } else if _ieq(src, n_lo, n_hi, "Secure".bytes()) {
+                    secure = true
+                } else if _ieq(src, n_lo, n_hi, "HttpOnly".bytes()) {
+                    http_only = true
+                } else if _ieq(src, n_lo, n_hi, "SameSite".bytes()) {
+                    same_site = _parse_same_site(src, v_lo, v_hi)
+                }
+            }
+            c = if has_s { s + 1 as usize } else { n }
+        }
+
+        value.Cookie {
+            name: name_str,
+            value: value_str,
+            expires: expires,
+            max_age: max_age,
+            domain: domain,
+            path: path,
+            secure: secure,
+            http_only: http_only,
+            same_site: same_site,
+        }
+    }
+}
+
+public function parse_set_cookie(src: String, allocator: Allocator) -> value.Cookie
+    with {allocator, err: error.ParseError}
+{
+    return parse_set_cookie_bytes(src.bytes(), allocator)?
+}

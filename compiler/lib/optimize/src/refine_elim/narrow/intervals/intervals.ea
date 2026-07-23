@@ -1,0 +1,263 @@
+
+module optimize.refine_elim.narrow.intervals.intervals
+
+import std.core.option
+import std.collections.vec
+
+import local.refine_elim.range.range as range_mod
+import local.refine_elim.narrow.util.util as util_mod
+
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+spec std.core.option.Option(range_mod.IntType)
+spec std.collections.vec.Vec(bool)
+
+public function rvalue_range(
+    value: mir_rvalue_mod.Rvalue,
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    return match value {
+        case .use_(let op) => operand_range(op, cur, defined, declared, pinned, it_interner)
+        case .binary(let op, let lhs, let rhs) =>
+            binary_range(op, lhs, rhs, cur, defined, declared, pinned, it_interner)
+        case .unary(let op, let operand) =>
+            unary_range(op, operand, cur, defined, declared, pinned, it_interner)
+        case .cast(let operand, _, let to, let kind) =>
+            cast_range(operand, to, kind, cur, defined, declared, pinned, it_interner)
+        case _ => range_mod.top()
+    }
+}
+
+function operand_range(
+    op: mir_rvalue_mod.Operand,
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    return match op {
+        case .copy_(let place, let ty) =>
+            place_range(place, ty, cur, defined, declared, pinned, it_interner)
+        case .move_(let place, let ty) =>
+            place_range(place, ty, cur, defined, declared, pinned, it_interner)
+        case .constant(let c) => const_range(c, it_interner)
+    }
+}
+
+function place_range(
+    place: mir_place_mod.Place,
+    ty: ty_mod.TyId,
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    let li = util_mod.bare_local_of(place)
+    if li >= (0 as i64) {
+        let idx = li as usize
+        if idx < range_mod.local_count(cur)
+            && Vec_bool.at(defined, idx)
+            && !util_mod.pinned_at(pinned, idx)
+        {
+            return range_mod.get_at(cur, idx)
+        }
+        if idx < range_mod.local_count(declared) {
+            return range_mod.get_at(declared, idx)
+        }
+    }
+    return range_mod.range_of_ty(ty, it_interner)
+}
+
+function const_range(
+    c: mir_rvalue_mod.Constant,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    return match c.kind {
+        case .int_(let bits) => decode_int_const(bits, c.ty, it_interner)
+        case .bool_(_) => range_mod.interval((0 as i128), (1 as i128))
+        case _ => range_mod.range_of_ty(c.ty, it_interner)
+    }
+}
+
+function decode_int_const(
+    bits: u128,
+    ty: ty_mod.TyId,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    let base = range_mod.range_of_ty(ty, it_interner)
+    return match int_type_of(ty, it_interner) {
+        case .none => base
+        case .some(let it) => range_mod.meet(range_mod.exact(decode_value(bits, it)), base)
+    }
+}
+
+function decode_value(bits: u128, it: range_mod.IntType) -> i128 {
+    let bi = bits as i128 wrapping
+    if !it.signed {
+        return bi
+    }
+    let signbit = (1 as i128) << ((it.bits - 1) as i128)
+    if bi >= signbit {
+        return bi - ((1 as i128) << (it.bits as i128))
+    }
+    return bi
+}
+
+function int_type_of(
+    ty: ty_mod.TyId,
+    it_interner: ty_interner_mod.Interner,
+) -> Option_IntType.Option {
+    if ty_mod.is_error(ty) {
+        return Option_IntType.none
+    }
+    if ty_mod.index(ty) >= ty_interner_mod.slot_count(it_interner) {
+        return Option_IntType.none
+    }
+    return match ty_interner_mod.lookup(it_interner, ty) {
+        case .primitive(let p) => range_mod.from_prim(p)
+        case _ => Option_IntType.none
+    }
+}
+
+function binary_range(
+    op: mir_rvalue_mod.MBinOp,
+    lhs: mir_rvalue_mod.Operand,
+    rhs: mir_rvalue_mod.Operand,
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    let lr = operand_range(lhs, cur, defined, declared, pinned, it_interner)
+    let rr = operand_range(rhs, cur, defined, declared, pinned, it_interner)
+    return match op {
+        case .add(let mode) => arith_add(lr, rr, mode)
+        case .sub(let mode) => arith_sub(lr, rr, mode)
+        case .mul(let mode) => arith_mul(lr, rr, mode)
+        case .eq => bool_range()
+        case .ne => bool_range()
+        case .lt => bool_range()
+        case .le => bool_range()
+        case .gt => bool_range()
+        case .ge => bool_range()
+        case .logical_and => bool_range()
+        case .logical_or => bool_range()
+        case _ => range_mod.top()
+    }
+}
+
+function bool_range() -> range_mod.IntRange {
+    return range_mod.interval((0 as i128), (1 as i128))
+}
+
+function arith_mode_ok(mode: mir_rvalue_mod.OverflowMode) -> bool {
+    return match mode {
+        case .trapping => true
+        case .checked_ => true
+        case _ => false
+    }
+}
+
+function arith_add(
+    lr: range_mod.IntRange,
+    rr: range_mod.IntRange,
+    mode: mir_rvalue_mod.OverflowMode,
+) -> range_mod.IntRange {
+    if !arith_mode_ok(mode) || !lr.known || !rr.known {
+        return range_mod.top()
+    }
+    return range_mod.interval(lr.lo +| rr.lo, lr.hi +| rr.hi)
+}
+
+function arith_sub(
+    lr: range_mod.IntRange,
+    rr: range_mod.IntRange,
+    mode: mir_rvalue_mod.OverflowMode,
+) -> range_mod.IntRange {
+    if !arith_mode_ok(mode) || !lr.known || !rr.known {
+        return range_mod.top()
+    }
+    return range_mod.interval(lr.lo -| rr.hi, lr.hi -| rr.lo)
+}
+
+function arith_mul(
+    lr: range_mod.IntRange,
+    rr: range_mod.IntRange,
+    mode: mir_rvalue_mod.OverflowMode,
+) -> range_mod.IntRange {
+    if !arith_mode_ok(mode) || !lr.known || !rr.known {
+        return range_mod.top()
+    }
+    let a = lr.lo *| rr.lo
+    let b = lr.lo *| rr.hi
+    let c = lr.hi *| rr.lo
+    let d = lr.hi *| rr.hi
+    let lo = imin(imin(a, b), imin(c, d))
+    let hi = imax(imax(a, b), imax(c, d))
+    return range_mod.interval(lo, hi)
+}
+
+function unary_range(
+    op: mir_rvalue_mod.MUnOp,
+    operand: mir_rvalue_mod.Operand,
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    let r = operand_range(operand, cur, defined, declared, pinned, it_interner)
+    return match op {
+        case .neg => {
+            if !r.known {
+                range_mod.top()
+            } else {
+                range_mod.interval((0 as i128) -| r.hi, (0 as i128) -| r.lo)
+            }
+        }
+        case _ => range_mod.top()
+    }
+}
+
+function cast_range(
+    operand: mir_rvalue_mod.Operand,
+    to: ty_mod.TyId,
+    kind: mir_rvalue_mod.CastKind,
+    cur: range_mod.RangeTable,
+    defined: Vec_bool.Vec,
+    declared: range_mod.RangeTable,
+    pinned: Vec_bool.Vec,
+    it_interner: ty_interner_mod.Interner,
+) -> range_mod.IntRange {
+    let base = range_mod.range_of_ty(to, it_interner)
+    return match kind {
+        case .int_to_int(let mode) => {
+            if arith_mode_ok(mode) {
+                range_mod.meet(base, operand_range(operand, cur, defined, declared, pinned, it_interner))
+            } else {
+                base
+            }
+        }
+        case .bool_to_int => range_mod.meet(base, bool_range())
+        case _ => base
+    }
+}
+
+function imin(a: i128, b: i128) -> i128 {
+    return if a <= b { a } else { b }
+}
+
+function imax(a: i128, b: i128) -> i128 {
+    return if a >= b { a } else { b }
+}

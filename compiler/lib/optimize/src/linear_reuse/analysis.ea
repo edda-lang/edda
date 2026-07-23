@@ -1,0 +1,77 @@
+module optimize.linear_reuse.analysis
+
+import std.mem.alloc
+import std.collections.vec
+import mir.body.model as mir_body_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+import mir.id.block as mir_block_mod
+
+import local.linear_reuse.dataflow.cfg.consumption as consumption_mod
+import local.linear_reuse.dataflow.live.liveness as liveness_mod
+
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+
+public type Analysis {
+    consumption: consumption_mod.ConsumptionInfo
+    liveness: liveness_mod.Liveness
+}
+
+public function analyze(out: init Analysis, body: mir_body_mod.MirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ci: consumption_mod.ConsumptionInfo
+    consumption_mod.classify(init ci, body, allocator)?
+    uninit lv: liveness_mod.Liveness
+    liveness_mod.compute(init lv, body, allocator)?
+    out = Analysis { consumption: ci, liveness: lv }
+}
+
+public function reuse_eligible(a: Analysis, id: mir_local_mod.LocalId) -> bool {
+    if mir_local_mod.is_error(id) { return false }
+    let d = consumption_mod.info_discipline(a.consumption, id)
+    return consumption_mod.reuse_eligible_discipline(d)
+}
+
+public function bare_local_of(place: mir_place_mod.Place) -> bool {
+    return mir_place_mod.proj_len(place) == 0
+}
+
+public function operand_move_eligible(a: Analysis, body: mir_body_mod.MirBody, place: mir_place_mod.Place, b: mir_block_mod.BlockId, index: usize) -> bool {
+    if !bare_local_of(place) { return false }
+    let id = place.local
+    if !reuse_eligible(a, id) { return false }
+    return liveness_mod.is_last_use(a.liveness, body, id, b, index)
+}
+
+public function drop_elidable(a: Analysis, body: mir_body_mod.MirBody, place: mir_place_mod.Place, b: mir_block_mod.BlockId) -> bool {
+    if !bare_local_of(place) { return false }
+    let id = place.local
+    if !reuse_eligible(a, id) { return false }
+    if !already_consumed_once(a, id) { return false }
+    return liveness_mod.dead_after_terminator(a.liveness, body, id, b)
+}
+
+public function affine_early_drop_eligible(a: Analysis, body: mir_body_mod.MirBody, id: mir_local_mod.LocalId, b: mir_block_mod.BlockId, index: usize) -> bool {
+    if mir_local_mod.is_error(id) { return false }
+    let d = consumption_mod.info_discipline(a.consumption, id)
+    if !is_affine(d) { return false }
+    return liveness_mod.dead_after(a.liveness, body, id, b, index)
+}
+
+public function inplace_reuse_eligible(a: Analysis, body: mir_body_mod.MirBody, src: mir_place_mod.Place, b: mir_block_mod.BlockId, index: usize) -> bool {
+    return operand_move_eligible(a, body, src, b, index)
+}
+
+public function already_consumed_once(a: Analysis, id: mir_local_mod.LocalId) -> bool {
+    return consumption_mod.info_has_unique_consume(a.consumption, id)
+}
+
+function is_affine(d: consumption_mod.Discipline) -> bool {
+    return match d {
+        case .affine_disc => true
+        case .linear_disc => false
+        case .move_disc => false
+        case .copy_disc => false
+    }
+}

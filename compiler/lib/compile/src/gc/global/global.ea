@@ -1,0 +1,286 @@
+
+module compile.gc.global.global
+
+import std.collections.vec
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import cache.tier.global as global_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(BlobEntry)
+
+
+public type BlobEntry {
+    path: String
+    size: u64
+    mtime: u64
+}
+
+public type SweepReport {
+    evicted_count: usize
+    evicted_bytes: u64
+    reaped_tmp_count: usize
+}
+
+
+public function default_max_bytes() -> u64 {
+    return 5368709120 as u64
+}
+
+public function default_tmp_grace_secs() -> u64 {
+    return 1800 as u64
+}
+
+
+public function sweep(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    g: global_mod.GlobalCache,
+    now_unix: u64,
+    max_bytes: u64,
+    tmp_grace_secs: u64,
+    allocator: Allocator,
+) -> SweepReport
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit roots: Vec_String.Vec
+    Vec_String.new(init roots, allocator)?
+    let codegen_root = codegen_root_of(g, allocator)?
+    Vec_String.push(mutable roots, take codegen_root, allocator)?
+    let specs_root = specs_root_of(g, allocator)?
+    Vec_String.push(mutable roots, take specs_root, allocator)?
+    let gr = global_mod.root(g, allocator)?
+    let objects_root = string.concat(gr, "/objects", allocator)?
+    Vec_String.push(mutable roots, take objects_root, allocator)?
+    return sweep_roots(rfs, wfs, roots, now_unix, max_bytes, tmp_grace_secs, allocator)?
+}
+
+
+public function sweep_roots(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    roots: Vec_String.Vec,
+    now_unix: u64,
+    max_bytes: u64,
+    tmp_grace_secs: u64,
+    allocator: Allocator,
+) -> SweepReport
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit blobs: Vec_BlobEntry.Vec
+    Vec_BlobEntry.new(init blobs, allocator)?
+    var reaped: usize = 0 as usize
+    let n = Vec_String.len(roots)
+    for i in 0..<n {
+        let root = Vec_String.at(roots, i)
+        if fs.path_exists(rfs, root) {
+            reaped = reaped + scan_root(rfs, wfs, root, now_unix, tmp_grace_secs, mutable blobs, allocator)?
+        }
+    }
+    let evicted = evict_over_cap(rfs, wfs, mutable blobs, max_bytes, allocator)?
+    return SweepReport {
+        evicted_count: evicted.count,
+        evicted_bytes: evicted.bytes,
+        reaped_tmp_count: reaped,
+    }
+}
+
+
+function codegen_root_of(g: global_mod.GlobalCache, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = global_mod.root(g, allocator)?
+    return string.concat(root, "/codegen", allocator)?
+}
+
+
+function specs_root_of(g: global_mod.GlobalCache, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = global_mod.root(g, allocator)?
+    return string.concat(root, "/specs", allocator)?
+}
+
+
+function join_path(base: String, seg: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let with_sep = string.concat(base, "/", allocator)?
+    return string.concat(with_sep, seg, allocator)?
+}
+
+
+function scan_root(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    codegen_root: String,
+    now_unix: u64,
+    tmp_grace_secs: u64,
+    blobs: mutable Vec_BlobEntry.Vec,
+    allocator: Allocator,
+) -> usize
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let shards = fs.read_dir(rfs, codegen_root, allocator)?
+    let n = shards.len()
+    var reaped: usize = 0 as usize
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n { break }
+        let shard = shards[i]
+        let shard_path = join_path(codegen_root, shard, allocator)?
+        let shard_reaped = handle err: fs.FsError as e -> match e {
+            case .not_a_directory(_) => 0 as usize
+            case _ => raise e
+        } {
+            scan_shard(rfs, wfs, shard_path, now_unix, tmp_grace_secs, mutable blobs, allocator)?
+        }
+        reaped = reaped + shard_reaped
+        i = i + 1 as usize
+    }
+    return reaped
+}
+
+
+function scan_shard(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    shard_path: String,
+    now_unix: u64,
+    tmp_grace_secs: u64,
+    blobs: mutable Vec_BlobEntry.Vec,
+    allocator: Allocator,
+) -> usize
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let entries = fs.read_dir(rfs, shard_path, allocator)?
+    let n = entries.len()
+    var reaped: usize = 0 as usize
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n { break }
+        let entry = entries[i]
+        let full = join_path(shard_path, entry, allocator)?
+        if string.contains(entry, ".tmp.") {
+            if reap_if_stale(rfs, wfs, full, now_unix, tmp_grace_secs, allocator)? {
+                reaped = reaped + 1 as usize
+            }
+        } else {
+            record_blob(rfs, full, mutable blobs, allocator)?
+        }
+        i = i + 1 as usize
+    }
+    return reaped
+}
+
+
+function reap_if_stale(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    path: String,
+    now_unix: u64,
+    grace_secs: u64,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    return handle err: fs.FsError as _e -> false {
+        let mtime = fs.modified_unix(rfs, path)?
+        let age = if now_unix > mtime { now_unix - mtime } else { 0 as u64 }
+        if age > grace_secs {
+            fs.remove(wfs, path)?
+            true
+        } else {
+            false
+        }
+    }
+}
+
+
+function record_blob(
+    rfs: ReadOnlyFilesystem,
+    path: String,
+    blobs: mutable Vec_BlobEntry.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    handle err: fs.FsError as _e -> () {
+        let size = fs.file_size(rfs, path)?
+        let mtime = fs.modified_unix(rfs, path)?
+        let owned_path = string.clone(path, allocator)?
+        Vec_BlobEntry.push(mutable blobs, BlobEntry { path: take owned_path, size: size, mtime: mtime }, allocator)?
+    }
+}
+
+
+public type EvictionTally {
+    count: usize
+    bytes: u64
+}
+
+
+function total_bytes(blobs: Vec_BlobEntry.Vec) -> u64 {
+    var sum: u64 = 0 as u64
+    let n = Vec_BlobEntry.len(blobs)
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n { break }
+        let e = Vec_BlobEntry.at_ref(blobs, i)
+        sum = sum +% e.size
+        i = i + 1 as usize
+    }
+    return sum
+}
+
+
+function oldest_index(blobs: Vec_BlobEntry.Vec) -> usize
+    requires Vec_BlobEntry.len(blobs) > 0 as usize
+{
+    let n = Vec_BlobEntry.len(blobs)
+    var best: usize = 0 as usize
+    var best_mtime: u64 = Vec_BlobEntry.at_ref(blobs, 0 as usize).mtime
+    var i: usize = 1
+    loop decreases (n - i + 1) as usize {
+        if i >= n { break }
+        let e = Vec_BlobEntry.at_ref(blobs, i)
+        if e.mtime < best_mtime {
+            best_mtime = e.mtime
+            best = i
+        }
+        i = i + 1 as usize
+    }
+    return best
+}
+
+
+function evict_over_cap(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    blobs: mutable Vec_BlobEntry.Vec,
+    max_bytes: u64,
+    allocator: Allocator,
+) -> EvictionTally
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    var total: u64 = total_bytes(blobs)
+    var count: usize = 0 as usize
+    var evicted_bytes: u64 = 0 as u64
+    var remaining: usize = Vec_BlobEntry.len(blobs)
+    loop decreases (remaining + 1) as usize {
+        if total <= max_bytes { break }
+        if remaining == 0 as usize { break }
+        let oldest_i = oldest_index(blobs)
+        let victim = Vec_BlobEntry.remove(mutable blobs, oldest_i)
+        handle err: fs.FsError as _e -> () {
+            fs.remove(wfs, victim.path)?
+        }
+        total = if total > victim.size { total - victim.size } else { 0 as u64 }
+        evicted_bytes = evicted_bytes +% victim.size
+        count = count + 1 as usize
+        remaining = remaining - 1 as usize
+    }
+    return EvictionTally { count: count, bytes: evicted_bytes }
+}

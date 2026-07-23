@@ -1,0 +1,116 @@
+
+module compile.check.runes.resolve.cache.cache
+
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import cache.addr.hash as chash_mod
+import manifest.model.dependency.dependency as dep_mod
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(RuneResolution)
+
+
+public type RuneResolution {
+    case cached(archive_path: String)
+    case uncached(archive_path: String)
+}
+
+
+public function rune_cache_root(project_root: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(project_root, "/.edda", allocator)?
+    let p2 = string.concat(p1, "/cache", allocator)?
+    return string.concat(p2, "/runes", allocator)?
+}
+
+
+public function source_descriptor(dep_name: String, source: dep_mod.DependencySource, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match source {
+        case .path(_) => Option_String.none
+        case .registry => {
+            let d = string.concat("registry+", dep_name, allocator)?
+            Option_String.some(value: d)
+        }
+        case .git(let url) => {
+            let d = string.concat("git+", url, allocator)?
+            Option_String.some(value: d)
+        }
+    }
+}
+
+
+public function archive_path_of(project_root: String, dep_name: String, descriptor: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = rune_cache_root(project_root, allocator)?
+    let with_sep = string.concat(root, "/", allocator)?
+    let with_name = string.concat(with_sep, dep_name, allocator)?
+    let name_sep = string.concat(with_name, "/", allocator)?
+    let key = key_of(descriptor, allocator)?
+    let with_key = string.concat(name_sep, key, allocator)?
+    return string.concat(with_key, ".rune", allocator)?
+}
+
+
+public function checkout_dir_of(project_root: String, dep_name: String, descriptor: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = rune_cache_root(project_root, allocator)?
+    let with_sep = string.concat(root, "/", allocator)?
+    let with_name = string.concat(with_sep, dep_name, allocator)?
+    let name_sep = string.concat(with_name, "/", allocator)?
+    let key = key_of(descriptor, allocator)?
+    let with_key = string.concat(name_sep, key, allocator)?
+    return string.concat(with_key, ".git", allocator)?
+}
+
+
+public function resolve_rune_archive(
+    rfs: ReadOnlyFilesystem,
+    project_root: String,
+    dep_name: String,
+    source: dep_mod.DependencySource,
+    allocator: Allocator,
+) -> Option_RuneResolution.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let descriptor_opt = source_descriptor(dep_name, source, allocator)?
+    let descriptor = match descriptor_opt {
+        case .none => return Option_RuneResolution.none
+        case .some(let d) => d
+    }
+    let archive_path = archive_path_of(project_root, dep_name, descriptor, allocator)?
+    if fs.path_exists(rfs, archive_path) {
+        return Option_RuneResolution.some(value: RuneResolution.cached(archive_path: archive_path))
+    }
+    return Option_RuneResolution.some(value: RuneResolution.uncached(archive_path: archive_path))
+}
+
+
+public function resolution_path(r: RuneResolution) -> String {
+    return match r {
+        case .cached(let p) => p
+        case .uncached(let p) => p
+    }
+}
+
+
+public function is_cached(r: RuneResolution) -> bool {
+    return match r {
+        case .cached(_) => true
+        case .uncached(_) => false
+    }
+}
+
+
+function key_of(descriptor: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let h = chash_mod.hash_bytes(descriptor.bytes(), allocator)?
+    return chash_mod.to_hex_string(h, allocator)?
+}

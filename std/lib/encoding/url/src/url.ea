@@ -1,0 +1,266 @@
+
+module std.encoding.url
+
+
+public type ParsedUrl {
+    has_scheme: bool
+    scheme_start: usize
+    scheme_end: usize
+
+    has_authority: bool
+
+    has_userinfo: bool
+    userinfo_start: usize
+    userinfo_end: usize
+
+    host_start: usize
+    host_end: usize
+
+    has_port: bool
+    port: u32
+
+    path_start: usize
+    path_end: usize
+
+    has_query: bool
+    query_start: usize
+    query_end: usize
+
+    has_fragment: bool
+    fragment_start: usize
+    fragment_end: usize
+}
+
+public type ParseUrlError {
+    case empty_input
+    case port_not_a_number
+    case port_overflow
+}
+
+
+public stable function parse(input: [u8]) -> ParsedUrl
+    with {err: ParseUrlError}
+{
+    let n: usize = input.len()
+    if n == 0 {
+        raise ParseUrlError.empty_input
+    }
+
+    var has_scheme: bool = false
+    let scheme_start: usize = 0
+    var scheme_end: usize = 0
+    var pos: usize = 0
+
+    let scheme_colon: usize = _find_scheme_colon(input)
+    if scheme_colon < n {
+        has_scheme = true
+        scheme_end = scheme_colon
+        pos = scheme_colon + 1
+    }
+
+    var has_authority: bool = false
+    var has_userinfo: bool = false
+    var userinfo_start: usize = 0
+    var userinfo_end: usize = 0
+    var host_start: usize = pos
+    var host_end: usize = pos
+    var has_port: bool = false
+    var port_value: u32 = 0
+
+    if pos + 1 < n && input[pos] == 47 && input[pos + 1] == 47 {
+        has_authority = true
+        pos += 2
+        let auth_start: usize = pos
+        let auth_end: usize = _find_authority_end(input, pos)
+
+        let at_pos: usize = _find_last_at(input, auth_start, auth_end)
+        var host_scan_start: usize = auth_start
+        if at_pos < auth_end {
+            has_userinfo = true
+            userinfo_start = auth_start
+            userinfo_end = at_pos
+            host_scan_start = at_pos + 1
+        }
+
+        let colon_pos: usize = _find_byte_in_range(input, host_scan_start, auth_end, 58)
+        if colon_pos < auth_end {
+            host_start = host_scan_start
+            host_end = colon_pos
+            has_port = true
+            port_value = _parse_port(input, colon_pos + 1, auth_end)?
+        } else {
+            host_start = host_scan_start
+            host_end = auth_end
+        }
+        pos = auth_end
+    }
+
+    let path_start: usize = pos
+    let path_end: usize = _find_byte_in_range_or_end(input, pos, n, 63, 35)
+    pos = path_end
+
+    var has_query: bool = false
+    var query_start: usize = pos
+    var query_end: usize = pos
+    if pos < n && input[pos] == 63 {
+        has_query = true
+        pos += 1
+        query_start = pos
+        query_end = _find_byte_in_range_or_end_single(input, pos, n, 35)
+        pos = query_end
+    }
+
+    var has_fragment: bool = false
+    var fragment_start: usize = pos
+    var fragment_end: usize = pos
+    if pos < n && input[pos] == 35 {
+        has_fragment = true
+        pos += 1
+        fragment_start = pos
+        fragment_end = n
+    }
+
+    return ParsedUrl {
+        has_scheme: has_scheme,
+        scheme_start: scheme_start,
+        scheme_end: scheme_end,
+        has_authority: has_authority,
+        has_userinfo: has_userinfo,
+        userinfo_start: userinfo_start,
+        userinfo_end: userinfo_end,
+        host_start: host_start,
+        host_end: host_end,
+        has_port: has_port,
+        port: port_value,
+        path_start: path_start,
+        path_end: path_end,
+        has_query: has_query,
+        query_start: query_start,
+        query_end: query_end,
+        has_fragment: has_fragment,
+        fragment_start: fragment_start,
+        fragment_end: fragment_end,
+    }
+}
+
+
+stable function _find_scheme_colon(input: [u8]) -> usize {
+    let n: usize = input.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { return n }
+        let byte: u8 = input[i]
+        if byte == 58 { return i }
+        if byte == 47 || byte == 63 || byte == 35 { return n }
+        i += 1
+    }
+}
+
+stable function _find_authority_end(input: [u8], start: usize) -> usize {
+    let n: usize = input.len()
+    var i: usize = start
+    loop
+        decreases n - i
+    {
+        if i >= n { return n }
+        let byte: u8 = input[i]
+        if byte == 47 || byte == 63 || byte == 35 {
+            return i
+        }
+        i += 1
+    }
+}
+
+stable function _find_last_at(input: [u8], start: usize, end: usize) -> usize {
+    var i: usize = end
+    loop
+        decreases i + 1 - start
+    {
+        if i == start { return end }
+        i -= 1
+        if input[i] == 64 { return i }
+    }
+}
+
+stable function _find_byte_in_range(
+    input: [u8],
+    start: usize,
+    end: usize,
+    target: u8,
+) -> usize {
+    var i: usize = start
+    loop
+        decreases end - i
+    {
+        if i >= end { return end }
+        if input[i] == target { return i }
+        i += 1
+    }
+}
+
+stable function _find_byte_in_range_or_end(
+    input: [u8],
+    start: usize,
+    end: usize,
+    target1: u8,
+    target2: u8,
+) -> usize {
+    var i: usize = start
+    loop
+        decreases end - i
+    {
+        if i >= end { return end }
+        let byte: u8 = input[i]
+        if byte == target1 || byte == target2 { return i }
+        i += 1
+    }
+}
+
+stable function _find_byte_in_range_or_end_single(
+    input: [u8],
+    start: usize,
+    end: usize,
+    target: u8,
+) -> usize {
+    var i: usize = start
+    loop
+        decreases end - i
+    {
+        if i >= end { return end }
+        if input[i] == target { return i }
+        i += 1
+    }
+}
+
+stable function _parse_port(
+    input: [u8],
+    start: usize,
+    end: usize,
+) -> u32
+    with {err: ParseUrlError}
+{
+    if start >= end {
+        raise ParseUrlError.port_not_a_number
+    }
+    var value: u32 = 0
+    var i: usize = start
+    loop
+        decreases end - i
+    {
+        if i >= end { break }
+        let byte: u8 = input[i]
+        if byte < 48 || byte > 57 {
+            raise ParseUrlError.port_not_a_number
+        }
+        let digit: u32 = (byte - 48) as u32
+        let next: u32 = value * 10 + digit
+        if next > 65535 {
+            raise ParseUrlError.port_overflow
+        }
+        value = next
+        i += 1
+    }
+    return value
+}

@@ -1,0 +1,217 @@
+
+module compile.phase.emit.wasm.mv3
+
+import std.mem.alloc
+import std.collections.vec
+import std.os.fs
+import std.text.string
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function emit_mv3(wfs: Filesystem, outdir: String, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    write_manifest(wfs, string.concat(outdir, "/manifest.json", allocator)?, allocator)?
+    write_context_loader(wfs, string.concat(outdir, "/content.js", allocator)?, "content_main", allocator)?
+    write_context_loader(wfs, string.concat(outdir, "/background.js", allocator)?, "background_main", allocator)?
+    write_context_loader(wfs, string.concat(outdir, "/popup.js", allocator)?, "popup_main", allocator)?
+    write_popup_html(wfs, string.concat(outdir, "/popup.html", allocator)?, allocator)?
+}
+
+
+function push_line(buf: mutable Vec_u8.Vec, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u8.push(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+    Vec_u8.push(mutable buf, 0x0A, allocator)?
+}
+
+
+function finish(wfs: Filesystem, path: String, buf: take Vec_u8.Vec, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let arr = Vec_u8.into_array(take buf, allocator)?
+    fs.write_bytes(wfs, path, arr)?
+}
+
+
+function write_manifest(wfs: Filesystem, path: String, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    push_line(mutable buf, "{", allocator)?
+    push_line(mutable buf, "  \"manifest_version\": 3,", allocator)?
+    push_line(mutable buf, "  \"name\": \"Edda Extension\",", allocator)?
+    push_line(mutable buf, "  \"version\": \"0.1.0\",", allocator)?
+    push_line(mutable buf, "  \"content_scripts\": [", allocator)?
+    push_line(mutable buf, "    { \"matches\": [\"<all_urls>\"], \"js\": [\"content.js\"], \"run_at\": \"document_idle\" }", allocator)?
+    push_line(mutable buf, "  ],", allocator)?
+    push_line(mutable buf, "  \"background\": { \"service_worker\": \"background.js\" },", allocator)?
+    push_line(mutable buf, "  \"action\": { \"default_popup\": \"popup.html\" },", allocator)?
+    push_line(mutable buf, "  \"web_accessible_resources\": [", allocator)?
+    push_line(mutable buf, "    { \"resources\": [\"program.wasm\"], \"matches\": [\"<all_urls>\"] }", allocator)?
+    push_line(mutable buf, "  ],", allocator)?
+    push_line(mutable buf, "  \"host_permissions\": [\"<all_urls>\"]", allocator)?
+    push_line(mutable buf, "}", allocator)?
+    finish(wfs, path, take buf, allocator)?
+}
+
+
+function write_context_loader(wfs: Filesystem, path: String, entry: String, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    push_line(mutable buf, "(function () {", allocator)?
+    push_host_glue(mutable buf, allocator)?
+    push_line(mutable buf, "  const url = (typeof chrome !== 'undefined' && chrome.runtime) ? chrome.runtime.getURL('program.wasm') : 'program.wasm';", allocator)?
+    push_line(mutable buf, "  fetch(url)", allocator)?
+    push_line(mutable buf, "    .then(function (r) { return r.arrayBuffer(); })", allocator)?
+    push_line(mutable buf, "    .then(function (b) { return WebAssembly.instantiate(b, imports); })", allocator)?
+    push_line(mutable buf, "    .then(function (res) {", allocator)?
+    push_line(mutable buf, "      ex = res.instance.exports;", allocator)?
+    push_line(mutable buf, "      mem = ex.memory;", allocator)?
+    push_entry_call(mutable buf, entry, allocator)?
+    push_line(mutable buf, "    })", allocator)?
+    push_line(mutable buf, "    .catch(function (e) { console.error('edda extension load failed', e); });", allocator)?
+    push_line(mutable buf, "})();", allocator)?
+    finish(wfs, path, take buf, allocator)?
+}
+
+
+public function push_host_glue(buf: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_host_runtime(mutable buf, allocator)?
+    push_host_dispatch(mutable buf, allocator)?
+}
+
+
+function push_host_runtime(buf: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_line(mutable buf, "  let mem = null;", allocator)?
+    push_line(mutable buf, "  let ex = null;", allocator)?
+    push_line(mutable buf, "  let nextToken = 1;", allocator)?
+    push_line(mutable buf, "  let nextCb = 1;", allocator)?
+    push_line(mutable buf, "  const pendingResponses = {};", allocator)?
+    push_line(mutable buf, "  function readStr(sv) {", allocator)?
+    push_line(mutable buf, "    const v = BigInt(sv);", allocator)?
+    push_line(mutable buf, "    const ptr = Number(v & 0xFFFFFFFFn);", allocator)?
+    push_line(mutable buf, "    const len = Number((v >> 32n) & 0xFFFFFFFFn);", allocator)?
+    push_line(mutable buf, "    if (!mem || len === 0) { return ''; }", allocator)?
+    push_line(mutable buf, "    return new TextDecoder('utf-8').decode(new Uint8Array(mem.buffer, ptr, len));", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function writeStr(sv) { console.log(readStr(sv)); }", allocator)?
+    push_line(mutable buf, "  function toBytes(v) {", allocator)?
+    push_line(mutable buf, "    if (v === null || v === undefined) { return null; }", allocator)?
+    push_line(mutable buf, "    const s = (typeof v === 'string') ? v : JSON.stringify(v);", allocator)?
+    push_line(mutable buf, "    return new TextEncoder().encode(s);", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function intoGuest(bytes) {", allocator)?
+    push_line(mutable buf, "    if (!bytes || bytes.length === 0 || !ex || typeof ex.__edda_alloc !== 'function') { return [0, 0]; }", allocator)?
+    push_line(mutable buf, "    const len = bytes.length >>> 0;", allocator)?
+    push_line(mutable buf, "    const ptr = ex.__edda_alloc(len) >>> 0;", allocator)?
+    push_line(mutable buf, "    new Uint8Array(mem.buffer, ptr, len).set(bytes);", allocator)?
+    push_line(mutable buf, "    return [ptr, len];", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function wake(token, status, value) {", allocator)?
+    push_line(mutable buf, "    const pl = intoGuest(toBytes(value));", allocator)?
+    push_line(mutable buf, "    if (ex && typeof ex.__edda_wake === 'function') { ex.__edda_wake(token >>> 0, status >>> 0, pl[0], pl[1]); }", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function settle(token, promise) {", allocator)?
+    push_line(mutable buf, "    Promise.resolve(promise).then(function (r) { wake(token, 0, r); }, function (e) { wake(token, 1, String((e && e.message) || e)); });", allocator)?
+    push_line(mutable buf, "    return token >>> 0;", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function dispatchEvent(cbId, value) {", allocator)?
+    push_line(mutable buf, "    const pl = intoGuest(toBytes(value));", allocator)?
+    push_line(mutable buf, "    if (ex && typeof ex.__edda_dispatch_event === 'function') { ex.__edda_dispatch_event(cbId >>> 0, pl[0], pl[1]); }", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function newToken() { const t = nextToken >>> 0; nextToken = (nextToken + 1) >>> 0; return t; }", allocator)?
+    push_line(mutable buf, "  function newCb() { const c = nextCb >>> 0; nextCb = (nextCb + 1) >>> 0; return c; }", allocator)?
+    push_line(mutable buf, "  function parse(sv) { const s = readStr(sv); if (s === '') { return undefined; } try { return JSON.parse(s); } catch (e) { return s; } }", allocator)?
+}
+
+
+function push_host_dispatch(buf: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_line(mutable buf, "  function webextDispatch(sym, a0, a1) {", allocator)?
+    push_line(mutable buf, "    const op = (sym.indexOf('__edda_webext_') === 0) ? sym.slice(14) : sym;", allocator)?
+    push_line(mutable buf, "    if (typeof chrome === 'undefined') { console.warn('edda: chrome.* unavailable for', sym); return 0; }", allocator)?
+    push_line(mutable buf, "    switch (op) {", allocator)?
+    push_line(mutable buf, "      case 'storage_get': return settle(newToken(), chrome.storage.local.get(readStr(a0)));", allocator)?
+    push_line(mutable buf, "      case 'storage_set': return settle(newToken(), chrome.storage.local.set(parse(a0)));", allocator)?
+    push_line(mutable buf, "      case 'runtime_send_message': return settle(newToken(), chrome.runtime.sendMessage(parse(a0)));", allocator)?
+    push_line(mutable buf, "      case 'runtime_send_response': { const cbId = Number(a0) >>> 0; const fn = pendingResponses[cbId]; if (fn) { fn(parse(a1)); delete pendingResponses[cbId]; } return 0; }", allocator)?
+    push_line(mutable buf, "      case 'runtime_on_message': { const cbId = newCb(); chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) { pendingResponses[cbId] = sendResponse; dispatchEvent(cbId, msg); return true; }); return cbId; }", allocator)?
+    push_line(mutable buf, "      case 'tabs_query': return settle(newToken(), chrome.tabs.query(parse(a0)));", allocator)?
+    push_line(mutable buf, "      default: console.warn('edda: unbound webext import', sym); return 0;", allocator)?
+    push_line(mutable buf, "    }", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function domDispatch(sym, a0, a1) {", allocator)?
+    push_line(mutable buf, "    const op = (sym.indexOf('__edda_dom_') === 0) ? sym.slice(11) : sym;", allocator)?
+    push_line(mutable buf, "    switch (op) {", allocator)?
+    push_line(mutable buf, "      case 'fetch': return settle(newToken(), fetch(readStr(a0)).then(function (r) { return r.text(); }));", allocator)?
+    push_line(mutable buf, "      case 'add_event_listener': { if (typeof document === 'undefined') { return 0; } const cbId = newCb(); const el = document.querySelector(readStr(a0)); const evt = readStr(a1); if (el) { el.addEventListener(evt, function (e) { dispatchEvent(cbId, { type: e.type }); }); } return cbId; }", allocator)?
+    push_line(mutable buf, "      default: console.warn('edda: unbound dom import', sym); return 0;", allocator)?
+    push_line(mutable buf, "    }", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function envDispatch(sym, a0) {", allocator)?
+    push_line(mutable buf, "    if (sym.indexOf('write_line') >= 0 || sym.indexOf('stdout') >= 0 || sym.indexOf('stderr') >= 0) { writeStr(a0); return 0; }", allocator)?
+    push_line(mutable buf, "    console.warn('edda: unbound host import', 'env', sym); return 0;", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  function makeNS(dispatch) {", allocator)?
+    push_line(mutable buf, "    return new Proxy({}, { get: function (_t, prop) { const sym = String(prop); return function (a0, a1, a2, a3) { return dispatch(sym, a0, a1, a2, a3); }; } });", allocator)?
+    push_line(mutable buf, "  }", allocator)?
+    push_line(mutable buf, "  const imports = { env: makeNS(envDispatch), dom: makeNS(domDispatch), webext: makeNS(webextDispatch) };", allocator)?
+}
+
+
+function push_entry_call(buf: mutable Vec_u8.Vec, entry: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_str(mutable buf, "      if (typeof ex.", allocator)?
+    push_str(mutable buf, entry, allocator)?
+    push_str(mutable buf, " === 'function') { try { ex.", allocator)?
+    push_str(mutable buf, entry, allocator)?
+    push_line(mutable buf, "(); } catch (e) { console.error('edda entry trapped', e); } }", allocator)?
+}
+
+
+function push_str(buf: mutable Vec_u8.Vec, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u8.push(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+}
+
+
+function write_popup_html(wfs: Filesystem, path: String, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    push_line(mutable buf, "<!doctype html>", allocator)?
+    push_line(mutable buf, "<html>", allocator)?
+    push_line(mutable buf, "  <head><meta charset='utf-8'><title>Edda</title></head>", allocator)?
+    push_line(mutable buf, "  <body><script src='popup.js'></script></body>", allocator)?
+    push_line(mutable buf, "</html>", allocator)?
+    finish(wfs, path, take buf, allocator)?
+}

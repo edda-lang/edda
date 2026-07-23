@@ -1,0 +1,184 @@
+
+module regex.syntax.parser.escape
+
+import regex.syntax.grammar.ast
+import regex.syntax.grammar.charset
+import regex.syntax.grammar.mode
+import regex.syntax.errors
+import regex.syntax.parser.util
+
+
+public function make_literal(
+    cp: u32,
+    flags: mode.Flags,
+    allocator: Allocator,
+) -> ast.RegexAst
+    with {allocator, err: errors.CompileError}
+{
+    if !flags.case_insensitive { return ast.ast_literal(cp) }
+    let is_upper = cp >= (0x41 as u32) && cp <= (0x5A as u32)
+    let is_lower = cp >= (0x61 as u32) && cp <= (0x7A as u32)
+    if !is_upper && !is_lower { return ast.ast_literal(cp) }
+    let other = cp ^ (0x20 as u32)
+    let slots = util.alloc_range_slots(allocator, 2 as usize)?
+    let lo_cp = if cp < other { cp } else { other }
+    let hi_cp = if cp < other { other } else { cp }
+    slots[0 as usize] = charset.char_range(lo_cp, lo_cp)
+    slots[1 as usize] = charset.char_range(hi_cp, hi_cp)
+    return ast.ast_class(charset.charset_from_ranges(slots, false))
+}
+
+
+public function builtin_digit_class(negated: bool, allocator: Allocator) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    let slots = util.alloc_range_slots(allocator, 1 as usize)?
+    slots[0] = charset.char_range(48 as u32, 57 as u32)
+    return charset.charset_from_ranges(slots, negated)
+}
+
+public function builtin_word_class(negated: bool, allocator: Allocator) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    let slots = util.alloc_range_slots(allocator, 4 as usize)?
+    slots[0] = charset.char_range(48 as u32, 57 as u32)
+    slots[1] = charset.char_range(65 as u32, 90 as u32)
+    slots[2] = charset.char_range(95 as u32, 95 as u32)
+    slots[3] = charset.char_range(97 as u32, 122 as u32)
+    return charset.charset_from_ranges(slots, negated)
+}
+
+public function builtin_space_class(negated: bool, allocator: Allocator) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    let slots = util.alloc_range_slots(allocator, 2 as usize)?
+    slots[0] = charset.char_range(9 as u32, 13 as u32)
+    slots[1] = charset.char_range(32 as u32, 32 as u32)
+    return charset.charset_from_ranges(slots, negated)
+}
+
+public function builtin_hws_class(negated: bool, allocator: Allocator) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    let slots = util.alloc_range_slots(allocator, 2 as usize)?
+    slots[0] = charset.char_range(9 as u32, 9 as u32)
+    slots[1] = charset.char_range(32 as u32, 32 as u32)
+    return charset.charset_from_ranges(slots, negated)
+}
+
+public function builtin_vws_class(negated: bool, allocator: Allocator) -> charset.CharSet
+    with {allocator, err: errors.CompileError}
+{
+    let slots = util.alloc_range_slots(allocator, 1 as usize)?
+    slots[0] = charset.char_range(10 as u32, 13 as u32)
+    return charset.charset_from_ranges(slots, negated)
+}
+
+
+public function parse_hex_escape(
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    var i: usize = pos + 2 as usize
+    if i < n && src[i] == 123 as u8 {
+        i = i + 1 as usize
+        var cp: u32 = 0 as u32
+        var count: u32 = 0 as u32
+        loop decreases n - i + 1 as usize {
+            if i >= n { raise errors.CompileError.bad_hex_escape(at: pos) }
+            let c = src[i]
+            if c == 125 as u8 { break }
+            if !util.is_hex_digit(c) { raise errors.CompileError.bad_hex_escape(at: pos) }
+            if count >= 6 as u32 { raise errors.CompileError.bad_hex_escape(at: pos) }
+            cp = (cp << (4 as u32)) | util.hex_value(c)
+            count = count + 1 as u32
+            i = i + 1 as usize
+        }
+        if count == 0 as u32 { raise errors.CompileError.bad_hex_escape(at: pos) }
+        return (make_literal(cp, flags, allocator)?, i + 1 as usize)
+    }
+    if i + 2 as usize > n {
+        raise errors.CompileError.bad_hex_escape(at: pos)
+    }
+    if !util.is_hex_digit(src[i]) || !util.is_hex_digit(src[i + 1 as usize]) {
+        raise errors.CompileError.bad_hex_escape(at: pos)
+    }
+    let cp = (util.hex_value(src[i]) << (4 as u32)) | util.hex_value(src[i + 1 as usize])
+    return (make_literal(cp, flags, allocator)?, i + 2 as usize)
+}
+
+public function parse_u_escape(
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    let i = pos + 2 as usize
+    if i + 4 as usize > n {
+        raise errors.CompileError.bad_hex_escape(at: pos)
+    }
+    var cp: u32 = 0 as u32
+    var k: usize = 0 as usize
+    loop decreases 4 as usize - k + 1 as usize {
+        if k >= 4 as usize { break }
+        let c = src[i + k]
+        if !util.is_hex_digit(c) {
+            raise errors.CompileError.bad_hex_escape(at: pos)
+        }
+        cp = (cp << (4 as u32)) | util.hex_value(c)
+        k = k + 1 as usize
+    }
+    return (make_literal(cp, flags, allocator)?, i + 4 as usize)
+}
+
+
+public function parse_escape(
+    src: [u8],
+    pos: usize,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> (ast.RegexAst, usize)
+    with {allocator, err: errors.CompileError}
+{
+    let n = src.len()
+    if pos + 1 as usize >= n {
+        raise errors.CompileError.bad_escape(at: pos)
+    }
+    let c = src[pos + 1 as usize]
+    if c == 110 as u8 { return (make_literal(10 as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 116 as u8 { return (make_literal(9 as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 114 as u8 { return (make_literal(13 as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 102 as u8 { return (make_literal(12 as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 97 as u8  { return (make_literal(7  as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 101 as u8 { return (make_literal(27 as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 48 as u8  { return (make_literal(0  as u32, flags, allocator)?, pos + 2 as usize) }
+    if c == 65 as u8  { return (ast.ast_anchor(ast.Anchor.start_of_text),  pos + 2 as usize) }
+    if c == 122 as u8 { return (ast.ast_anchor(ast.Anchor.end_of_text),    pos + 2 as usize) }
+    if c == 98 as u8  { return (ast.ast_anchor(ast.Anchor.word_boundary),  pos + 2 as usize) }
+    if c == 66 as u8  { return (ast.ast_anchor(ast.Anchor.not_word_boundary), pos + 2 as usize) }
+    if c == 100 as u8 { return (ast.ast_class(builtin_digit_class(false, allocator)?), pos + 2 as usize) }
+    if c == 68 as u8  { return (ast.ast_class(builtin_digit_class(true,  allocator)?), pos + 2 as usize) }
+    if c == 119 as u8 { return (ast.ast_class(builtin_word_class(false,  allocator)?), pos + 2 as usize) }
+    if c == 87 as u8  { return (ast.ast_class(builtin_word_class(true,   allocator)?), pos + 2 as usize) }
+    if c == 115 as u8 { return (ast.ast_class(builtin_space_class(false, allocator)?), pos + 2 as usize) }
+    if c == 83 as u8  { return (ast.ast_class(builtin_space_class(true,  allocator)?), pos + 2 as usize) }
+    if c == 104 as u8 { return (ast.ast_class(builtin_hws_class(false,   allocator)?), pos + 2 as usize) }
+    if c == 72 as u8  { return (ast.ast_class(builtin_hws_class(true,    allocator)?), pos + 2 as usize) }
+    if c == 118 as u8 { return (ast.ast_class(builtin_vws_class(false,   allocator)?), pos + 2 as usize) }
+    if c == 86 as u8  { return (ast.ast_class(builtin_vws_class(true,    allocator)?), pos + 2 as usize) }
+    if c == 120 as u8 { return parse_hex_escape(src, pos, flags, allocator)? }
+    if c == 117 as u8 { return parse_u_escape(src, pos, flags, allocator)? }
+    if c >= 49 as u8 && c <= 57 as u8 {
+        let idx = (c - 48 as u8) as u32
+        return (ast.ast_backref(idx), pos + 2 as usize)
+    }
+    return (make_literal(c as u32, flags, allocator)?, pos + 2 as usize)
+}

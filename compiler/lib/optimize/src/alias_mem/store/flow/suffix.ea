@@ -1,0 +1,160 @@
+module optimize.alias_mem.store.flow.suffix
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+
+import local.alias_mem.escape as escape_mod
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+
+public type SuffixEvents {
+    read_pos: Vec_usize.Vec
+    read_stamp: Vec_usize.Vec
+    ovw_pos: Vec_usize.Vec
+    ovw_stamp: Vec_usize.Vec
+    epoch: usize
+}
+
+public function new_events(out: init SuffixEvents, n_locals: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit rp: Vec_usize.Vec
+    new_zero_vec(init rp, n_locals, allocator)?
+    uninit rs: Vec_usize.Vec
+    new_zero_vec(init rs, n_locals, allocator)?
+    uninit op: Vec_usize.Vec
+    new_zero_vec(init op, n_locals, allocator)?
+    uninit os: Vec_usize.Vec
+    new_zero_vec(init os, n_locals, allocator)?
+    out = SuffixEvents {
+        read_pos: rp,
+        read_stamp: rs,
+        ovw_pos: op,
+        ovw_stamp: os,
+        epoch: 1,
+    }
+}
+
+function new_zero_vec(out: init Vec_usize.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_usize.Vec
+    Vec_usize.with_capacity(init v, n, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_usize.push(mutable v, 0, allocator)?
+        i += 1
+    }
+    out = v
+}
+
+public function begin_block(s: mutable SuffixEvents) -> () {
+    s.epoch += 1
+}
+
+public function first_is_overwrite(s: SuffixEvents, l: mir_local_mod.LocalId, pos: usize) -> bool {
+    let idx = mir_local_mod.index(l)
+    if idx >= Vec_usize.len(s.ovw_stamp) { return false }
+    let has_ovw = Vec_usize.at(s.ovw_stamp, idx) == s.epoch && Vec_usize.at(s.ovw_pos, idx) > pos
+    if has_ovw == false { return false }
+    let has_read = idx < Vec_usize.len(s.read_stamp)
+        && Vec_usize.at(s.read_stamp, idx) == s.epoch
+        && Vec_usize.at(s.read_pos, idx) > pos
+    if has_read == false { return true }
+    return Vec_usize.at(s.ovw_pos, idx) < Vec_usize.at(s.read_pos, idx)
+}
+
+public function fold_statement(s: mutable SuffixEvents, stmt: mir_stmt_mod.Statement, pos: usize) -> () {
+    match stmt.kind {
+        case .assign(let dest, let value) => {
+            note_place_index_reads(mutable s, dest, pos)
+            note_rvalue_reads(mutable s, value, pos)
+            if escape_mod.is_bare(dest) {
+                note_overwrite(mutable s, escape_mod.base_local(dest), pos)
+            }
+        }
+        case .storage_live(_) => ()
+        case .storage_dead(_) => ()
+        case .nop_ => ()
+    }
+}
+
+function note_read(s: mutable SuffixEvents, l: mir_local_mod.LocalId, pos: usize) -> () {
+    let idx = mir_local_mod.index(l)
+    if idx >= Vec_usize.len(s.read_pos) { return }
+    Vec_usize.set_at(mutable s.read_pos, idx, pos)
+    Vec_usize.set_at(mutable s.read_stamp, idx, s.epoch)
+}
+
+function note_overwrite(s: mutable SuffixEvents, l: mir_local_mod.LocalId, pos: usize) -> () {
+    let idx = mir_local_mod.index(l)
+    if idx >= Vec_usize.len(s.ovw_pos) { return }
+    Vec_usize.set_at(mutable s.ovw_pos, idx, pos)
+    Vec_usize.set_at(mutable s.ovw_stamp, idx, s.epoch)
+}
+
+function note_rvalue_reads(s: mutable SuffixEvents, rv: mir_rvalue_mod.Rvalue, pos: usize) -> () {
+    match rv {
+        case .use_(let operand) => note_operand_reads(mutable s, operand, pos)
+        case .binary(_, let lhs, let rhs) => {
+            note_operand_reads(mutable s, lhs, pos)
+            note_operand_reads(mutable s, rhs, pos)
+        }
+        case .unary(_, let operand) => note_operand_reads(mutable s, operand, pos)
+        case .cast(let operand, _, _, _) => note_operand_reads(mutable s, operand, pos)
+        case .aggregate(_, let elems, _) => note_operands_reads(mutable s, elems, pos)
+        case .ref_(_, let place) => note_place_full_read(mutable s, place, pos)
+        case .len(let place) => note_place_full_read(mutable s, place, pos)
+        case .discriminant(let place) => note_place_full_read(mutable s, place, pos)
+        case .make_closure(_, let env) => note_operand_reads(mutable s, env, pos)
+    }
+}
+
+function note_operands_reads(s: mutable SuffixEvents, ops: Vec_Operand.Vec, pos: usize) -> () {
+    let n = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        note_operand_reads(mutable s, Vec_Operand.at(ops, i), pos)
+        i += 1
+    }
+}
+
+function note_operand_reads(s: mutable SuffixEvents, op: mir_rvalue_mod.Operand, pos: usize) -> () {
+    match op {
+        case .copy_(let place, _) => note_place_full_read(mutable s, place, pos)
+        case .move_(let place, _) => note_place_full_read(mutable s, place, pos)
+        case .constant(_) => ()
+    }
+}
+
+function note_place_full_read(s: mutable SuffixEvents, p: mir_place_mod.Place, pos: usize) -> () {
+    note_read(mutable s, escape_mod.base_local(p), pos)
+    note_place_index_reads(mutable s, p, pos)
+}
+
+function note_place_index_reads(s: mutable SuffixEvents, p: mir_place_mod.Place, pos: usize) -> () {
+    let n = mir_place_mod.proj_len(p)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(p, i)
+        match proj.kind {
+            case .index(let idx_local, _) => note_read(mutable s, idx_local, pos)
+            case .slice_subrange(let lo_local, let hi_local, _) => {
+                note_read(mutable s, lo_local, pos)
+                note_read(mutable s, hi_local, pos)
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}

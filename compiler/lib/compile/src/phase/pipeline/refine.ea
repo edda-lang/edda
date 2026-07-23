@@ -1,0 +1,96 @@
+
+module compile.phase.pipeline.refine
+
+import std.mem.alloc
+import std.collections.vec
+import diagnostics.emit.collection as diags_mod
+import intern.interner as interner_mod
+import mir.file.store as mir_file_mod
+import refine.discharge.discharge as refine_discharge_mod
+import refine.discharge.error as refine_error_mod
+import refine.discharge.output as refine_output_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(refine_error_mod.RefineError)
+
+
+public function discharge_files(
+    mir_files: Vec_MirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    ptr_width: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (usize, usize, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_MirFile.len(mir_files)
+    var i: usize = 0
+    var discharged: usize = 0
+    var skipped: usize = 0
+    var proven: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let mir = Vec_MirFile.at(mir_files, i)
+        let type_out = Vec_TypeOutput.at(type_outputs, i)
+        let output = discharge_and_emit(mir, type_out, ty_interner, mutable interner, ptr_width, mutable diags, allocator)?
+        discharged = discharged +| refine_output_mod.discharged_count(output)
+        skipped = skipped +| refine_output_mod.skipped_count(output)
+        proven = proven +| refine_output_mod.proven_count(output)
+        i = i + 1 as usize
+    }
+    return (discharged, skipped, proven)
+}
+
+
+public function discharge_and_emit(
+    file: mir_file_mod.MirFile,
+    type_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    ptr_width: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> refine_output_mod.RefineOutput
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let output = refine_discharge_mod.discharge_file(
+        file,
+        type_out,
+        ty_interner,
+        type_out.builtins,
+        mutable interner,
+        ptr_width,
+        allocator,
+    )?
+    emit_failures(mutable diags, output, allocator)?
+    return output
+}
+
+
+function emit_failures(
+    diags: mutable diags_mod.Diagnostics,
+    output: refine_output_mod.RefineOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_RefineError.len(output.failures)
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let e = Vec_RefineError.at(output.failures, i)
+        let d = refine_error_mod.to_diagnostic(e, allocator)?
+        diags_mod.emit(mutable diags, take d, allocator)?
+        i = i + 1 as usize
+    }
+}

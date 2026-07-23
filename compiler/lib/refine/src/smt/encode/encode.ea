@@ -1,0 +1,185 @@
+
+module refine.smt.encode.encode
+
+import std.collections.vec
+import std.mem.alloc
+import syntax.ast.tree as ast_tree
+import types.check.env.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.encode.encres as result_mod
+import local.smt.encode.atom.atom as atom_mod
+import local.smt.encode.op.op as op_mod
+import local.smt.encode.ctrl.ctrl as ctrl_mod
+import local.smt.encode.quant.quant as quant_mod
+import local.smt.encode.udf.udf as udf_mod
+import local.smt.encode.idx.idx as idx_mod
+import local.smt.encode.proj.proj as proj_mod
+import local.smt.encode.cast.cast as cast_mod
+
+
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+
+
+public function encode_predicate(
+    e: ast_tree.Expr,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match e.kind {
+        case .literal(let lit) => atom_mod.encode_literal(lit)
+        case .path(let path) => atom_mod.encode_path(path, vars, ty_interner, allocator)?
+        case .unary(let op, let inner) =>
+            op_mod.encode_unary(op, inner, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .binary(let op, let lhs, let rhs) =>
+            op_mod.encode_binary(op, lhs, rhs, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .block(let body) =>
+            ctrl_mod.encode_block(body, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .if_(let cond, let then_block, let else_branch) =>
+            ctrl_mod.encode_if(cond, then_block, else_branch, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .forall_(let bound, let iter, let body) =>
+            quant_mod.encode_quantifier(true, bound, iter, body, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .exists_(let bound, let iter, let body) =>
+            quant_mod.encode_quantifier(false, bound, iter, body, vars, ty_interner, builtins, allocator, encode_predicate)?
+
+        case .field(let receiver, let name) =>
+            proj_mod.encode_field(receiver, name, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .positional(let receiver, let index) =>
+            idx_mod.encode_positional(receiver, index, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .tuple_index(let receiver, let index) =>
+            idx_mod.encode_tuple_index(receiver, index, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .index(let receiver, let index) =>
+            idx_mod.encode_index(receiver, index, vars, ty_interner, builtins, allocator, encode_predicate)?
+
+        case .call(let callee, let args) =>
+            udf_mod.encode_call(callee, args, vars, ty_interner, builtins, allocator, encode_predicate)?
+        case .method_call(let receiver, let name, let args) =>
+            udf_mod.encode_method_call(receiver, name, args, vars, ty_interner, builtins, allocator, encode_predicate)?
+
+        case .cast(let expr, let ty, let mode) =>
+            cast_mod.encode_cast(expr, ty, mode, vars, ty_interner, builtins, allocator, encode_predicate)?
+
+        case .tuple(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "tuple in refinement",
+            ),
+        )
+        case .struct_lit(_, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "struct-literal construction in refinement",
+            ),
+        )
+        case .fstring(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "f-string interpolation in refinement",
+            ),
+        )
+
+        case .range(_, _, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "range as expression in refinement (admitted only as quantifier iter)",
+            ),
+        )
+
+        case .match_(_, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "match expression in refinement",
+            ),
+        )
+
+        case .loop_(_, _, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "loop in refinement",
+            ),
+        )
+        case .for_(_, _, _, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "for-loop in refinement",
+            ),
+        )
+        case .return_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "return in refinement",
+            ),
+        )
+        case .break_(_, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "break in refinement",
+            ),
+        )
+        case .continue_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "continue in refinement",
+            ),
+        )
+
+        case .try_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "? operator in refinement (refinement predicates are pure)",
+            ),
+        )
+        case .await_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "await in refinement",
+            ),
+        )
+        case .raise_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "raise in refinement",
+            ),
+        )
+        case .panic_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "panic in refinement",
+            ),
+        )
+        case .handle_(_, _, _, _, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "handle expression in refinement",
+            ),
+        )
+        case .scope_(_, _, _) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "scope expression in refinement",
+            ),
+        )
+        case .spawn(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "spawn in refinement",
+            ),
+        )
+        case .closure(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "closure in refinement",
+            ),
+        )
+
+        case .comptime_(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "comptime expression in refinement",
+            ),
+        )
+        case .comptime_block(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "comptime block in refinement",
+            ),
+        )
+
+        case .effect_row(_) => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "effect-row literal in refinement",
+            ),
+        )
+
+        case .error => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "parser-recovery error sentinel",
+            ),
+        )
+    }
+}

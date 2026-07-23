@@ -1,0 +1,204 @@
+
+module egraph.graph.hashcons
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import local.eclass as eclass_mod
+import local.graph.unionfind as uf_mod
+import local.graph.enode as enode_mod
+import local.key as key_mod
+import ir.hlir.op as hlir_op_mod
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(MemoEntry)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(eclass_mod.EClassId)
+spec std.core.option.Option(usize)
+
+
+derive eq, hash, debug for MemoEntry
+
+
+public type MemoEntry {
+    node: enode_mod.ENode
+    class_: eclass_mod.EClassId
+    bucket: i64
+}
+
+
+public type Hashcons {
+    entries: Vec_MemoEntry.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+}
+
+
+public function new(out: init Hashcons, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_MemoEntry.Vec
+    Vec_MemoEntry.new(init entries, allocator)?
+    Vec_MemoEntry.push(mutable entries, take sentinel_entry(), allocator)?
+    uninit nexts: Vec_usize.Vec
+    Vec_usize.new(init nexts, allocator)?
+    Vec_usize.push(mutable nexts, 0 as usize, allocator)?
+    let head = IntMap_usize.new(allocator)?
+    out = Hashcons {
+        entries: entries,
+        head: head,
+        nexts: nexts,
+    }
+}
+
+
+function sentinel_entry() -> MemoEntry {
+    return MemoEntry {
+        node: enode_mod.ENode {
+            kind: enode_mod.EnodeKind.literal(c: hlir_op_mod.HConstant.unit_),
+            flags: hlir_op_mod.OpFlags {
+                overflow_safe: false,
+                in_bounds: false,
+                nonzero_divisor: false,
+                range_safe: false,
+                intrinsic: hlir_op_mod.Intrinsic.none,
+                div_overflow: hlir_op_mod.DivOverflow.trap,
+                div_overflow_safe: false,
+                extern_call: false,
+                extern_ret_size: 0 as u32,
+            },
+        },
+        class_: eclass_mod.error(),
+        bucket: 0,
+    }
+}
+
+
+public function clear(hc: mutable Hashcons, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_MemoEntry.clear(mutable hc.entries)
+    Vec_MemoEntry.push(mutable hc.entries, take sentinel_entry(), allocator)?
+    Vec_usize.clear(mutable hc.nexts)
+    Vec_usize.push(mutable hc.nexts, 0 as usize, allocator)?
+    IntMap_usize.clear(mutable hc.head)
+}
+
+
+public function entry_count(hc: Hashcons) -> usize
+    ensures result == Vec_MemoEntry.len(hc.entries)
+{
+    return Vec_MemoEntry.len(hc.entries)
+}
+
+
+public function entry_node(hc: Hashcons, i: usize) -> enode_mod.ENode
+    requires i < Vec_MemoEntry.len(hc.entries)
+{
+    return Vec_MemoEntry.at(hc.entries, i).node
+}
+
+
+public function entry_class(hc: Hashcons, i: usize) -> eclass_mod.EClassId
+    requires i < Vec_MemoEntry.len(hc.entries)
+{
+    return Vec_MemoEntry.at(hc.entries, i).class_
+}
+
+
+public function entry_bucket(hc: Hashcons, i: usize) -> i64
+    requires i < Vec_MemoEntry.len(hc.entries)
+{
+    return Vec_MemoEntry.at(hc.entries, i).bucket
+}
+
+
+public function lookup(
+    hc: Hashcons,
+    uf: mutable uf_mod.UnionFind,
+    query: enode_mod.ENode,
+) -> Option_EClassId.Option
+    with {panic}
+{
+    let bucket = key_mod.node_hash(mutable uf, query) as i64 wrapping
+    return lookup_hashed(hc, mutable uf, query, bucket)
+}
+
+
+public function lookup_hashed(
+    hc: Hashcons,
+    uf: mutable uf_mod.UnionFind,
+    query: enode_mod.ENode,
+    bucket: i64,
+) -> Option_EClassId.Option
+    with {panic}
+{
+    let start = IntMap_usize.get(hc.head, bucket)
+    let fuel = Vec_usize.len(hc.nexts)
+    return walk_chain(hc, mutable uf, query, start, fuel)
+}
+
+
+function walk_chain(
+    hc: Hashcons,
+    uf: mutable uf_mod.UnionFind,
+    query: enode_mod.ENode,
+    slot: Option_usize.Option,
+    fuel: usize,
+) -> Option_EClassId.Option
+    with {panic}
+    decreases fuel
+{
+    if fuel == 0 { return Option_EClassId.none }
+    let idx: usize = match slot {
+        case .none => return Option_EClassId.none
+        case .some(let v) => v
+    }
+    if idx == 0 { return Option_EClassId.none }
+    if idx >= Vec_MemoEntry.len(hc.entries) { return Option_EClassId.none }
+    let entry = Vec_MemoEntry.at(hc.entries, idx)
+    if key_mod.node_equal(mutable uf, entry.node, query) {
+        return Option_EClassId.some(value: entry.class_)
+    }
+    if idx >= Vec_usize.len(hc.nexts) { return Option_EClassId.none }
+    let nxt = Vec_usize.at(hc.nexts, idx)
+    if nxt == 0 { return Option_EClassId.none }
+    return walk_chain(hc, mutable uf, query, Option_usize.some(value: nxt), fuel - 1)
+}
+
+
+public function insert(
+    hc: mutable Hashcons,
+    uf: mutable uf_mod.UnionFind,
+    node: take enode_mod.ENode,
+    class_: eclass_mod.EClassId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let bucket = key_mod.node_hash(mutable uf, node) as i64 wrapping
+    insert_hashed(mutable hc, take node, class_, bucket, allocator)?
+}
+
+
+public function insert_hashed(
+    hc: mutable Hashcons,
+    node: take enode_mod.ENode,
+    class_: eclass_mod.EClassId,
+    bucket: i64,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let new_index = Vec_MemoEntry.len(hc.entries)
+    let chain_link = match IntMap_usize.get(hc.head, bucket) {
+        case .some(let head_index) => head_index
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable hc.nexts, chain_link, allocator)?
+    let entry = MemoEntry { node: node, class_: class_, bucket: bucket }
+    Vec_MemoEntry.push(mutable hc.entries, take entry, allocator)?
+    let _ = IntMap_usize.insert(mutable hc.head, bucket, new_index, allocator)?
+}

@@ -1,0 +1,100 @@
+
+module compile.instantiate.iter.instances.instances
+
+import std.collections.vec
+import std.mem.alloc
+import span.loc.pos.span as span_mod
+import intern.symbol as sym_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.attr as attr_mod
+import specs.gen.build.output as spec_output_mod
+
+
+spec std.collections.vec.Vec(spec_output_mod.SpecOutput)
+spec std.collections.vec.Vec(spec_output_mod.InstanceItems)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+
+
+public function materialize_instances(
+    outputs: Vec_SpecOutput.Vec,
+    allocator: Allocator,
+) -> Vec_File.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit files: Vec_File.Vec
+    Vec_File.new(init files, allocator)?
+    let no = Vec_SpecOutput.len(outputs)
+    var oi: usize = 0
+    loop decreases (no - oi) {
+        if oi >= no { break }
+        let out = Vec_SpecOutput.at(outputs, oi)
+        let ng = Vec_InstanceItems.len(out.gen_items)
+        var gi: usize = 0
+        loop decreases (ng - gi) {
+            if gi >= ng { break }
+            let inst = Vec_InstanceItems.at(out.gen_items, gi)
+            let file = build_instance_file(inst, allocator)?
+            Vec_File.push(mutable files, take file, allocator)?
+            gi = gi + 1
+        }
+        oi = oi + 1
+    }
+    return files
+}
+
+
+function build_instance_file(
+    inst: spec_output_mod.InstanceItems,
+    allocator: Allocator,
+) -> ast_file_mod.File
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(inst.items)
+    let sp = if n > 0 as usize {
+        let first = Vec_Item.at(inst.items, 0 as usize)
+        span_mod.empty_at(first.span.file, first.span.start)
+    } else {
+        span_mod.dummy()
+    }
+
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    Vec_Item.push(mutable items, take module_decl_item(inst.module_name, sp, allocator)?, allocator)?
+
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Item.push(mutable items, Vec_Item.at(inst.items, i), allocator)?
+        i = i + 1
+    }
+
+    return ast_file_mod.File { span: sp, items: items }
+}
+
+
+function module_decl_item(
+    name: sym_mod.Symbol,
+    sp: span_mod.Span,
+    allocator: Allocator,
+) -> ast_item_mod.Item
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    Vec_Ident.push(mutable segs, ast_ident_mod.Ident { name: name, span: sp }, allocator)?
+    let path = ast_ident_mod.Path { segments: segs, span: sp }
+    let decl = ast_item_mod.ModuleDecl { span: sp, path: path }
+
+    uninit attrs: Vec_Attribute.Vec
+    Vec_Attribute.new(init attrs, allocator)?
+    return ast_item_mod.Item {
+        span: sp,
+        attributes: attrs,
+        kind: ast_item_mod.ItemKind.module_(decl: decl),
+    }
+}

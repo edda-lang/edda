@@ -1,0 +1,159 @@
+
+module resolve.paths.modules
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import intern.symbol
+
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ModuleTreeEntry)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(PrefixMatch)
+
+
+derive eq, hash, debug for ModuleId
+derive eq, hash, debug for ModuleTreeEntry
+derive eq, hash, debug for ModuleTree
+derive eq, hash, debug for PrefixMatch
+
+
+public type ModuleId {
+    raw: u32
+}
+
+public type ModuleTreeEntry {
+    segments: Vec_Symbol.Vec
+    mod_id: ModuleId
+}
+
+public type ModuleTree {
+    entries: Vec_ModuleTreeEntry.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+}
+
+public type PrefixMatch {
+    mod_id: ModuleId
+    segments_consumed: usize
+}
+
+
+stable function mix(acc: u64, value: u64) -> u64 {
+    return (acc ^ value) *% (1099511628211 as u64)
+}
+
+public stable function prefix_hash(segments: Vec_Symbol.Vec, count: usize) -> u64
+    requires count <= Vec_Symbol.len(segments)
+{
+    var h = mix(1469598103934665603 as u64, count as u64)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        h = mix(h, Vec_Symbol.at(segments, i).raw as u64)
+        i = i + 1
+    }
+    return h
+}
+
+
+public function new_tree(out: init ModuleTree, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit entries: Vec_ModuleTreeEntry.Vec
+    Vec_ModuleTreeEntry.new(init entries, allocator)?
+    uninit nexts: Vec_usize.Vec
+    Vec_usize.new(init nexts, allocator)?
+    let head = IntMap_usize.new(allocator)?
+    out = ModuleTree { entries: entries, head: head, nexts: nexts }
+}
+
+
+public function register_module_path(
+    mt: mutable ModuleTree,
+    segments: take Vec_Symbol.Vec,
+    mod_id: ModuleId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let seg_count = Vec_Symbol.len(segments)
+    let bucket = prefix_hash(segments, seg_count) as i64 wrapping
+    let new_index = Vec_ModuleTreeEntry.len(mt.entries)
+    let prev = match IntMap_usize.get(mt.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable mt.nexts, prev, allocator)?
+    let entry = ModuleTreeEntry { segments: segments, mod_id: mod_id }
+    Vec_ModuleTreeEntry.push(mutable mt.entries, take entry, allocator)?
+    let _ = IntMap_usize.insert(mutable mt.head, bucket, new_index + 1 as usize, allocator)?
+}
+
+
+public stable function find_longest_prefix(mt: ModuleTree, path_segments: Vec_Symbol.Vec) -> Option_PrefixMatch.Option {
+    let path_len = Vec_Symbol.len(path_segments)
+    let fuel = Vec_ModuleTreeEntry.len(mt.entries) + 1 as usize
+    var l = path_len
+    loop decreases (l + 1) {
+        if l == 0 { break }
+        let bucket = prefix_hash(path_segments, l) as i64 wrapping
+        let start = match IntMap_usize.get(mt.head, bucket) {
+            case .some(let v) => v
+            case .none => 0 as usize
+        }
+        let hit = walk_prefix(mt, path_segments, l, start, fuel)
+        match hit {
+            case .some(_) => return hit
+            case .none => ()
+        }
+        l = l - 1
+    }
+    return Option_PrefixMatch.none
+}
+
+stable function walk_prefix(
+    mt: ModuleTree,
+    path_segments: Vec_Symbol.Vec,
+    target_len: usize,
+    slot_one_based: usize,
+    fuel: usize,
+) -> Option_PrefixMatch.Option
+    requires target_len <= Vec_Symbol.len(path_segments)
+    decreases fuel
+{
+    if fuel == 0 { return Option_PrefixMatch.none }
+    if slot_one_based == 0 { return Option_PrefixMatch.none }
+    let idx = slot_one_based - 1
+    if idx >= Vec_ModuleTreeEntry.len(mt.entries) { return Option_PrefixMatch.none }
+    let entry = Vec_ModuleTreeEntry.at(mt.entries, idx)
+    if Vec_Symbol.len(entry.segments) == target_len && is_prefix(entry.segments, path_segments) {
+        return Option_PrefixMatch.some(value: PrefixMatch { mod_id: entry.mod_id, segments_consumed: target_len })
+    }
+    if idx >= Vec_usize.len(mt.nexts) { return Option_PrefixMatch.none }
+    let nxt = Vec_usize.at(mt.nexts, idx)
+    return walk_prefix(mt, path_segments, target_len, nxt, fuel - 1)
+}
+
+public stable function len(mt: ModuleTree) -> usize {
+    return Vec_ModuleTreeEntry.len(mt.entries)
+}
+
+
+stable function is_prefix(prefix: Vec_Symbol.Vec, full: Vec_Symbol.Vec) -> bool
+    requires Vec_Symbol.len(prefix) <= Vec_Symbol.len(full)
+{
+    let pn = Vec_Symbol.len(prefix)
+    var i: usize = 0
+    loop decreases (pn - i) {
+        if i >= pn { return true }
+        let a = Vec_Symbol.at(prefix, i)
+        let b = Vec_Symbol.at(full, i)
+        if a.raw != b.raw { return false }
+        i = i + 1
+    }
+    return true
+}

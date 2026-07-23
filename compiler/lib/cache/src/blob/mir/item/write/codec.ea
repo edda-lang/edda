@@ -1,0 +1,127 @@
+
+module cache.blob.mir.item.write.codec
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ty.write.codec as ty_codec_mod
+import local.blob.mir.expr.write.codec as expr_codec_mod
+import local.blob.mir.item.leaf.codec as item_leaf_mod
+import local.blob.mir.item.write.decl as decl_mod
+import local.blob.mir.item.write.tydecl as tydecl_mod
+
+
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.mem.alloc.Box(ast_item_mod.TypeDecl)
+spec std.mem.alloc.Box(ast_item_mod.Spec)
+spec std.mem.alloc.Box(ast_item_mod.SpecInvocation)
+spec std.mem.alloc.Box(ast_item_mod.LetDecl)
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+
+
+public function write_item(
+    it: interner_mod.Interner,
+    item: ast_item_mod.Item,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(item.span, mutable out, allocator)?
+    item_leaf_mod.write_attribute_vec(item.attributes, it, mutable out, allocator)?
+    match item.kind {
+        case .function_(let decl) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            decl_mod.write_fn_decl(it, Box_FnDecl.get(decl), mutable out, allocator)?
+        }
+        case .type_decl(let decl) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            tydecl_mod.write_type_decl(it, Box_TypeDecl.get(decl), mutable out, allocator)?
+        }
+        case .spec_(let decl) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            write_spec(it, Box_Spec.get(decl), mutable out, allocator)?
+        }
+        case .spec_invocation(let invocation) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            write_spec_invocation(it, Box_SpecInvocation.get(invocation), mutable out, allocator)?
+        }
+        case .let_(let decl) => {
+            prim_mod.push_u8(mutable out, 4, allocator)?
+            write_let_decl(it, Box_LetDecl.get(decl), mutable out, allocator)?
+        }
+        case .import_(_) => raise error_mod.CacheError.unsupported_body(message: "ItemKind.import_ not admitted in cached spec output")
+        case .module_(_) => raise error_mod.CacheError.unsupported_body(message: "ItemKind.module_ not admitted in cached spec output")
+        case .derive_(_) => raise error_mod.CacheError.unsupported_body(message: "ItemKind.derive_ not admitted in cached spec output")
+    }
+}
+
+public function write_item_vec(
+    items: Vec_Item.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_Item.len(items)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_item(it, Vec_Item.at(items, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_spec(
+    it: interner_mod.Interner,
+    decl: ast_item_mod.Spec,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(decl.span, mutable out, allocator)?
+    item_leaf_mod.write_option_stability(it, decl.stability, mutable out, allocator)?
+    item_leaf_mod.write_visibility(decl.visibility, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, decl.name, mutable out, allocator)?
+    decl_mod.write_generic_param_vec(decl.generics, it, mutable out, allocator)?
+    decl_mod.write_refinement_clause_vec(decl.where_clauses, it, mutable out, allocator)?
+    write_item_vec(decl.body, it, mutable out, allocator)?
+}
+
+public function write_spec_invocation(
+    it: interner_mod.Interner,
+    invocation: ast_item_mod.SpecInvocation,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(invocation.span, mutable out, allocator)?
+    ast_codec_mod.write_path(it, invocation.path, mutable out, allocator)?
+    expr_codec_mod.write_expr_vec(invocation.args, it, mutable out, allocator)?
+}
+
+public function write_let_decl(
+    it: interner_mod.Interner,
+    decl: ast_item_mod.LetDecl,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(decl.span, mutable out, allocator)?
+    item_leaf_mod.write_visibility(decl.visibility, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, decl.name, mutable out, allocator)?
+    ty_codec_mod.write_ty(it, decl.ty, mutable out, allocator, expr_codec_mod.write_expr)?
+    expr_codec_mod.write_expr(it, decl.init_, mutable out, allocator)?
+}

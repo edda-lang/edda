@@ -1,0 +1,373 @@
+
+module compile.phase.emit.write.write
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.os.fs
+import std.text.string
+import std.core.fmt as fmt_mod
+
+import target.triple as triple_mod
+import cache.addr.hash as hash_mod
+import intern.interner as interner_mod
+import types.ty.interner as ty_interner_mod
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import mir.file.store as mir_file_mod
+import mir.body.model as body_mod
+import hir.def as def_mod
+import object.coff.codeview.typetable.table as debug_table_mod
+import object.lib as object_mod
+import ir.hlir.error as hlir_error_mod
+import ir.lir.error as lir_error_mod
+import object.coff.wrap.wrap as coff_wrap_mod
+import object.sym.coff.multisym as multisym_mod
+
+import diagnostics.emit.collection as diags_mod
+
+import local.phase.emit.link.link as link_phase_mod
+import local.phase.emit.codegen.codegen as codegen_mod
+import local.phase.emit.write.aggregate as aggregate_mod
+import local.phase.emit.write.name as name_mod
+import local.member.cache.object as objcache_mod
+import local.member.cache.objindex as objindex_mod
+import local.member.cache.store.blob as store_mod
+import local.trace.trace as trace_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(body_mod.MirBody)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(u8)
+spec std.collections.hashmap.IntMap(String)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(hash_mod.ArtifactHash)
+spec std.core.option.Option(hash_mod.ArtifactHash)
+
+
+public function emit_objects(
+    optimized: mutable Vec_MirFile.Vec,
+    target: triple_mod.TargetTriple,
+    outdir: String,
+    syms: IntMap_String.IntMap,
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    output_root: String,
+    object_index: StringMap_ArtifactHash.StringMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_table_mod.DebugTypeTable,
+    source_map: source_map_mod.SourceMap,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    diags: mutable diags_mod.Diagnostics,
+    paths: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {wfs, rfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    let s_dedup = trace_mod.phase_begin(trace, clock, errout, "emit-dedup", allocator)?
+    let dropped = dedup_bodies_by_symbol(mutable optimized, syms, allocator)?
+    trace_mod.phase_end_n(s_dedup, clock, errout, dropped, "duplicate bodies", allocator)?
+    let s_agg = trace_mod.phase_begin(trace, clock, errout, "emit-aggregate", allocator)?
+    var merged = aggregate_mod.aggregate_by_package(mutable optimized, source_map, allocator)?
+    trace_mod.phase_end_n(s_agg, clock, errout, Vec_MirFile.len(merged), "packages", allocator)?
+    var i: usize = 0
+    loop decreases (Vec_MirFile.len(merged) + 1 as usize) {
+        if Vec_MirFile.is_empty(merged) { break }
+        let file = Vec_MirFile.remove(mutable merged, 0 as usize)
+        emit_one_package(take file, i, outdir, target, syms, wfs, rfs, output_root, object_index, interner, ty_interner, debug_table, source_map, clock, errout, trace, mutable diags, mutable paths, allocator)?
+        i += 1 as usize
+    }
+}
+
+
+public function emit_one_package(
+    file: take mir_file_mod.MirFile,
+    index: usize,
+    outdir: String,
+    target: triple_mod.TargetTriple,
+    syms: IntMap_String.IntMap,
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    output_root: String,
+    object_index: StringMap_ArtifactHash.StringMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_table_mod.DebugTypeTable,
+    source_map: source_map_mod.SourceMap,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    diags: mutable diags_mod.Diagnostics,
+    paths: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {wfs, rfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    let path = object_path(file, outdir, index, interner, allocator)?
+    let s_obj = trace_mod.phase_begin(trace, clock, errout, "object", allocator)?
+    let path_detail = string.clone(path, allocator)?
+    let scratch = alloc.fork(allocator)
+    emit_one_object(file, path, outdir, target, syms, wfs, rfs, output_root, object_index, interner, ty_interner, debug_table, source_map, clock, errout, trace, mutable diags, mutable paths, scratch, allocator)?
+    alloc.close(take scratch)
+    trace_mod.phase_end_detail(s_obj, clock, errout, path_detail, allocator)?
+}
+
+
+function dedup_bodies_by_symbol(
+    optimized: mutable Vec_MirFile.Vec,
+    syms: IntMap_String.IntMap,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    var seen = StringMap_bool.new(allocator)?
+    var dropped: usize = 0
+    let nf = Vec_MirFile.len(optimized)
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        var file = Vec_MirFile.at(optimized, i)
+        let n = dedup_file_bodies(mutable file, syms, mutable seen, allocator)?
+        Vec_MirFile.set_at(mutable optimized, i, take file)
+        dropped = dropped + n
+        i += 1
+    }
+    return dropped
+}
+
+
+function dedup_file_bodies(
+    file: mutable mir_file_mod.MirFile,
+    syms: IntMap_String.IntMap,
+    seen: mutable StringMap_bool.StringMap,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    var dropped: usize = 0
+    var i: usize = 0
+    loop decreases Vec_MirBody.len(file.bodies) - i {
+        if i >= Vec_MirBody.len(file.bodies) { break }
+        let body_def = Vec_MirBody.at(file.bodies, i).def_id
+        let key = body_def.raw as i64
+        let duplicate = if def_mod.is_error(body_def) {
+            false
+        } else { match IntMap_String.get(syms, key) {
+            case .some(let sym) => match StringMap_bool.get(seen, sym) {
+                case .some(_) => true
+                case .none => {
+                    let _ = StringMap_bool.insert(mutable seen, sym, true, allocator)?
+                    false
+                }
+            }
+            case .none => false
+        } }
+        if duplicate {
+            let _ = Vec_MirBody.remove(mutable file.bodies, i)
+            dropped += 1
+        } else {
+            i += 1
+        }
+    }
+    return dropped
+}
+
+
+function emit_one_object(
+    file: mir_file_mod.MirFile,
+    path: String,
+    outdir: String,
+    target: triple_mod.TargetTriple,
+    syms: IntMap_String.IntMap,
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    output_root: String,
+    object_index: StringMap_ArtifactHash.StringMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_table_mod.DebugTypeTable,
+    source_map: source_map_mod.SourceMap,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    diags: mutable diags_mod.Diagnostics,
+    paths: mutable Vec_String.Vec,
+    scratch: Allocator,
+    allocator: Allocator,
+) -> ()
+    with {wfs, rfs, clock, errout, scratch, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    handle err: hlir_error_mod.HlirError as he -> link_phase_mod.emit_codegen_diag(mutable diags, hlir_error_span(he), hlir_stage_detail(he, allocator)?, allocator)? {
+    handle err: lir_error_mod.LirError as le -> link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), lir_stage_detail(le, allocator)?, allocator)? {
+    handle err: coff_wrap_mod.WrapError -> link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), "coff-wrap", allocator)? {
+    handle err: multisym_mod.MultiSymError as me -> link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), multisym_detail(me, path, allocator)?, allocator)? {
+        write_object(file, path, outdir, target, syms, wfs, rfs, output_root, object_index, interner, ty_interner, debug_table, source_map, clock, errout, trace, mutable paths, scratch, allocator)?
+    }}}}
+}
+
+
+function multisym_detail(e: multisym_mod.MultiSymError, path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .unresolved_symbol(let def_raw) => {
+            let n = fmt_mod.usize_to_string(def_raw as usize, allocator)?
+            let head = string.concat("object-assembly: unresolved symbol for def ", n, allocator)?
+            let mid = string.concat(head, " in ", allocator)?
+            string.concat(mid, path, allocator)?
+        }
+    }
+}
+
+
+function write_object(
+    file: mir_file_mod.MirFile,
+    path: String,
+    outdir: String,
+    target: triple_mod.TargetTriple,
+    syms: IntMap_String.IntMap,
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    output_root: String,
+    object_index: StringMap_ArtifactHash.StringMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_table_mod.DebugTypeTable,
+    source_map: source_map_mod.SourceMap,
+    clock: MonotonicClock,
+    errout: Stderr,
+    trace: trace_mod.TraceConfig,
+    paths: mutable Vec_String.Vec,
+    scratch: Allocator,
+    allocator: Allocator,
+) -> ()
+    with {
+        wfs,
+        rfs,
+        clock,
+        errout,
+        scratch,
+        allocator,
+        err: fs.FsError,
+        err: alloc.AllocError,
+        err: hlir_error_mod.HlirError,
+        err: lir_error_mod.LirError,
+        err: coff_wrap_mod.WrapError,
+        err: multisym_mod.MultiSymError,
+        panic,
+    }
+{
+    let cache_key = objindex_mod.object_cache_key(file, source_map, object_index, scratch)?
+    match cache_key {
+        case .some(let key) => {
+            if try_restore_cached(key, path, outdir, target, wfs, rfs, output_root, scratch)? {
+                Vec_String.push(mutable paths, take path, allocator)?
+                return
+            }
+        }
+        case .none => ()
+    }
+    uninit bytes: Vec_u8.Vec
+    uninit obj: object_mod.ObjectFile
+    codegen_mod.compile_mir_file_to_object(init bytes, init obj, file, target, syms, interner, ty_interner, debug_table, source_map, clock, errout, trace, scratch)?
+    let buf = Vec_u8.into_array(take bytes, scratch)?
+    fs.write_bytes(wfs, path, buf)?
+    match cache_key {
+        case .some(let key) => objcache_mod.try_store_object(rfs, wfs, output_root, key, buf, scratch)?
+        case .none => ()
+    }
+    Vec_String.push(mutable paths, take path, allocator)?
+}
+
+
+function try_restore_cached(
+    key: hash_mod.ArtifactHash,
+    path: String,
+    outdir: String,
+    target: triple_mod.TargetTriple,
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    output_root: String,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let fmt = object_mod.format_for_triple(target)
+    let supported = match fmt {
+        case .coff => true
+        case .elf => true
+        case .macho => true
+    }
+    if !supported {
+        return false
+    }
+    let loc = store_mod.ExeLocation {
+        dir: string.clone(outdir, allocator)?,
+        path: string.clone(path, allocator)?,
+    }
+    return objcache_mod.try_restore_object(rfs, wfs, output_root, key, loc, allocator)?
+}
+
+
+function hlir_stage_detail(
+    e: hlir_error_mod.HlirError,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .internal_lowering_invariant(_, let message) => string.concat("hlir-lowering: ", message, allocator)?
+        case .unsupported_mir_form(_, _) => "hlir-lowering: unsupported MIR form"
+    }
+}
+
+function hlir_error_span(e: hlir_error_mod.HlirError) -> span_mod.Span {
+    return match e {
+        case .internal_lowering_invariant(let at, _) => at
+        case .unsupported_mir_form(let at, _) => at
+    }
+}
+
+function lir_stage_detail(
+    e: lir_error_mod.LirError,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .internal_lowering_invariant(_, let message) => string.concat("lir-lowering: ", message, allocator)?
+        case .unsupported_hlir_form(_, _) => "lir-lowering: unsupported HLIR form"
+    }
+}
+
+
+function object_path(
+    file: mir_file_mod.MirFile,
+    outdir: String,
+    index: usize,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let base = name_mod.package_basename(file, interner, allocator)?
+    let name = if string.is_empty(base) { fallback_basename(index, allocator)? } else { base }
+    let dir = string.concat(outdir, "/", allocator)?
+    let with_name = string.concat(dir, name, allocator)?
+    return string.concat(with_name, ".o", allocator)?
+}
+
+
+function fallback_basename(
+    index: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("obj_", fmt_mod.usize_to_string(index, allocator)?, allocator)?
+}

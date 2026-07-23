@@ -1,0 +1,144 @@
+
+module cache.blob.mir.rvalue.codec
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import mir.rvalue as rvalue_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.place.codec as place_codec_mod
+import local.blob.mir.operand.codec as operand_codec_mod
+import local.blob.mir.ops.codec as ops_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+
+
+public function write_rvalue(
+    rv: rvalue_mod.Rvalue,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match rv {
+        case .use_(let operand) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            operand_codec_mod.write_operand(operand, it, mutable out, allocator)?
+        }
+        case .binary(let op, let lhs, let rhs) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            ops_mod.write_bin_op(op, mutable out, allocator)?
+            operand_codec_mod.write_operand(lhs, it, mutable out, allocator)?
+            operand_codec_mod.write_operand(rhs, it, mutable out, allocator)?
+        }
+        case .unary(let op, let operand) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            ops_mod.write_un_op(op, mutable out, allocator)?
+            operand_codec_mod.write_operand(operand, it, mutable out, allocator)?
+        }
+        case .cast(let operand, let from, let to, let kind) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            operand_codec_mod.write_operand(operand, it, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, from.raw, allocator)?
+            prim_mod.push_u32_le(mutable out, to.raw, allocator)?
+            ops_mod.write_cast_kind(kind, mutable out, allocator)?
+        }
+        case .aggregate(let kind, let elems, let result_ty) => {
+            prim_mod.push_u8(mutable out, 4, allocator)?
+            ops_mod.write_aggregate_kind(kind, mutable out, allocator)?
+            let n = Vec_Operand.len(elems)
+            prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                operand_codec_mod.write_operand(Vec_Operand.at(elems, i), it, mutable out, allocator)?
+                i += 1
+            }
+            prim_mod.push_u32_le(mutable out, result_ty.raw, allocator)?
+        }
+        case .ref_(let kind, let place) => {
+            prim_mod.push_u8(mutable out, 5, allocator)?
+            ops_mod.write_borrow_kind(kind, mutable out, allocator)?
+            place_codec_mod.write_place(place, mutable out, allocator)?
+        }
+        case .len(let place) => {
+            prim_mod.push_u8(mutable out, 6, allocator)?
+            place_codec_mod.write_place(place, mutable out, allocator)?
+        }
+        case .discriminant(let place) => {
+            prim_mod.push_u8(mutable out, 7, allocator)?
+            place_codec_mod.write_place(place, mutable out, allocator)?
+        }
+        case .make_closure(let code, let env) => {
+            prim_mod.push_u8(mutable out, 8, allocator)?
+            prim_mod.push_u32_le(mutable out, code.raw, allocator)?
+            operand_codec_mod.write_operand(env, it, mutable out, allocator)?
+        }
+    }
+}
+
+public function read_rvalue(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Rvalue
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => rvalue_mod.Rvalue.use_(operand: operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => {
+            let op = ops_mod.read_bin_op(bytes, mutable cur)?
+            let lhs = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let rhs = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            rvalue_mod.Rvalue.binary(op: op, lhs: lhs, rhs: rhs)
+        }
+        case 2 => {
+            let op = ops_mod.read_un_op(bytes, mutable cur)?
+            let operand = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            rvalue_mod.Rvalue.unary(op: op, operand: operand)
+        }
+        case 3 => {
+            let operand = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let from = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let to = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let kind = ops_mod.read_cast_kind(bytes, mutable cur)?
+            rvalue_mod.Rvalue.cast(operand: operand, from: from, to: to, kind: kind)
+        }
+        case 4 => {
+            let kind = ops_mod.read_aggregate_kind(bytes, mutable cur)?
+            let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+            uninit elems: Vec_Operand.Vec
+            Vec_Operand.new(init elems, allocator)?
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                let elem = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+                Vec_Operand.push(mutable elems, take elem, allocator)?
+                i += 1
+            }
+            let result_ty = ty_mod.TyId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            rvalue_mod.Rvalue.aggregate(kind: kind, elems: elems, result_ty: result_ty)
+        }
+        case 5 => {
+            let kind = ops_mod.read_borrow_kind(bytes, mutable cur)?
+            let place = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            rvalue_mod.Rvalue.ref_(kind: kind, place: place)
+        }
+        case 6 => rvalue_mod.Rvalue.len(place: place_codec_mod.read_place(bytes, mutable cur, allocator)?)
+        case 7 => rvalue_mod.Rvalue.discriminant(place: place_codec_mod.read_place(bytes, mutable cur, allocator)?)
+        case 8 => {
+            let code = def_mod.DefId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let env = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            rvalue_mod.Rvalue.make_closure(code: code, env: env)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown Rvalue tag")
+    }
+}

@@ -1,0 +1,233 @@
+
+module std.compress.zstd.huffman
+
+import std.mem.alloc
+import local.bits.stream as bits
+import local.fse
+import local.fault
+
+spec std.mem.alloc.Array(u8)
+spec std.mem.alloc.Array(usize)
+
+
+public type Table {
+    max_bits: usize where max_bits <= 11
+    symbol: [u8]
+    lengths: [u8]
+}
+
+public type Parsed {
+    table: Table
+    consumed: usize
+}
+
+
+public function read_table(src: [u8], allocator: Allocator) -> Parsed
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    if src.len() == 0 { raise fault.Fault.bad_huffman }
+    let h: usize = src[0] as usize
+    var weights: [usize] = Array_usize.alloc(allocator, 256)?
+    var num: usize = 0
+    var consumed: usize = 1
+    if h < 128 {
+        if h == 0 { raise fault.Fault.bad_huffman }
+        if h + 1 > src.len() { raise fault.Fault.bad_huffman }
+        num = read_fse_weights(src[1 ..< h + 1], mutable weights, allocator)?
+        consumed = h + 1
+    } else {
+        num = h - 127
+        let packed: usize = (num + 1) / 2
+        if packed + 1 > src.len() { raise fault.Fault.bad_huffman }
+        var i: usize = 0
+        loop
+            decreases num - i
+        {
+            if i >= num { break }
+            let byte: u8 = src[1 + i / 2]
+            let w: usize = if i % 2 == 0 { (byte >> 4) as usize } else { (byte & 0x0F) as usize }
+            if i >= weights.len() { raise fault.Fault.bad_huffman }
+            weights[i] = w
+            i += 1
+        }
+        consumed = 1 + packed
+    }
+    let table: Table = build_from_weights(mutable weights, num, allocator)?
+    return Parsed { table: table, consumed: consumed }
+}
+
+function read_fse_weights(
+    src: [u8],
+    weights: mutable [usize],
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    var f: bits.Fwd = bits.open_fwd()
+    let norm: fse.Norm = fse.read_norm(src, mutable f, 256, 6, allocator)?
+    let table: fse.Table = fse.build_table(norm, allocator)?
+    let hdr: usize = bits.fwd_bytes_consumed(f)
+    if hdr >= src.len() { raise fault.Fault.bad_huffman }
+    let payload: [u8] = src[hdr ..]
+    var b: bits.Back = bits.open_back(payload)
+    if b.overrun { raise fault.Fault.bad_huffman }
+    var s1: usize = fse.init_state(payload, mutable b, table)
+    var s2: usize = fse.init_state(payload, mutable b, table)
+    if b.overrun { raise fault.Fault.bad_huffman }
+    var num: usize = 0
+    loop
+        decreases weights.len() - num
+    {
+        if num >= weights.len() { raise fault.Fault.bad_huffman }
+        weights[num] = fse.symbol_at(table, s1)? as usize
+        num += 1
+        s1 = fse.next_state(payload, mutable b, table, s1)?
+        if b.overrun {
+            if num >= weights.len() { raise fault.Fault.bad_huffman }
+            weights[num] = fse.symbol_at(table, s2)? as usize
+            num += 1
+            break
+        }
+        if num >= weights.len() { raise fault.Fault.bad_huffman }
+        weights[num] = fse.symbol_at(table, s2)? as usize
+        num += 1
+        s2 = fse.next_state(payload, mutable b, table, s2)?
+        if b.overrun {
+            if num >= weights.len() { raise fault.Fault.bad_huffman }
+            weights[num] = fse.symbol_at(table, s1)? as usize
+            num += 1
+            break
+        }
+    }
+    return num
+}
+
+function build_from_weights(
+    weights: mutable [usize],
+    num_known: usize,
+    allocator: Allocator,
+) -> Table
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    if num_known == 0 || num_known > 255 { raise fault.Fault.bad_huffman }
+    if num_known +| 1 > weights.len() { raise fault.Fault.bad_huffman }
+    var total: usize = 0
+    var i: usize = 0
+    loop
+        decreases num_known - i
+    {
+        if i >= num_known { break }
+        let w: usize = weights[i]
+        if w > 11 { raise fault.Fault.bad_huffman }
+        if w > 0 { total = total +| fse.pow2(w - 1) }
+        i += 1
+    }
+    if total == 0 { raise fault.Fault.bad_huffman }
+    let max_bits: usize = fse.highbit(total) + 1
+    if max_bits > 11 { raise fault.Fault.bad_huffman }
+    let left: usize = fse.pow2(max_bits) - total
+    if left == 0 { raise fault.Fault.bad_huffman }
+    if (left & (left - 1)) != 0 { raise fault.Fault.bad_huffman }
+    let last_w: usize = fse.highbit(left) + 1
+    weights[num_known] = last_w
+    let num: usize = num_known + 1
+    let size: usize = fse.pow2(max_bits)
+    var symbol: [u8] = Array_u8.alloc(allocator, size)?
+    var lengths: [u8] = Array_u8.alloc(allocator, size)?
+    var rank_idx: [usize] = Array_usize.alloc(allocator, 13)?
+    var w0: usize = 0
+    loop
+        decreases 13 - w0
+    {
+        if w0 >= 13 { break }
+        rank_idx[w0] = 0
+        w0 += 1
+    }
+    var rank_count: [usize] = Array_usize.alloc(allocator, 13)?
+    var w1: usize = 0
+    loop
+        decreases 13 - w1
+    {
+        if w1 >= 13 { break }
+        rank_count[w1] = 0
+        w1 += 1
+    }
+    var j: usize = 0
+    loop
+        decreases num - j
+    {
+        if j >= num { break }
+        let w: usize = weights[j]
+        if w > 12 { raise fault.Fault.bad_huffman }
+        rank_count[w] = rank_count[w] + 1
+        j += 1
+    }
+    var w: usize = 2
+    loop
+        decreases 13 - w
+    {
+        if w >= 13 { break }
+        rank_idx[w] = rank_idx[w - 1] +| (rank_count[w - 1] *| fse.pow2(w - 2))
+        w += 1
+    }
+    var s: usize = 0
+    loop
+        decreases num - s
+    {
+        if s >= num { break }
+        let ws: usize = weights[s]
+        if ws > 0 {
+            if ws > 11 { raise fault.Fault.bad_huffman }
+            let width: usize = fse.pow2(ws - 1)
+            let base: usize = rank_idx[ws]
+            if base +| width > size { raise fault.Fault.bad_huffman }
+            let nb: usize = max_bits + 1 - ws
+            var k: usize = 0
+            loop
+                decreases width - k
+            {
+                if k >= width { break }
+                symbol[base + k] = s as u8 wrapping
+                lengths[base + k] = nb as u8 wrapping
+                k += 1
+            }
+            rank_idx[ws] = base + width
+        }
+        s += 1
+    }
+    return Table { max_bits: max_bits, symbol: symbol, lengths: lengths }
+}
+
+
+public function decode_stream(
+    src: [u8],
+    t: Table,
+    out: mutable [u8],
+    start: usize,
+    count: usize,
+) -> ()
+    with {err: fault.Fault}
+{
+    if start +| count > out.len() { raise fault.Fault.bad_literals }
+    var b: bits.Back = bits.open_back(src)
+    if b.overrun { raise fault.Fault.bad_literals }
+    var state: usize = bits.read_back_padded(src, mutable b, t.max_bits)
+    var k: usize = 0
+    loop
+        decreases count - k
+    {
+        if k >= count { break }
+        if b.overrun { raise fault.Fault.bad_literals }
+        if state >= t.symbol.len() { raise fault.Fault.bad_literals }
+        out[start + k] = t.symbol[state]
+        let nb: usize = t.lengths[state] as usize
+        if nb > 32 { raise fault.Fault.bad_literals }
+        let rest: usize = bits.read_back_padded(src, mutable b, nb)
+        if t.symbol.len() == 0 { raise fault.Fault.bad_literals }
+        state = ((state *| fse.pow2(nb)) +| rest) % t.symbol.len()
+        k += 1
+    }
+    if b.overrun { raise fault.Fault.bad_literals }
+    if b.remaining != 0 { raise fault.Fault.bad_literals }
+    if b.debt > t.max_bits { raise fault.Fault.bad_literals }
+}

@@ -1,0 +1,386 @@
+
+module resolve.lints.cohesion.graph.graph
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+spec std.core.option.Option(usize)
+
+
+public function min_component_count() -> usize { return 2 }
+public function min_component_size() -> usize { return 3 }
+public function min_function_count() -> usize { return 8 }
+public function min_residual_component_size() -> usize { return 2 }
+public function scc_dominance_num() -> usize { return 3 }
+public function scc_dominance_den() -> usize { return 10 }
+public function scc_absolute_floor() -> usize { return 20 }
+public function min_total_cluster_coverage() -> usize { return 10 }
+
+
+public type CallGraph {
+    edge_from: Vec_usize.Vec
+    edge_to: Vec_usize.Vec
+}
+
+public type DispatcherResult {
+    found: bool
+    node: usize
+    qualifying: usize
+    total: usize
+}
+
+
+public function new_graph(allocator: Allocator) -> CallGraph
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ef: Vec_usize.Vec
+    Vec_usize.new(init ef, allocator)?
+    uninit et: Vec_usize.Vec
+    Vec_usize.new(init et, allocator)?
+    return CallGraph { edge_from: ef, edge_to: et }
+}
+
+
+function has_edge(g: CallGraph, from: usize, to: usize) -> bool {
+    let n = Vec_usize.len(g.edge_from)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        if Vec_usize.at(g.edge_from, i) == from && Vec_usize.at(g.edge_to, i) == to { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+public function add_edge(g: mutable CallGraph, from: usize, to: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if from == to { return }
+    if has_edge(g, from, to) { return }
+    Vec_usize.push(mutable g.edge_from, from, allocator)?
+    Vec_usize.push(mutable g.edge_to, to, allocator)?
+}
+
+
+public function out_degree(g: CallGraph, node: usize) -> usize {
+    let n = Vec_usize.len(g.edge_from)
+    var i: usize = 0
+    var count: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_usize.at(g.edge_from, i) == node { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+
+function zeroed_bools(n: usize, allocator: Allocator) -> Vec_bool.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_bool.Vec
+    Vec_bool.with_capacity(init out, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_bool.push(mutable out, false, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function zeroed_usizes(n: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.with_capacity(init out, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_usize.push(mutable out, 0, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function mark_component_undirected(g: CallGraph, start: usize, visited: mutable Vec_bool.Vec, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit stack: Vec_usize.Vec
+    Vec_usize.new(init stack, allocator)?
+    Vec_usize.push(mutable stack, start, allocator)?
+    Vec_bool.set_at(mutable visited, start, true)
+    var size: usize = 0
+    loop {
+        match Vec_usize.pop(mutable stack) {
+            case .some(let v) => {
+                size = size + 1
+                let ne = Vec_usize.len(g.edge_from)
+                var e: usize = 0
+                loop decreases (ne - e) {
+                    if e >= ne { break }
+                    let a = Vec_usize.at(g.edge_from, e)
+                    let b = Vec_usize.at(g.edge_to, e)
+                    if a == v && !Vec_bool.at(visited, b) {
+                        Vec_bool.set_at(mutable visited, b, true)
+                        Vec_usize.push(mutable stack, b, allocator)?
+                    }
+                    if b == v && !Vec_bool.at(visited, a) {
+                        Vec_bool.set_at(mutable visited, a, true)
+                        Vec_usize.push(mutable stack, a, allocator)?
+                    }
+                    e = e + 1
+                }
+            }
+            case .none => break
+        }
+    }
+    return size
+}
+
+
+public function component_stats(g: CallGraph, n: usize, excluded: Option_usize.Option, min_size: usize, allocator: Allocator) -> (usize, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var visited = zeroed_bools(n, allocator)?
+    match excluded {
+        case .some(let ex) => Vec_bool.set_at(mutable visited, ex, true)
+        case .none => ()
+    }
+    var qualifying: usize = 0
+    var total: usize = 0
+    var start: usize = 0
+    loop decreases (n - start) {
+        if start >= n { break }
+        if !Vec_bool.at(visited, start) {
+            let size = mark_component_undirected(g, start, mutable visited, allocator)?
+            if size >= min_size {
+                qualifying = qualifying + 1
+                total = total + size
+            }
+        }
+        start = start + 1
+    }
+    return (qualifying, total)
+}
+
+
+function directed_reach_excluding(g: CallGraph, start: usize, excluded: usize, visited: mutable Vec_bool.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if start == excluded { return }
+    if Vec_bool.at(visited, start) { return }
+    uninit stack: Vec_usize.Vec
+    Vec_usize.new(init stack, allocator)?
+    Vec_usize.push(mutable stack, start, allocator)?
+    Vec_bool.set_at(mutable visited, start, true)
+    loop {
+        match Vec_usize.pop(mutable stack) {
+            case .some(let v) => {
+                let ne = Vec_usize.len(g.edge_from)
+                var e: usize = 0
+                loop decreases (ne - e) {
+                    if e >= ne { break }
+                    if Vec_usize.at(g.edge_from, e) == v {
+                        let to = Vec_usize.at(g.edge_to, e)
+                        if to != excluded && !Vec_bool.at(visited, to) {
+                            Vec_bool.set_at(mutable visited, to, true)
+                            Vec_usize.push(mutable stack, to, allocator)?
+                        }
+                    }
+                    e = e + 1
+                }
+            }
+            case .none => break
+        }
+    }
+}
+
+
+function find_root(parent: Vec_usize.Vec, x: usize) -> usize
+    with {divergence}
+{
+    var cur = x
+    loop {
+        let p = Vec_usize.at(parent, cur)
+        if p == cur { return cur }
+        cur = p
+    }
+}
+
+
+function union_roots(parent: mutable Vec_usize.Vec, a: usize, b: usize) -> ()
+    with {divergence}
+{
+    let ra = find_root(parent, a)
+    let rb = find_root(parent, b)
+    if ra != rb {
+        Vec_usize.set_at(mutable parent, ra, rb)
+    }
+}
+
+
+public function largest_scc_size(g: CallGraph, n: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if n == 0 { return 0 }
+    uninit parent: Vec_usize.Vec
+    Vec_usize.with_capacity(init parent, n, allocator)?
+    var pi: usize = 0
+    loop decreases (n - pi) {
+        if pi >= n { break }
+        Vec_usize.push(mutable parent, pi, allocator)?
+        pi = pi + 1
+    }
+    var a: usize = 0
+    loop decreases (n - a) {
+        if a >= n { break }
+        var reach_a = zeroed_bools(n, allocator)?
+        directed_reach_excluding(g, a, n, mutable reach_a, allocator)?
+        var b: usize = a + 1
+        loop decreases (n - b) {
+            if b >= n { break }
+            if Vec_bool.at(reach_a, b) {
+                var reach_b = zeroed_bools(n, allocator)?
+                directed_reach_excluding(g, b, n, mutable reach_b, allocator)?
+                if Vec_bool.at(reach_b, a) {
+                    union_roots(mutable parent, a, b)
+                }
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    var counts = zeroed_usizes(n, allocator)?
+    var c: usize = 0
+    loop decreases (n - c) {
+        if c >= n { break }
+        let r = find_root(parent, c)
+        let cur = Vec_usize.at(counts, r)
+        Vec_usize.set_at(mutable counts, r, cur + 1)
+        c = c + 1
+    }
+    var best: usize = 0
+    var d: usize = 0
+    loop decreases (n - d) {
+        if d >= n { break }
+        let v = Vec_usize.at(counts, d)
+        if v > best { best = v }
+        d = d + 1
+    }
+    return best
+}
+
+
+function direct_callees(g: CallGraph, node: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.new(init out, allocator)?
+    let ne = Vec_usize.len(g.edge_from)
+    var e: usize = 0
+    loop decreases (ne - e) {
+        if e >= ne { break }
+        if Vec_usize.at(g.edge_from, e) == node {
+            Vec_usize.push(mutable out, Vec_usize.at(g.edge_to, e), allocator)?
+        }
+        e = e + 1
+    }
+    return out
+}
+
+
+function spoke_stats_for(g: CallGraph, n: usize, dispatcher: usize, allocator: Allocator) -> (usize, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let callees = direct_callees(g, dispatcher, allocator)?
+    let nc = Vec_usize.len(callees)
+
+    var spoke_count = zeroed_usizes(n, allocator)?
+    var ci: usize = 0
+    loop decreases (nc - ci) {
+        if ci >= nc { break }
+        let c = Vec_usize.at(callees, ci)
+        var visited = zeroed_bools(n, allocator)?
+        directed_reach_excluding(g, c, dispatcher, mutable visited, allocator)?
+        var node: usize = 0
+        loop decreases (n - node) {
+            if node >= n { break }
+            if Vec_bool.at(visited, node) && node != dispatcher {
+                let cur = Vec_usize.at(spoke_count, node)
+                Vec_usize.set_at(mutable spoke_count, node, cur + 1)
+            }
+            node = node + 1
+        }
+        ci = ci + 1
+    }
+
+    var qualifying: usize = 0
+    var total: usize = 0
+    var cj: usize = 0
+    loop decreases (nc - cj) {
+        if cj >= nc { break }
+        let c = Vec_usize.at(callees, cj)
+        var visited2 = zeroed_bools(n, allocator)?
+        directed_reach_excluding(g, c, dispatcher, mutable visited2, allocator)?
+        var cluster_size: usize = 0
+        var node2: usize = 0
+        loop decreases (n - node2) {
+            if node2 >= n { break }
+            if Vec_bool.at(visited2, node2) && node2 != dispatcher && Vec_usize.at(spoke_count, node2) == 1 {
+                cluster_size = cluster_size + 1
+            }
+            node2 = node2 + 1
+        }
+        if cluster_size >= min_residual_component_size() {
+            qualifying = qualifying + 1
+            total = total + cluster_size
+        }
+        cj = cj + 1
+    }
+    return (qualifying, total)
+}
+
+
+public function find_best_dispatcher(g: CallGraph, n: usize, allocator: Allocator) -> DispatcherResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var best_found = false
+    var best_node: usize = 0
+    var best_qualifying: usize = 0
+    var best_total: usize = 0
+    var c: usize = 0
+    loop decreases (n - c) {
+        if c >= n { break }
+        if out_degree(g, c) >= min_component_count() {
+            let r = spoke_stats_for(g, n, c, allocator)?
+            let qualifying = r.0
+            let total = r.1
+            if qualifying >= min_component_count() && total >= min_total_cluster_coverage() {
+                let better = if !best_found {
+                    true
+                } else if qualifying > best_qualifying {
+                    true
+                } else if qualifying == best_qualifying && total > best_total {
+                    true
+                } else {
+                    false
+                }
+                if better {
+                    best_found = true
+                    best_node = c
+                    best_qualifying = qualifying
+                    best_total = total
+                }
+            }
+        }
+        c = c + 1
+    }
+    return DispatcherResult { found: best_found, node: best_node, qualifying: best_qualifying, total: best_total }
+}

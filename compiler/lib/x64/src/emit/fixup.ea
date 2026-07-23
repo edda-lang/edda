@@ -1,0 +1,124 @@
+
+module x64.emit.fixup
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.error as lir_error_mod
+import ir.emitted as etypes_mod
+import local.emit.types as x64types_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(x64types_mod.BranchFixup)
+spec std.collections.vec.Vec(etypes_mod.EmittedReloc)
+
+
+public function record_fixup(
+    fixups: mutable Vec_BranchFixup.Vec,
+    site: u32,
+    target_block: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_BranchFixup.push(mutable fixups, take x64types_mod.BranchFixup {
+        site: site,
+        target_block: target_block,
+    }, allocator)?
+}
+
+public function record_reloc(
+    relocs: mutable Vec_EmittedReloc.Vec,
+    offset: u32,
+    target: etypes_mod.RelocTarget,
+    kind: etypes_mod.RelocKind,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_EmittedReloc.push(mutable relocs, take etypes_mod.EmittedReloc {
+        offset: offset,
+        target: target,
+        kind: kind,
+    }, allocator)?
+}
+
+public function resolve_fixups(
+    code: mutable Vec_u8.Vec,
+    fixups: Vec_BranchFixup.Vec,
+    offsets: Vec_u32.Vec,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let nf = Vec_BranchFixup.len(fixups)
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        let fx = Vec_BranchFixup.at(fixups, i)
+        let tb = fx.target_block as usize
+        if tb >= Vec_u32.len(offsets) {
+            raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "x64.gen.emit: branch fixup target block out of range",
+            )
+        }
+        let target_off = Vec_u32.at(offsets, tb)
+        patch_rel32(mutable code, fx.site, target_off)?
+        i += 1
+    }
+}
+
+function patch_rel32(
+    code: mutable Vec_u8.Vec,
+    site: u32,
+    target_off: u32,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let s = site as usize
+    let len = Vec_u8.len(code)
+    if s >= len {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: branch fixup site out of range",
+        )
+    }
+    if len - s < 4 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: branch fixup site lacks a full rel32 field",
+        )
+    }
+    let next_ip: i64 = (site as i64) + 4
+    let rel: i64 = (target_off as i64) - next_ip
+    let i32_min: i64 = -2147483648 as i64
+    let i32_max: i64 = 2147483647 as i64
+    if rel < i32_min || rel > i32_max {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: rel32 branch displacement exceeds signed 32-bit range",
+        )
+    }
+    let u: u32 = rel as u32 wrapping
+    Vec_u8.set_at(mutable code, s, u as u8 wrapping)
+    Vec_u8.set_at(mutable code, s + 1, (u >> 8) as u8 wrapping)
+    Vec_u8.set_at(mutable code, s + 2, (u >> 16) as u8 wrapping)
+    Vec_u8.set_at(mutable code, s + 3, (u >> 24) as u8 wrapping)
+}
+
+public function tail_site(code: Vec_u8.Vec) -> u32
+    with {err: lir_error_mod.LirError}
+{
+    let len = Vec_u8.len(code)
+    if len < 4 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: rel32 tail underflow",
+        )
+    }
+    return (len - 4) as u32 wrapping
+}

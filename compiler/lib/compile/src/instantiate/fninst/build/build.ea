@@ -1,0 +1,361 @@
+module compile.instantiate.fninst.build.build
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import cteval.state.value as value_mod
+import hir.build.file as hir_file_mod
+import types.check as check_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import resolve.build.drive.surface.registry as registry_mod
+import resolve.paths.modules as mt_mod
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import specs.address.id as id_mod
+import specs.error as spec_err_mod
+import specs.gen.build.output as output_mod
+import specs.gen.monomorphise.address.address as addr_mod
+import specs.gen.respan.respan as respan_mod
+import specs.gen.typaths as typaths_mod
+import specs.subst.item as item_subst_mod
+import specs.subst.walk.map as map_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.literal as ast_literal_mod
+import syntax.ast.tree as ast_tree_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import local.instantiate.fninst.table.table as table_mod
+import local.instantiate.fninst.discover.discover as discover_mod
+import local.instantiate.fninst.mangle.mangle as mangle_mod
+
+
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.core.option.Option(ast_tree_mod.Expr)
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(output_mod.InstanceItems)
+spec std.collections.hashmap.IntMap(bool)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(check_mod.TypeOutput)
+spec std.collections.vec.Vec(output_mod.SpecOutput)
+spec std.collections.vec.Vec(mangle_mod.FnInstNeed)
+spec std.collections.vec.Vec(table_mod.TemplateEntry)
+
+
+public function build_output(
+    needs: Vec_FnInstNeed.Vec,
+    t: table_mod.TemplateTable,
+    ty_paths: typaths_mod.TyPathMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    interner: mutable interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> output_mod.SpecOutput
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: output_mod.SpecOutput
+    output_mod.new(init out, allocator)?
+    var i: usize = 0
+    loop
+        decreases Vec_FnInstNeed.len(needs) - i
+    {
+        if i >= Vec_FnInstNeed.len(needs) { break }
+        let need = Vec_FnInstNeed.at(needs, i)
+        handle err: spec_err_mod.SpecError as e -> {
+            let _ = e
+        } {
+            build_one(need, t, ty_paths, registry, mt, mutable interner, ty_interner, mutable out, mutable map, allocator)?
+        }
+        i += 1
+    }
+    return out
+}
+
+
+function build_one(
+    need: mangle_mod.FnInstNeed,
+    t: table_mod.TemplateTable,
+    ty_paths: typaths_mod.TyPathMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    interner: mutable interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    out: mutable output_mod.SpecOutput,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: spec_err_mod.SpecError, divergence}
+{
+    let entry = Vec_TemplateEntry.at(t.entries, need.entry_idx as usize)
+    let at = entry.decl.span
+    uninit args: Vec_ComptimeValue.Vec
+    Vec_ComptimeValue.new(init args, allocator)?
+    uninit arg_exprs: Vec_Expr.Vec
+    Vec_Expr.new(init arg_exprs, allocator)?
+    var k: usize = 0
+    loop
+        decreases Vec_TyId.len(need.bound) - k
+    {
+        if k >= Vec_TyId.len(need.bound) { break }
+        let bt = Vec_TyId.at(need.bound, k)
+        Vec_ComptimeValue.push(mutable args, value_mod.ComptimeValue.type_meta(ty: bt), allocator)?
+        match ty_expr_of(bt, ty_paths, ty_interner, mutable interner, at, allocator, 16 as usize)? {
+            case .some(let ex) => Vec_Expr.push(mutable arg_exprs, ex, allocator)?
+            case .none => return ()
+        }
+        k += 1
+    }
+    let spec_name = addr_mod.render_symbol_string(need.mangled, interner, allocator)?
+    uninit body_names: Vec_Symbol.Vec
+    Vec_Symbol.new(init body_names, allocator)?
+    uninit gparams: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init gparams, allocator)?
+    var gi: usize = 0
+    loop
+        decreases Vec_GenericParam.len(entry.decl.outbound_generics) - gi
+    {
+        if gi >= Vec_GenericParam.len(entry.decl.outbound_generics) { break }
+        Vec_GenericParam.push(mutable gparams, Vec_GenericParam.at(entry.decl.outbound_generics, gi), allocator)?
+        gi += 1
+    }
+    var gj: usize = 0
+    loop
+        decreases Vec_GenericParam.len(entry.decl.generics) - gj
+    {
+        if gj >= Vec_GenericParam.len(entry.decl.generics) { break }
+        Vec_GenericParam.push(mutable gparams, Vec_GenericParam.at(entry.decl.generics, gj), allocator)?
+        gj += 1
+    }
+    let s = map_mod.build(
+        take spec_name, gparams, args, arg_exprs, at,
+        entry.origin_segs, entry.import_scope, registry, mt, take body_names, allocator,
+    )?
+    let dcopy = entry.decl
+    let item0 = ast_item_mod.Item {
+        span: entry.decl.span,
+        attributes: entry.attrs,
+        kind: ast_item_mod.ItemKind.function_(decl: Box_FnDecl.new(take dcopy, allocator)?),
+    }
+    let item1 = item_subst_mod.subst_item(item0, s, false, allocator)?
+    let item2 = strip_outbound(item1, allocator)?
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    Vec_Item.push(mutable items, item2, allocator)?
+    let name_str = addr_mod.render_symbol_string(need.mangled, interner, allocator)?
+    let synth_file = source_map_mod.add_file(mutable map, f"<generated: {name_str}>", "", allocator)?
+    let respanned = respan_mod.respan_items(items, synth_file, allocator)?
+    let mid = id_mod.ModuleId { raw: Vec_InstanceItems.len(out.gen_items) as u32 }
+    output_mod.record_instance_items(mutable out, mid, need.mangled, take respanned, allocator)?
+}
+
+
+function strip_outbound(item: ast_item_mod.Item, allocator: Allocator) -> ast_item_mod.Item
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(let b) => {
+            let d = Box_FnDecl.get(b)
+            uninit og: Vec_GenericParam.Vec
+            Vec_GenericParam.new(init og, allocator)?
+            uninit ig: Vec_GenericParam.Vec
+            Vec_GenericParam.new(init ig, allocator)?
+            let d2 = ast_item_mod.FnDecl {
+                span: d.span,
+                stability: d.stability,
+                visibility: d.visibility,
+                refinement_stable: d.refinement_stable,
+                name: d.name,
+                outbound_generics: og,
+                generics: ig,
+                params: d.params,
+                return_mode: d.return_mode,
+                return_ty: d.return_ty,
+                effects: d.effects,
+                refinements: d.refinements,
+                body: d.body,
+            }
+            return ast_item_mod.Item {
+                span: item.span,
+                attributes: item.attributes,
+                kind: ast_item_mod.ItemKind.function_(decl: Box_FnDecl.new(take d2, allocator)?),
+            }
+        }
+        case _ => return item
+    }
+}
+
+
+function ty_expr_of(
+    bt: ty_mod.TyId,
+    ty_paths: typaths_mod.TyPathMap,
+    ty_interner: ty_interner_mod.Interner,
+    interner: mutable interner_mod.Interner,
+    at: span_mod.Span,
+    allocator: Allocator,
+    fuel: usize,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+    decreases fuel
+{
+    if fuel == 0 as usize { return Option_Expr.none }
+    if ty_mod.is_error(bt) { return Option_Expr.none }
+    if ty_mod.index(bt) >= ty_interner_mod.slot_count(ty_interner) { return Option_Expr.none }
+    match ty_interner_mod.lookup(ty_interner, bt) {
+        case .primitive(let p) => return prim_expr(p, at, mutable interner, allocator)?
+        case .string_ => return name_ty_expr("String", at, mutable interner, allocator)?
+        case .record(_) => return nominal_expr(bt, ty_paths, at, allocator)?
+        case .sum_(_) => return nominal_expr(bt, ty_paths, at, allocator)?
+        case .tuple_(let elems) => {
+            uninit parts: Vec_Expr.Vec
+            Vec_Expr.new(init parts, allocator)?
+            var k: usize = 0
+            loop
+                decreases (Vec_TyId.len(elems) - k)
+            {
+                if k >= Vec_TyId.len(elems) { break }
+                match ty_expr_of(Vec_TyId.at(elems, k), ty_paths, ty_interner, mutable interner, at, allocator, fuel - 1)? {
+                    case .some(let ex) => Vec_Expr.push(mutable parts, ex, allocator)?
+                    case .none => return Option_Expr.none
+                }
+                k = k + 1
+            }
+            return Option_Expr.some(value: ast_tree_mod.Expr {
+                span: at,
+                kind: ast_tree_mod.ExprKind.tuple(elements: parts),
+            })
+        }
+        case _ => return Option_Expr.none
+    }
+}
+
+
+function nominal_expr(
+    bt: ty_mod.TyId,
+    ty_paths: typaths_mod.TyPathMap,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match typaths_mod.ty_path_of(ty_paths, bt) {
+        case .some(let tp) => {
+            let exprs = addr_mod.ty_path_arg_exprs(tp, at, allocator)?
+            if Vec_Expr.len(exprs) == 0 { return Option_Expr.none }
+            return Option_Expr.some(value: Vec_Expr.at(exprs, 0 as usize))
+        }
+        case .none => return Option_Expr.none
+    }
+}
+
+
+function name_ty_expr(
+    name: String,
+    at: span_mod.Span,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let sym = interner_mod.intern(mutable interner, name, allocator)?
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    Vec_Ident.push(mutable segs, ast_ident_mod.Ident { name: sym, span: at }, allocator)?
+    return Option_Expr.some(value: ast_tree_mod.Expr {
+        span: at,
+        kind: ast_tree_mod.ExprKind.path(path: ast_ident_mod.Path { segments: segs, span: at }),
+    })
+}
+
+
+function prim_expr(
+    p: ty_kind_mod.PrimKind,
+    at: span_mod.Span,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match p {
+        case .unit_ => return Option_Expr.some(value: ast_tree_mod.Expr {
+            span: at,
+            kind: ast_tree_mod.ExprKind.literal(value: ast_literal_mod.Literal.unit),
+        })
+        case _ => ()
+    }
+    let name: Option_String.Option = match p {
+        case .i8_ => Option_String.some(value: "i8")
+        case .i16_ => Option_String.some(value: "i16")
+        case .i32_ => Option_String.some(value: "i32")
+        case .i64_ => Option_String.some(value: "i64")
+        case .i128_ => Option_String.some(value: "i128")
+        case .u8_ => Option_String.some(value: "u8")
+        case .u16_ => Option_String.some(value: "u16")
+        case .u32_ => Option_String.some(value: "u32")
+        case .u64_ => Option_String.some(value: "u64")
+        case .u128_ => Option_String.some(value: "u128")
+        case .isize_ => Option_String.some(value: "isize")
+        case .usize_ => Option_String.some(value: "usize")
+        case .f32_ => Option_String.some(value: "f32")
+        case .f64_ => Option_String.some(value: "f64")
+        case .bool_ => Option_String.some(value: "bool")
+        case .codepoint_ => Option_String.some(value: "Codepoint")
+        case _ => Option_String.none
+    }
+    return match name {
+        case .some(let n) => name_ty_expr(n, at, mutable interner, allocator)?
+        case .none => Option_Expr.none
+    }
+}
+
+
+public function expand_round(
+    files: Vec_HirFile.Vec,
+    types: Vec_TypeOutput.Vec,
+    tmpl: mutable table_mod.TemplateTable,
+    ty_paths: typaths_mod.TyPathMap,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    interner: mutable interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    map: mutable source_map_mod.SourceMap,
+    work: mutable Vec_SpecOutput.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    table_mod.extend(mutable tmpl, files, mt, interner, allocator)?
+    uninit needs: Vec_FnInstNeed.Vec
+    Vec_FnInstNeed.new(init needs, allocator)?
+    var seen = IntMap_bool.new(allocator)?
+    var i: usize = 0
+    loop
+        decreases Vec_HirFile.len(files) - i
+    {
+        if i >= Vec_HirFile.len(files) { break }
+        if i >= Vec_TypeOutput.len(types) { break }
+        let calls = discover_mod.collect_calls(
+            Vec_HirFile.at(files, i), Vec_TypeOutput.at(types, i), tmpl, ty_interner, allocator,
+        )?
+        mangle_mod.needs_from_calls(
+            calls, tmpl, ty_paths, ty_interner,
+            mutable interner, mutable seen, mutable needs, allocator,
+        )?
+        i += 1
+    }
+    if Vec_FnInstNeed.len(needs) > 0 {
+        let round_out = build_output(needs, tmpl, ty_paths, registry, mt, mutable interner, ty_interner, mutable map, allocator)?
+        Vec_SpecOutput.push(mutable work, take round_out, allocator)?
+    }
+}

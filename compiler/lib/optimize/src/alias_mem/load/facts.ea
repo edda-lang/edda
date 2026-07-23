@@ -1,0 +1,367 @@
+module optimize.alias_mem.load.facts
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+import types.pass.ty as ty_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.load.model as model_mod
+
+
+spec std.core.option.Option(mir_rvalue_mod.Operand)
+spec std.core.option.Option(model_mod.AvailFact)
+spec std.core.option.Option(usize)
+spec std.collections.vec.Vec(Option_AvailFact)
+spec std.collections.vec.Vec(i64)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+
+
+public type FactTable {
+    slots: Vec_Option_AvailFact.Vec
+    src_of: Vec_i64.Vec
+    src_head: Vec_i64.Vec
+    src_next: Vec_i64.Vec
+    src_prev: Vec_i64.Vec
+    active: Vec_usize.Vec
+    active_pos: Vec_i64.Vec
+}
+
+
+function neg_one() -> i64 {
+    return (0 as i64) - (1 as i64)
+}
+
+
+function new_neg_ones(out: init Vec_i64.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_i64.Vec
+    Vec_i64.with_capacity(init v, n, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_i64.push(mutable v, neg_one(), allocator)?
+        i += 1
+    }
+    out = v
+}
+
+
+public function new_table(
+    out: init FactTable,
+    info: escape_mod.EscapeInfo,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = escape_mod.local_count(info)
+    uninit slots: Vec_Option_AvailFact.Vec
+    Vec_Option_AvailFact.with_capacity(init slots, n, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_Option_AvailFact.push(mutable slots, Option_AvailFact.none, allocator)?
+        i += 1
+    }
+    uninit src_of: Vec_i64.Vec
+    new_neg_ones(init src_of, n, allocator)?
+    uninit src_head: Vec_i64.Vec
+    new_neg_ones(init src_head, n, allocator)?
+    uninit src_next: Vec_i64.Vec
+    new_neg_ones(init src_next, n, allocator)?
+    uninit src_prev: Vec_i64.Vec
+    new_neg_ones(init src_prev, n, allocator)?
+    uninit active_pos: Vec_i64.Vec
+    new_neg_ones(init active_pos, n, allocator)?
+    uninit active: Vec_usize.Vec
+    Vec_usize.new(init active, allocator)?
+    out = FactTable {
+        slots: slots,
+        src_of: src_of,
+        src_head: src_head,
+        src_next: src_next,
+        src_prev: src_prev,
+        active: active,
+        active_pos: active_pos,
+    }
+}
+
+
+public function reset(t: mutable FactTable) -> () {
+    var i: usize = Vec_usize.len(t.active)
+    loop decreases i {
+        if i == 0 { break }
+        i -= 1
+        let k = Vec_usize.at(t.active, i)
+        if k < Vec_i64.len(t.active_pos) {
+            let s = Vec_i64.at(t.src_of, k)
+            if s >= (0 as i64) {
+                Vec_i64.set_at(mutable t.src_head, s as usize, neg_one())
+            }
+            Vec_i64.set_at(mutable t.src_of, k, neg_one())
+            Vec_i64.set_at(mutable t.src_prev, k, neg_one())
+            Vec_i64.set_at(mutable t.src_next, k, neg_one())
+            Vec_i64.set_at(mutable t.active_pos, k, neg_one())
+            Vec_Option_AvailFact.set_at(mutable t.slots, k, Option_AvailFact.none)
+        }
+    }
+    Vec_usize.clear(mutable t.active)
+}
+
+
+function kill(t: mutable FactTable, k: usize) -> () {
+    if k >= Vec_i64.len(t.active_pos) { return }
+    let pos_i = Vec_i64.at(t.active_pos, k)
+    if pos_i < (0 as i64) { return }
+    let s = Vec_i64.at(t.src_of, k)
+    if s >= (0 as i64) {
+        let p = Vec_i64.at(t.src_prev, k)
+        let nx = Vec_i64.at(t.src_next, k)
+        if p >= (0 as i64) {
+            Vec_i64.set_at(mutable t.src_next, p as usize, nx)
+        } else {
+            Vec_i64.set_at(mutable t.src_head, s as usize, nx)
+        }
+        if nx >= (0 as i64) {
+            Vec_i64.set_at(mutable t.src_prev, nx as usize, p)
+        }
+    }
+    Vec_i64.set_at(mutable t.src_of, k, neg_one())
+    Vec_i64.set_at(mutable t.src_prev, k, neg_one())
+    Vec_i64.set_at(mutable t.src_next, k, neg_one())
+    Vec_Option_AvailFact.set_at(mutable t.slots, k, Option_AvailFact.none)
+    let pos = pos_i as usize
+    let n_active = Vec_usize.len(t.active)
+    if pos < n_active {
+        let last = n_active - 1
+        let last_k = Vec_usize.at(t.active, last)
+        Vec_usize.set_at(mutable t.active, pos, last_k)
+        if last_k < Vec_i64.len(t.active_pos) {
+            Vec_i64.set_at(mutable t.active_pos, last_k, pos as i64)
+        }
+        let _ = Vec_usize.pop(mutable t.active)
+    }
+    Vec_i64.set_at(mutable t.active_pos, k, neg_one())
+}
+
+
+public function update_facts_for_assign(
+    t: mutable FactTable,
+    dest: mir_place_mod.Place,
+    rewritten: mir_rvalue_mod.Rvalue,
+    info: escape_mod.EscapeInfo,
+    locals: Vec_Local.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let dest_ok = escape_mod.is_bare(dest)
+        && escape_mod.escapes(info, escape_mod.base_local(dest)) == false
+
+    invalidate_write(mutable t, dest)
+    match recordable_source(rewritten, locals) {
+        case .some(let source) =>
+            if dest_ok {
+                record_fact(mutable t, dest, source, allocator)?
+            }
+        case .none => ()
+    }
+}
+
+
+function recordable_source(rv: mir_rvalue_mod.Rvalue, locals: Vec_Local.Vec) -> Option_Operand.Option {
+    return match rv {
+        case .use_(let operand) => match operand {
+            case .copy_(let place, let ty) =>
+                if escape_mod.is_bare(place) && read_matches_local_ty(place, ty, locals) {
+                    Option_Operand.some(value: operand)
+                } else {
+                    Option_Operand.none
+                }
+            case .move_(_, _) => Option_Operand.none
+            case .constant(_) => Option_Operand.some(value: operand)
+        }
+        case _ => Option_Operand.none
+    }
+}
+
+
+function read_matches_local_ty(
+    place: mir_place_mod.Place,
+    ty: ty_mod.TyId,
+    locals: Vec_Local.Vec,
+) -> bool {
+    let idx = mir_local_mod.index(escape_mod.base_local(place))
+    if idx >= Vec_Local.len(locals) {
+        return false
+    }
+    return Vec_Local.at(locals, idx).ty.raw == ty.raw
+}
+
+
+function record_fact(
+    t: mutable FactTable,
+    dest: mir_place_mod.Place,
+    source: mir_rvalue_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let idx: usize = mir_local_mod.index(escape_mod.base_local(dest))
+    if idx >= Vec_Option_AvailFact.len(t.slots) {
+        return
+    }
+    let shd: bool = match escape_mod.operand_place(source) {
+        case .some(let p) => escape_mod.has_deref(p)
+        case .none => false
+    }
+    if shd {
+        return
+    }
+    kill(mutable t, idx)
+    Vec_Option_AvailFact.set_at(
+        mutable t.slots,
+        idx,
+        Option_AvailFact.some(value: model_mod.AvailFact {
+            dest: dest,
+            source: source,
+            source_has_deref: shd,
+        }),
+    )
+    let s: i64 = match escape_mod.operand_place(source) {
+        case .some(let p) => {
+            let si = mir_local_mod.index(escape_mod.base_local(p))
+            if si < Vec_i64.len(t.src_head) { si as i64 } else { neg_one() }
+        }
+        case .none => neg_one()
+    }
+    Vec_i64.set_at(mutable t.src_of, idx, s)
+    if s >= (0 as i64) {
+        let head = Vec_i64.at(t.src_head, s as usize)
+        Vec_i64.set_at(mutable t.src_next, idx, head)
+        Vec_i64.set_at(mutable t.src_prev, idx, neg_one())
+        if head >= (0 as i64) {
+            Vec_i64.set_at(mutable t.src_prev, head as usize, idx as i64)
+        }
+        Vec_i64.set_at(mutable t.src_head, s as usize, idx as i64)
+    }
+    Vec_usize.push(mutable t.active, idx, allocator)?
+    Vec_i64.set_at(mutable t.active_pos, idx, (Vec_usize.len(t.active) - 1) as i64)
+}
+
+
+function invalidate_write(t: mutable FactTable, written: mir_place_mod.Place) -> () {
+    if escape_mod.has_deref(written) {
+        reset(mutable t)
+        return
+    }
+    let w: usize = mir_local_mod.index(escape_mod.base_local(written))
+    if w >= Vec_i64.len(t.active_pos) {
+        return
+    }
+    kill(mutable t, w)
+    var cur = Vec_i64.at(t.src_head, w)
+    var fuel: usize = Vec_usize.len(t.active) + 1
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        if cur < (0 as i64) { break }
+        let k = cur as usize
+        if k >= Vec_i64.len(t.src_next) { break }
+        let nx = Vec_i64.at(t.src_next, k)
+        kill(mutable t, k)
+        cur = nx
+    }
+}
+
+
+function invalidate_escaped(t: mutable FactTable, info: escape_mod.EscapeInfo) -> () {
+    var i: usize = Vec_usize.len(t.active)
+    loop decreases i {
+        if i == 0 { break }
+        i -= 1
+        if i >= Vec_usize.len(t.active) { break }
+        let k = Vec_usize.at(t.active, i)
+        let dies: bool = if k < Vec_Option_AvailFact.len(t.slots) {
+            match Vec_Option_AvailFact.at(t.slots, k) {
+                case .some(let fact) => fact_survives_call(fact, info) == false
+                case .none => false
+            }
+        } else {
+            false
+        }
+        if dies {
+            kill(mutable t, k)
+        }
+    }
+}
+
+
+function fact_survives_call(fact: model_mod.AvailFact, info: escape_mod.EscapeInfo) -> bool {
+    if escape_mod.escapes(info, escape_mod.base_local(fact.dest)) {
+        return false
+    }
+    return match escape_mod.operand_place(fact.source) {
+        case .some(let src_place) =>
+            escape_mod.escapes(info, escape_mod.base_local(src_place)) == false
+        case .none => true
+    }
+}
+
+
+public function lookup_fact(
+    t: FactTable,
+    key: mir_place_mod.Place,
+    fallback: mir_rvalue_mod.Operand,
+) -> mir_rvalue_mod.Operand {
+    if escape_mod.is_bare(key) == false {
+        return fallback
+    }
+    let idx: usize = mir_local_mod.index(escape_mod.base_local(key))
+    if idx >= Vec_Option_AvailFact.len(t.slots) {
+        return fallback
+    }
+    return match Vec_Option_AvailFact.at(t.slots, idx) {
+        case .some(let fact) => fact.source
+        case .none => fallback
+    }
+}
+
+
+public function apply_call_clobber(
+    t: mutable FactTable,
+    kind: mir_term_mod.TermKind,
+    info: escape_mod.EscapeInfo,
+) -> () {
+    match kind {
+        case .call_(_, _, let dest, _, _) =>
+            clobber_at(mutable t, dest, info)
+        case .await_(_, let dest, _, _) =>
+            clobber_at(mutable t, dest, info)
+        case .spawn_(_, _, _, let handle_dest, _, _) =>
+            clobber_at(mutable t, handle_dest, info)
+        case _ => ()
+    }
+}
+
+
+function clobber_at(
+    t: mutable FactTable,
+    dest: mir_place_mod.Place,
+    info: escape_mod.EscapeInfo,
+) -> () {
+    if escape_mod.is_opaque(info) {
+        reset(mutable t)
+        return
+    }
+    invalidate_escaped(mutable t, info)
+    invalidate_write(mutable t, dest)
+}

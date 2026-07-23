@@ -1,0 +1,170 @@
+module structmap.budget.gate.analyze.analyze
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string as string
+import local.data.model as model
+import local.budget.model as bmodel
+import local.budget.cohesion.spoke.spoke as sp
+import local.budget.gate.select.select as sel
+import local.budget.gate.measure.measure as mz
+import local.budget.gate.directive.directive as dir_mod
+import local.budget.gateb.laws.laws as laws
+import local.render.doc.emit as emit_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(bmodel.NodeMeasure)
+spec std.collections.vec.Vec(bmodel.WorklistEntry)
+spec std.core.option.Option(bmodel.Directive)
+
+
+function lookup_text(files: emit_mod.RenderedFiles, dir: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let with_sep = string.concat(dir, "/", allocator)?
+    let target = string.concat(with_sep, model.index_filename(), allocator)?
+    let n: usize = Vec_String.len(files.paths)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_String.at(files.paths, i), target) {
+            return Vec_String.at(files.texts, i)
+        }
+        i += 1
+    }
+    return string.clone("", allocator)?
+}
+
+function component_equals(b: [u8], start: usize, word: String) -> bool {
+    let w = word.bytes()
+    let wn: usize = w.len()
+    let bn: usize = b.len()
+    if start +| wn > bn { return false }
+    var k: usize = 0
+    loop decreases (wn - k) {
+        if k >= wn { break }
+        if b[start + k] != w[k] { return false }
+        k += 1
+    }
+    let after: usize = start +| wn
+    if after == bn { return true }
+    return b[after] == 0x2F || b[after] == 0x5C
+}
+
+function is_generated_dir(dir: String, root: String) -> bool {
+    if !string.starts_with(dir, root) { return false }
+    let db = dir.bytes()
+    let rb = root.bytes()
+    var i: usize = rb.len()
+    if i < db.len() && (db[i] == 0x2F || db[i] == 0x5C) { i = i + 1 }
+    return component_equals(db, i, "codegen") || component_equals(db, i, "target")
+}
+
+function exempt_sum(tree: model.Tree, dir_idx: usize, cfg: bmodel.BudgetConfig, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let exempt = sel.exempt_files(tree, dir_idx, allocator)?
+    let n: usize = Vec_String.len(exempt)
+    var sum: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        sum = sum +| mz.file_interface_cost(tree, dir_idx, Vec_String.at(exempt, i), cfg, allocator)?
+        i += 1
+    }
+    return sum
+}
+
+function worklist_before(a: bmodel.WorklistEntry, b: bmodel.WorklistEntry) -> bool {
+    if a.overage != b.overage { return a.overage > b.overage }
+    return sp.string_less(a.node, b.node)
+}
+
+function sort_worklist(v: mutable Vec_WorklistEntry.Vec) -> () {
+    let n = Vec_WorklistEntry.len(v)
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        var j: usize = i
+        loop decreases j {
+            if j == 0 as usize { break }
+            let cur = Vec_WorklistEntry.at(v, j)
+            let prev = Vec_WorklistEntry.at(v, j - 1)
+            if worklist_before(cur, prev) {
+                Vec_WorklistEntry.set_at(mutable v, j, cur)
+                Vec_WorklistEntry.set_at(mutable v, j - 1, prev)
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        i += 1
+    }
+}
+
+public function analyze_gate_a(tree: model.Tree, files: emit_mod.RenderedFiles, cfg: bmodel.BudgetConfig, root: String, allocator: Allocator) -> bmodel.BudgetReport
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit measures: Vec_NodeMeasure.Vec
+    Vec_NodeMeasure.new(init measures, allocator)?
+    uninit worklist: Vec_WorklistEntry.Vec
+    Vec_WorklistEntry.new(init worklist, allocator)?
+
+    let ndirs: usize = Vec_String.len(tree.paths)
+    var dir_idx: usize = 0
+    loop decreases (ndirs - dir_idx) {
+        if dir_idx >= ndirs { break }
+        let dir = Vec_String.at(tree.paths, dir_idx)
+        let text = lookup_text(files, dir, allocator)?
+        let node_cost = mz.measure_text(text, cfg)
+        let export_count = mz.parse_export_count(text)
+        let subtracted = exempt_sum(tree, dir_idx, cfg, allocator)?
+        let projected = node_cost -| subtracted
+        let band = mz.node_band(projected, cfg)
+
+        Vec_NodeMeasure.push(mutable measures, bmodel.NodeMeasure {
+            dir: string.clone(dir, allocator)?,
+            token_cost: node_cost,
+            export_count: export_count,
+            band: band
+        }, allocator)?
+
+        if mz.is_green(band) { dir_idx = dir_idx + 1; continue }
+        if is_generated_dir(dir, root) { dir_idx = dir_idx + 1; continue }
+
+        let directive = if mz.is_red(band) {
+            dir_mod.classify_red_node(tree, dir_idx, cfg, allocator)?
+        } else {
+            Option_Directive.none()
+        }
+        let overage = projected -| cfg.node_green_max
+        Vec_WorklistEntry.push(mutable worklist, bmodel.WorklistEntry {
+            gate: bmodel.Gate.per_node,
+            node: string.clone(dir, allocator)?,
+            token_cost: projected,
+            ceiling: cfg.node_green_max,
+            overage: overage,
+            directive: directive,
+            band: band
+        }, allocator)?
+        dir_idx = dir_idx + 1
+    }
+
+    sort_worklist(mutable worklist)
+    return bmodel.BudgetReport {
+        measures: measures,
+        worklist: worklist,
+        root: string.clone(root, allocator)?
+    }
+}
+
+public function analyze_budget(tree: model.Tree, files: emit_mod.RenderedFiles, cfg: bmodel.BudgetConfig, root: String, allocator: Allocator) -> bmodel.BudgetReport
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var report = analyze_gate_a(tree, files, cfg, root, allocator)?
+    laws.gate_b_structure(tree, cfg, root, mutable report.worklist, allocator)?
+    sort_worklist(mutable report.worklist)
+    return report
+}

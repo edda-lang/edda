@@ -1,0 +1,181 @@
+
+module syntax.parse.expr.spawn
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+import local.parse.ty.core.core as ty_mod
+import local.parse.stmt.kinds.core as stmt_mod
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(tree_mod.SpawnArg)
+spec std.mem.alloc.Box(tree_mod.SpawnExpr)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.core.option.Option(tree_mod.Ty)
+
+
+public function is_spawn_block(tokens: [lexed_mod.Lexed], path: ident_mod.Path, pos: usize) -> bool {
+    if path.segments.len() != 2 { return false }
+    let tail_is_spawn = match Vec_Ident.get(path.segments, 1) {
+        case .some(let seg) => symbol.is_spawn(seg.name)
+        case .none => false
+    }
+    if !tail_is_spawn { return false }
+    return match util_mod.peek(tokens, pos) {
+        case .l_brace => true
+        case .l_paren => match util_mod.peek_at(tokens, pos, 1) {
+            case .kw_take => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+public function parse_spawn_tail(
+    tokens: [lexed_mod.Lexed],
+    path: ident_mod.Path,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_span = path.span
+    let scope_name = match Vec_Ident.get(path.segments, 0) {
+        case .some(let seg) => seg
+        case .none => ident_mod.Ident { name: symbol.empty(), span: path_span }
+    }
+    var p = pos
+    uninit args: Vec_SpawnArg.Vec
+    Vec_SpawnArg.new(init args, allocator)?
+    match util_mod.peek(tokens, p) {
+        case .l_paren => {
+            p = parse_spawn_args(tokens, mutable args, p + 1, mutable diags, allocator, parse_expr_fn, depth)?
+        }
+        case _ => ()
+    }
+    let block_r = stmt_mod.parse_block(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    let body = block_r.0
+    let full_span = merge_spans(path_span, body.span)
+    let payload = tree_mod.SpawnExpr {
+        span: full_span,
+        scope_name: scope_name,
+        args: args,
+        body: body,
+    }
+    let boxed = Box_SpawnExpr.new(payload, allocator)?
+    let expr = tree_mod.Expr {
+        span: full_span,
+        kind: tree_mod.ExprKind.spawn(payload: boxed),
+    }
+    return (expr, block_r.1)
+}
+
+function parse_spawn_args(
+    tokens: [lexed_mod.Lexed],
+    args: mutable Vec_SpawnArg.Vec,
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        let stop = match util_mod.peek(tokens, p) {
+            case .r_paren => true
+            case .eof => true
+            case _ => false
+        }
+        if stop { break }
+        let iter_start = p
+        let arg_r = parse_spawn_arg(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_SpawnArg.push(mutable args, arg_r.0, allocator)?
+        p = arg_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => { p = p + 1 }
+            case _ => ()
+        }
+        if p == iter_start { p = p + 1 }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` after spawn arguments", allocator)?
+        }
+    }
+    return p
+}
+
+function parse_spawn_arg(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.SpawnArg, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .kw_take => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `take` — spawn arguments are always take-mode", allocator)?
+        }
+    }
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let nsym) => {
+            let nspan = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: nsym, span: nspan }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected spawn argument binding name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: util_mod.span_at(tokens, p) }
+        }
+    }
+    let ty = match util_mod.peek(tokens, p) {
+        case .colon => {
+            let ty_r = ty_mod.parse_ty_no_where(tokens, p + 1, mutable diags, allocator, parse_expr_fn, depth)?
+            p = ty_r.1
+            Option_Ty.some(value: ty_r.0)
+        }
+        case _ => Option_Ty.none
+    }
+    match util_mod.peek(tokens, p) {
+        case .eq => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `=` after spawn argument binder", allocator)?
+        }
+    }
+    let init_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+    let arg = tree_mod.SpawnArg {
+        span: merge_spans(start_span, init_r.0.span),
+        name: name,
+        ty: ty,
+        init_: init_r.0,
+    }
+    return (arg, init_r.1)
+}
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

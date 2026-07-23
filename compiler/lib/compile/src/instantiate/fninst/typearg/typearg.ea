@@ -1,0 +1,162 @@
+module compile.instantiate.fninst.typearg.typearg
+
+import std.collections.vec
+import std.mem.alloc
+import hir.def as def_mod
+import hir.tree as hir_tree
+import types.check as check_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HArg)
+
+
+public function evaluate(
+    e: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: usize,
+    allocator: Allocator,
+) -> ty_mod.TyId
+    with {allocator, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 as usize {
+        return ty_mod.error()
+    }
+    match e.kind {
+        case .use_(let def) => {
+            match check_mod.type_id_of_def(types_out, def) {
+                case .some(let t) => return t
+                case .none => ()
+            }
+            match check_mod.prim_def_id_to_ty_id(types_out, def) {
+                case .some(let t2) => return t2
+                case .none => ()
+            }
+            return ty_mod.error()
+        }
+        case .literal(let lit) => {
+            return match lit {
+                case .unit => find_unit(ty_interner)
+                case _ => ty_mod.error()
+            }
+        }
+        case .tuple(let elements) => {
+            uninit elems: Vec_TyId.Vec
+            Vec_TyId.new(init elems, allocator)?
+            var i: usize = 0
+            loop
+                decreases Vec_HExpr.len(elements) - i
+            {
+                if i >= Vec_HExpr.len(elements) { break }
+                let et = evaluate(Vec_HExpr.at(elements, i), types_out, ty_interner, fuel - 1, allocator)?
+                if ty_mod.is_error(et) {
+                    return ty_mod.error()
+                }
+                Vec_TyId.push(mutable elems, et, allocator)?
+                i += 1
+            }
+            return find_tuple(ty_interner, elems)
+        }
+        case .call(let cd, let cargs) => {
+            if def_mod.is_error(cd) || cd.raw != types_out.builtins.comptime_defs.field_type_at.raw {
+                return ty_mod.error()
+            }
+            if Vec_HArg.len(cargs) != 2 as usize {
+                return ty_mod.error()
+            }
+            let base = evaluate(Vec_HArg.at(cargs, 0).expr, types_out, ty_interner, fuel - 1, allocator)?
+            if ty_mod.is_error(base) {
+                return ty_mod.error()
+            }
+            let idx = match Vec_HArg.at(cargs, 1).expr.kind {
+                case .literal(let ilit) => match ilit {
+                    case .int(let v, _) => v as usize wrapping
+                    case _ => return ty_mod.error()
+                }
+                case _ => return ty_mod.error()
+            }
+            if ty_mod.index(base) >= ty_interner_mod.slot_count(ty_interner) {
+                return ty_mod.error()
+            }
+            return match ty_interner_mod.lookup(ty_interner, base) {
+                case .record(let d) => check_mod.field_ty_at(types_out, d, idx)
+                case .sum_(let d2) => check_mod.field_ty_at(types_out, d2, idx)
+                case .tuple_(let telems) => element_at(telems, idx)
+                case _ => ty_mod.error()
+            }
+        }
+        case _ => return ty_mod.error()
+    }
+}
+
+
+function element_at(elems: Vec_TyId.Vec, idx: usize) -> ty_mod.TyId {
+    if idx >= Vec_TyId.len(elems) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(elems, idx)
+}
+
+
+function find_unit(ty_interner: ty_interner_mod.Interner) -> ty_mod.TyId {
+    var i: usize = 1
+    loop
+        decreases ty_interner_mod.slot_count(ty_interner) - i
+    {
+        if i >= ty_interner_mod.slot_count(ty_interner) { break }
+        let id = ty_mod.TyId { raw: i as u32 wrapping }
+        match ty_interner_mod.lookup(ty_interner, id) {
+            case .primitive(let p) => {
+                match p {
+                    case .unit_ => return id
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    return ty_mod.error()
+}
+
+
+function find_tuple(ty_interner: ty_interner_mod.Interner, elems: Vec_TyId.Vec) -> ty_mod.TyId {
+    var i: usize = 1
+    loop
+        decreases ty_interner_mod.slot_count(ty_interner) - i
+    {
+        if i >= ty_interner_mod.slot_count(ty_interner) { break }
+        let id = ty_mod.TyId { raw: i as u32 wrapping }
+        match ty_interner_mod.lookup(ty_interner, id) {
+            case .tuple_(let cand) => {
+                if tuple_matches(cand, elems) { return id }
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    return ty_mod.error()
+}
+
+
+function tuple_matches(cand: Vec_TyId.Vec, elems: Vec_TyId.Vec) -> bool {
+    if Vec_TyId.len(cand) != Vec_TyId.len(elems) {
+        return false
+    }
+    var k: usize = 0
+    loop
+        decreases Vec_TyId.len(cand) - k
+    {
+        if k >= Vec_TyId.len(cand) { break }
+        if ty_mod.index(Vec_TyId.at(cand, k)) != ty_mod.index(Vec_TyId.at(elems, k)) {
+            return false
+        }
+        k += 1
+    }
+    return true
+}

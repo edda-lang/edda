@@ -1,0 +1,129 @@
+
+module resolve.map.error
+
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import intern.interner as intern_mod
+import intern.symbol
+import span.loc.pos.span as span_mod
+import hir.def as def_mod
+import manifest.lex.toml.val.values as values_mod
+
+derive eq for ResolveErrorKind
+derive eq for ResolveError
+
+
+public type ResolveErrorKind {
+    case unresolved_path(leaf: symbol.Symbol)
+
+    case ambiguous_path(leaf: symbol.Symbol, first: def_mod.DefId, second: def_mod.DefId)
+
+    case duplicate_item(name: symbol.Symbol, prior: def_mod.DefId)
+
+    case derive_unknown(name: symbol.Symbol)
+
+    case reserved_namespace(name: symbol.Symbol)
+
+    case or_binding_mismatch(name: symbol.Symbol, missing: bool)
+}
+
+public type ResolveError {
+    at: span_mod.Span
+    kind: ResolveErrorKind
+}
+
+
+public stable function span_of(e: ResolveError) -> span_mod.Span {
+    return e.at
+}
+
+
+public stable function to_diagnostic(e: ResolveError, interner: intern_mod.Interner, allocator: Allocator) -> diag_mod.Diagnostic
+    with {allocator, err: alloc.AllocError}
+{
+    let msg = format_message(e, interner, allocator)?
+    return diag_mod.error_at(code_mod.import_resolution_error(), e.at, msg)
+}
+
+
+stable function format_message(e: ResolveError, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e.kind {
+        case .unresolved_path(let leaf) => fmt_unresolved(leaf, interner, allocator)?
+        case .ambiguous_path(let leaf, _, _) => fmt_ambiguous(leaf, interner, allocator)?
+        case .duplicate_item(let name, _) => fmt_duplicate(name, interner, allocator)?
+        case .derive_unknown(let name) => fmt_derive_unknown(name, interner, allocator)?
+        case .reserved_namespace(let name) => fmt_reserved(name, interner, allocator)?
+        case .or_binding_mismatch(let name, let missing) => fmt_or_binding_mismatch(name, missing, interner, allocator)?
+    }
+}
+
+stable function symbol_to_string(s: symbol.Symbol, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = intern_mod.lookup(interner, s)
+    return values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+stable function fmt_unresolved(leaf: symbol.Symbol, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let name = symbol_to_string(leaf, interner, allocator)?
+    let p1 = string.concat("could not resolve path with leaf `", name, allocator)?
+    return string.concat(p1, "` — name not in scope", allocator)?
+}
+
+stable function fmt_ambiguous(leaf: symbol.Symbol, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let name = symbol_to_string(leaf, interner, allocator)?
+    let p1 = string.concat("path leaf `", name, allocator)?
+    return string.concat(p1, "` is ambiguous — multiple items in scope share this name", allocator)?
+}
+
+stable function fmt_duplicate(name: symbol.Symbol, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = symbol_to_string(name, interner, allocator)?
+    let p1 = string.concat("duplicate item `", n, allocator)?
+    return string.concat(p1, "` — another declaration in the same module already binds this name", allocator)?
+}
+
+stable function fmt_derive_unknown(name: symbol.Symbol, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = symbol_to_string(name, interner, allocator)?
+    let p1 = string.concat("unknown derive `", n, allocator)?
+    return string.concat(
+        p1,
+        "` — admitted derives are `eq`, `ord`, `hash`, `debug`, `clone`, `properties`, `serialize`, `deserialize`",
+        allocator,
+    )?
+}
+
+stable function fmt_reserved(name: symbol.Symbol, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = symbol_to_string(name, interner, allocator)?
+    let p1 = string.concat("`", n, allocator)?
+    return string.concat(
+        p1,
+        "` is a compiler-reserved root namespace (`std`, `codegen`, `tests`, `bench`, `examples`)",
+        allocator,
+    )?
+}
+
+stable function fmt_or_binding_mismatch(name: symbol.Symbol, missing: bool, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = symbol_to_string(name, interner, allocator)?
+    if missing {
+        let p1 = string.concat("or-pattern alternative does not bind `", n, allocator)?
+        return string.concat(p1, "` — every alternative must bind the same set of names", allocator)?
+    }
+    let p1 = string.concat("or-pattern alternative binds `", n, allocator)?
+    return string.concat(p1, "` — a name the first alternative does not bind; every alternative must bind the same set of names", allocator)?
+}

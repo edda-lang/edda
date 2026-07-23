@@ -1,0 +1,108 @@
+
+module cteval.eval.ops.scalar.unary
+
+import std.core.overflow
+import span.loc.pos.span as span_mod
+import syntax.ast.ops as ast_ops
+import local.error as err_mod
+import local.state.value as value_mod
+
+
+derive eq, debug for UnaryOutcome
+
+
+public type UnaryOutcome {
+    case ok(value: value_mod.ComptimeValue)
+    case failed(error: err_mod.ComptimeError)
+}
+
+
+public function apply_unary(
+    op: ast_ops.UnOp,
+    v: value_mod.ComptimeValue,
+    at: span_mod.Span,
+) -> UnaryOutcome {
+    return match op {
+        case .not => apply_not(v, at)
+        case .neg => apply_neg(v, at)
+        case .bit_not => UnaryOutcome.failed(
+            error: err_mod.ComptimeError.evaluation_failed(
+                at: at,
+                message: "unary `~` (bitwise NOT) is reserved for post-V1.0",
+            ),
+        )
+    }
+}
+
+
+function apply_not(v: value_mod.ComptimeValue, at: span_mod.Span) -> UnaryOutcome {
+    return match v {
+        case .bool_(let bv) =>
+            UnaryOutcome.ok(value: value_mod.ComptimeValue.bool_(value: !bv))
+        case _ => UnaryOutcome.failed(
+            error: err_mod.ComptimeError.evaluation_failed(
+                at: at,
+                message: "unary `!` requires a bool operand",
+            ),
+        )
+    }
+}
+
+
+function apply_neg(v: value_mod.ComptimeValue, at: span_mod.Span) -> UnaryOutcome {
+    return match v {
+        case .int_signed(let iv, let width) => signed_neg(iv, width, at)
+        case .int_unsigned(let uv, let width) => unsigned_neg(uv, width, at)
+        case _ => UnaryOutcome.failed(
+            error: err_mod.ComptimeError.evaluation_failed(
+                at: at,
+                message: "unary `-` requires an integer operand",
+            ),
+        )
+    }
+}
+
+function signed_neg(v: i64, width: value_mod.IntWidth, at: span_mod.Span) -> UnaryOutcome {
+    return handle err: overflow.Overflow -> overflow_outcome(at, "signed neg") {
+        let raw = 0 -? v
+        let narrowed = signed_in_width(raw, width)?
+        UnaryOutcome.ok(
+            value: value_mod.ComptimeValue.int_signed(value: narrowed, width: width),
+        )
+    }
+}
+
+function unsigned_neg(v: u64, width: value_mod.IntWidth, at: span_mod.Span) -> UnaryOutcome {
+    if v == 0 {
+        return UnaryOutcome.ok(
+            value: value_mod.ComptimeValue.int_unsigned(value: 0, width: width),
+        )
+    }
+    return overflow_outcome(at, "unsigned neg")
+}
+
+
+function signed_in_width(v: i64, width: value_mod.IntWidth) -> i64
+    with {err: overflow.Overflow}
+{
+    return match width {
+        case .w8 => signed_range(v, -128, 127)?
+        case .w16 => signed_range(v, -32768, 32767)?
+        case .w32 => signed_range(v, -2147483648, 2147483647)?
+        case .w64 => v
+        case .wsize => v
+    }
+}
+
+function signed_range(v: i64, lo: i64, hi: i64) -> i64 with {err: overflow.Overflow} {
+    if v < lo || v > hi {
+        raise overflow.Overflow.overflow
+    }
+    return v
+}
+
+function overflow_outcome(at: span_mod.Span, op_label: String) -> UnaryOutcome {
+    return UnaryOutcome.failed(
+        error: err_mod.ComptimeError.overflow(at: at, message: op_label),
+    )
+}

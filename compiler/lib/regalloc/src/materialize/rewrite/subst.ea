@@ -1,0 +1,368 @@
+
+module regalloc.materialize.rewrite.subst
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import types.pass.ty as ty_mod
+import hir.node as node_mod
+import target.triple as triple_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.hlir.op as hlir_op_mod
+
+import local.frame.frame as frame_mod
+
+
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(frame_mod.SpillSlot)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+
+
+spec std.core.option.Option(i32)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+spec std.core.option.Option(lir_reg_mod.PReg)
+
+
+public function subst_use(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    use_id: lir_vreg_mod.LirVRegId,
+    scratch: lir_reg_mod.PReg,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match slot_disp(layout, use_id.raw) {
+        case .none => return use_id
+        case .some(let d) => {
+            let sc = mint_scratch(mutable body, use_id.raw, scratch, target, allocator)?
+            let addr = framebase_memref(framebase, d)
+            push_op_id(mutable body, mutable new_ops, origin, spill_flags(), lir_op_mod.LirOpKind.load(addr: addr, dst: sc, width: 8 as u32), allocator)?
+            return sc
+        }
+    }
+}
+
+
+public function subst_operand(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    operand: lir_reg_mod.Operand,
+    scratch: lir_reg_mod.PReg,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> lir_reg_mod.Operand
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    return match operand {
+        case .vreg(let id) => lir_reg_mod.Operand.vreg(id: subst_use(mutable body, mutable new_ops, id, scratch, layout, framebase, origin, target, allocator)?)
+        case .preg(_) => operand
+        case .imm(_) => operand
+    }
+}
+
+
+public function subst_memref(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    addr: lir_reg_mod.MemRef,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> lir_reg_mod.MemRef
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let nb = match addr.base {
+        case .none => Option_LirVRegId.none
+        case .some(let id) => Option_LirVRegId.some(value: subst_use(mutable body, mutable new_ops, id, scratch_a(target), layout, framebase, origin, target, allocator)?)
+    }
+    let ni = match addr.index {
+        case .none => Option_LirVRegId.none
+        case .some(let id) => Option_LirVRegId.some(value: subst_use(mutable body, mutable new_ops, id, scratch_b(target), layout, framebase, origin, target, allocator)?)
+    }
+    return lir_reg_mod.MemRef {
+        base: nb,
+        index: ni,
+        scale: addr.scale,
+        displacement: addr.displacement,
+    }
+}
+
+
+public function subst_memref_base_only(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    addr: lir_reg_mod.MemRef,
+    scratch: lir_reg_mod.PReg,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> lir_reg_mod.MemRef
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let nb = match addr.base {
+        case .none => Option_LirVRegId.none
+        case .some(let id) => Option_LirVRegId.some(value: subst_use(mutable body, mutable new_ops, id, scratch, layout, framebase, origin, target, allocator)?)
+    }
+    return lir_reg_mod.MemRef {
+        base: nb,
+        index: addr.index,
+        scale: addr.scale,
+        displacement: addr.displacement,
+    }
+}
+
+
+public function store_slot(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    value: lir_vreg_mod.LirVRegId,
+    framebase: lir_vreg_mod.LirVRegId,
+    disp: i32,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let addr = framebase_memref(framebase, disp)
+    push_op_id(mutable body, mutable new_ops, origin, spill_flags(), lir_op_mod.LirOpKind.store(value: value, addr: addr, width: 8 as u32), allocator)?
+}
+
+
+public function push_op_id(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    kind: lir_op_mod.LirOpKind,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let op = lir_op_mod.LirOp {
+        origin: origin,
+        kind: kind,
+        flags: flags,
+    }
+    let id = lir_body_mod.push_op(mutable body, take op, allocator)?
+    Vec_LirOpId.push(mutable new_ops, id, allocator)?
+}
+
+
+public function mint_pinned(
+    body: mutable lir_body_mod.LirBody,
+    class_: lir_reg_mod.RegClass,
+    preg: lir_reg_mod.PReg,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError}
+{
+    let vreg = lir_reg_mod.LirVReg {
+        class_: class_,
+        pin: Option_PReg.some(value: preg),
+        ty: ty_mod.error(),
+        size: lir_reg_mod.register_width(),
+        int_width: lir_reg_mod.register_width(),
+        int_signed: false,
+        is_ref: false,
+    }
+    return lir_body_mod.push_vreg(mutable body, take vreg, allocator)?
+}
+
+
+public function mint_scratch(
+    body: mutable lir_body_mod.LirBody,
+    vreg_raw: u32,
+    gp_scratch: lir_reg_mod.PReg,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> lir_vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError}
+{
+    let cls = class_of(body, vreg_raw)
+    let preg = scratch_in_class(cls, gp_scratch, target)
+    let idx = vreg_raw as usize
+    if idx == 0 || idx >= Vec_LirVReg.len(body.vregs) {
+        return mint_pinned(mutable body, cls, preg, allocator)?
+    }
+    let orig = Vec_LirVReg.at(body.vregs, idx)
+    let vreg = lir_reg_mod.LirVReg {
+        class_: cls,
+        pin: Option_PReg.some(value: preg),
+        ty: ty_mod.error(),
+        size: orig.size,
+        int_width: orig.int_width,
+        int_signed: orig.int_signed,
+        is_ref: orig.is_ref,
+    }
+    return lir_body_mod.push_vreg(mutable body, take vreg, allocator)?
+}
+
+
+public function class_of(body: lir_body_mod.LirBody, vreg_raw: u32) -> lir_reg_mod.RegClass {
+    let idx = vreg_raw as usize
+    if idx == 0 { return lir_reg_mod.RegClass.gp }
+    if idx >= Vec_LirVReg.len(body.vregs) { return lir_reg_mod.RegClass.gp }
+    return Vec_LirVReg.at(body.vregs, idx).class_
+}
+
+
+public function size_of_vreg(body: lir_body_mod.LirBody, vreg_raw: u32) -> u32 {
+    let idx = vreg_raw as usize
+    if idx == 0 { return lir_reg_mod.register_width() }
+    if idx >= Vec_LirVReg.len(body.vregs) { return lir_reg_mod.register_width() }
+    return Vec_LirVReg.at(body.vregs, idx).size
+}
+
+
+public function is_ref_vreg(body: lir_body_mod.LirBody, vreg_raw: u32) -> bool {
+    let idx = vreg_raw as usize
+    if idx == 0 { return false }
+    if idx >= Vec_LirVReg.len(body.vregs) { return false }
+    return Vec_LirVReg.at(body.vregs, idx).is_ref
+}
+
+
+function scratch_in_class(class_: lir_reg_mod.RegClass, gp_scratch: lir_reg_mod.PReg, target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    return match class_ {
+        case .fp     => fp_scratch_for(gp_scratch, target)
+        case .vector => fp_scratch_for(gp_scratch, target)
+        case _       => gp_scratch
+    }
+}
+
+
+function fp_scratch_for(gp_scratch: lir_reg_mod.PReg, target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if gp_scratch.raw == scratch_a(target).raw {
+        return fp_scratch_a(target)
+    }
+    return fp_scratch_b(target)
+}
+
+
+public function slot_disp(layout: frame_mod.FrameLayout, vreg_raw: u32) -> Option_i32.Option {
+    let n = Vec_SpillSlot.len(layout.slots)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = Vec_SpillSlot.at(layout.slots, i)
+        if s.vreg_raw == vreg_raw {
+            let top = s.offset + s.size
+            let d = (0 as i32) - (top as i32)
+            return Option_i32.some(value: d)
+        }
+        i += 1
+    }
+    return Option_i32.none
+}
+
+
+public function memref_index_spilled(addr: lir_reg_mod.MemRef, layout: frame_mod.FrameLayout) -> bool {
+    return match addr.index {
+        case .none => false
+        case .some(let id) => match slot_disp(layout, id.raw) {
+            case .some(_) => true
+            case .none => false
+        }
+    }
+}
+
+
+public function memref_base_spilled(addr: lir_reg_mod.MemRef, layout: frame_mod.FrameLayout) -> bool {
+    return match addr.base {
+        case .none => false
+        case .some(let id) => match slot_disp(layout, id.raw) {
+            case .some(_) => true
+            case .none => false
+        }
+    }
+}
+
+
+public function vreg_spilled(layout: frame_mod.FrameLayout, vreg_raw: u32) -> bool {
+    return match slot_disp(layout, vreg_raw) {
+        case .some(_) => true
+        case .none => false
+    }
+}
+
+
+function is_aarch64(target: triple_mod.TargetTriple) -> bool {
+    return match triple_mod.arch(target) {
+        case .aarch64 => true
+        case _        => false
+    }
+}
+
+
+public function frame_base_preg(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if is_aarch64(target) { return lir_reg_mod.PReg { raw: 29 as u32 } }
+    return lir_reg_mod.PReg { raw: 5 as u32 }
+}
+
+
+public function scratch_a(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if is_aarch64(target) { return lir_reg_mod.PReg { raw: 16 as u32 } }
+    return lir_reg_mod.PReg { raw: 10 as u32 }
+}
+
+
+public function scratch_b(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if is_aarch64(target) { return lir_reg_mod.PReg { raw: 17 as u32 } }
+    return lir_reg_mod.PReg { raw: 11 as u32 }
+}
+
+
+public function fp_scratch_a(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if is_aarch64(target) { return lir_reg_mod.PReg { raw: 30 as u32 } }
+    return lir_reg_mod.PReg { raw: 14 as u32 }
+}
+
+
+public function fp_scratch_b(target: triple_mod.TargetTriple) -> lir_reg_mod.PReg {
+    if is_aarch64(target) { return lir_reg_mod.PReg { raw: 31 as u32 } }
+    return lir_reg_mod.PReg { raw: 15 as u32 }
+}
+
+
+function framebase_memref(framebase: lir_vreg_mod.LirVRegId, disp: i32) -> lir_reg_mod.MemRef {
+    return lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: framebase),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: disp,
+    }
+}
+
+
+function spill_flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: true,
+        nonzero_divisor: false,
+        range_safe: true,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}

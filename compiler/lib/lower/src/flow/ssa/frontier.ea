@@ -1,0 +1,245 @@
+
+module lower.flow.ssa.frontier
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.flow.cfg.cfg as cfg_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+
+
+public function build_frontiers(
+    offsets_out: init Vec_usize.Vec,
+    pool_out: init Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    idom: Vec_u32.Vec,
+    pred_offsets: Vec_usize.Vec,
+    pred_pool: Vec_u32.Vec,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit count: Vec_usize.Vec
+    new_usizes(init count, n_blocks, allocator)?
+    uninit stamp1: Vec_u32.Vec
+    new_u32s(init stamp1, n_blocks, allocator)?
+    frontier_pass(mutable count, mutable stamp1, cfg, idom, pred_offsets, pred_pool, n_blocks)
+
+    uninit offsets: Vec_usize.Vec
+    Vec_usize.new(init offsets, allocator)?
+    var total: usize = 0
+    var b: usize = 0
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        Vec_usize.push(mutable offsets, total, allocator)?
+        total = total +| Vec_usize.at(count, b)
+        b += 1
+    }
+    Vec_usize.push(mutable offsets, total, allocator)?
+
+    uninit pool: Vec_u32.Vec
+    new_u32s(init pool, total, allocator)?
+    uninit cursor: Vec_usize.Vec
+    Vec_usize.new(init cursor, allocator)?
+    var c: usize = 0
+    loop decreases n_blocks - c {
+        if c >= n_blocks { break }
+        Vec_usize.push(mutable cursor, Vec_usize.at(offsets, c), allocator)?
+        c += 1
+    }
+    uninit stamp2: Vec_u32.Vec
+    new_u32s(init stamp2, n_blocks, allocator)?
+    frontier_fill(mutable pool, mutable cursor, mutable stamp2, cfg, idom, pred_offsets, pred_pool, n_blocks)
+
+    offsets_out = offsets
+    pool_out = pool
+}
+
+
+function frontier_pass(
+    count: mutable Vec_usize.Vec,
+    stamp: mutable Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    idom: Vec_u32.Vec,
+    pred_offsets: Vec_usize.Vec,
+    pred_pool: Vec_u32.Vec,
+    n_blocks: usize,
+) -> () {
+    var b: usize = 2
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        if merge_target(cfg, idom, b, n_blocks) {
+            if b + 1 < Vec_usize.len(pred_offsets) {
+                var i = Vec_usize.at(pred_offsets, b)
+                let end = Vec_usize.at(pred_offsets, b + 1)
+                loop decreases end - i {
+                    if i >= end { break }
+                    if i < Vec_u32.len(pred_pool) {
+                        let p = Vec_u32.at(pred_pool, i)
+                        credit_walk_count(mutable count, mutable stamp, idom, p, b, n_blocks)
+                    }
+                    i += 1
+                }
+            }
+        }
+        b += 1
+    }
+}
+
+
+function merge_target(cfg: cfg_mod.Cfg, idom: Vec_u32.Vec, b: usize, n_blocks: usize) -> bool {
+    if b >= n_blocks { return false }
+    if b >= Vec_u32.len(cfg.pred_count) { return false }
+    if Vec_u32.at(cfg.pred_count, b) < (2 as u32) { return false }
+    if b >= Vec_u32.len(cfg.rpo_pos) { return false }
+    if Vec_u32.at(cfg.rpo_pos, b) == (0 as u32) { return false }
+    if b >= Vec_u32.len(idom) { return false }
+    return Vec_u32.at(idom, b) != (0 as u32)
+}
+
+
+function credit_walk_count(
+    count: mutable Vec_usize.Vec,
+    stamp: mutable Vec_u32.Vec,
+    idom: Vec_u32.Vec,
+    p: u32,
+    b: usize,
+    n_blocks: usize,
+) -> () {
+    let target_idom = if b < Vec_u32.len(idom) { Vec_u32.at(idom, b) } else { 0 as u32 }
+    let bmark = (b + 1) as u32 wrapping
+    var runner = p
+    var fuel: usize = n_blocks + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        if runner == target_idom { break }
+        let r = runner as usize
+        if r >= n_blocks { break }
+        if r >= Vec_u32.len(idom) { break }
+        let rid = Vec_u32.at(idom, r)
+        if rid == (0 as u32) { break }
+        if r < Vec_u32.len(stamp) {
+            if Vec_u32.at(stamp, r) == bmark { break }
+            Vec_u32.set_at(mutable stamp, r, bmark)
+        }
+        if r < Vec_usize.len(count) {
+            Vec_usize.set_at(mutable count, r, Vec_usize.at(count, r) +| 1)
+        }
+        if rid == runner { break }
+        runner = rid
+    }
+}
+
+
+function frontier_fill(
+    pool: mutable Vec_u32.Vec,
+    cursor: mutable Vec_usize.Vec,
+    stamp: mutable Vec_u32.Vec,
+    cfg: cfg_mod.Cfg,
+    idom: Vec_u32.Vec,
+    pred_offsets: Vec_usize.Vec,
+    pred_pool: Vec_u32.Vec,
+    n_blocks: usize,
+) -> () {
+    var b: usize = 2
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        if merge_target(cfg, idom, b, n_blocks) {
+            if b + 1 < Vec_usize.len(pred_offsets) {
+                var i = Vec_usize.at(pred_offsets, b)
+                let end = Vec_usize.at(pred_offsets, b + 1)
+                loop decreases end - i {
+                    if i >= end { break }
+                    if i < Vec_u32.len(pred_pool) {
+                        let p = Vec_u32.at(pred_pool, i)
+                        credit_walk_fill(mutable pool, mutable cursor, mutable stamp, idom, p, b, n_blocks)
+                    }
+                    i += 1
+                }
+            }
+        }
+        b += 1
+    }
+}
+
+
+function credit_walk_fill(
+    pool: mutable Vec_u32.Vec,
+    cursor: mutable Vec_usize.Vec,
+    stamp: mutable Vec_u32.Vec,
+    idom: Vec_u32.Vec,
+    p: u32,
+    b: usize,
+    n_blocks: usize,
+) -> () {
+    let target_idom = if b < Vec_u32.len(idom) { Vec_u32.at(idom, b) } else { 0 as u32 }
+    let bmark = (b + 1) as u32 wrapping
+    var runner = p
+    var fuel: usize = n_blocks + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        if runner == target_idom { break }
+        let r = runner as usize
+        if r >= n_blocks { break }
+        if r >= Vec_u32.len(idom) { break }
+        let rid = Vec_u32.at(idom, r)
+        if rid == (0 as u32) { break }
+        if r < Vec_u32.len(stamp) {
+            if Vec_u32.at(stamp, r) == bmark { break }
+            Vec_u32.set_at(mutable stamp, r, bmark)
+        }
+        fill_slot(mutable pool, mutable cursor, r, b)
+        if rid == runner { break }
+        runner = rid
+    }
+}
+
+
+function fill_slot(
+    pool: mutable Vec_u32.Vec,
+    cursor: mutable Vec_usize.Vec,
+    r: usize,
+    b: usize,
+) -> () {
+    if r >= Vec_usize.len(cursor) { return }
+    let slot = Vec_usize.at(cursor, r)
+    if slot >= Vec_u32.len(pool) { return }
+    Vec_u32.set_at(mutable pool, slot, b as u32 wrapping)
+    Vec_usize.set_at(mutable cursor, r, slot + 1)
+}
+
+
+function new_u32s(out: init Vec_u32.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u32.Vec
+    Vec_u32.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable v, 0 as u32, allocator)?
+        i += 1
+    }
+    out = v
+}
+
+
+function new_usizes(out: init Vec_usize.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_usize.Vec
+    Vec_usize.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_usize.push(mutable v, 0, allocator)?
+        i += 1
+    }
+    out = v
+}

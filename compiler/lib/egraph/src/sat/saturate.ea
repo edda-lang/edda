@@ -1,0 +1,348 @@
+
+module egraph.sat.saturate
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import local.eclass as eclass_mod
+import local.graph.unionfind as uf_mod
+import local.graph.enode as enode_mod
+import local.graph.graph as graph_mod
+import local.key as key_mod
+import local.graph.hashcons as hashcons_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(enode_mod.ENode)
+spec std.collections.vec.Vec(graph_mod.EClass)
+spec std.collections.vec.Vec(eclass_mod.EClassId)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(enode_mod.ENode)
+spec std.core.option.Option(graph_mod.EClass)
+
+
+public type Saturator {
+    memo: hashcons_mod.Hashcons
+    scratch: hashcons_mod.Hashcons
+    worklist: Vec_u32.Vec
+    touched: IntMap_usize.IntMap
+    affected: Vec_usize.Vec
+}
+
+
+public function new(out: init Saturator, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit memo: hashcons_mod.Hashcons
+    hashcons_mod.new(init memo, allocator)?
+    uninit scratch: hashcons_mod.Hashcons
+    hashcons_mod.new(init scratch, allocator)?
+    uninit worklist: Vec_u32.Vec
+    Vec_u32.new(init worklist, allocator)?
+    let touched = IntMap_usize.new(allocator)?
+    uninit affected: Vec_usize.Vec
+    Vec_usize.new(init affected, allocator)?
+    out = Saturator {
+        memo: memo,
+        scratch: scratch,
+        worklist: worklist,
+        touched: touched,
+        affected: affected,
+    }
+}
+
+
+public function find(graph: mutable graph_mod.EGraph, c: eclass_mod.EClassId) -> eclass_mod.EClassId
+    with {panic}
+{
+    return key_mod.canon_child(mutable graph.uf, c)
+}
+
+
+public function add(
+    graph: mutable graph_mod.EGraph,
+    sat: mutable Saturator,
+    node: take enode_mod.ENode,
+    allocator: Allocator,
+) -> eclass_mod.EClassId
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match hashcons_mod.lookup(sat.memo, mutable graph.uf, node) {
+        case .some(let existing) => return key_mod.canon_child(mutable graph.uf, existing)
+        case .none => ()
+    }
+    return add_fresh(mutable graph, mutable sat, take node, allocator)?
+}
+
+
+function add_fresh(
+    graph: mutable graph_mod.EGraph,
+    sat: mutable Saturator,
+    node: take enode_mod.ENode,
+    allocator: Allocator,
+) -> eclass_mod.EClassId
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if Vec_u32.len(graph.uf.parent) >= 4294967295 {
+        panic("egraph.add: union-find parent capacity exhausted")
+    }
+    if Vec_u32.len(graph.uf.rank) >= 4294967295 {
+        panic("egraph.add: union-find rank capacity exhausted")
+    }
+    let id = graph_mod.add_class(mutable graph, take node, allocator)?
+    match Vec_EClass.get(graph.classes, id.raw as usize) {
+        case .some(let cls) => insert_class_node(mutable graph, mutable sat, cls, id, allocator)?
+        case .none => ()
+    }
+    return id
+}
+
+
+function insert_class_node(
+    graph: mutable graph_mod.EGraph,
+    sat: mutable Saturator,
+    cls: graph_mod.EClass,
+    id: eclass_mod.EClassId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match Vec_ENode.get(cls.nodes, 0 as usize) {
+        case .some(let stored) =>
+            hashcons_mod.insert(mutable sat.memo, mutable graph.uf, take stored, id, allocator)?
+        case .none => ()
+    }
+}
+
+
+public function merge(
+    graph: mutable graph_mod.EGraph,
+    sat: mutable Saturator,
+    a: eclass_mod.EClassId,
+    b: eclass_mod.EClassId,
+    allocator: Allocator,
+) -> eclass_mod.EClassId
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let ra = key_mod.canon_child(mutable graph.uf, a)
+    let rb = key_mod.canon_child(mutable graph.uf, b)
+    if ra.raw == rb.raw { return ra }
+    let root = union_roots(mutable graph.uf, ra, rb)
+    Vec_u32.push(mutable sat.worklist, ra.raw, allocator)?
+    Vec_u32.push(mutable sat.worklist, rb.raw, allocator)?
+    return root
+}
+
+
+function union_roots(
+    uf: mutable uf_mod.UnionFind,
+    ra: eclass_mod.EClassId,
+    rb: eclass_mod.EClassId,
+) -> eclass_mod.EClassId
+    with {panic}
+{
+    if ra.raw == 0 { return rb }
+    if rb.raw == 0 { return ra }
+    let cap = Vec_u32.len(uf.parent)
+    if (ra.raw as usize) >= cap { return rb }
+    if (rb.raw as usize) >= cap { return ra }
+    return uf_mod.union_classes(mutable uf, ra, rb)
+}
+
+
+public function pending_merges(sat: Saturator) -> usize {
+    return Vec_u32.len(sat.worklist)
+}
+
+
+public function rebuild(
+    graph: mutable graph_mod.EGraph,
+    sat: mutable Saturator,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, panic}
+{
+    IntMap_usize.clear(mutable sat.touched)
+    let wl = Vec_u32.len(sat.worklist)
+    var t: usize = 0
+    loop
+        decreases wl - t
+    {
+        if t >= wl { break }
+        let id = Vec_u32.at(sat.worklist, t) as i64
+        let _ = IntMap_usize.insert(mutable sat.touched, id, 1 as usize, allocator)?
+        t = t + 1
+    }
+    Vec_u32.clear(mutable sat.worklist)
+
+    var fresh: hashcons_mod.Hashcons = sat.scratch
+    hashcons_mod.clear(mutable fresh, allocator)?
+    Vec_usize.clear(mutable sat.affected)
+    let n = hashcons_mod.entry_count(sat.memo)
+    var i: usize = 1
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let node = hashcons_mod.entry_node(sat.memo, i)
+        if node_touches(mutable graph, sat.touched, node) {
+            Vec_usize.push(mutable sat.affected, i, allocator)?
+        } else {
+            let owner = key_mod.canon_child(mutable graph.uf, hashcons_mod.entry_class(sat.memo, i))
+            let bucket = hashcons_mod.entry_bucket(sat.memo, i)
+            hashcons_mod.insert_hashed(mutable fresh, take node, owner, bucket, allocator)?
+        }
+        i = i + 1
+    }
+
+    var changed: bool = false
+    let m = Vec_usize.len(sat.affected)
+    var a: usize = 0
+    loop
+        decreases m - a
+    {
+        if a >= m { break }
+        let idx = Vec_usize.at(sat.affected, a)
+        let cnt = hashcons_mod.entry_count(sat.memo)
+        if idx < cnt {
+            let node = hashcons_mod.entry_node(sat.memo, idx)
+            let owner = key_mod.canon_child(mutable graph.uf, hashcons_mod.entry_class(sat.memo, idx))
+            let bucket = key_mod.node_hash(mutable graph.uf, node) as i64 wrapping
+            let merged = reinsert_affected(mutable graph, mutable sat.worklist, mutable fresh, take node, owner, bucket, allocator)?
+            if merged {
+                changed = true
+            }
+        }
+        a = a + 1
+    }
+
+    sat.scratch = sat.memo
+    sat.memo = fresh
+    return changed
+}
+
+
+function reinsert_affected(
+    graph: mutable graph_mod.EGraph,
+    worklist: mutable Vec_u32.Vec,
+    fresh: mutable hashcons_mod.Hashcons,
+    node: take enode_mod.ENode,
+    owner: eclass_mod.EClassId,
+    bucket: i64,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match hashcons_mod.lookup_hashed(fresh, mutable graph.uf, node, bucket) {
+        case .some(let existing) =>
+            return merge_into_owner(mutable graph, mutable worklist, owner, existing, allocator)?
+        case .none => ()
+    }
+    hashcons_mod.insert_hashed(mutable fresh, take node, owner, bucket, allocator)?
+    return false
+}
+
+
+function merge_into_owner(
+    graph: mutable graph_mod.EGraph,
+    worklist: mutable Vec_u32.Vec,
+    owner: eclass_mod.EClassId,
+    existing: eclass_mod.EClassId,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let other = key_mod.canon_child(mutable graph.uf, existing)
+    if other.raw == owner.raw { return false }
+    let _ = union_roots(mutable graph.uf, owner, other)
+    Vec_u32.push(mutable worklist, owner.raw, allocator)?
+    Vec_u32.push(mutable worklist, other.raw, allocator)?
+    return true
+}
+
+
+function child_touched(
+    graph: mutable graph_mod.EGraph,
+    touched: IntMap_usize.IntMap,
+    c: eclass_mod.EClassId,
+) -> bool
+    with {panic}
+{
+    let root = key_mod.canon_child(mutable graph.uf, c)
+    return IntMap_usize.contains(touched, root.raw as i64)
+}
+
+
+function any_touched(
+    graph: mutable graph_mod.EGraph,
+    touched: IntMap_usize.IntMap,
+    kids: Vec_EClassId.Vec,
+) -> bool
+    with {panic}
+{
+    let n = Vec_EClassId.len(kids)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if child_touched(mutable graph, touched, Vec_EClassId.at(kids, i)) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function node_touches(
+    graph: mutable graph_mod.EGraph,
+    touched: IntMap_usize.IntMap,
+    node: enode_mod.ENode,
+) -> bool
+    with {panic}
+{
+    return match node.kind {
+        case .literal(_) => false
+        case .binary(_, let lhs, let rhs) =>
+            child_touched(mutable graph, touched, lhs) || child_touched(mutable graph, touched, rhs)
+        case .unary(_, let operand) => child_touched(mutable graph, touched, operand)
+        case .cast(let value, _, _, _) => child_touched(mutable graph, touched, value)
+        case .call_(let callee, let args) =>
+            child_touched(mutable graph, touched, callee) || any_touched(mutable graph, touched, args)
+        case .field(let operand, _) => child_touched(mutable graph, touched, operand)
+        case .index(let operand, let index_v) =>
+            child_touched(mutable graph, touched, operand) || child_touched(mutable graph, touched, index_v)
+        case .len(let operand) => child_touched(mutable graph, touched, operand)
+        case .discriminant(let operand) => child_touched(mutable graph, touched, operand)
+        case .aggregate(_, let elems) => any_touched(mutable graph, touched, elems)
+        case .ref_(_, let operand) => child_touched(mutable graph, touched, operand)
+    }
+}
+
+
+public function saturate(
+    graph: mutable graph_mod.EGraph,
+    sat: mutable Saturator,
+    budget: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if Vec_u32.len(sat.worklist) == 0 { return 0 }
+    var remaining: usize = budget
+    var rounds: usize = 0
+    var active: bool = true
+    loop
+        decreases remaining
+    {
+        if remaining == 0 { break }
+        if !active { break }
+        let changed = rebuild(mutable graph, mutable sat, allocator)?
+        rounds = rounds + 1
+        remaining = remaining - 1
+        active = changed
+    }
+    return rounds
+}

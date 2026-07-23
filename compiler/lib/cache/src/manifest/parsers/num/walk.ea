@@ -1,0 +1,264 @@
+
+module cache.manifest.parsers.num.walk
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import local.toon.lex as lex_mod
+import local.manifest.parsers.num.scalar as scalar_mod
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(ManifestKv)
+
+
+public type ManifestKv {
+    key: String
+    value: String
+}
+
+public type ListFieldState {
+    case none
+    case empty
+    case block(body_start: usize)
+}
+
+
+public function walk_top_scalar(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    key: String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return Option_String.none }
+    if lex_mod.indent_at(lx, i) != 0 {
+        return walk_top_scalar(lx, i + 1, n, key, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    return match split_kv(line, allocator)? {
+        case .none => walk_top_scalar(lx, i + 1, n, key, allocator)?
+        case .some(let kv) => {
+            if string.equals(kv.key, key) {
+                Option_String.some(value: kv.value)
+            } else {
+                walk_top_scalar(lx, i + 1, n, key, allocator)?
+            }
+        }
+    }
+}
+
+public function find_block_opener(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    target_indent: usize,
+    key: String,
+    allocator: Allocator,
+) -> Option_usize
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return Option_usize.none }
+    if lex_mod.indent_at(lx, i) != target_indent {
+        return find_block_opener(lx, i + 1, n, target_indent, key, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !line_key_equals(line, key) {
+        return find_block_opener(lx, i + 1, n, target_indent, key, allocator)?
+    }
+    let tail = scalar_mod.line_value_part(line, allocator)?
+    if tail.bytes().len() > 0 { return Option_usize.none }
+    return Option_usize.some(value: i + 1)
+}
+
+public function walk_indented_scalar(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    target_indent: usize,
+    outer_indent: usize,
+    key: String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return Option_String.none }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth <= outer_indent { return Option_String.none }
+    if depth != target_indent {
+        return walk_indented_scalar(lx, i + 1, n, target_indent, outer_indent, key, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    return match split_kv(line, allocator)? {
+        case .none => walk_indented_scalar(lx, i + 1, n, target_indent, outer_indent, key, allocator)?
+        case .some(let kv) => {
+            if string.equals(kv.key, key) {
+                let v = kv.value
+                if v.bytes().len() == 0 {
+                    Option_String.none
+                } else {
+                    Option_String.some(value: v)
+                }
+            } else {
+                walk_indented_scalar(lx, i + 1, n, target_indent, outer_indent, key, allocator)?
+            }
+        }
+    }
+}
+
+public function walk_string_list_items(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    target_indent: usize,
+    outer_indent: usize,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth <= outer_indent { return () }
+    if depth != target_indent {
+        return walk_string_list_items(lx, i + 1, n, target_indent, outer_indent, mutable out, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !is_list_item_line(line) {
+        return walk_string_list_items(lx, i + 1, n, target_indent, outer_indent, mutable out, allocator)?
+    }
+    let after_dash = strip_list_marker(line, allocator)?
+    Vec_String.push(mutable out, take after_dash, allocator)?
+    return walk_string_list_items(lx, i + 1, n, target_indent, outer_indent, mutable out, allocator)?
+}
+
+public function classify_inputs_field(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    key: String,
+    allocator: Allocator,
+) -> ListFieldState
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return ListFieldState.none }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth <= 2 { return ListFieldState.none }
+    if depth != 3 {
+        return classify_inputs_field(lx, i + 1, n, key, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !line_key_equals(line, key) {
+        return classify_inputs_field(lx, i + 1, n, key, allocator)?
+    }
+    let tail = scalar_mod.line_value_part(line, allocator)?
+    if string.equals(tail, "[]") { return ListFieldState.empty }
+    if tail.bytes().len() > 0 { return ListFieldState.none }
+    return ListFieldState.block(body_start: i + 1)
+}
+
+
+public function split_kv(line: String, allocator: Allocator) -> Option_ManifestKv
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    return match scalar_mod.find_byte(bytes, 0, bytes.len(), 58) {
+        case .none => Option_ManifestKv.none
+        case .some(let colon) => {
+            let raw_key_end = strip_schema_annotation_end(bytes, colon)
+            let key = scalar_mod.slice_to_string(bytes, 0, raw_key_end, allocator)?
+            let value_start = scalar_mod.skip_spaces(bytes, colon + 1, bytes.len())
+            let value = scalar_mod.unquote_scalar(bytes, value_start, bytes.len(), allocator)?
+            Option_ManifestKv.some(value: ManifestKv { key: key, value: value })
+        }
+    }
+}
+
+public function line_key_equals(line: String, expected: String) -> bool {
+    let bytes = line.bytes()
+    return match scalar_mod.find_byte(bytes, 0, bytes.len(), 58) {
+        case .none => false
+        case .some(let colon) => {
+            let key_end = strip_schema_annotation_end(bytes, colon)
+            bytes_equal(bytes, 0, key_end, expected.bytes())
+        }
+    }
+}
+
+public function is_list_item_line(line: String) -> bool {
+    let bytes = line.bytes()
+    if bytes.len() == 0 { return false }
+    if bytes[0] != 45 { return false }
+    if bytes.len() == 1 { return true }
+    return bytes[1] == 32
+}
+
+public function strip_list_marker(line: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    if bytes.len() <= 2 {
+        let buf: [u8] = allocator.alloc_array(u8, 0)?
+        return string.from_owned_utf8(take buf)
+    }
+    return scalar_mod.unquote_scalar(bytes, 2, bytes.len(), allocator)?
+}
+
+public function strip_schema_annotation_end(bytes: [u8], colon: usize) -> usize
+    requires colon <= bytes.len()
+{
+    let lbrack: usize = find_byte_bounded(bytes, 0, colon, 91)
+    let lbrace: usize = find_byte_bounded(bytes, 0, colon, 123)
+    if lbrack < lbrace { return lbrack }
+    return lbrace
+}
+
+public function find_byte_bounded(bytes: [u8], i: usize, end: usize, target: u8) -> usize
+    requires i <= end
+    requires end <= bytes.len()
+    ensures result <= end
+    decreases end - i
+{
+    if i >= end { return end }
+    if bytes[i] == target { return i }
+    return find_byte_bounded(bytes, i + 1, end, target)
+}
+
+
+public function bytes_equal(bytes: [u8], lo: usize, hi: usize, other: [u8]) -> bool
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    if hi - lo != other.len() { return false }
+    return bytes_equal_acc(bytes, lo, other, 0, hi - lo)
+}
+
+function bytes_equal_acc(bytes: [u8], lo: usize, other: [u8], i: usize, n: usize) -> bool
+    requires lo + n <= bytes.len()
+    requires n <= other.len()
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return true }
+    if bytes[lo + i] != other[i] { return false }
+    return bytes_equal_acc(bytes, lo, other, i + 1, n)
+}

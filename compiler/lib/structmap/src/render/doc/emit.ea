@@ -1,0 +1,231 @@
+
+module structmap.render.doc.emit
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string as string
+import local.data.model as model
+import local.render.toon as toon
+import local.render.doc.body as body_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+
+
+public type RenderedFiles {
+    paths: Vec_String.Vec
+    texts: Vec_String.Vec
+}
+
+public function new_rendered(out: init RenderedFiles, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit paths: Vec_String.Vec
+    Vec_String.new(init paths, allocator)?
+    uninit texts: Vec_String.Vec
+    Vec_String.new(init texts, allocator)?
+    out = RenderedFiles { paths: paths, texts: texts }
+}
+
+public function render(
+    project_name: String,
+    compiler_version: String,
+    descendant_tree: bool,
+    package_root: String,
+    tree: model.Tree,
+    out: mutable RenderedFiles,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let dir = Vec_String.at(tree.paths, i)
+        let with_sep = string.concat(dir, "/", allocator)?
+        let full_path = string.concat(with_sep, model.index_filename(), allocator)?
+        let is_root = string.equals(dir, package_root)
+        if is_root && descendant_tree {
+            let text = render_root_descendant_tree(
+                project_name, compiler_version, package_root, tree, allocator,
+            )?
+            Vec_String.push(mutable out.paths, full_path, allocator)?
+            Vec_String.push(mutable out.texts, text, allocator)?
+        } else {
+            let text = render_one(
+                project_name, compiler_version, package_root, tree, i, allocator,
+            )?
+            Vec_String.push(mutable out.paths, full_path, allocator)?
+            Vec_String.push(mutable out.texts, text, allocator)?
+        }
+        i += 1
+    }
+}
+
+
+public function render_bodies(
+    tree: model.Tree,
+    allocator: Allocator,
+) -> RenderedFiles
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: RenderedFiles
+    new_rendered(init out, allocator)?
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let dir = Vec_String.at(tree.paths, i)
+        uninit buf: Vec_u8.Vec
+        Vec_u8.new(init buf, allocator)?
+        body_mod.render_dir_body(mutable buf, tree, i, allocator)?
+        let text = toon.finish_string(take buf, allocator)?
+        Vec_String.push(mutable out.paths, string.clone(dir, allocator)?, allocator)?
+        Vec_String.push(mutable out.texts, text, allocator)?
+        i += 1
+    }
+    return out
+}
+
+function render_one(
+    project_name: String,
+    compiler_version: String,
+    package_root: String,
+    tree: model.Tree,
+    dir_idx: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let dir = Vec_String.at(tree.paths, dir_idx)
+    let is_root = string.equals(dir, package_root)
+    if is_root {
+        write_header(mutable buf, true, project_name, compiler_version, "", allocator)?
+    } else {
+        let loc = relative_to_root(dir, package_root, allocator)?
+        write_header(mutable buf, false, project_name, compiler_version, loc, allocator)?
+    }
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    body_mod.render_dir_body(mutable buf, tree, dir_idx, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}
+
+function render_root_descendant_tree(
+    project_name: String,
+    compiler_version: String,
+    package_root: String,
+    tree: model.Tree,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    write_header(mutable buf, true, project_name, compiler_version, "", allocator)?
+    toon.push_str(mutable buf, "descendant_tree: true\n", allocator)?
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    let root_idx = root_dir_index(tree, package_root)
+    body_mod.render_dir_body(mutable buf, tree, root_idx, allocator)?
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i != root_idx {
+            let dir = Vec_String.at(tree.paths, i)
+            let rel = relative_to_root(dir, package_root, allocator)?
+            toon.push_str(mutable buf, "# directory: ", allocator)?
+            toon.push_str(mutable buf, rel, allocator)?
+            toon.push_byte(mutable buf, 0x0A, allocator)?
+            toon.push_byte(mutable buf, 0x0A, allocator)?
+            body_mod.render_dir_body(mutable buf, tree, i, allocator)?
+        }
+        i += 1
+    }
+    return toon.finish_string(take buf, allocator)?
+}
+
+function root_dir_index(tree: model.Tree, package_root: String) -> usize {
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if string.equals(Vec_String.at(tree.paths, i), package_root) {
+            return i
+        }
+        i += 1
+    }
+    return 0
+}
+
+function relative_to_root(dir: String, root: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if !string.starts_with(dir, root) {
+        return string.clone(dir, allocator)?
+    }
+    let d_bytes = dir.bytes()
+    let r_bytes = root.bytes()
+    let dn: usize = d_bytes.len()
+    let rn: usize = r_bytes.len()
+    if dn == rn {
+        return string.clone(".", allocator)?
+    }
+    var start: usize = rn
+    if start < dn && (d_bytes[start] == 0x2F || d_bytes[start] == 0x5C) {
+        start += 1
+    }
+    let rest_len: usize = dn - start
+    let buf: [u8] = allocator.alloc_array(u8, rest_len)?
+    var i: usize = 0
+    loop
+        decreases rest_len - i
+    {
+        if i >= rest_len { break }
+        let b = d_bytes[start + i]
+        if b == 0x5C {
+            buf[i] = 0x2F
+        } else {
+            buf[i] = b
+        }
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function write_header(
+    buf: mutable Vec_u8.Vec,
+    is_root: bool,
+    project_name: String,
+    compiler_version: String,
+    loc: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if is_root {
+        toon.push_str(mutable buf, "project: ", allocator)?
+        toon.push_quoted(mutable buf, project_name, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_str(mutable buf, "compiler_version: ", allocator)?
+        toon.push_quoted(mutable buf, compiler_version, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_str(mutable buf, "schema_version: ", allocator)?
+        toon.push_u32_decimal(mutable buf, model.schema_version(), allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+    } else {
+        toon.push_str(mutable buf, "loc: ", allocator)?
+        toon.push_str(mutable buf, loc, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+    }
+}

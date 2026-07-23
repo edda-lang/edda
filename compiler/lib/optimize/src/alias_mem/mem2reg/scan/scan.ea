@@ -1,0 +1,365 @@
+module optimize.alias_mem.mem2reg.scan.scan
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.mem2reg.model as model_mod
+
+
+spec std.core.option.Option(mir_rvalue_mod.Operand)
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(model_mod.DefOp)
+
+
+public function candidate_def_op(counters: model_mod.Counters, is_cand: bool, idx: usize) -> model_mod.DefOp {
+    if is_cand == false {
+        return model_mod.DefOp { value: Option_Operand.none }
+    }
+    if idx >= Vec_DefOp.len(counters.def_op) {
+        return model_mod.DefOp { value: Option_Operand.none }
+    }
+    return Vec_DefOp.at(counters.def_op, idx)
+}
+
+
+public function build_counters(
+    body: mir_body_mod.MirBody,
+    n_locals: usize,
+    allocator: Allocator,
+) -> model_mod.Counters
+    with {allocator, err: alloc.AllocError}
+{
+    uninit n_def_assign: Vec_u32.Vec
+    Vec_u32.new(init n_def_assign, allocator)?
+    uninit n_def_other: Vec_u32.Vec
+    Vec_u32.new(init n_def_other, allocator)?
+    uninit n_read_other: Vec_u32.Vec
+    Vec_u32.new(init n_read_other, allocator)?
+    uninit is_dest_anywhere: Vec_bool.Vec
+    Vec_bool.new(init is_dest_anywhere, allocator)?
+    uninit def_op: Vec_DefOp.Vec
+    Vec_DefOp.new(init def_op, allocator)?
+
+    var li: usize = 0
+    loop decreases n_locals - li {
+        if li >= n_locals { break }
+        Vec_u32.push(mutable n_def_assign, 0, allocator)?
+        Vec_u32.push(mutable n_def_other, 0, allocator)?
+        Vec_u32.push(mutable n_read_other, 0, allocator)?
+        Vec_bool.push(mutable is_dest_anywhere, false, allocator)?
+        Vec_DefOp.push(mutable def_op, model_mod.DefOp { value: Option_Operand.none }, allocator)?
+        li += 1
+    }
+
+    var counters = model_mod.Counters {
+        n_def_assign: n_def_assign,
+        n_def_other: n_def_other,
+        n_read_other: n_read_other,
+        is_dest_anywhere: is_dest_anywhere,
+        def_op: def_op,
+    }
+
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        scan_block(mutable counters, block)
+        bi += 1
+    }
+
+    return counters
+}
+
+
+function scan_block(counters: mutable model_mod.Counters, block: mir_body_mod.BasicBlock) -> () {
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(block.statements, si)
+        scan_statement(mutable counters, stmt)
+        si += 1
+    }
+    scan_terminator(mutable counters, block.terminator)
+}
+
+
+function scan_statement(counters: mutable model_mod.Counters, stmt: mir_stmt_mod.Statement) -> () {
+    match stmt.kind {
+        case .assign(let dest, let value) => scan_assign(mutable counters, dest, value)
+        case .storage_live(_) => ()
+        case .storage_dead(_) => ()
+        case .nop_ => ()
+    }
+}
+
+
+function scan_assign(
+    counters: mutable model_mod.Counters,
+    dest: mir_place_mod.Place,
+    value: mir_rvalue_mod.Rvalue,
+) -> () {
+    let dest_base: mir_local_mod.LocalId = escape_mod.base_local(dest)
+    mark_dest(mutable counters, dest_base)
+
+    let bare_use: bool = escape_mod.is_bare(dest) && rvalue_is_bare_use(value)
+    if bare_use {
+        record_def_assign(mutable counters, dest_base, value)
+    } else {
+        record_def_other(mutable counters, dest_base)
+    }
+
+    scan_place_index_reads(mutable counters, dest)
+    scan_rvalue_reads(mutable counters, value)
+}
+
+
+function rvalue_is_bare_use(rv: mir_rvalue_mod.Rvalue) -> bool {
+    return match rv {
+        case .use_(_) => true
+        case _ => false
+    }
+}
+
+
+function scan_rvalue_reads(counters: mutable model_mod.Counters, rv: mir_rvalue_mod.Rvalue) -> () {
+    match rv {
+        case .use_(let operand) => scan_operand_read(mutable counters, operand)
+        case .binary(_, let lhs, let rhs) => {
+            scan_operand_read(mutable counters, lhs)
+            scan_operand_read(mutable counters, rhs)
+        }
+        case .unary(_, let operand) => scan_operand_read(mutable counters, operand)
+        case .cast(let operand, _, _, _) => scan_operand_read(mutable counters, operand)
+        case .aggregate(_, let elems, _) => scan_operands_read(mutable counters, elems)
+        case .ref_(_, let place) => mark_place_read_other(mutable counters, place)
+        case .len(let place) => mark_place_read_other(mutable counters, place)
+        case .discriminant(let place) => mark_place_read_other(mutable counters, place)
+        case .make_closure(_, let env) => scan_operand_read(mutable counters, env)
+    }
+}
+
+
+function scan_terminator(counters: mutable model_mod.Counters, term: mir_term_mod.Terminator) -> () {
+    match term.kind {
+        case .branch(let cond, _, _) => scan_operand_read(mutable counters, cond)
+        case .switch_(let discr, _) => scan_operand_read(mutable counters, discr)
+        case .raise_(let value, _) => scan_operand_read(mutable counters, value)
+        case .panic_(let message) => scan_operand_read(mutable counters, message)
+        case .call_(let callee, let args, let dest, _, _) => {
+            scan_operand_read(mutable counters, callee)
+            scan_operands_read(mutable counters, args)
+            mark_dest(mutable counters, escape_mod.base_local(dest))
+            record_def_other(mutable counters, escape_mod.base_local(dest))
+            scan_place_index_reads(mutable counters, dest)
+        }
+        case .drop_(let place, _, _) => mark_place_read_other(mutable counters, place)
+        case .spawn_(_, let args, _, let handle_dest, _, _) => {
+            scan_operands_read(mutable counters, args)
+            mark_dest(mutable counters, escape_mod.base_local(handle_dest))
+            record_def_other(mutable counters, escape_mod.base_local(handle_dest))
+            scan_place_index_reads(mutable counters, handle_dest)
+        }
+        case .await_(let handle, let dest, _, _) => {
+            scan_operand_read(mutable counters, handle)
+            mark_dest(mutable counters, escape_mod.base_local(dest))
+            record_def_other(mutable counters, escape_mod.base_local(dest))
+            scan_place_index_reads(mutable counters, dest)
+        }
+        case _ => ()
+    }
+}
+
+
+function scan_operands_read(counters: mutable model_mod.Counters, ops: Vec_Operand.Vec) -> () {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        scan_operand_read(mutable counters, op)
+        i += 1
+    }
+}
+
+
+function scan_operand_read(counters: mutable model_mod.Counters, op: mir_rvalue_mod.Operand) -> () {
+    match op {
+        case .copy_(let place, _) => {
+            if escape_mod.is_bare(place) {
+                ()
+            } else {
+                mark_place_read_other(mutable counters, place)
+            }
+        }
+        case .move_(let place, _) => mark_place_read_other(mutable counters, place)
+        case .constant(_) => ()
+    }
+}
+
+
+function mark_place_read_other(counters: mutable model_mod.Counters, place: mir_place_mod.Place) -> () {
+    bump_read_other(mutable counters, escape_mod.base_local(place))
+    scan_place_index_reads(mutable counters, place)
+}
+
+
+function scan_place_index_reads(counters: mutable model_mod.Counters, place: mir_place_mod.Place) -> () {
+    let n: usize = mir_place_mod.proj_len(place)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(place, i)
+        match proj.kind {
+            case .index(let idx_local, _) => bump_read_other(mutable counters, idx_local)
+            case .slice_subrange(let lo_local, let hi_local, _) => {
+                bump_read_other(mutable counters, lo_local)
+                bump_read_other(mutable counters, hi_local)
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}
+
+
+function mark_dest(counters: mutable model_mod.Counters, l: mir_local_mod.LocalId) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_bool.len(counters.is_dest_anywhere) {
+        Vec_bool.set_at(mutable counters.is_dest_anywhere, idx, true)
+    }
+}
+
+
+function record_def_assign(
+    counters: mutable model_mod.Counters,
+    l: mir_local_mod.LocalId,
+    value: mir_rvalue_mod.Rvalue,
+) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_u32.len(counters.n_def_assign) {
+        let prior: u32 = Vec_u32.at(counters.n_def_assign, idx)
+        Vec_u32.set_at(mutable counters.n_def_assign, idx, prior +% 1)
+    }
+    if idx < Vec_DefOp.len(counters.def_op) {
+        let op_opt = rvalue_use_operand(value)
+        Vec_DefOp.set_at(mutable counters.def_op, idx, model_mod.DefOp { value: op_opt })
+    }
+}
+
+
+function rvalue_use_operand(rv: mir_rvalue_mod.Rvalue) -> Option_Operand.Option {
+    return match rv {
+        case .use_(let operand) => Option_Operand.some(value: operand)
+        case _ => Option_Operand.none
+    }
+}
+
+
+function record_def_other(counters: mutable model_mod.Counters, l: mir_local_mod.LocalId) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_u32.len(counters.n_def_other) {
+        let prior: u32 = Vec_u32.at(counters.n_def_other, idx)
+        Vec_u32.set_at(mutable counters.n_def_other, idx, prior +% 1)
+    }
+}
+
+
+function bump_read_other(counters: mutable model_mod.Counters, l: mir_local_mod.LocalId) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_u32.len(counters.n_read_other) {
+        let prior: u32 = Vec_u32.at(counters.n_read_other, idx)
+        Vec_u32.set_at(mutable counters.n_read_other, idx, prior +% 1)
+    }
+}
+
+
+public function qualifies(
+    counters: model_mod.Counters,
+    info: escape_mod.EscapeInfo,
+    body: mir_body_mod.MirBody,
+    l: mir_local_mod.LocalId,
+    idx: usize,
+) -> bool {
+    if idx < escape_mod.first_temp_index(body) {
+        return false
+    }
+    if escape_mod.escapes(info, l) {
+        return false
+    }
+    if idx >= Vec_u32.len(counters.n_def_assign) {
+        return false
+    }
+    if Vec_u32.at(counters.n_def_assign, idx) != 1 {
+        return false
+    }
+    if idx >= Vec_u32.len(counters.n_def_other) {
+        return false
+    }
+    if Vec_u32.at(counters.n_def_other, idx) != 0 {
+        return false
+    }
+    if idx >= Vec_u32.len(counters.n_read_other) {
+        return false
+    }
+    if Vec_u32.at(counters.n_read_other, idx) != 0 {
+        return false
+    }
+    return def_operand_forwardable(counters, idx)
+}
+
+
+function def_operand_forwardable(counters: model_mod.Counters, idx: usize) -> bool {
+    if idx >= Vec_DefOp.len(counters.def_op) {
+        return false
+    }
+    let entry = Vec_DefOp.at(counters.def_op, idx)
+    return match entry.value {
+        case .some(let op) => operand_forwardable(counters, op)
+        case .none => false
+    }
+}
+
+
+function operand_forwardable(counters: model_mod.Counters, op: mir_rvalue_mod.Operand) -> bool {
+    return match op {
+        case .constant(_) => true
+        case .copy_(let place, _) => copy_source_stable(counters, place)
+        case .move_(_, _) => false
+    }
+}
+
+
+function copy_source_stable(counters: model_mod.Counters, place: mir_place_mod.Place) -> bool {
+    if escape_mod.is_bare(place) == false {
+        return false
+    }
+    if escape_mod.has_deref(place) {
+        return false
+    }
+    let src_idx: usize = mir_local_mod.index(escape_mod.base_local(place))
+    if src_idx >= Vec_bool.len(counters.is_dest_anywhere) {
+        return false
+    }
+    if Vec_bool.at(counters.is_dest_anywhere, src_idx) {
+        return false
+    }
+    return true
+}

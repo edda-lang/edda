@@ -1,0 +1,286 @@
+
+module regex.main
+
+import std.io.stream
+import std.mem.alloc
+import std.text.string
+import regex.api
+import regex.api.find as api_find
+import regex.api.compile as api_compile
+import regex.api.replace as api_replace
+import regex.api.iter as api_iter
+import regex.engine.exec.vm
+
+public function main(
+    out: Stdout,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, divergence}
+{
+    let _ = handle err: api.RegexError -> { _print_error(out) } {
+        _run_smoke_tests(out, mutable allocator)?
+    }
+    return ()
+}
+
+function _print_error(out: Stdout) -> () with {out} {
+    out.print_line("regex: error during smoke run")
+    return ()
+}
+
+function _run_smoke_tests(
+    out: Stdout,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, err: api.RegexError, divergence}
+{
+    out.print_line("regex smoke tests")
+    out.print_line("=================")
+
+    _check(out, "literal abc", "abc", "xxabcxx", true, mutable allocator)?
+    _check(out, "literal no-match", "abc", "xxxxxx", false, mutable allocator)?
+    _check(out, "dot", "a.c", "abc", true, mutable allocator)?
+    _check(out, "dot no-newline", "a.c", "a\nc", false, mutable allocator)?
+    _check(out, "anchor start", "^abc", "abcdef", true, mutable allocator)?
+    _check(out, "anchor start fail", "^abc", "xabc", false, mutable allocator)?
+    _check(out, "anchor end", "abc$", "xxabc", true, mutable allocator)?
+    _check(out, "star", "ab*c", "ac", true, mutable allocator)?
+    _check(out, "star many", "ab*c", "abbbbc", true, mutable allocator)?
+    _check(out, "plus", "ab+c", "ac", false, mutable allocator)?
+    _check(out, "plus one", "ab+c", "abc", true, mutable allocator)?
+    _check(out, "question opt", "ab?c", "ac", true, mutable allocator)?
+    _check(out, "question opt-1", "ab?c", "abc", true, mutable allocator)?
+    _check(out, "alt left", "cat|dog", "I have a cat", true, mutable allocator)?
+    _check(out, "alt right", "cat|dog", "I have a dog", true, mutable allocator)?
+    _check(out, "alt neither", "cat|dog", "I have a hamster", false, mutable allocator)?
+    _check(out, "class digit", "[0-9]+", "abc123def", true, mutable allocator)?
+    _check(out, "class neg", "[^a]+", "bbbb", true, mutable allocator)?
+    _check(out, "perl \\d", "\\d{3}", "ab123cd", true, mutable allocator)?
+    _check(out, "perl \\w", "\\w+", "  hello  ", true, mutable allocator)?
+    _check(out, "perl \\s", "\\s+", "a b", true, mutable allocator)?
+    _check(out, "group capture", "(a)(b)", "ab", true, mutable allocator)?
+    _check(out, "non-capture", "(?:abc)", "abc", true, mutable allocator)?
+    _check(out, "repeat exact", "a{3}", "aaa", true, mutable allocator)?
+    _check(out, "repeat exact fail", "a{3}", "aa", false, mutable allocator)?
+    _check(out, "repeat range", "a{2,4}", "aaaa", true, mutable allocator)?
+    _check(out, "hex escape", "\\x41", "AAA", true, mutable allocator)?
+    _check(out, "unicode esc", "\\u0041", "BAB", true, mutable allocator)?
+
+    _check(out, "ci literal up", "(?i)hello", "HELLO", true, mutable allocator)?
+    _check(out, "ci literal lo", "(?i)WORLD", "world", true, mutable allocator)?
+    _check(out, "ci mixed",      "(?i)CaT", "cAt", true, mutable allocator)?
+    _check(out, "ci scoped",     "ab(?i:cd)ef", "abCDef", true, mutable allocator)?
+    _check(out, "ci scoped off", "(?i:ab)CD", "abCD", true, mutable allocator)?
+    _check(out, "ci class",      "(?i)[a-z]+", "HELLO", true, mutable allocator)?
+    _check(out, "ci class miss", "(?i)[a-z]", "1234", false, mutable allocator)?
+    _check(out, "case sensitive","hello", "HELLO", false, mutable allocator)?
+
+    _check(out, "class overlap",  "[a-zA-Za-c]+", "zoo", true, mutable allocator)?
+    _check(out, "class touch",    "[a-cd-f]", "e", true, mutable allocator)?
+
+    _check(out, "posix alpha",  "[[:alpha:]]+", "1234abc", true, mutable allocator)?
+    _check(out, "posix digit",  "[[:digit:]]+", "abc456", true, mutable allocator)?
+    _check(out, "posix alnum",  "[[:alnum:]_]+", "_var1", true, mutable allocator)?
+    _check(out, "posix space",  "[[:space:]]+", "x y", true, mutable allocator)?
+    _check(out, "posix xdigit", "[[:xdigit:]]+", "deadBEEF", true, mutable allocator)?
+    _check(out, "posix punct",  "[[:punct:]]+", "!?", true, mutable allocator)?
+    _check(out, "posix neg outer", "[^[:digit:]]+", "abc", true, mutable allocator)?
+
+    _check(out, "utf8 latin1", "café", "café", true, mutable allocator)?
+    _check(out, "utf8 cjk",    "\\u00e9", "café", true, mutable allocator)?
+    _check(out, "utf8 emoji",  "🦀", "have a 🦀 rust crab", true, mutable allocator)?
+    _check(out, "utf8 cp range","[\\u00c0-\\u00ff]+", "café", true, mutable allocator)?
+    _check(out, "utf8 dot",    "a.c", "a→c", true, mutable allocator)?
+    _check(out, "utf8 dot len","a..c", "abc", false, mutable allocator)?
+    _check(out, "utf8 cls excl","[^a]", "→", true, mutable allocator)?
+    _check(out, "utf8 + len",  "[\\u00c0-\\u00ff]{2}", "café", false, mutable allocator)?
+    _check(out, "utf8 quant",  "a\\u00e9+f", "aééf", true, mutable allocator)?
+
+    _check_replace(out, "replace word", "world", "hello world", "Edda",
+                   "hello Edda", mutable allocator)?
+    _check_replace(out, "replace all 'a'", "a", "banana", "X",
+                   "bXnXnX", mutable allocator)?
+    _check_replace(out, "replace group swap", "(\\w+) (\\w+)", "John Smith", "$2 $1",
+                   "Smith John", mutable allocator)?
+    _check_replace(out, "replace dollar escape", "x", "ax", "$$y",
+                   "a$y", mutable allocator)?
+    _check_replace(out, "replace none", "xyz", "hello", "Q",
+                   "hello", mutable allocator)?
+    _check_replace(out, "replace $<name>", "(?P<word>\\w+)",
+                   "hello world", "[$<word>]",
+                   "[hello] [world]", mutable allocator)?
+    _check_replace(out, "replace $<unknown>", "(?P<a>x)", "x", "<$<missing>>",
+                   "<>", mutable allocator)?
+    _check_replace(out, "replace $<>+lit", "(?<num>\\d+)-(?<unit>\\w+)",
+                   "12-px and 5-em", "$<unit>=$<num>",
+                   "px=12 and em=5", mutable allocator)?
+
+    _check_named_span(out, "named (?P<>)", "(?P<word>\\w+)", "hello world",
+                     "word", 0 as usize, 5 as usize, mutable allocator)?
+    _check_named_span(out, "named (?<>)", "(?<num>\\d+)-(?<unit>\\w+)", "12-px",
+                     "unit", 3 as usize, 5 as usize, mutable allocator)?
+    _check_named_span(out, "named two-groups", "(?<num>\\d+)-(?<unit>\\w+)", "12-px",
+                     "num", 0 as usize, 2 as usize, mutable allocator)?
+    _check_named_missing(out, "named missing", "(?P<a>x)", "x", "nonexistent", mutable allocator)?
+
+    _check(out, "perl \\h tab",      "\\h+", "a\tb", true, mutable allocator)?
+    _check(out, "perl \\h space",    "\\h+", "a b", true, mutable allocator)?
+    _check(out, "perl \\H",          "\\H+", "a\tb", true, mutable allocator)?
+    _check(out, "perl \\v lf",       "\\v", "x\ny", true, mutable allocator)?
+    _check(out, "perl \\v cr",       "\\v", "x\ry", true, mutable allocator)?
+    _check(out, "perl \\V",          "\\V+", "abc", true, mutable allocator)?
+    _check(out, "class \\d inside",  "[\\d_]+", "x_3y", true, mutable allocator)?
+    _check(out, "class \\s inside",  "[\\s,]+", "a, b", true, mutable allocator)?
+    _check(out, "class \\h inside",  "[\\h]+", "a\tb", true, mutable allocator)?
+
+    _check_find_iter(out, "iter words", "\\w+", "one two three four", 4 as u32, mutable allocator)?
+    _check_find_iter(out, "iter empty", "x", "abc", 0 as u32, mutable allocator)?
+    _check_find_iter(out, "iter overlap-guard", "a*", "aaaa", 2 as u32, mutable allocator)?
+    _check_find_iter(out, "iter utf8", "\\u00e9", "café résumé", 3 as u32, mutable allocator)?
+
+    out.print_line("=================")
+    out.print_line("smoke run complete")
+    return ()
+}
+
+function _check_named_span(
+    out: Stdout,
+    label: String,
+    pattern: String,
+    input: String,
+    name: String,
+    expected_start: usize,
+    expected_end: usize,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, err: api.RegexError, divergence}
+{
+    let re = api_compile.compile(pattern, mutable allocator)?
+    let m_opt = api_find.find(re, input.bytes(), mutable allocator)?
+    let mark = match m_opt {
+        case .none => "FAIL"
+        case .some(let m) => {
+            let span_opt = api.group_span_named(re, m, name)
+            match span_opt {
+                case .none => "FAIL"
+                case .some(let span) => {
+                    if span.start == expected_start && span.end == expected_end {
+                        "ok "
+                    } else {
+                        "FAIL"
+                    }
+                }
+            }
+        }
+    }
+    out.print_line(f"{mark}  {label}  re=/{pattern}/  name={name} expected=[{expected_start},{expected_end})")
+    return ()
+}
+
+function _check_named_missing(
+    out: Stdout,
+    label: String,
+    pattern: String,
+    input: String,
+    name: String,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, err: api.RegexError, divergence}
+{
+    let re = api_compile.compile(pattern, mutable allocator)?
+    let m_opt = api_find.find(re, input.bytes(), mutable allocator)?
+    let mark = match m_opt {
+        case .none => "FAIL"
+        case .some(let m) => {
+            let span_opt = api.group_span_named(re, m, name)
+            match span_opt {
+                case .none    => "ok "
+                case .some(_) => "FAIL"
+            }
+        }
+    }
+    out.print_line(f"{mark}  {label}  re=/{pattern}/  expected-miss for `{name}`")
+    return ()
+}
+
+function _check_find_iter(
+    out: Stdout,
+    label: String,
+    pattern: String,
+    input: String,
+    expected: u32,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, err: api.RegexError, divergence}
+{
+    let re = api_compile.compile(pattern, mutable allocator)?
+    let iter = api_iter.find_iter(re, input.bytes(), mutable allocator)?
+    var count: u32 = 0 as u32
+    var safety: u32 = 0 as u32
+    loop decreases 10000 as u32 - safety + 1 as u32 {
+        if safety >= 10000 as u32 { break }
+        safety = safety + 1 as u32
+        let m_opt = api_iter.find_iter_next(iter, mutable allocator)?
+        let advance = match m_opt {
+            case .none    => false
+            case .some(_) => true
+        }
+        if !advance { break }
+        count = count + 1 as u32
+    }
+    let mark = if count == expected { "ok " } else { "FAIL" }
+    out.print_line(f"{mark}  {label}  re=/{pattern}/  count={count}  expected={expected}")
+    return ()
+}
+
+function _str_bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _check_replace(
+    out: Stdout,
+    label: String,
+    pattern: String,
+    input: String,
+    replacement: String,
+    expected: String,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, err: api.RegexError, divergence}
+{
+    let re = api_compile.compile(pattern, mutable allocator)?
+    let got = api_replace.replace_all(re, input.bytes(), replacement.bytes(), mutable allocator)?
+    let ok = _str_bytes_eq(got, expected.bytes())
+    let mark = if ok { "ok " } else { "FAIL" }
+    let got_str = handle err: alloc.AllocError -> (raise api.RegexError.exec_failed(err: vm.ExecError.allocation_failed)) {
+        string.bytes_slice_to_string(got, 0, got.len(), allocator)?
+    }
+    out.print_line(f"{mark}  {label}  re=/{pattern}/  -> `{got_str}` (expected `{expected}`)")
+    return ()
+}
+
+function _check(
+    out: Stdout,
+    label: String,
+    pattern: String,
+    input: String,
+    expect_match: bool,
+    allocator: mutable Allocator,
+) -> ()
+    with {out, allocator, err: api.RegexError, divergence}
+{
+    let re = api_compile.compile(pattern, mutable allocator)?
+    let got = api_find.is_match(re, input.bytes(), mutable allocator)?
+    let mark = if got == expect_match { "ok " } else { "FAIL" }
+    let pat_q = pattern
+    out.print_line(f"{mark}  {label}  pattern=/{pat_q}/  input=`{input}`  matched={got}  expected={expect_match}")
+    return ()
+}

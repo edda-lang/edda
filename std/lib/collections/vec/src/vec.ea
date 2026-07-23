@@ -1,0 +1,200 @@
+
+module std.collections.vec
+
+import std.mem.alloc
+import std.core.option
+
+public spec Vec(comptime T: Type) {
+    spec std.core.option.Option(T)
+
+    public type Vec {
+        capacity: usize
+        len: usize where len <= capacity
+        data: [T] where data.len() == capacity
+    }
+
+    public function _alloc_array(allocator: Allocator, n: usize) -> [T]
+        with {allocator, err: alloc.AllocError}
+    extern "__edda_alloc_array"
+
+    public function _realloc_array(data: take [T], n: usize, allocator: Allocator) -> [T]
+        with {allocator, err: alloc.AllocError}
+    extern "__edda_realloc_array"
+
+    function _copy_array(dst: mutable [T], src: [T]) -> ()
+        where dst.len() >= src.len()
+    extern "__edda_copy_array"
+
+    public function new(out: init Vec, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        let raw = _alloc_array(allocator, 0)?
+        out = Vec { capacity: 0, len: 0, data: raw }
+    }
+
+    public function with_capacity(out: init Vec, cap: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        let raw = _alloc_array(allocator, cap)?
+        out = Vec { capacity: cap, len: 0, data: raw }
+    }
+
+    public function into_array(v: take Vec, allocator: Allocator) -> [T]
+        with {allocator, err: alloc.AllocError}
+    {
+        let target: usize = v.len
+        return _realloc_array(take v.data, target, allocator)?
+    }
+
+    public stable function len(v: Vec) -> usize {
+        return v.len
+    }
+
+    public function is_empty(v: Vec) -> bool {
+        return v.len == 0
+    }
+
+    public function capacity(v: Vec) -> usize {
+        return v.capacity
+    }
+
+    public function clear(v: mutable Vec) -> () {
+        v.len = 0
+    }
+
+    public function push(v: mutable Vec, item: take T, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        reserve(mutable v, v.len + 1, allocator)?
+        v.data[v.len] = item
+        v.len += 1
+    }
+
+    public function pop(v: mutable Vec) -> Option_T {
+        if v.len == 0 {
+            return Option_T.none
+        }
+        v.len -= 1
+        return Option_T.some(value: v.data[v.len])
+    }
+
+    public function get(v: Vec, i: usize) -> Option_T {
+        if i < v.len {
+            return Option_T.some(value: v.data[i])
+        }
+        return Option_T.none
+    }
+
+    public stable function at(v: Vec, i: usize where i < v.len) -> T {
+        return v.data[i]
+    }
+
+    public function at_ref(v: Vec, i: usize where i < v.len) -> let T {
+        return v.data[i]
+    }
+
+    public function set_at(v: mutable Vec, i: usize where i < v.len, value: take T) -> () {
+        v.data[i] = value
+    }
+
+    public function at_mut(v: mutable Vec, i: usize where i < v.len) -> mutable T {
+        return v.data[i]
+    }
+
+    public function first(v: Vec) -> Option_T {
+        if v.len == 0 {
+            return Option_T.none
+        }
+        return Option_T.some(value: v.data[0])
+    }
+
+    public function last(v: Vec) -> Option_T {
+        if v.len == 0 {
+            return Option_T.none
+        }
+        return Option_T.some(value: v.data[v.len - 1])
+    }
+
+    public function insert(
+        v: mutable Vec,
+        i: usize where i <= v.len,
+        value: take T,
+        allocator: Allocator,
+    ) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        reserve(mutable v, v.len + 1, allocator)?
+        var j: usize = v.len
+        loop
+            decreases j - i
+        {
+            if j <= i { break }
+            v.data[j] = v.data[j - 1]
+            j -= 1
+        }
+        v.data[i] = value
+        v.len += 1
+    }
+
+    public function remove(v: mutable Vec, i: usize where i < v.len) -> T {
+        let removed = v.data[i]
+        let n: usize = v.len
+        var j: usize = i
+        loop
+            decreases n - j
+        {
+            if j + 1 >= n { break }
+            v.data[j] = v.data[j + 1]
+            j += 1
+        }
+        v.len -= 1
+        return removed
+    }
+
+    public function swap(
+        v: mutable Vec,
+        i: usize where i < v.len,
+        j: usize where j < v.len,
+    ) -> () {
+        let tmp = v.data[i]
+        v.data[i] = v.data[j]
+        v.data[j] = tmp
+    }
+
+    public function reserve(v: mutable Vec, min_cap: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        if v.capacity >= min_cap { return }
+        let initial_cap: usize = 8
+        let two: usize = 2
+        let doubled: usize = if v.capacity == 0 { initial_cap } else { v.capacity * two }
+        let target: usize = if doubled >= min_cap { doubled } else { min_cap }
+        v.data = _realloc_array(take v.data, target, allocator)?
+        v.capacity = target
+    }
+
+    public function as_slice(v: Vec) -> [T] {
+        return v.data[0..<v.len]
+    }
+
+    public function extend_from_slice(v: mutable Vec, src: [T], allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        let n: usize = src.len()
+        let base: usize = v.len
+        reserve(mutable v, base + n, allocator)?
+        comptime if is_primitive(T) {
+            _copy_array(mutable v.data[base..<base + n], src)
+        } else {
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                v.data[base + i] = src[i]
+                i += 1
+            }
+        }
+        v.len = base + n
+    }
+}

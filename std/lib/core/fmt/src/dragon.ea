@@ -1,0 +1,254 @@
+
+module std.core.fmt.dragon
+
+import std.mem.alloc
+import std.math.bigint
+
+
+function bigint_from_u64(v: u64, allocator: Allocator) -> bigint.BigInt
+    with {allocator, err: alloc.AllocError}
+{
+    let buf: [u8] = allocator.alloc_array(u8, 8)?
+    buf[0] = ((v >> 56) & 0xFF) as u8
+    buf[1] = ((v >> 48) & 0xFF) as u8
+    buf[2] = ((v >> 40) & 0xFF) as u8
+    buf[3] = ((v >> 32) & 0xFF) as u8
+    buf[4] = ((v >> 24) & 0xFF) as u8
+    buf[5] = ((v >> 16) & 0xFF) as u8
+    buf[6] = ((v >> 8) & 0xFF) as u8
+    buf[7] = (v & 0xFF) as u8
+    return bigint.from_bytes_be(allocator, buf)?
+}
+
+function bigint_small(v: u8, allocator: Allocator) -> bigint.BigInt
+    with {allocator, err: alloc.AllocError}
+{
+    let buf: [u8] = allocator.alloc_array(u8, 1)?
+    buf[0] = v
+    return bigint.from_bytes_be(allocator, buf)?
+}
+
+function bigint_pow2(n: usize, allocator: Allocator) -> bigint.BigInt
+    with {allocator, err: alloc.AllocError}
+{
+    let len: usize = (n / 8) + 1
+    let buf: [u8] = allocator.alloc_array(u8, len)?
+    var i: usize = 0
+    loop
+        decreases len - i
+    {
+        if i >= len { break }
+        buf[i] = 0
+        i += 1
+    }
+    let shift: usize = n % 8
+    let one_u8: u8 = 1
+    buf[0] = one_u8 << (shift as u8)
+    return bigint.from_bytes_be(allocator, buf)?
+}
+
+function bigint_digit(d: bigint.BigInt, allocator: Allocator) -> u8
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if bigint.is_zero(d) {
+        return 0
+    }
+    var buf: [u8] = allocator.alloc_array(u8, 1)?
+    handle err: bigint.BigIntError as e -> panic("std.core.fmt.dragon: digit out of range") {
+        bigint.to_bytes_be(d, mutable buf)?
+    }
+    return buf[0]
+}
+
+function bigint_divmod_checked(a: bigint.BigInt, b: bigint.BigInt, allocator: Allocator) -> (bigint.BigInt, bigint.BigInt)
+    with {allocator, err: alloc.AllocError, panic}
+{
+    return handle err: bigint.BigIntError as e -> panic("std.core.fmt.dragon: bigint divmod invariant violated") {
+        bigint.divmod(allocator, a, b)?
+    }
+}
+
+function bigint_le(a: bigint.BigInt, b: bigint.BigInt) -> bool {
+    return bigint.lt(a, b) || bigint.eq(a, b)
+}
+
+
+function resolve_digit(d: u8, low: bool, high: bool, rem: bigint.BigInt, s: bigint.BigInt, allocator: Allocator) -> u8
+    with {allocator, err: alloc.AllocError}
+{
+    if low && !high {
+        return d
+    }
+    if high && !low {
+        return d + 1
+    }
+    let two_tb: bigint.BigInt = bigint_small(2, allocator)?
+    let doubled: bigint.BigInt = bigint.mul(allocator, rem, two_tb)?
+    bigint.destroy(take two_tb)
+    let ge: bool = !bigint.lt(doubled, s)
+    bigint.destroy(take doubled)
+    if ge {
+        return d + 1
+    }
+    return d
+}
+
+function carry_propagate(digits: mutable [u8], n: mutable usize, k: mutable i64) -> ()
+    with {divergence}
+{
+    var carry: bool = true
+    var i: usize = n
+    loop {
+        if !carry { break }
+        if i == 0 {
+            var j: usize = n
+            loop
+                decreases j
+            {
+                if j == 0 { break }
+                digits[j] = digits[j - 1]
+                j -= 1
+            }
+            digits[0] = 1
+            n += 1
+            k += 1
+            carry = false
+        } else {
+            i -= 1
+            if digits[i] == 9 {
+                digits[i] = 0
+            } else {
+                digits[i] = digits[i] + 1
+                carry = false
+            }
+        }
+    }
+}
+
+function gen_digits(
+    r: take bigint.BigInt,
+    mp: take bigint.BigInt,
+    mm: take bigint.BigInt,
+    s: take bigint.BigInt,
+    ten: bigint.BigInt,
+    digits: mutable [u8],
+    n: mutable usize,
+    k: mutable i64,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let r10: bigint.BigInt = bigint.mul(allocator, r, ten)?
+    bigint.destroy(take r)
+    let mp10: bigint.BigInt = bigint.mul(allocator, mp, ten)?
+    bigint.destroy(take mp)
+    let mm10: bigint.BigInt = bigint.mul(allocator, mm, ten)?
+    bigint.destroy(take mm)
+
+    let parts: (bigint.BigInt, bigint.BigInt) = bigint_divmod_checked(r10, s, allocator)?
+    bigint.destroy(take r10)
+    match parts {
+        case (let d_big, let rem) => {
+            let d: u8 = bigint_digit(d_big, allocator)?
+            bigint.destroy(take d_big)
+
+            let low: bool = bigint.lt(rem, mm10)
+            let sum_high: bigint.BigInt = bigint.add(allocator, rem, mp10)?
+            let high: bool = bigint.lt(s, sum_high)
+            bigint.destroy(take sum_high)
+
+            if !low && !high {
+                digits[n] = d
+                n += 1
+                gen_digits(take rem, take mp10, take mm10, take s, ten, mutable digits, mutable n, mutable k, allocator)?
+            } else {
+                let final_digit: u8 = resolve_digit(d, low, high, rem, s, allocator)?
+                bigint.destroy(take rem)
+                bigint.destroy(take mp10)
+                bigint.destroy(take mm10)
+                bigint.destroy(take s)
+                if final_digit == 10 {
+                    carry_propagate(mutable digits, mutable n, mutable k)
+                } else {
+                    digits[n] = final_digit
+                    n += 1
+                }
+            }
+        }
+    }
+}
+
+function fixup(
+    r: take bigint.BigInt,
+    s: take bigint.BigInt,
+    mp: take bigint.BigInt,
+    mm: take bigint.BigInt,
+    ten: bigint.BigInt,
+    k: mutable i64,
+    digits: mutable [u8],
+    n: mutable usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let sum: bigint.BigInt = bigint.add(allocator, r, mp)?
+    let over: bool = bigint.lt(s, sum)
+    if over {
+        bigint.destroy(take sum)
+        let new_s: bigint.BigInt = bigint.mul(allocator, s, ten)?
+        bigint.destroy(take s)
+        k += 1
+        return fixup(take r, take new_s, take mp, take mm, ten, mutable k, mutable digits, mutable n, allocator)?
+    } else {
+        let scaled: bigint.BigInt = bigint.mul(allocator, sum, ten)?
+        bigint.destroy(take sum)
+        let under: bool = bigint_le(scaled, s)
+        bigint.destroy(take scaled)
+        if under {
+            let new_r: bigint.BigInt = bigint.mul(allocator, r, ten)?
+            bigint.destroy(take r)
+            let new_mp: bigint.BigInt = bigint.mul(allocator, mp, ten)?
+            bigint.destroy(take mp)
+            let new_mm: bigint.BigInt = bigint.mul(allocator, mm, ten)?
+            bigint.destroy(take mm)
+            k -= 1
+            return fixup(take new_r, take s, take new_mp, take new_mm, ten, mutable k, mutable digits, mutable n, allocator)?
+        } else {
+            return gen_digits(take r, take mp, take mm, take s, ten, mutable digits, mutable n, mutable k, allocator)?
+        }
+    }
+}
+
+
+public function to_decimal(f: u64, e: i64, digits: mutable [u8], k_out: mutable i64, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let f_big: bigint.BigInt = bigint_from_u64(f, allocator)?
+    let ten: bigint.BigInt = bigint_small(10, allocator)?
+    var k: i64 = 0
+    var n: usize = 0
+    if e >= 0 {
+        let e_bits: usize = e as usize
+        let scale: bigint.BigInt = bigint_pow2(e_bits + 1, allocator)?
+        let r0: bigint.BigInt = bigint.mul(allocator, f_big, scale)?
+        bigint.destroy(take scale)
+        bigint.destroy(take f_big)
+        let s0: bigint.BigInt = bigint_small(2, allocator)?
+        let mp0: bigint.BigInt = bigint_pow2(e_bits, allocator)?
+        let mm0: bigint.BigInt = bigint.clone(allocator, mp0)?
+        fixup(take r0, take s0, take mp0, take mm0, ten, mutable k, mutable digits, mutable n, allocator)?
+    } else {
+        let neg_e: usize = (-e) as usize
+        let two: bigint.BigInt = bigint_small(2, allocator)?
+        let r0: bigint.BigInt = bigint.mul(allocator, f_big, two)?
+        bigint.destroy(take two)
+        bigint.destroy(take f_big)
+        let s0: bigint.BigInt = bigint_pow2(neg_e + 1, allocator)?
+        let mp0: bigint.BigInt = bigint_small(1, allocator)?
+        let mm0: bigint.BigInt = bigint.clone(allocator, mp0)?
+        fixup(take r0, take s0, take mp0, take mm0, ten, mutable k, mutable digits, mutable n, allocator)?
+    }
+    bigint.destroy(take ten)
+    k_out = k
+    return n
+}

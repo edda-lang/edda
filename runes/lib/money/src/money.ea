@@ -1,0 +1,260 @@
+module money.money
+
+import std.mem.alloc
+import std.core.option
+import std.core.overflow
+import std.collections.vec
+import std.text.itoa
+import std.text.string
+
+spec std.core.option.Option(Money)
+spec std.collections.vec.Vec(u8)
+
+
+public type Money {
+    minor: i64
+    scale: u8
+}
+
+public function from_minor(minor: i64, scale: u8) -> Money {
+    return Money { minor: minor, scale: scale }
+}
+
+public function zero(scale: u8) -> Money {
+    return Money { minor: 0, scale: scale }
+}
+
+public function is_negative(m: Money) -> bool {
+    return m.minor < 0
+}
+
+public function neg(m: Money) -> Money {
+    return Money { minor: 0 -| m.minor, scale: m.scale }
+}
+
+public function add(a: Money, b: Money) -> Money
+    with {err: overflow.Overflow}
+    requires a.scale == b.scale
+{
+    let sum = a.minor +? b.minor
+    return Money { minor: sum, scale: a.scale }
+}
+
+public function sub(a: Money, b: Money) -> Money
+    with {err: overflow.Overflow}
+    requires a.scale == b.scale
+{
+    let diff = a.minor -? b.minor
+    return Money { minor: diff, scale: a.scale }
+}
+
+public function mul_int(m: Money, n: i64) -> Money
+    with {err: overflow.Overflow}
+{
+    let prod = m.minor *? n
+    return Money { minor: prod, scale: m.scale }
+}
+
+public function compare(a: Money, b: Money) -> i8
+    requires a.scale == b.scale
+{
+    if a.minor < b.minor { return 0 -| (1 as i8) }
+    if a.minor > b.minor { return 1 as i8 }
+    return 0 as i8
+}
+
+function _magnitude(minor: i64) -> u64 {
+    if minor < 0 {
+        return (0 -% minor) as u64 wrapping
+    }
+    return minor as u64
+}
+
+function _pow10_u64_sat(scale: usize) -> u64 {
+    var p: u64 = 1
+    var i: usize = 0
+    loop
+        decreases scale - i
+    {
+        if i >= scale { break }
+        p = p *| (10 as u64)
+        i += 1
+    }
+    return p
+}
+
+function _push_int_grouped(v: mutable Vec_u8.Vec, value: u64, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let dc: usize = itoa.digit_count_u64(value)
+    let digits: [u8] = allocator.alloc_array(u8, dc)?
+    var rem: u64 = value
+    var i: usize = 0
+    loop
+        decreases dc - i
+    {
+        if i >= dc { break }
+        digits[dc - 1 - i] = (rem % 10) as u8 + 48
+        rem = rem / 10
+        i += 1
+    }
+    var k: usize = 0
+    loop
+        decreases dc - k
+    {
+        if k >= dc { break }
+        if k > 0 && (dc - k) % 3 == 0 {
+            Vec_u8.push(mutable v, 44 as u8, allocator)?
+        }
+        Vec_u8.push(mutable v, digits[k], allocator)?
+        k += 1
+    }
+}
+
+function _push_frac_padded(
+    v: mutable Vec_u8.Vec,
+    frac: u64,
+    scale: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let digits: [u8] = allocator.alloc_array(u8, scale)?
+    var rem: u64 = frac
+    var i: usize = 0
+    loop
+        decreases scale - i
+    {
+        if i >= scale { break }
+        digits[scale - 1 - i] = (rem % 10) as u8 + 48
+        rem = rem / 10
+        i += 1
+    }
+    var k: usize = 0
+    loop
+        decreases scale - k
+    {
+        if k >= scale { break }
+        Vec_u8.push(mutable v, digits[k], allocator)?
+        k += 1
+    }
+}
+
+public function format(m: Money, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let sc: usize = m.scale as usize
+    let mag: u64 = _magnitude(m.minor)
+    let div: u64 = _pow10_u64_sat(sc)
+    let int_part: u64 = mag / div
+    let frac: u64 = mag % div
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    if m.minor < 0 {
+        Vec_u8.push(mutable v, 45 as u8, allocator)?
+    }
+    _push_int_grouped(mutable v, int_part, allocator)?
+    if sc > 0 {
+        Vec_u8.push(mutable v, 46 as u8, allocator)?
+        _push_frac_padded(mutable v, frac, sc, allocator)?
+    }
+    let bytes = Vec_u8.into_array(take v, allocator)?
+    return string.from_owned_utf8(take bytes)
+}
+
+function _pow10_i64_checked(p: usize) -> i64
+    with {err: overflow.Overflow}
+{
+    var value: i64 = 1
+    var i: usize = 0
+    loop
+        decreases p - i
+    {
+        if i >= p { break }
+        value = value *? (10 as i64)
+        i += 1
+    }
+    return value
+}
+
+function _is_digit(b: u8) -> bool {
+    return b >= 48 && b <= 57
+}
+
+function _build_minor(
+    whole: i64,
+    frac: i64,
+    frac_digits: usize,
+    scale: usize,
+    negative: bool,
+) -> Money
+    with {err: overflow.Overflow}
+    requires frac_digits <= scale
+{
+    let pow_scale: i64 = _pow10_i64_checked(scale)?
+    let pad: usize = scale - frac_digits
+    let pow_pad: i64 = _pow10_i64_checked(pad)?
+    let frac_scaled: i64 = frac *? pow_pad
+    let whole_scaled: i64 = whole *? pow_scale
+    let mag: i64 = whole_scaled +? frac_scaled
+    let signed: i64 = if negative { 0 -? mag } else { mag }
+    return Money { minor: signed, scale: scale as u8 }
+}
+
+public function parse(s: String, scale: u8, allocator: Allocator) -> Option_Money {
+    let _ = allocator
+    let bytes: [u8] = s.bytes()
+    let n: usize = bytes.len()
+    if n == 0 { return Option_Money.none }
+    let sc: usize = scale as usize
+    var idx: usize = 0
+    var negative: bool = false
+    if bytes[0] == 45 {
+        negative = true
+        idx = 1
+    } else if bytes[0] == 43 {
+        idx = 1
+    }
+    var whole: i64 = 0
+    var frac: i64 = 0
+    var frac_digits: usize = 0
+    var saw_digit: bool = false
+    var seen_dot: bool = false
+    let folded: Option_Money = handle err: overflow.Overflow as _e -> Option_Money.none {
+        var i: usize = idx
+        loop
+            decreases n - i
+        {
+            if i >= n { break }
+            let b: u8 = bytes[i]
+            if b == 44 {
+                i += 1
+                continue
+            }
+            if b == 46 {
+                if seen_dot { return Option_Money.none }
+                seen_dot = true
+                i += 1
+                continue
+            }
+            if !_is_digit(b) {
+                return Option_Money.none
+            }
+            saw_digit = true
+            let d: i64 = (b - 48) as i64
+            if seen_dot {
+                if frac_digits < sc {
+                    frac = frac *? (10 as i64) +? d
+                    frac_digits += 1
+                }
+            } else {
+                whole = whole *? (10 as i64) +? d
+            }
+            i += 1
+        }
+        if !saw_digit { return Option_Money.none }
+        let money: Money = _build_minor(whole, frac, frac_digits, sc, negative)?
+        Option_Money.some(value: money)
+    }
+    return folded
+}

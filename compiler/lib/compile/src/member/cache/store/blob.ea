@@ -1,0 +1,257 @@
+
+module compile.member.cache.store.blob
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.os.fs
+import std.text.string
+import cache.addr.hash as hash_mod
+import cache.addr.path.name as name_mod
+import cache.addr.path.paths as paths_mod
+import cache.blob.header as header_mod
+import cache.blob.kind as kind_mod
+import cache.error as cache_error_mod
+import cache.tier.global as global_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.core.option.Option(String)
+spec std.core.option.Option(header_mod.BlobHeader)
+spec std.core.option.Option(global_mod.GlobalCache)
+
+
+public type ExeLocation {
+    dir: String
+    path: String
+}
+
+
+public function build_exe_blob(
+    source_hash: hash_mod.ArtifactHash,
+    exe_bytes: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let header = header_mod.BlobHeader {
+        format_version: header_mod.current_format_version(),
+        hash: source_hash,
+        body_version: hash_mod.current_body_version(),
+        kind: kind_mod.BlobKind.obj,
+        payload_len: exe_bytes.len() as u64,
+    }
+    uninit blob_buf: Vec_u8.Vec
+    Vec_u8.new(init blob_buf, allocator)?
+    Vec_u8.extend_from_slice(mutable blob_buf, header_mod.to_bytes(header, allocator)?, allocator)?
+    Vec_u8.extend_from_slice(mutable blob_buf, exe_bytes, allocator)?
+    return Vec_u8.into_array(take blob_buf, allocator)?
+}
+
+
+public function restore_from_blob_path(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    blob_path: String,
+    source_hash: hash_mod.ArtifactHash,
+    loc: ExeLocation,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if !fs.path_exists(rfs, blob_path) {
+        return false
+    }
+    let blob_bytes = fs.read_bytes(rfs, blob_path, allocator)?
+    let header_size = header_mod.header_len()
+    if blob_bytes.len() < header_size {
+        return false
+    }
+    let header_opt = handle err: cache_error_mod.CacheError as e -> Option_BlobHeader.none {
+        Option_BlobHeader.some(value: header_mod.parse(blob_bytes, blob_path, allocator)?)
+    }
+    return match header_opt {
+        case .none => false
+        case .some(let header) => restore_payload(wfs, blob_bytes, header, header_size, source_hash, loc)?
+    }
+}
+
+
+function restore_payload(
+    wfs: Filesystem,
+    blob_bytes: [u8],
+    header: header_mod.BlobHeader,
+    header_size: usize,
+    source_hash: hash_mod.ArtifactHash,
+    loc: ExeLocation,
+) -> bool
+    with {wfs, err: fs.FsError}
+{
+    let same_hash = header.hash.w0 == source_hash.w0 && header.hash.w1 == source_hash.w1
+        && header.hash.w2 == source_hash.w2 && header.hash.w3 == source_hash.w3
+    if !same_hash {
+        return false
+    }
+    let payload = blob_bytes[header_size..]
+    fs.create_dir_all(wfs, loc.dir)?
+    fs.write_bytes(wfs, loc.path, payload)?
+    return true
+}
+
+
+public function resolve_home(allocator: Allocator) -> Option_String
+    with {allocator, err: alloc.AllocError}
+{
+    match env.read_optional("EDDA_GLOBAL_CACHE_HOME", allocator) {
+        case .some(let h) => return Option_String.some(value: string.replace(h, "\\", "/", allocator)?)
+        case .none => ()
+    }
+    match env.read_optional("USERPROFILE", allocator) {
+        case .some(let h) => return Option_String.some(value: string.replace(h, "\\", "/", allocator)?)
+        case .none => ()
+    }
+    match env.read_optional("HOME", allocator) {
+        case .some(let h) => return Option_String.some(value: string.replace(h, "\\", "/", allocator)?)
+        case .none => ()
+    }
+    return Option_String.none
+}
+
+
+public function resolve_global(allocator: Allocator) -> Option_GlobalCache
+    with {allocator, err: alloc.AllocError}
+{
+    return match resolve_home(allocator)? {
+        case .none => Option_GlobalCache.none
+        case .some(let home) => global_mod.resolve_from_env(take home, true, allocator)?
+    }
+}
+
+
+public function try_restore_global(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    source_hash: hash_mod.ArtifactHash,
+    loc: ExeLocation,
+    member: String,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    return match resolve_global(allocator)? {
+        case .none => false
+        case .some(let g) => restore_from_global(rfs, wfs, g, source_hash, loc, member, allocator)?
+    }
+}
+
+
+function restore_from_global(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    g: global_mod.GlobalCache,
+    source_hash: hash_mod.ArtifactHash,
+    loc: ExeLocation,
+    member: String,
+    allocator: Allocator,
+) -> bool
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let short_owned = string.clone(member, allocator)?
+    let name_opt = name_mod.new(take short_owned, source_hash)
+    return match name_opt {
+        case .none => false
+        case .some(let name) => {
+            let blob_path = global_mod.artifact_path(g, source_hash, name, allocator)?
+            restore_from_blob_path(rfs, wfs, blob_path, source_hash, loc, allocator)?
+        }
+    }
+}
+
+
+function global_shard_dir_of(
+    g: global_mod.GlobalCache,
+    source_hash: hash_mod.ArtifactHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let root = global_mod.root(g, allocator)?
+    let with_codegen = string.concat(root, "/codegen", allocator)?
+    let shard = paths_mod.shard_string(source_hash, allocator)?
+    let with_slash = string.concat(with_codegen, "/", allocator)?
+    return string.concat(with_slash, shard, allocator)?
+}
+
+
+function global_tmp_path(
+    blob_path: String,
+    output_root: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let oh = hash_mod.hash_bytes(output_root.bytes(), allocator)?
+    let oh_hex = hash_mod.to_hex_string(oh, allocator)?
+    let stem = string.concat(blob_path, ".tmp.", allocator)?
+    return string.concat(stem, oh_hex, allocator)?
+}
+
+
+function publish_rename(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    tmp_path: String,
+    blob_path: String,
+) -> ()
+    with {rfs, wfs, err: fs.FsError}
+{
+    if fs.path_exists(rfs, blob_path) {
+        fs.remove(wfs, tmp_path)?
+        return
+    }
+    fs.rename(wfs, tmp_path, blob_path)?
+}
+
+
+function publish_to_global(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    g: global_mod.GlobalCache,
+    source_hash: hash_mod.ArtifactHash,
+    exe_bytes: [u8],
+    name: name_mod.ArtifactName,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let blob_path = global_mod.artifact_path(g, source_hash, name, allocator)?
+    if fs.path_exists(rfs, blob_path) {
+        return
+    }
+    let blob_bytes = build_exe_blob(source_hash, exe_bytes, allocator)?
+    let shard_dir = global_shard_dir_of(g, source_hash, allocator)?
+    fs.create_dir_all(wfs, shard_dir)?
+    let tmp_path = global_tmp_path(blob_path, output_root, allocator)?
+    fs.write_bytes(wfs, tmp_path, blob_bytes)?
+    publish_rename(rfs, wfs, tmp_path, blob_path)?
+}
+
+
+public function publish_global(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    output_root: String,
+    source_hash: hash_mod.ArtifactHash,
+    exe_bytes: [u8],
+    name: name_mod.ArtifactName,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    match resolve_global(allocator)? {
+        case .none => ()
+        case .some(let g) => publish_to_global(rfs, wfs, output_root, g, source_hash, exe_bytes, name, allocator)?
+    }
+}

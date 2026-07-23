@@ -1,0 +1,172 @@
+module tinysql.exec.eval
+
+import std.mem.alloc
+import tinysql.model.value
+import tinysql.model.schema
+import tinysql.model.ast
+import tinysql.model.error
+
+function _alloc_value_slots(allocator: Allocator, n: usize) -> [value.Value]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _eval_compare(op: ast.CompareOp, cell: value.Value, operand: value.Value) -> bool {
+    let c = value.compare(cell, operand)
+    return match op {
+        case .op_eq => value.equals(cell, operand)
+        case .op_ne => !value.equals(cell, operand)
+        case .op_lt => c < 0 as i64
+        case .op_le => c <= 0 as i64
+        case .op_gt => c > 0 as i64
+        case .op_ge => c >= 0 as i64
+    }
+}
+
+function _eval_term(t: ast.Comparison, columns: [schema.Column], row: schema.Row) -> bool
+    with {err: error.SqlError}
+{
+    let idx = match schema.column_index(columns, t.column) {
+        case .some(let i) => i
+        case .none        => raise error.SqlError.no_such_column
+    }
+    if idx >= row.cells.len() { raise error.SqlError.no_such_column }
+    return _eval_compare(t.op, row.cells[idx], t.operand)
+}
+
+function _eval_conj(conj: ast.Conjunction, columns: [schema.Column], row: schema.Row) -> bool
+    with {err: error.SqlError}
+{
+    let terms = conj.terms
+    let n = terms.len()
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if !_eval_term(terms[i], columns, row)? { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+public function row_matches(filter: ast.WhereClause, columns: [schema.Column], row: schema.Row) -> bool
+    with {err: error.SqlError}
+{
+    return match filter {
+        case .always => true
+        case .any_of(let disjuncts) => {
+            let n = disjuncts.len()
+            var i: usize = 0
+            var hit: bool = false
+            loop decreases n - i + 1 as usize {
+                if i >= n { break }
+                if _eval_conj(disjuncts[i], columns, row)? { hit = true; break }
+                i = i + 1 as usize
+            }
+            hit
+        }
+    }
+}
+
+public function build_cells(
+    columns: [schema.Column],
+    has_cols: bool,
+    insert_cols: [String],
+    values: [value.Value],
+    allocator: Allocator,
+) -> [value.Value]
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let ncols = columns.len()
+    let cells = _alloc_value_slots(allocator, ncols + 1 as usize)?
+    if !has_cols {
+        if values.len() != ncols { raise error.SqlError.column_count_mismatch }
+        var j: usize = 0
+        loop decreases ncols - j + 1 as usize {
+            if j >= ncols { break }
+            if !value.type_matches(values[j], columns[j].col_type) {
+                raise error.SqlError.type_mismatch
+            }
+            cells[j] = values[j]
+            j = j + 1 as usize
+        }
+        return cells[0 as usize..<ncols]
+    }
+    if insert_cols.len() != values.len() { raise error.SqlError.column_count_mismatch }
+    var k: usize = 0
+    loop decreases ncols - k + 1 as usize {
+        if k >= ncols { break }
+        cells[k] = value.Value.null_value
+        k = k + 1 as usize
+    }
+    let m = insert_cols.len()
+    var p: usize = 0
+    loop decreases m - p + 1 as usize {
+        if p >= m { break }
+        let ci = match schema.column_index(columns, insert_cols[p]) {
+            case .some(let i) => i
+            case .none        => raise error.SqlError.no_such_column
+        }
+        if ci >= ncols { raise error.SqlError.no_such_column }
+        if !value.type_matches(values[p], columns[ci].col_type) {
+            raise error.SqlError.type_mismatch
+        }
+        cells[ci] = values[p]
+        p = p + 1 as usize
+    }
+    return cells[0 as usize..<ncols]
+}
+
+public function project_row(
+    row: schema.Row,
+    indices: [usize],
+    nproj: usize,
+    allocator: Allocator,
+) -> schema.Row
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let cells = _alloc_value_slots(allocator, nproj + 1 as usize)?
+    let ncells = row.cells.len()
+    var j: usize = 0
+    loop decreases nproj - j + 1 as usize {
+        if j >= nproj { break }
+        let ci = indices[j]
+        if ci >= ncells { raise error.SqlError.no_such_column }
+        cells[j] = row.cells[ci]
+        j = j + 1 as usize
+    }
+    return schema.Row { cells: cells[0 as usize..<nproj] }
+}
+
+public function apply_assignments(
+    row: schema.Row,
+    columns: [schema.Column],
+    assignments: [ast.Assignment],
+    allocator: Allocator,
+) -> schema.Row
+    with {allocator, err: error.SqlError, err: alloc.AllocError}
+{
+    let ncells = row.cells.len()
+    let cells = _alloc_value_slots(allocator, ncells + 1 as usize)?
+    var j: usize = 0
+    loop decreases ncells - j + 1 as usize {
+        if j >= ncells { break }
+        cells[j] = row.cells[j]
+        j = j + 1 as usize
+    }
+    let m = assignments.len()
+    var k: usize = 0
+    loop decreases m - k + 1 as usize {
+        if k >= m { break }
+        let a = assignments[k]
+        let ci = match schema.column_index(columns, a.column) {
+            case .some(let i) => i
+            case .none        => raise error.SqlError.no_such_column
+        }
+        if ci >= ncells { raise error.SqlError.no_such_column }
+        if !value.type_matches(a.operand, columns[ci].col_type) {
+            raise error.SqlError.type_mismatch
+        }
+        cells[ci] = a.operand
+        k = k + 1 as usize
+    }
+    return schema.Row { cells: cells[0 as usize..<ncells] }
+}

@@ -1,0 +1,191 @@
+
+module hir.item
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol
+import span.loc.pos.span as span_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import syntax.ast.ops as ast_ops
+import local.node as node_mod
+import local.def as def_mod
+import local.tree as hir_tree
+
+
+spec std.mem.alloc.Box(HFnSignature)
+spec std.mem.alloc.Box(HTypeSignature)
+spec std.mem.alloc.Box(HSpecSignature)
+
+
+spec std.collections.vec.Vec(HItem)
+spec std.collections.vec.Vec(HDeclItem)
+spec std.collections.vec.Vec(HParam)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+spec std.collections.vec.Vec(ast_item_mod.Variant)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+
+
+spec std.core.option.Option(ast_item_mod.Stability)
+spec std.core.option.Option(ast_item_mod.Linearity)
+spec std.core.option.Option(ast_tree.EffectRow)
+spec std.core.option.Option(symbol.Symbol)
+
+
+derive eq, clone, debug for HItem
+derive eq, clone, debug for HItemKind
+derive eq, clone, debug for HFnSignature
+derive eq, clone, debug for HTypeSignature
+derive eq, clone, debug for HTypeDeclKind
+derive eq, clone, debug for HSpecSignature
+derive eq, clone, debug for HParam
+derive eq, clone, debug for HDeclItem
+derive eq, clone, debug for HDeclItemKind
+
+
+public type HItem {
+    node_id: node_mod.NodeId
+    def_id: def_mod.DefId
+    ast_item: ast_item_mod.Item
+    kind: HItemKind
+    has_comptime: bool
+}
+
+
+public type HItemKind {
+    case function_(sig: Box_HFnSignature, body: hir_tree.HBlock)
+    case function_extern(sig: Box_HFnSignature, extern_name: symbol.Symbol, extern_span: span_mod.Span, extern_dll: Option_Symbol)
+    case type_decl(sig: Box_HTypeSignature)
+    case spec_decl(sig: Box_HSpecSignature, items: Vec_HItem)
+    case spec_invocation(path: ast_ident.Path, args: Vec_HExpr)
+    case let_decl(name: symbol.Symbol, ty: ast_tree.Ty, init_: hir_tree.HExpr)
+    case import_decl
+    case module_decl
+    case derive_decl(items_to_derive: Vec_Symbol, target_def: def_mod.DefId)
+}
+
+
+public type HFnSignature {
+    name: symbol.Symbol
+    stability: Option_Stability
+    visibility: ast_item_mod.Visibility
+    refinement_stable: bool
+    outbound_generics: Vec_GenericParam
+    generics: Vec_GenericParam
+    comptime_param_defs: Vec_DefId
+    params: Vec_HParam
+    return_mode: ast_ops.ReturnMode
+    return_ty: ast_tree.Ty
+    effects: Option_EffectRow
+    refinements: Vec_RefinementClause
+    refinements_hir: Vec_HExpr
+}
+
+
+public type HTypeSignature {
+    name: symbol.Symbol
+    stability: Option_Stability
+    visibility: ast_item_mod.Visibility
+    linearity: Option_Linearity
+    generics: Vec_GenericParam
+    kind: HTypeDeclKind
+    synthesize_box_ptr: bool
+}
+
+public type HTypeDeclKind {
+    case product(fields: Vec_TypeField)
+    case sum_(variants: Vec_Variant)
+}
+
+
+public type HSpecSignature {
+    name: symbol.Symbol
+    stability: Option_Stability
+    visibility: ast_item_mod.Visibility
+    generics: Vec_GenericParam
+    where_clauses: Vec_RefinementClause
+    where_clauses_hir: Vec_HExpr
+}
+
+
+public type HParam {
+    node_id: node_mod.NodeId
+    def_id: def_mod.DefId
+    name: symbol.Symbol
+    mode: ast_ops.ParamMode
+    ty: ast_tree.Ty
+}
+
+
+public type HDeclItem {
+    node_id: node_mod.NodeId
+    def_id: def_mod.DefId
+    ast_item: ast_item_mod.Item
+    kind: HDeclItemKind
+    has_comptime: bool
+}
+
+
+public type HDeclItemKind {
+    case function_(sig: Box_HFnSignature)
+    case function_extern(sig: Box_HFnSignature, extern_name: symbol.Symbol, extern_span: span_mod.Span, extern_dll: Option_Symbol)
+    case type_decl(sig: Box_HTypeSignature)
+    case spec_decl(sig: Box_HSpecSignature, items: Vec_HDeclItem)
+    case spec_invocation(path: ast_ident.Path, args: Vec_HExpr)
+    case let_decl(name: symbol.Symbol, ty: ast_tree.Ty, init_: hir_tree.HExpr)
+    case import_decl
+    case module_decl
+    case derive_decl(items_to_derive: Vec_Symbol, target_def: def_mod.DefId)
+}
+
+
+public function to_decl_item(item: HItem, allocator: Allocator) -> HDeclItem
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return HDeclItem {
+        node_id: item.node_id,
+        def_id: item.def_id,
+        ast_item: item.ast_item,
+        kind: to_decl_kind(item.kind, allocator)?,
+        has_comptime: item.has_comptime,
+    }
+}
+
+
+function to_decl_kind(kind: HItemKind, allocator: Allocator) -> HDeclItemKind
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match kind {
+        case .function_(let sig, let body) => HDeclItemKind.function_(sig: sig)
+        case .function_extern(let sig, let extern_name, let extern_span, let extern_dll) => HDeclItemKind.function_extern(sig: sig, extern_name: extern_name, extern_span: extern_span, extern_dll: extern_dll)
+        case .type_decl(let sig) => HDeclItemKind.type_decl(sig: sig)
+        case .spec_decl(let sig, let items) => HDeclItemKind.spec_decl(sig: sig, items: to_decl_items(items, allocator)?)
+        case .spec_invocation(let path, let args) => HDeclItemKind.spec_invocation(path: path, args: args)
+        case .let_decl(let name, let ty, let init_) => HDeclItemKind.let_decl(name: name, ty: ty, init_: init_)
+        case .import_decl => HDeclItemKind.import_decl
+        case .module_decl => HDeclItemKind.module_decl
+        case .derive_decl(let items_to_derive, let target_def) => HDeclItemKind.derive_decl(items_to_derive: items_to_derive, target_def: target_def)
+    }
+}
+
+
+public function to_decl_items(items: Vec_HItem.Vec, allocator: Allocator) -> Vec_HDeclItem.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HDeclItem.Vec
+    Vec_HDeclItem.new(init out, allocator)?
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_HDeclItem.push(mutable out, to_decl_item(Vec_HItem.at(items, i), allocator)?, allocator)?
+        i = i + 1
+    }
+    return out
+}

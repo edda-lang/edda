@@ -1,0 +1,202 @@
+
+module std.os.fs.readdir.linux
+import std.text.string
+
+import std.os.raw
+import std.os.pages
+import std.mem.alloc
+import std.text.utf8
+import local.readdir.error as rderr
+
+public function read_dir_linux(rfs: ReadOnlyFilesystem, path: String, allocator: Allocator) -> [String]
+    with {rfs, allocator, err: rderr.ReadDirError}
+{
+    comptime if target_has("windows") {
+        return handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+            allocator.alloc_array(String, 0)?
+        }
+    } else {
+    if path.bytes().len() + 1 > 4096 { raise rderr.ReadDirError.other }
+    let pg: u64 = handle err: pages.PageError as _e -> (raise rderr.ReadDirError.other) {
+        pages.map(4096)?
+    }
+    dir_copy_cstr(pg, path)
+    let fd: i64 = raw.syscall6(257, dir_at_fdcwd(), pg, 0x10000, 0, 0, 0)
+    dir_release(pg)
+    if fd < 0 { raise dir_errno(fd, path) }
+    let buf: u64 = handle err: pages.PageError as _e -> {
+        dir_close(fd)
+        raise rderr.ReadDirError.other
+    } { pages.map(65536)? }
+    let count: usize = handle err: rderr.ReadDirError as e -> {
+        dir_close(fd)
+        dir_unmap_buf(buf)
+        raise e
+    } { dir_count(fd, buf, 65536)? }
+    let _ = raw.syscall6(8, fd as u64, 0, 0, 0, 0, 0)
+    var out: [String] = handle err: alloc.AllocError as _e -> {
+        dir_close(fd)
+        dir_unmap_buf(buf)
+        raise rderr.ReadDirError.other
+    } { allocator.alloc_array(String, count)? }
+    handle err: rderr.ReadDirError as e -> {
+        dir_close(fd)
+        dir_unmap_buf(buf)
+        raise e
+    } { dir_fill(fd, buf, mutable out, allocator)? }
+    dir_close(fd)
+    dir_unmap_buf(buf)
+    return out
+    }
+}
+
+function dir_at_fdcwd() -> u64 {
+    return 0xFFFFFFFFFFFFFF9C
+}
+
+function dir_errno(code: i64, path: String) -> rderr.ReadDirError {
+    if code == -2 { return rderr.ReadDirError.not_found(path: path) }
+    if code == -13 { return rderr.ReadDirError.permission_denied(path: path) }
+    if code == -20 { return rderr.ReadDirError.not_a_directory(path: path) }
+    return rderr.ReadDirError.os_error(code: code as i32 wrapping)
+}
+
+function dir_copy_cstr(pg: u64, path: String) -> () {
+    let b: [u8] = path.bytes()
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        raw.store_u8(pg +% (i as u64), b[i])
+        i = i + 1
+    }
+    raw.store_u8(pg +% (b.len() as u64), 0)
+}
+
+function dir_release(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, 4096)?
+    }
+}
+
+function dir_unmap_buf(buf: u64) -> () {
+    if buf == 0 || buf % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(buf, 65536)?
+    }
+}
+
+function dir_close(fd: i64) -> () {
+    if fd < 0 { return }
+    let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+}
+
+function dir_name_len(base: u64, reclen: u32) -> u32 {
+    let max: u32 = if reclen > 19 { reclen - 19 } else { 0 }
+    var n: u32 = 0
+    loop
+        decreases max - n
+    {
+        if n >= max { break }
+        if raw.load_u8(base +% 19 +% (n as u64)) == 0 { break }
+        n = n + 1
+    }
+    return n
+}
+
+function dir_is_dot(base: u64, len: u32) -> bool {
+    if len == 1 {
+        return raw.load_u8(base +% 19) == 0x2E
+    }
+    if len == 2 {
+        return raw.load_u8(base +% 19) == 0x2E && raw.load_u8(base +% 20) == 0x2E
+    }
+    return false
+}
+
+function dir_name_string(base: u64, len: u32, allocator: Allocator) -> String
+    with {allocator, err: rderr.ReadDirError}
+{
+    let out: [u8] = handle err: alloc.AllocError as _e -> (raise rderr.ReadDirError.other) {
+        allocator.alloc_array(u8, len as usize)?
+    }
+    var i: usize = 0
+    loop
+        decreases (len as usize) - i
+    {
+        if i >= len as usize { break }
+        out[i] = raw.load_u8(base +% 19 +% (i as u64))
+        i = i + 1
+    }
+    if !utf8.validate(out) { raise rderr.ReadDirError.invalid_utf8 }
+    return string.from_owned_utf8(take out)
+}
+
+function dir_count(fd: i64, buf: u64, cap: u64) -> usize
+    with {err: rderr.ReadDirError}
+{
+    var total: usize = 0
+    var rounds: u64 = 65536
+    loop
+        decreases rounds
+    {
+        if rounds == 0 { raise rderr.ReadDirError.other }
+        rounds = rounds - 1
+        let nread: i64 = raw.syscall6(217, fd as u64, buf, cap, 0, 0, 0)
+        if nread < 0 { raise dir_errno(nread, "") }
+        if nread == 0 { break }
+        let used: u64 = nread as u64
+        var off: u64 = 0
+        var fuel: u64 = used +% 1
+        loop
+            decreases fuel
+        {
+            if fuel == 0 { break }
+            fuel = fuel - 1
+            if off +% 19 > used { break }
+            let base: u64 = buf +% off
+            let reclen: u32 = raw.load_u16(base +% 16) as u32
+            if reclen == 0 { break }
+            let nlen: u32 = dir_name_len(base, reclen)
+            if !dir_is_dot(base, nlen) { total = total + 1 }
+            off = off +% (reclen as u64)
+        }
+    }
+    return total
+}
+
+function dir_fill(fd: i64, buf: u64, out: mutable [String], allocator: Allocator) -> ()
+    with {allocator, err: rderr.ReadDirError}
+{
+    var idx: usize = 0
+    var rounds: u64 = 65536
+    loop
+        decreases rounds
+    {
+        if rounds == 0 { break }
+        rounds = rounds - 1
+        let nread: i64 = raw.syscall6(217, fd as u64, buf, 65536, 0, 0, 0)
+        if nread <= 0 { break }
+        let used: u64 = nread as u64
+        var off: u64 = 0
+        var fuel: u64 = used +% 1
+        loop
+            decreases fuel
+        {
+            if fuel == 0 { break }
+            fuel = fuel - 1
+            if off +% 19 > used { break }
+            let base: u64 = buf +% off
+            let reclen: u32 = raw.load_u16(base +% 16) as u32
+            if reclen == 0 { break }
+            let nlen: u32 = dir_name_len(base, reclen)
+            if !dir_is_dot(base, nlen) && idx < out.len() {
+                out[idx] = dir_name_string(base, nlen, allocator)?
+                idx = idx + 1
+            }
+            off = off +% (reclen as u64)
+        }
+    }
+}

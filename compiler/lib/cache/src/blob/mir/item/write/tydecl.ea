@@ -1,0 +1,142 @@
+
+module cache.blob.mir.item.write.tydecl
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ty.write.codec as ty_codec_mod
+import local.blob.mir.expr.write.codec as expr_codec_mod
+import local.blob.mir.item.leaf.codec as item_leaf_mod
+import local.blob.mir.item.write.decl as decl_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+spec std.collections.vec.Vec(ast_item_mod.Variant)
+
+
+public function write_type_decl(
+    it: interner_mod.Interner,
+    decl: ast_item_mod.TypeDecl,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(decl.span, mutable out, allocator)?
+    item_leaf_mod.write_option_stability(it, decl.stability, mutable out, allocator)?
+    item_leaf_mod.write_visibility(decl.visibility, mutable out, allocator)?
+    item_leaf_mod.write_option_linearity(decl.linearity, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, decl.name, mutable out, allocator)?
+    decl_mod.write_generic_param_vec(decl.generics, it, mutable out, allocator)?
+    write_type_decl_kind(it, decl.kind, mutable out, allocator)?
+    prim_mod.push_bool(mutable out, decl.synthesize_box_ptr, allocator)?
+}
+
+public function write_type_decl_kind(
+    it: interner_mod.Interner,
+    kind: ast_item_mod.TypeDeclKind,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match kind {
+        case .product(let fields) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            write_type_field_vec(fields, it, mutable out, allocator)?
+        }
+        case .sum(let variants) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            write_variant_vec(variants, it, mutable out, allocator)?
+        }
+    }
+}
+
+public function write_type_field(
+    it: interner_mod.Interner,
+    field: ast_item_mod.TypeField,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(field.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, field.name, mutable out, allocator)?
+    ty_codec_mod.write_ty(it, field.ty, mutable out, allocator, expr_codec_mod.write_expr)?
+    expr_codec_mod.write_option_expr(field.refinement, it, mutable out, allocator)?
+}
+
+public function write_type_field_vec(
+    fields: Vec_TypeField.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_TypeField.len(fields)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_type_field(it, Vec_TypeField.at(fields, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_variant(
+    it: interner_mod.Interner,
+    variant: ast_item_mod.Variant,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(variant.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, variant.name, mutable out, allocator)?
+    write_variant_payload(it, variant.payload, mutable out, allocator)?
+}
+
+public function write_variant_vec(
+    variants: Vec_Variant.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_Variant.len(variants)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_variant(it, Vec_Variant.at(variants, i), mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function write_variant_payload(
+    it: interner_mod.Interner,
+    payload: ast_item_mod.VariantPayload,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match payload {
+        case .unit => prim_mod.push_u8(mutable out, 0, allocator)?
+        case .tuple(let elements) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            ty_codec_mod.write_ty_vec(elements, it, mutable out, allocator, expr_codec_mod.write_expr)?
+        }
+        case .struct_(let fields) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            write_type_field_vec(fields, it, mutable out, allocator)?
+        }
+    }
+}

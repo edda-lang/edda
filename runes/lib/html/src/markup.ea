@@ -1,0 +1,130 @@
+module html.markup
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.htmlescape
+import std.text.string
+import textbuilder.builder as tb
+
+spec std.collections.vec.Vec(String)
+
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+public type Html {
+    out: tb.Builder
+    stack: Vec_String.Vec
+    tag_open: bool
+}
+
+public function new(allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError}
+{
+    let out = tb.new(allocator)?
+    uninit stack: Vec_String.Vec
+    Vec_String.new(init stack, allocator)?
+    return Html { out: out, stack: stack, tag_open: false }
+}
+
+function _close_tag_if_open(h: mutable Html, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if h.tag_open {
+        tb.push_byte(mutable h.out, 62 as u8, allocator)?
+        h.tag_open = false
+    }
+}
+
+function _push_escaped(h: mutable Html, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, err: htmlescape.HtmlEscapeError}
+{
+    let input = s.bytes()
+    let cap = htmlescape.max_escaped_len(input.len())
+    var tmp: [u8] = _alloc_byte_slab(allocator, cap)?
+    let end = htmlescape.escape_html(input, mutable tmp, 0 as usize)?
+    let bounded = if end <= cap { end } else { cap }
+    tb.push_bytes(mutable h.out, tmp[0 as usize..<bounded], allocator)?
+}
+
+function _push_escaped_attr(h: mutable Html, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, err: htmlescape.HtmlEscapeError}
+{
+    let input = s.bytes()
+    let cap = htmlescape.max_escaped_len(input.len())
+    var tmp: [u8] = _alloc_byte_slab(allocator, cap)?
+    let end = htmlescape.escape_html_attr(input, mutable tmp, 0 as usize)?
+    let bounded = if end <= cap { end } else { cap }
+    tb.push_bytes(mutable h.out, tmp[0 as usize..<bounded], allocator)?
+}
+
+public function el(h: take Html, tag: String, allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError}
+{
+    _close_tag_if_open(mutable h, allocator)?
+    tb.push_byte(mutable h.out, 60 as u8, allocator)?
+    tb.push_str(mutable h.out, tag, allocator)?
+    let name = string.clone(tag, allocator)?
+    Vec_String.push(mutable h.stack, take name, allocator)?
+    h.tag_open = true
+    return h
+}
+
+public function attr(h: take Html, name: String, value: String, allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError, err: htmlescape.HtmlEscapeError}
+{
+    if h.tag_open {
+        tb.push_byte(mutable h.out, 32 as u8, allocator)?
+        tb.push_str(mutable h.out, name, allocator)?
+        tb.push_byte(mutable h.out, 61 as u8, allocator)?
+        tb.push_byte(mutable h.out, 34 as u8, allocator)?
+        _push_escaped_attr(mutable h, value, allocator)?
+        tb.push_byte(mutable h.out, 34 as u8, allocator)?
+    }
+    return h
+}
+
+public function text(h: take Html, s: String, allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError, err: htmlescape.HtmlEscapeError}
+{
+    _close_tag_if_open(mutable h, allocator)?
+    _push_escaped(mutable h, s, allocator)?
+    return h
+}
+
+public function raw(h: take Html, s: String, allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError}
+{
+    _close_tag_if_open(mutable h, allocator)?
+    tb.push_str(mutable h.out, s, allocator)?
+    return h
+}
+
+function _write_close(h: take Html, tag: String, allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError}
+{
+    tb.push_byte(mutable h.out, 60 as u8, allocator)?
+    tb.push_byte(mutable h.out, 47 as u8, allocator)?
+    tb.push_str(mutable h.out, tag, allocator)?
+    tb.push_byte(mutable h.out, 62 as u8, allocator)?
+    return h
+}
+
+public function end(h: take Html, allocator: Allocator) -> Html
+    with {allocator, err: alloc.AllocError}
+{
+    _close_tag_if_open(mutable h, allocator)?
+    let popped = Vec_String.pop(mutable h.stack)
+    return match popped {
+        case .some(let tag) => _write_close(take h, tag, allocator)?
+        case .none          => h
+    }
+}
+
+public function render(h: Html, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    return tb.to_bytes(h.out, allocator)?
+}

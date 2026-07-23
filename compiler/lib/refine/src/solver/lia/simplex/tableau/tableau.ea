@@ -1,0 +1,360 @@
+
+module refine.solver.lia.simplex.tableau.tableau
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.rational.scalar as rat_mod
+import local.solver.rational.compare as ratcmp_mod
+
+
+spec std.collections.vec.Vec(rat_mod.Rational)
+spec std.collections.vec.Vec(VarBound)
+spec std.collections.vec.Vec(Row)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(lit_mod.Lit)
+
+
+public type VarBound {
+    has_lower: bool
+    lower: rat_mod.Rational
+    lower_lit: lit_mod.Lit
+    has_upper: bool
+    upper: rat_mod.Rational
+    upper_lit: lit_mod.Lit
+}
+
+
+public type Row {
+    basic: usize
+    coeffs: Vec_Rational.Vec
+}
+
+
+public type Tableau {
+    n: usize
+    value: Vec_Rational.Vec
+    bound: Vec_VarBound.Vec
+    is_basic: Vec_bool.Vec
+    is_int: Vec_bool.Vec
+    rows: Vec_Row.Vec
+}
+
+
+public type LiaResult {
+    case feasible
+    case infeasible(explanation: Vec_Lit.Vec)
+    case unknown
+}
+
+
+function no_bound() -> VarBound {
+    return VarBound {
+        has_lower: false,
+        lower: rat_mod.zero(),
+        lower_lit: lit_mod.Lit { code: 0 },
+        has_upper: false,
+        upper: rat_mod.zero(),
+        upper_lit: lit_mod.Lit { code: 0 },
+    }
+}
+
+
+public function new(out: init Tableau, n_vars: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit value: Vec_Rational.Vec
+    Vec_Rational.new(init value, allocator)?
+    uninit bound: Vec_VarBound.Vec
+    Vec_VarBound.new(init bound, allocator)?
+    uninit is_basic: Vec_bool.Vec
+    Vec_bool.new(init is_basic, allocator)?
+    uninit is_int: Vec_bool.Vec
+    Vec_bool.new(init is_int, allocator)?
+    var i: usize = 0
+    loop
+        decreases (n_vars - i)
+    {
+        if i >= n_vars {
+            break
+        }
+        let z = rat_mod.zero()
+        Vec_Rational.push(mutable value, take z, allocator)?
+        let nb = no_bound()
+        Vec_VarBound.push(mutable bound, take nb, allocator)?
+        let f = false
+        Vec_bool.push(mutable is_basic, take f, allocator)?
+        let yes = true
+        Vec_bool.push(mutable is_int, take yes, allocator)?
+        i = i + 1
+    }
+    uninit rows: Vec_Row.Vec
+    Vec_Row.new(init rows, allocator)?
+    out = Tableau {
+        n: n_vars,
+        value: value,
+        bound: bound,
+        is_basic: is_basic,
+        is_int: is_int,
+        rows: rows,
+    }
+}
+
+
+public function set_int(t: mutable Tableau, v: usize, flag: bool) -> () {
+    if v >= Vec_bool.len(t.is_int) {
+        return
+    }
+    Vec_bool.set_at(mutable t.is_int, v, take flag)
+}
+
+
+public function is_int_var(t: Tableau, v: usize) -> bool {
+    if v >= Vec_bool.len(t.is_int) {
+        return false
+    }
+    return Vec_bool.at(t.is_int, v)
+}
+
+
+public function value_of(t: Tableau, v: usize) -> rat_mod.Rational {
+    if v >= Vec_Rational.len(t.value) {
+        return rat_mod.zero()
+    }
+    return Vec_Rational.at(t.value, v)
+}
+
+
+public function set_value(t: mutable Tableau, v: usize, value: rat_mod.Rational) -> () {
+    if v >= Vec_Rational.len(t.value) {
+        return
+    }
+    Vec_Rational.set_at(mutable t.value, v, take value)
+}
+
+
+public function bound_of(t: Tableau, v: usize) -> VarBound {
+    if v >= Vec_VarBound.len(t.bound) {
+        return no_bound()
+    }
+    return Vec_VarBound.at(t.bound, v)
+}
+
+
+public function is_basic_var(t: Tableau, v: usize) -> bool {
+    if v >= Vec_bool.len(t.is_basic) {
+        return false
+    }
+    return Vec_bool.at(t.is_basic, v)
+}
+
+
+public function set_basic(t: mutable Tableau, v: usize, flag: bool) -> () {
+    if v >= Vec_bool.len(t.is_basic) {
+        return
+    }
+    Vec_bool.set_at(mutable t.is_basic, v, take flag)
+}
+
+
+public function add_row(t: mutable Tableau, basic: usize, coeffs: take Vec_Rational.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let row = Row {
+        basic: basic,
+        coeffs: coeffs,
+    }
+    Vec_Row.push(mutable t.rows, take row, allocator)?
+    set_basic(mutable t, basic, true)
+}
+
+
+public function set_lower(t: mutable Tableau, v: usize, c: rat_mod.Rational, lit: lit_mod.Lit) -> () {
+    if v >= Vec_VarBound.len(t.bound) {
+        return
+    }
+    var b = Vec_VarBound.at(t.bound, v)
+    b = VarBound {
+        has_lower: true,
+        lower: c,
+        lower_lit: lit,
+        has_upper: b.has_upper,
+        upper: b.upper,
+        upper_lit: b.upper_lit,
+    }
+    Vec_VarBound.set_at(mutable t.bound, v, take b)
+}
+
+
+public function set_upper(t: mutable Tableau, v: usize, c: rat_mod.Rational, lit: lit_mod.Lit) -> () {
+    if v >= Vec_VarBound.len(t.bound) {
+        return
+    }
+    var b = Vec_VarBound.at(t.bound, v)
+    b = VarBound {
+        has_lower: b.has_lower,
+        lower: b.lower,
+        lower_lit: b.lower_lit,
+        has_upper: true,
+        upper: c,
+        upper_lit: lit,
+    }
+    Vec_VarBound.set_at(mutable t.bound, v, take b)
+}
+
+
+public function below_lower(b: VarBound, val: rat_mod.Rational) -> bool {
+    if !b.has_lower {
+        return false
+    }
+    return ratcmp_mod.lt(val, b.lower)
+}
+
+
+public function above_upper(b: VarBound, val: rat_mod.Rational) -> bool {
+    if !b.has_upper {
+        return false
+    }
+    return ratcmp_mod.gt(val, b.upper)
+}
+
+
+public function row_count(t: Tableau) -> usize {
+    return Vec_Row.len(t.rows)
+}
+
+
+public function row_at(t: Tableau, i: usize) -> Row
+    requires i < Vec_Row.len(t.rows)
+{
+    return Vec_Row.at(t.rows, i)
+}
+
+
+public function row_coeff(r: Row, j: usize) -> rat_mod.Rational {
+    if j >= Vec_Rational.len(r.coeffs) {
+        return rat_mod.zero()
+    }
+    return Vec_Rational.at(r.coeffs, j)
+}
+
+
+function clone_rationals(src: Vec_Rational.Vec, allocator: Allocator) -> Vec_Rational.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Rational.Vec
+    Vec_Rational.new(init out, allocator)?
+    let n = Vec_Rational.len(src)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let v = Vec_Rational.at(src, i)
+        Vec_Rational.push(mutable out, take v, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function clone_tableau(t: Tableau, allocator: Allocator) -> Tableau
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let value = clone_rationals(t.value, allocator)?
+    uninit bound: Vec_VarBound.Vec
+    Vec_VarBound.new(init bound, allocator)?
+    uninit is_basic: Vec_bool.Vec
+    Vec_bool.new(init is_basic, allocator)?
+    uninit is_int: Vec_bool.Vec
+    Vec_bool.new(init is_int, allocator)?
+    var i: usize = 0
+    loop
+        decreases (t.n - i)
+    {
+        if i >= t.n {
+            break
+        }
+        let b = bound_of(t, i)
+        Vec_VarBound.push(mutable bound, take b, allocator)?
+        let ib = is_basic_var(t, i)
+        Vec_bool.push(mutable is_basic, take ib, allocator)?
+        let ii = is_int_var(t, i)
+        Vec_bool.push(mutable is_int, take ii, allocator)?
+        i = i + 1
+    }
+    uninit rows: Vec_Row.Vec
+    Vec_Row.new(init rows, allocator)?
+    let m = Vec_Row.len(t.rows)
+    var r: usize = 0
+    loop
+        decreases (m - r)
+    {
+        if r >= m {
+            break
+        }
+        let src = Vec_Row.at(t.rows, r)
+        let coeffs = clone_rationals(src.coeffs, allocator)?
+        let nrow = Row {
+            basic: src.basic,
+            coeffs: coeffs,
+        }
+        Vec_Row.push(mutable rows, take nrow, allocator)?
+        r = r + 1
+    }
+    return Tableau {
+        n: t.n,
+        value: value,
+        bound: bound,
+        is_basic: is_basic,
+        is_int: is_int,
+        rows: rows,
+    }
+}
+
+
+public function first_fractional(t: Tableau) -> usize {
+    var j: usize = 0
+    loop
+        decreases (t.n - j)
+    {
+        if j >= t.n {
+            break
+        }
+        if is_int_var(t, j) {
+            if !rat_mod.is_integer(value_of(t, j)) {
+                return j
+            }
+        }
+        j = j + 1
+    }
+    return t.n
+}
+
+
+public function collect_asserted_bounds(t: Tableau, allocator: Allocator) -> Vec_Lit.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Lit.Vec
+    Vec_Lit.new(init out, allocator)?
+    var i: usize = 0
+    loop
+        decreases (t.n - i)
+    {
+        if i >= t.n {
+            break
+        }
+        let b = bound_of(t, i)
+        if b.has_lower {
+            Vec_Lit.push(mutable out, take b.lower_lit, allocator)?
+        }
+        if b.has_upper {
+            Vec_Lit.push(mutable out, take b.upper_lit, allocator)?
+        }
+        i = i + 1
+    }
+    return out
+}

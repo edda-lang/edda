@@ -1,0 +1,100 @@
+
+module optimize.effect_gvn.licm.rel.succ.succ
+
+import std.mem.alloc
+import std.collections.vec
+import ir.hlir.id.block as block_mod
+import ir.hlir.term as term_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(term_mod.SwitchCase)
+
+
+public function collect_successors(
+    out: mutable Vec_u32.Vec,
+    term: term_mod.HlirTerminator,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match term.kind {
+        case .goto_(let target, let args) =>
+            push_target(mutable out, target, n, allocator)?
+        case .branch(let cond, let t, let ta, let f, let fa) => {
+            push_target(mutable out, t, n, allocator)?
+            push_target(mutable out, f, n, allocator)?
+        }
+        case .switch_(let discr, let targets) =>
+            push_switch_targets(mutable out, targets, n, allocator)?
+        case .drop_(let value, let destructor, let target, let unwind) => {
+            push_target(mutable out, target, n, allocator)?
+            push_unwind_target(mutable out, unwind, n, allocator)?
+        }
+        case .raise_(let value, let unwind) =>
+            push_unwind_target(mutable out, unwind, n, allocator)?
+        case .coherence_enter(let body_entry, let exit) => {
+            push_target(mutable out, body_entry, n, allocator)?
+            push_target(mutable out, exit, n, allocator)?
+        }
+        case .coherence_exit(let target) =>
+            push_target(mutable out, target, n, allocator)?
+        case .return_(let values) => ()
+        case .unreachable_ => ()
+        case .panic_(let message) => ()
+    }
+}
+
+
+function push_switch_targets(
+    out: mutable Vec_u32.Vec,
+    targets: term_mod.SwitchTargets,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    push_target(mutable out, targets.default, n, allocator)?
+    let m = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        let sc = Vec_SwitchCase.at(targets.cases, i)
+        push_target(mutable out, sc.target, n, allocator)?
+        i = i + 1
+    }
+}
+
+
+function push_unwind_target(
+    out: mutable Vec_u32.Vec,
+    unwind: term_mod.UnwindAction,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match unwind {
+        case .cleanup(let target) =>
+            push_target(mutable out, target, n, allocator)?
+        case .continue_ => ()
+        case .unreachable_ => ()
+    }
+}
+
+
+function push_target(
+    out: mutable Vec_u32.Vec,
+    target: block_mod.BlockId,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if target.raw == 0 { return () }
+    if (target.raw as usize) >= n { return () }
+    Vec_u32.push(mutable out, target.raw, allocator)?
+}

@@ -1,0 +1,226 @@
+
+module link.argv.unix
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import local.emit.image.output as output_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(output_mod.LibSpec)
+
+
+public function argv_elf(
+    output: String,
+    kind: output_mod.OutputKind,
+    inputs: [String],
+    libs: Vec_LibSpec.Vec,
+    lib_search_paths: Vec_String.Vec,
+    extra_args: Vec_String.Vec,
+    capacity: usize,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit argv: Vec_String.Vec
+    Vec_String.with_capacity(init argv, capacity, allocator)?
+    Vec_String.push(mutable argv, "-o", allocator)?
+    Vec_String.push(mutable argv, clone_string(output, allocator)?, allocator)?
+    Vec_String.push(mutable argv, "--gc-sections", allocator)?
+    if is_dynamic_library(kind) {
+        Vec_String.push(mutable argv, "-shared", allocator)?
+    }
+    append_lib_search_paths(mutable argv, lib_search_paths, allocator)?
+    append_inputs(mutable argv, inputs, allocator)?
+    append_libs_elf(mutable argv, libs, allocator)?
+    append_extra_args(mutable argv, extra_args, allocator)?
+    return argv
+}
+
+public function argv_ld64_lld(
+    output: String,
+    kind: output_mod.OutputKind,
+    inputs: [String],
+    libs: Vec_LibSpec.Vec,
+    lib_search_paths: Vec_String.Vec,
+    extra_args: Vec_String.Vec,
+    capacity: usize,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit argv: Vec_String.Vec
+    Vec_String.with_capacity(init argv, capacity, allocator)?
+    Vec_String.push(mutable argv, "-o", allocator)?
+    Vec_String.push(mutable argv, clone_string(output, allocator)?, allocator)?
+    Vec_String.push(mutable argv, "-dead_strip", allocator)?
+    if is_dynamic_library(kind) {
+        Vec_String.push(mutable argv, "-dylib", allocator)?
+    }
+    append_lib_search_paths(mutable argv, lib_search_paths, allocator)?
+    append_inputs(mutable argv, inputs, allocator)?
+    append_libs_ld64(mutable argv, libs, allocator)?
+    append_extra_args(mutable argv, extra_args, allocator)?
+    return argv
+}
+
+public function argv_wasm_ld(
+    output: String,
+    kind: output_mod.OutputKind,
+    inputs: [String],
+    libs: Vec_LibSpec.Vec,
+    lib_search_paths: Vec_String.Vec,
+    extra_args: Vec_String.Vec,
+    capacity: usize,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit argv: Vec_String.Vec
+    Vec_String.with_capacity(init argv, capacity, allocator)?
+    Vec_String.push(mutable argv, "-o", allocator)?
+    Vec_String.push(mutable argv, clone_string(output, allocator)?, allocator)?
+    Vec_String.push(mutable argv, "--gc-sections", allocator)?
+    if is_dynamic_library(kind) {
+        Vec_String.push(mutable argv, "--no-entry", allocator)?
+    }
+    append_lib_search_paths(mutable argv, lib_search_paths, allocator)?
+    append_inputs(mutable argv, inputs, allocator)?
+    append_libs_wasm(mutable argv, libs, allocator)?
+    append_extra_args(mutable argv, extra_args, allocator)?
+    return argv
+}
+
+
+function append_libs_elf(argv: mutable Vec_String.Vec, libs: Vec_LibSpec.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LibSpec.len(libs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let flag = elf_lib_flag(Vec_LibSpec.at(libs, i), allocator)?
+        Vec_String.push(mutable argv, flag, allocator)?
+        i += 1
+    }
+}
+
+function elf_lib_flag(entry: output_mod.LibSpec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if is_static_lib(entry.kind) {
+        let p1 = string.concat("-l:lib", entry.name, allocator)?
+        return string.concat(p1, ".a", allocator)?
+    }
+    return string.concat("-l", entry.name, allocator)?
+}
+
+function append_libs_ld64(argv: mutable Vec_String.Vec, libs: Vec_LibSpec.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LibSpec.len(libs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let entry = Vec_LibSpec.at(libs, i)
+        if is_framework(entry.kind) {
+            Vec_String.push(mutable argv, "-framework", allocator)?
+            Vec_String.push(mutable argv, clone_string(entry.name, allocator)?, allocator)?
+        } else {
+            Vec_String.push(mutable argv, string.concat("-l", entry.name, allocator)?, allocator)?
+        }
+        i += 1
+    }
+}
+
+function append_libs_wasm(argv: mutable Vec_String.Vec, libs: Vec_LibSpec.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LibSpec.len(libs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let entry = Vec_LibSpec.at(libs, i)
+        Vec_String.push(mutable argv, string.concat("-l", entry.name, allocator)?, allocator)?
+        i += 1
+    }
+}
+
+
+function append_lib_search_paths(argv: mutable Vec_String.Vec, paths: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let path = Vec_String.at(paths, i)
+        Vec_String.push(mutable argv, string.concat("-L", path, allocator)?, allocator)?
+        i += 1
+    }
+}
+
+function append_inputs(argv: mutable Vec_String.Vec, inputs: [String], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = inputs.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_String.push(mutable argv, clone_string(inputs[i], allocator)?, allocator)?
+        i += 1
+    }
+}
+
+function append_extra_args(argv: mutable Vec_String.Vec, extra: Vec_String.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(extra)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let arg = Vec_String.at(extra, i)
+        Vec_String.push(mutable argv, clone_string(arg, allocator)?, allocator)?
+        i += 1
+    }
+}
+
+
+function clone_string(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat(s, "", allocator)?
+}
+
+function is_dynamic_library(k: output_mod.OutputKind) -> bool {
+    return match k {
+        case .dynamic_library => true
+        case _                => false
+    }
+}
+
+function is_static_lib(k: output_mod.LibKind) -> bool {
+    return match k {
+        case .static_lib => true
+        case _           => false
+    }
+}
+
+function is_framework(k: output_mod.LibKind) -> bool {
+    return match k {
+        case .framework => true
+        case _          => false
+    }
+}

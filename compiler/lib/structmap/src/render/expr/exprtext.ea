@@ -1,0 +1,245 @@
+
+module structmap.render.expr.exprtext
+
+import std.mem.alloc
+import std.collections.vec
+import intern.symbol as sym_mod
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.literal as ast_literal
+import syntax.ast.ident as ast_ident
+import syntax.ast.ops as ast_ops
+import local.render.toon as toon
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(ast_tree.CallArg)
+spec std.collections.vec.Vec(ast_tree.FStringSeg)
+spec std.mem.alloc.Box(ast_tree.Expr)
+
+
+public function expr_text(
+    e: ast_tree.Expr,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    expr_text_to(mutable buf, e, interner, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}
+
+public function expr_text_to(
+    buf: mutable Vec_u8.Vec,
+    e: ast_tree.Expr,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match e.kind {
+        case .literal(let lit) => push_literal(mutable buf, lit, interner, allocator)?
+        case .path(let p) => push_path(mutable buf, p, interner, allocator)?
+        case .binary(let op, let lhs_box, let rhs_box) => {
+            toon.push_byte(mutable buf, 0x28, allocator)?
+            expr_text_to(mutable buf, Box_Expr.get(lhs_box), interner, allocator)?
+            toon.push_byte(mutable buf, 0x20, allocator)?
+            toon.push_str(mutable buf, binop_str(op), allocator)?
+            toon.push_byte(mutable buf, 0x20, allocator)?
+            expr_text_to(mutable buf, Box_Expr.get(rhs_box), interner, allocator)?
+            toon.push_byte(mutable buf, 0x29, allocator)?
+        }
+        case .unary(let op, let inner_box) => {
+            toon.push_byte(mutable buf, 0x28, allocator)?
+            toon.push_str(mutable buf, unop_str(op), allocator)?
+            expr_text_to(mutable buf, Box_Expr.get(inner_box), interner, allocator)?
+            toon.push_byte(mutable buf, 0x29, allocator)?
+        }
+        case .call(let callee_box, let args) => {
+            expr_text_to(mutable buf, Box_Expr.get(callee_box), interner, allocator)?
+            toon.push_byte(mutable buf, 0x28, allocator)?
+            let n: usize = Vec_CallArg.len(args)
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                if i > 0 {
+                    toon.push_str(mutable buf, ", ", allocator)?
+                }
+                let arg = Vec_CallArg.at(args, i)
+                expr_text_to(mutable buf, arg.expr, interner, allocator)?
+                i += 1
+            }
+            toon.push_byte(mutable buf, 0x29, allocator)?
+        }
+        case .fstring(let segs) => {
+            toon.push_byte(mutable buf, 0x66, allocator)?
+            toon.push_byte(mutable buf, 0x22, allocator)?
+            let n: usize = Vec_FStringSeg.len(segs)
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                let seg = Vec_FStringSeg.at(segs, i)
+                match seg {
+                    case .text(let sym) => push_sym(mutable buf, sym, interner, allocator)?
+                    case .interp(let inner) => {
+                        toon.push_byte(mutable buf, 0x7B, allocator)?
+                        expr_text_to(mutable buf, Box_Expr.get(inner), interner, allocator)?
+                        toon.push_byte(mutable buf, 0x7D, allocator)?
+                    }
+                }
+                i += 1
+            }
+            toon.push_byte(mutable buf, 0x22, allocator)?
+        }
+        case _ => toon.push_str(mutable buf, "<expr>", allocator)?
+    }
+}
+
+
+public function binop_str(op: ast_ops.BinOp) -> String {
+    return match op {
+        case .add => "+"
+        case .sub => "-"
+        case .mul => "*"
+        case .div => "/"
+        case .mod => "%"
+        case .wrap_add => "+%"
+        case .wrap_sub => "-%"
+        case .wrap_mul => "*%"
+        case .sat_add => "+|"
+        case .sat_sub => "-|"
+        case .sat_mul => "*|"
+        case .check_add => "+?"
+        case .check_sub => "-?"
+        case .check_mul => "*?"
+        case .check_mod => "%?"
+        case .eq => "=="
+        case .ne => "!="
+        case .lt => "<"
+        case .le => "<="
+        case .gt => ">"
+        case .ge => ">="
+        case .and => "&&"
+        case .or => "||"
+        case .bit_and => "&"
+        case .bit_or => "|"
+        case .bit_xor => "^"
+        case .shl => "<<"
+        case .shr => ">>"
+    }
+}
+
+public function unop_str(op: ast_ops.UnOp) -> String {
+    return match op {
+        case .neg => "-"
+        case .not => "!"
+        case .bit_not => "~"
+    }
+}
+
+
+function push_path(
+    buf: mutable Vec_u8.Vec,
+    p: ast_ident.Path,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i > 0 {
+            toon.push_byte(mutable buf, 0x2E, allocator)?
+        }
+        let seg = Vec_Ident.at(p.segments, i)
+        push_sym(mutable buf, seg.name, interner, allocator)?
+        i += 1
+    }
+}
+
+function push_sym(
+    buf: mutable Vec_u8.Vec,
+    sym: sym_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(interner) {
+        toon.push_str(mutable buf, "<missing>", allocator)?
+        return
+    }
+    let bytes = interner_mod.lookup(interner, sym)
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        toon.push_byte(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+}
+
+function push_literal(
+    buf: mutable Vec_u8.Vec,
+    lit: ast_literal.Literal,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match lit {
+        case .int(let value, let _base) => push_u128_decimal(mutable buf, value, allocator)?
+        case .float(let sym) => push_sym(mutable buf, sym, interner, allocator)?
+        case .str(let sym) => {
+            toon.push_byte(mutable buf, 0x22, allocator)?
+            push_sym(mutable buf, sym, interner, allocator)?
+            toon.push_byte(mutable buf, 0x22, allocator)?
+        }
+        case .bool(let b) => {
+            let s = if b { "true" } else { "false" }
+            toon.push_str(mutable buf, s, allocator)?
+        }
+        case .unit => toon.push_str(mutable buf, "()", allocator)?
+    }
+}
+
+function push_u128_decimal(buf: mutable Vec_u8.Vec, n: u128, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if n == (0 as u128) {
+        toon.push_byte(mutable buf, 0x30, allocator)?
+        return
+    }
+    uninit tmp: Vec_u8.Vec
+    Vec_u8.with_capacity(init tmp, 39, allocator)?
+    var v: u128 = n
+    loop
+        decreases v
+    {
+        if v == (0 as u128) { break }
+        let digit: u8 = ((v % (10 as u128)) as u8) + 0x30
+        Vec_u8.push(mutable tmp, digit, allocator)?
+        v = v / (10 as u128)
+    }
+    let m: usize = Vec_u8.len(tmp)
+    var k: usize = m
+    loop
+        decreases k
+    {
+        if k == 0 { break }
+        k -= 1
+        toon.push_byte(mutable buf, Vec_u8.at(tmp, k), allocator)?
+    }
+}

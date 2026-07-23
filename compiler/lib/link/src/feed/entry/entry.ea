@@ -1,0 +1,88 @@
+
+module link.feed.entry.entry
+
+import std.mem.alloc
+import std.collections.vec
+import object.coff as coff_mod
+import object.coff.wrap.wrap as wrap_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+
+public function entry_symbol() -> String {
+    return "_edda_start"
+}
+
+
+function push_b(code: mutable Vec_u8.Vec, b: u8, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_u8.push(mutable code, take b, allocator)?
+}
+
+
+function push_sub_rsp_shadow(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_b(mutable code, 0x48 as u8, allocator)?
+    push_b(mutable code, 0x83 as u8, allocator)?
+    push_b(mutable code, 0xEC as u8, allocator)?
+    push_b(mutable code, 0x28 as u8, allocator)?
+}
+
+
+function push_call_rel32(code: mutable Vec_u8.Vec, allocator: Allocator) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    push_b(mutable code, 0xE8 as u8, allocator)?
+    let site = Vec_u8.len(code) as u32
+    push_b(mutable code, 0x00 as u8, allocator)?
+    push_b(mutable code, 0x00 as u8, allocator)?
+    push_b(mutable code, 0x00 as u8, allocator)?
+    push_b(mutable code, 0x00 as u8, allocator)?
+    return site
+}
+
+
+function push_mov_ecx_eax(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_b(mutable code, 0x89 as u8, allocator)?
+    push_b(mutable code, 0xC1 as u8, allocator)?
+}
+
+
+public function build_entry_stub(
+    out: init coff_mod.CoffFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit file: coff_mod.CoffFile
+    wrap_mod.new_object(init file, coff_mod.CoffMachine.amd64, allocator)?
+
+    uninit code: Vec_u8.Vec
+    Vec_u8.new(init code, allocator)?
+    push_sub_rsp_shadow(mutable code, allocator)?
+    let main_site = push_call_rel32(mutable code, allocator)?
+    push_mov_ecx_eax(mutable code, allocator)?
+    let exit_site = push_call_rel32(mutable code, allocator)?
+    push_b(mutable code, 0xCC as u8, allocator)?
+
+    uninit relocs: Vec_CoffRelocation.Vec
+    Vec_CoffRelocation.new(init relocs, allocator)?
+    let r_main = wrap_mod.make_relocation(main_site, 1 as u32, wrap_mod.rel_amd64_rel32())
+    Vec_CoffRelocation.push(mutable relocs, take r_main, allocator)?
+    let r_exit = wrap_mod.make_relocation(exit_site, 2 as u32, wrap_mod.rel_amd64_rel32())
+    Vec_CoffRelocation.push(mutable relocs, take r_exit, allocator)?
+
+    wrap_mod.add_section(mutable file, ".text", wrap_mod.text_characteristics(), take code, take relocs, allocator)?
+
+    wrap_mod.add_symbol(mutable file, entry_symbol(), 1 as i16, 0 as u32, wrap_mod.storage_external(), wrap_mod.symbol_type_function(), allocator)?
+    wrap_mod.add_symbol(mutable file, "main", 0 as i16, 0 as u32, wrap_mod.storage_external(), wrap_mod.symbol_type_function(), allocator)?
+    wrap_mod.add_symbol(mutable file, "__edda_process_exit", 0 as i16, 0 as u32, wrap_mod.storage_external(), wrap_mod.symbol_type_function(), allocator)?
+
+    out = file
+}

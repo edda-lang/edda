@@ -1,0 +1,378 @@
+
+module cache.blob.mir.body.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import hir.def as def_mod
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+import types.effect.row as effect_facts_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.literal as literal_mod
+import span.loc.pos.span as span_mod
+import mir.id.hir as hir_file_mod
+import mir.stmt as stmt_mod
+import mir.term as term_mod
+import mir.id.block as block_mod
+import mir.layout.table as layout_mod
+import mir.body.model as body_model_mod
+import local.error as error_mod
+import local.addr.hash as hash_mod
+import local.blob.header as header_mod
+import local.blob.kind as kind_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.local.block as local_block_mod
+import local.blob.mir.trust.effects as trust_effects_mod
+import local.blob.mir.expr.write.codec as expr_write_mod
+import local.blob.mir.expr.read.codec as expr_read_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(body_model_mod.Local)
+spec std.collections.vec.Vec(body_model_mod.BasicBlock)
+spec std.collections.vec.Vec(body_model_mod.Obligation)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(body_model_mod.RegionId)
+
+
+public function encode_body(body: body_model_mod.MirBody, it: interner_mod.Interner, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+
+    let reserved = header_mod.header_len()
+    var h: usize = 0
+    loop decreases reserved - h {
+        if h >= reserved { break }
+        prim_mod.push_u8(mutable out, 0, allocator)?
+        h += 1
+    }
+
+    prim_mod.push_u32_le(mutable out, body.def_id.raw, allocator)?
+    symbol_codec_mod.write_symbol(it, body.name, mutable out, allocator)?
+    prim_mod.push_u32_le(mutable out, body.origin_file.raw, allocator)?
+
+    let n_locals = Vec_Local.len(body.locals)
+    prim_mod.push_u32_le(mutable out, n_locals as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n_locals - i {
+        if i >= n_locals { break }
+        local_block_mod.write_local(Vec_Local.at(body.locals, i), it, mutable out, allocator)?
+        i += 1
+    }
+
+    prim_mod.push_u32_le(mutable out, body.n_params, allocator)?
+
+    let n_blocks = Vec_BasicBlock.len(body.blocks)
+    prim_mod.push_u32_le(mutable out, n_blocks as u32 wrapping, allocator)?
+    var j: usize = 0
+    loop decreases n_blocks - j {
+        if j >= n_blocks { break }
+        local_block_mod.write_basic_block(Vec_BasicBlock.at(body.blocks, j), it, mutable out, allocator)?
+        j += 1
+    }
+
+    trust_effects_mod.write_trust_annotation(body.function_trust, it, mutable out, allocator)?
+    trust_effects_mod.write_effect_facts(body.effect_facts, mutable out, allocator)?
+    prim_mod.push_bool(mutable out, body.err_bymem, allocator)?
+
+    let n_obligations = Vec_Obligation.len(body.obligations)
+    prim_mod.push_u32_le(mutable out, n_obligations as u32 wrapping, allocator)?
+    var k: usize = 0
+    loop decreases n_obligations - k {
+        if k >= n_obligations { break }
+        write_obligation(Vec_Obligation.at(body.obligations, k), it, mutable out, allocator)?
+        k += 1
+    }
+
+    expr_write_mod.write_expr_vec(body.requires_assumptions, it, mutable out, allocator)?
+
+    return Vec_u8.into_array(take out, allocator)?
+}
+
+function write_obligation(ob: body_model_mod.Obligation, it: interner_mod.Interner, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    prim_mod.push_u32_le(mutable out, ob.block.raw, allocator)?
+    prim_mod.push_u32_le(mutable out, ob.stmt_index, allocator)?
+    prim_mod.push_u8(mutable out, obligation_kind_tag(ob.kind), allocator)?
+    expr_write_mod.write_expr(it, ob.predicate, mutable out, allocator)?
+    expr_write_mod.write_expr_vec(ob.context, it, mutable out, allocator)?
+    trust_effects_mod.write_trust_annotation(ob.trust, it, mutable out, allocator)?
+}
+
+function obligation_kind_tag(kind: body_model_mod.ObligationKind) -> u8 {
+    return match kind {
+        case .int_overflow => 0
+        case .div_by_zero => 1
+        case .div_overflow => 2
+        case .index_in_bounds => 3
+        case .slice_subrange_in_bounds => 4
+        case .narrowing_cast_range => 5
+        case .precondition => 6
+        case .postcondition => 7
+        case .decreases_decreasing => 8
+    }
+}
+
+public function decode_body(bytes: [u8], it: mutable interner_mod.Interner, allocator: Allocator) -> body_model_mod.MirBody
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    var cur = prim_mod.reader_at_start()
+
+    let def_id = def_mod.DefId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let name = symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?
+    let origin_file = hir_file_mod.HirFileId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+
+    let n_locals = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit locals: Vec_Local.Vec
+    Vec_Local.with_capacity(init locals, n_locals, allocator)?
+    var i: usize = 0
+    loop decreases n_locals - i {
+        if i >= n_locals { break }
+        let l = local_block_mod.read_local(bytes, mutable cur, mutable it, allocator)?
+        Vec_Local.push(mutable locals, take l, allocator)?
+        i += 1
+    }
+
+    let n_params = prim_mod.read_u32_le(bytes, mutable cur)?
+
+    let n_blocks = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit blocks: Vec_BasicBlock.Vec
+    Vec_BasicBlock.with_capacity(init blocks, n_blocks, allocator)?
+    var j: usize = 0
+    loop decreases n_blocks - j {
+        if j >= n_blocks { break }
+        let b = local_block_mod.read_basic_block(bytes, mutable cur, mutable it, allocator)?
+        Vec_BasicBlock.push(mutable blocks, take b, allocator)?
+        j += 1
+    }
+
+    let function_trust = trust_effects_mod.read_trust_annotation(bytes, mutable cur, mutable it, allocator)?
+    let effect_facts = trust_effects_mod.read_effect_facts(bytes, mutable cur)?
+    let err_bymem = prim_mod.read_bool(bytes, mutable cur)?
+
+    let n_obligations = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit obligations: Vec_Obligation.Vec
+    Vec_Obligation.with_capacity(init obligations, n_obligations, allocator)?
+    var k: usize = 0
+    loop decreases n_obligations - k {
+        if k >= n_obligations { break }
+        let ob = read_obligation(bytes, mutable cur, mutable it, allocator)?
+        Vec_Obligation.push(mutable obligations, take ob, allocator)?
+        k += 1
+    }
+
+    let requires_assumptions = expr_read_mod.read_expr_vec(bytes, mutable cur, mutable it, allocator)?
+
+    return body_model_mod.MirBody {
+        def_id: def_id,
+        name: name,
+        origin_file: origin_file,
+        locals: locals,
+        n_params: n_params,
+        blocks: blocks,
+        obligations: obligations,
+        function_trust: function_trust,
+        effect_facts: effect_facts,
+        agg_layouts: layout_mod.new_table(allocator)?,
+        requires_assumptions: requires_assumptions,
+        err_bymem: err_bymem,
+    }
+}
+
+function read_obligation(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> body_model_mod.Obligation
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let block = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let stmt_index = prim_mod.read_u32_le(bytes, mutable cur)?
+    let kind = read_obligation_kind(bytes, mutable cur)?
+    let predicate = expr_read_mod.read_expr(bytes, mutable cur, mutable it, allocator)?
+    let context = expr_read_mod.read_expr_vec(bytes, mutable cur, mutable it, allocator)?
+    let trust = trust_effects_mod.read_trust_annotation(bytes, mutable cur, mutable it, allocator)?
+    return body_model_mod.Obligation {
+        block: block,
+        stmt_index: stmt_index,
+        kind: kind,
+        predicate: predicate,
+        context: context,
+        trust: trust,
+    }
+}
+
+function read_obligation_kind(bytes: [u8], cur: mutable prim_mod.Reader) -> body_model_mod.ObligationKind
+    with {err: error_mod.CacheError}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => body_model_mod.ObligationKind.int_overflow
+        case 1 => body_model_mod.ObligationKind.div_by_zero
+        case 2 => body_model_mod.ObligationKind.div_overflow
+        case 3 => body_model_mod.ObligationKind.index_in_bounds
+        case 4 => body_model_mod.ObligationKind.slice_subrange_in_bounds
+        case 5 => body_model_mod.ObligationKind.narrowing_cast_range
+        case 6 => body_model_mod.ObligationKind.precondition
+        case 7 => body_model_mod.ObligationKind.postcondition
+        case 8 => body_model_mod.ObligationKind.decreases_decreasing
+        case _ => raise error_mod.CacheError.body_parse(message: "invalid obligation kind tag")
+    }
+}
+
+public function write_blob(body: body_model_mod.MirBody, it: interner_mod.Interner, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    var buf = encode_body(body, it, allocator)?
+    if buf.len() < 43 {
+        raise error_mod.CacheError.body_parse(message: "encoded mir body shorter than blob header")
+    }
+    let total = buf.len()
+    let hash = hash_mod.hash_bytes(buf[43..<total], allocator)?
+    let header = header_mod.BlobHeader {
+        format_version: header_mod.current_format_version(),
+        hash: hash,
+        body_version: hash_mod.current_body_version(),
+        kind: kind_mod.BlobKind.ir,
+        payload_len: (total - 43) as u64,
+    }
+    header_mod.write(header, mutable buf, 0)
+    return buf
+}
+
+public function read_blob(
+    bytes: [u8],
+    path: String,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> body_model_mod.MirBody
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let header = header_mod.parse(bytes, path, allocator)?
+    let hlen = header_mod.header_len()
+    let payload_len = header.payload_len as usize
+    if (hlen + payload_len) > bytes.len() {
+        raise error_mod.CacheError.body_parse(message: "blob shorter than declared payload length")
+    }
+    let payload = bytes[hlen..<(hlen + payload_len)]
+    return decode_body(payload, mutable it, allocator)?
+}
+
+@property()
+function round_trip_preserves_mir_body_scaffold(
+    def_id_raw: u32,
+    origin_file_raw: u32,
+    local_ty_raw: u32,
+    n_params: u32,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    uninit it: interner_mod.Interner
+    interner_mod.new_interner(init it, allocator)?
+    let name = interner_mod.intern(mutable it, "test_fn", allocator)?
+    let local_name = interner_mod.intern(mutable it, "x", allocator)?
+
+    uninit locals: Vec_Local.Vec
+    Vec_Local.new(init locals, allocator)?
+    Vec_Local.push(
+        mutable locals,
+        take body_model_mod.Local {
+            ty: ty_mod.TyId { raw: local_ty_raw },
+            mutability: body_model_mod.Mutability.immutable_,
+            consumption: body_model_mod.Consumption.copy_,
+            name: Option_Symbol.some(value: local_name),
+            origin: Option_NodeId.none,
+        },
+        allocator,
+    )?
+
+    uninit stmts: Vec_Statement.Vec
+    Vec_Statement.new(init stmts, allocator)?
+    uninit blocks: Vec_BasicBlock.Vec
+    Vec_BasicBlock.new(init blocks, allocator)?
+    Vec_BasicBlock.push(
+        mutable blocks,
+        take body_model_mod.BasicBlock {
+            node_id_origin: node_mod.NodeId { raw: 1 },
+            statements: stmts,
+            terminator: term_mod.Terminator {
+                origin: node_mod.NodeId { raw: 1 },
+                kind: term_mod.TermKind.return_,
+            },
+            coherence_region: Option_RegionId.none,
+        },
+        allocator,
+    )?
+
+    uninit context: Vec_Expr.Vec
+    Vec_Expr.new(init context, allocator)?
+    uninit obligations: Vec_Obligation.Vec
+    Vec_Obligation.new(init obligations, allocator)?
+    Vec_Obligation.push(
+        mutable obligations,
+        take body_model_mod.Obligation {
+            block: block_mod.BlockId { raw: 3 },
+            stmt_index: 7,
+            kind: body_model_mod.ObligationKind.precondition,
+            predicate: unit_literal_expr(),
+            context: context,
+            trust: body_model_mod.TrustAnnotation.discharged,
+        },
+        allocator,
+    )?
+
+    uninit requires_assumptions: Vec_Expr.Vec
+    Vec_Expr.new(init requires_assumptions, allocator)?
+    Vec_Expr.push(mutable requires_assumptions, take unit_literal_expr(), allocator)?
+
+    let body = body_model_mod.MirBody {
+        def_id: def_mod.DefId { raw: def_id_raw },
+        name: name,
+        origin_file: hir_file_mod.HirFileId { raw: origin_file_raw },
+        locals: locals,
+        n_params: n_params,
+        blocks: blocks,
+        obligations: obligations,
+        function_trust: body_model_mod.TrustAnnotation.discharged,
+        effect_facts: effect_facts_mod.pure_facts(),
+        agg_layouts: layout_mod.new_table(allocator)?,
+        requires_assumptions: requires_assumptions,
+        err_bymem: false,
+    }
+
+    let bytes = write_blob(body, it, allocator)?
+    let decoded = read_blob(bytes, "property", mutable it, allocator)?
+
+    let matches = decoded.def_id == body.def_id
+        && decoded.name == body.name
+        && decoded.origin_file == body.origin_file
+        && decoded.n_params == body.n_params
+        && Vec_Local.len(decoded.locals) == Vec_Local.len(body.locals)
+        && Vec_BasicBlock.len(decoded.blocks) == Vec_BasicBlock.len(body.blocks)
+        && Vec_Local.at(decoded.locals, 0).ty == Vec_Local.at(body.locals, 0).ty
+        && decoded.function_trust == body.function_trust
+        && decoded.err_bymem == body.err_bymem
+        && Vec_Obligation.len(decoded.obligations) == Vec_Obligation.len(body.obligations)
+        && Vec_Obligation.at(decoded.obligations, 0).block == Vec_Obligation.at(body.obligations, 0).block
+        && Vec_Obligation.at(decoded.obligations, 0).stmt_index == Vec_Obligation.at(body.obligations, 0).stmt_index
+        && Vec_Obligation.at(decoded.obligations, 0).kind == Vec_Obligation.at(body.obligations, 0).kind
+        && Vec_Obligation.at(decoded.obligations, 0).trust == Vec_Obligation.at(body.obligations, 0).trust
+        && Vec_Expr.len(decoded.requires_assumptions) == Vec_Expr.len(body.requires_assumptions)
+
+    interner_mod.dispose(take it)
+    return matches
+}
+
+function unit_literal_expr() -> ast_tree_mod.Expr {
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.literal(value: literal_mod.Literal.unit),
+    }
+}

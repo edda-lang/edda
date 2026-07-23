@@ -1,0 +1,283 @@
+
+module resolve.lints.cycles
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import local.ctx as ctx_mod
+import local.paths.imports as imports_mod
+import local.paths.modules as mt_mod
+import local.bind.lookup.lookup as lookup_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(span_mod.Span)
+spec std.collections.vec.Vec(mt_mod.ModuleId)
+spec std.core.option.Option(span_mod.Span)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(bool)
+
+
+public type ModuleEdge {
+    to: mt_mod.ModuleId
+    at: span_mod.Span
+}
+
+spec std.collections.vec.Vec(ModuleEdge)
+spec std.collections.hashmap.IntMap(Vec_ModuleEdge)
+spec std.collections.hashmap.IntMap(usize)
+spec std.collections.hashmap.IntMap(bool)
+spec std.core.option.Option(Vec_ModuleEdge)
+
+
+type ImportGraph {
+    adj: IntMap_Vec_ModuleEdge.IntMap
+    indegree: IntMap_usize.IntMap
+    nodes: Vec_ModuleId.Vec
+}
+
+
+function new_graph(allocator: Allocator) -> ImportGraph
+    with {allocator, err: alloc.AllocError}
+{
+    let adj = IntMap_Vec_ModuleEdge.new(allocator)?
+    let indegree = IntMap_usize.new(allocator)?
+    uninit nodes: Vec_ModuleId.Vec
+    Vec_ModuleId.new(init nodes, allocator)?
+    return ImportGraph { adj: adj, indegree: indegree, nodes: nodes }
+}
+
+
+function contains_module_id(list: Vec_ModuleId.Vec, id: mt_mod.ModuleId) -> bool {
+    let n = Vec_ModuleId.len(list)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_ModuleId.at(list, i).raw == id.raw { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function degree_of(graph: ImportGraph, node: mt_mod.ModuleId) -> usize {
+    return match IntMap_usize.get(graph.indegree, node.raw as i64) {
+        case .some(let v) => v
+        case .none => 0
+    }
+}
+
+
+function ensure_node(graph: mutable ImportGraph, id: mt_mod.ModuleId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if !contains_module_id(graph.nodes, id) {
+        Vec_ModuleId.push(mutable graph.nodes, id, allocator)?
+    }
+}
+
+
+function add_edge(graph: mutable ImportGraph, from: mt_mod.ModuleId, to: mt_mod.ModuleId, at: span_mod.Span, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if from.raw == to.raw {
+        return
+    }
+    ensure_node(mutable graph, from, allocator)?
+    ensure_node(mutable graph, to, allocator)?
+    let edge = ModuleEdge { to: to, at: at }
+    match IntMap_Vec_ModuleEdge.get(graph.adj, from.raw as i64) {
+        case .some(let existing) => {
+            var lst = existing
+            Vec_ModuleEdge.push(mutable lst, edge, allocator)?
+            let _ = IntMap_Vec_ModuleEdge.insert(mutable graph.adj, from.raw as i64, lst, allocator)?
+        }
+        case .none => {
+            uninit lst: Vec_ModuleEdge.Vec
+            Vec_ModuleEdge.new(init lst, allocator)?
+            Vec_ModuleEdge.push(mutable lst, edge, allocator)?
+            let _ = IntMap_Vec_ModuleEdge.insert(mutable graph.adj, from.raw as i64, lst, allocator)?
+        }
+    }
+    let cur = degree_of(graph, to)
+    let _ = IntMap_usize.insert(mutable graph.indegree, to.raw as i64, cur + 1, allocator)?
+}
+
+
+function add_import_edge(graph: mutable ImportGraph, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, from_id: mt_mod.ModuleId, imp: ast_item.Import, mp: Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let module_path = imports_mod.translate_path(imp.path, mp, mt, interner, allocator)?
+    match mt_mod.find_longest_prefix(mt, module_path) {
+        case .some(let pm) => {
+            if pm.segments_consumed == Vec_Symbol.len(module_path) {
+                add_edge(mutable graph, from_id, pm.mod_id, imp.span, allocator)?
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+function add_file_edges(ctx: ctx_mod.ResolveCtx, graph: mutable ImportGraph, mt: mt_mod.ModuleTree, interner: interner_mod.Interner, file: ast_file.File, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let mp = lookup_mod.module_path_of(file.items, allocator)?
+    let from_id = ctx_mod.module_id_of(ctx, mp)
+    if from_id.raw == 0 {
+        return
+    }
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .import_(let imp) => add_import_edge(mutable graph, mt, interner, from_id, imp, mp, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function is_processed(processed: IntMap_bool.IntMap, node: mt_mod.ModuleId) -> bool {
+    return match IntMap_bool.get(processed, node.raw as i64) {
+        case .some(let v) => v
+        case .none => false
+    }
+}
+
+
+function decrement_neighbors(graph: mutable ImportGraph, node: mt_mod.ModuleId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match IntMap_Vec_ModuleEdge.get(graph.adj, node.raw as i64) {
+        case .some(let edges) => {
+            let n = Vec_ModuleEdge.len(edges)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let e = Vec_ModuleEdge.at(edges, i)
+                let d = degree_of(graph, e.to)
+                if d > 0 {
+                    let _ = IntMap_usize.insert(mutable graph.indegree, e.to.raw as i64, d - 1, allocator)?
+                }
+                i = i + 1
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+function run_round(graph: mutable ImportGraph, processed: mutable IntMap_bool.IntMap, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let total = Vec_ModuleId.len(graph.nodes)
+    var progress = false
+    var i: usize = 0
+    loop decreases (total - i) {
+        if i >= total { break }
+        let node = Vec_ModuleId.at(graph.nodes, i)
+        if !is_processed(processed, node) {
+            if degree_of(graph, node) == 0 {
+                let _ = IntMap_bool.insert(mutable processed, node.raw as i64, true, allocator)?
+                decrement_neighbors(mutable graph, node, allocator)?
+                progress = true
+            }
+        }
+        i = i + 1
+    }
+    return progress
+}
+
+
+function first_cyclic_edge_in(processed: IntMap_bool.IntMap, edges: Vec_ModuleEdge.Vec) -> Option_Span.Option {
+    let n = Vec_ModuleEdge.len(edges)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_ModuleEdge.at(edges, i)
+        if !is_processed(processed, e.to) {
+            return Option_Span.some(value: e.at)
+        }
+        i = i + 1
+    }
+    return Option_Span.none
+}
+
+
+function first_cyclic_edge(graph: ImportGraph, processed: IntMap_bool.IntMap, node: mt_mod.ModuleId) -> Option_Span.Option {
+    return match IntMap_Vec_ModuleEdge.get(graph.adj, node.raw as i64) {
+        case .some(let edges) => first_cyclic_edge_in(processed, edges)
+        case .none => Option_Span.none
+    }
+}
+
+
+function detect_cycles(graph: mutable ImportGraph, allocator: Allocator) -> Vec_Span.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let total = Vec_ModuleId.len(graph.nodes)
+    var processed = IntMap_bool.new(allocator)?
+
+    var round: usize = 0
+    loop decreases (total - round) {
+        if round >= total { break }
+        let made_progress = run_round(mutable graph, mutable processed, allocator)?
+        if !made_progress { break }
+        round = round + 1
+    }
+
+    uninit hits: Vec_Span.Vec
+    Vec_Span.new(init hits, allocator)?
+    var k: usize = 0
+    loop decreases (total - k) {
+        if k >= total { break }
+        let node = Vec_ModuleId.at(graph.nodes, k)
+        if !is_processed(processed, node) {
+            match first_cyclic_edge(graph, processed, node) {
+                case .some(let sp) => Vec_Span.push(mutable hits, sp, allocator)?
+                case .none => ()
+            }
+        }
+        k = k + 1
+    }
+    return hits
+}
+
+
+public function check_import_cycles(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let mt = ctx_mod.module_tree(ctx)
+    var graph = new_graph(allocator)?
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        add_file_edges(ctx, mutable graph, mt, interner, Vec_File.at(files, i), allocator)?
+        i = i + 1
+    }
+
+    let hits = detect_cycles(mutable graph, allocator)?
+    let hn = Vec_Span.len(hits)
+    var j: usize = 0
+    loop decreases (hn - j) {
+        if j >= hn { break }
+        let at = Vec_Span.at(hits, j)
+        let d = diag_mod.warn_at(diag_code_mod.import_cycle(), at, "import creates a cycle in the module dependency graph")
+        ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+        j = j + 1
+    }
+}

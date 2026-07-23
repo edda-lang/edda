@@ -1,0 +1,294 @@
+
+module optimize.effect_gvn.licm.cfg
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import ir.hlir.id.block as block_mod
+import ir.hlir.tree.body as hlir_body_mod
+import local.effect_gvn.licm.dom.dom as dom_mod
+
+
+spec std.collections.vec.Vec(Loop)
+spec std.collections.vec.Vec(BackEdge)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+
+
+public type BackEdge {
+    source: block_mod.BlockId
+    header: block_mod.BlockId
+}
+
+
+public type Loop {
+    header: block_mod.BlockId
+    body: IntMap_u32.IntMap
+    preheader: block_mod.BlockId
+    preheader_known: bool
+}
+
+
+public function block_in_loop(lp: Loop, b: u32) -> bool {
+    return IntMap_u32.contains(lp.body, b as i64)
+}
+
+
+public function collect_back_edges(
+    cfg: dom_mod.Cfg,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> Vec_BackEdge.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit out: Vec_BackEdge.Vec
+    Vec_BackEdge.new(init out, allocator)?
+    let n = Vec_HlirBlock.len(body.blocks)
+    var src: usize = 1
+    loop
+        decreases n - src
+    {
+        if src >= n { break }
+        if dom_mod.is_reachable(cfg, src as u32) {
+            scan_block_back_edges(mutable out, cfg, body, src as u32, n, allocator)?
+        }
+        src = src + 1
+    }
+    return out
+}
+
+
+function scan_block_back_edges(
+    out: mutable Vec_BackEdge.Vec,
+    cfg: dom_mod.Cfg,
+    body: hlir_body_mod.HlirBody,
+    src: u32,
+    n: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let block = Vec_HlirBlock.at(body.blocks, src as usize)
+    uninit succs: Vec_u32.Vec
+    Vec_u32.new(init succs, allocator)?
+    dom_mod.collect_successors(mutable succs, block.terminator, n, allocator)?
+    let m = Vec_u32.len(succs)
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        let target = Vec_u32.at(succs, i)
+        if dom_mod.dominates(cfg, target, src) {
+            let edge = BackEdge {
+                source: block_mod.BlockId { raw: src },
+                header: block_mod.BlockId { raw: target },
+            }
+            Vec_BackEdge.push(mutable out, take edge, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+public function build_loops(
+    cfg: dom_mod.Cfg,
+    body: hlir_body_mod.HlirBody,
+    back_edges: Vec_BackEdge.Vec,
+    allocator: Allocator,
+) -> Vec_Loop.Vec
+    with {allocator, err: alloc.AllocError, panic}
+{
+    uninit out: Vec_Loop.Vec
+    Vec_Loop.new(init out, allocator)?
+    uninit seen_headers: Vec_u32.Vec
+    Vec_u32.new(init seen_headers, allocator)?
+    let n = Vec_BackEdge.len(back_edges)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let edge = Vec_BackEdge.at(back_edges, i)
+        if !header_seen(seen_headers, edge.header.raw) {
+            Vec_u32.push(mutable seen_headers, edge.header.raw, allocator)?
+            let lp = build_loop_for_header(cfg, body, back_edges, edge.header, allocator)?
+            Vec_Loop.push(mutable out, take lp, allocator)?
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+function header_seen(seen: Vec_u32.Vec, header_raw: u32) -> bool {
+    let n = Vec_u32.len(seen)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if Vec_u32.at(seen, i) == header_raw { return true }
+        i = i + 1
+    }
+    return false
+}
+
+
+function build_loop_for_header(
+    cfg: dom_mod.Cfg,
+    body: hlir_body_mod.HlirBody,
+    back_edges: Vec_BackEdge.Vec,
+    header: block_mod.BlockId,
+    allocator: Allocator,
+) -> Loop
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let bodyset = compute_loop_body(cfg, body, back_edges, header, allocator)?
+    let pre = find_preheader(cfg, bodyset, header)
+    return match pre {
+        case .some(let pre_raw) => Loop {
+            header: header,
+            body: bodyset,
+            preheader: block_mod.BlockId { raw: pre_raw },
+            preheader_known: true,
+        }
+        case .none => Loop {
+            header: header,
+            body: bodyset,
+            preheader: block_mod.error(),
+            preheader_known: false,
+        }
+    }
+}
+
+
+function compute_loop_body(
+    cfg: dom_mod.Cfg,
+    body: hlir_body_mod.HlirBody,
+    back_edges: Vec_BackEdge.Vec,
+    header: block_mod.BlockId,
+    allocator: Allocator,
+) -> IntMap_u32.IntMap
+    with {allocator, err: alloc.AllocError, panic}
+{
+    var bodyset = IntMap_u32.new(allocator)?
+    let _ = IntMap_u32.insert(mutable bodyset, header.raw as i64, 1 as u32, allocator)?
+    uninit worklist: Vec_u32.Vec
+    Vec_u32.new(init worklist, allocator)?
+    seed_latches(mutable bodyset, mutable worklist, back_edges, header, allocator)?
+    let budget = cfg.n_blocks * cfg.n_blocks + 1
+    var steps: usize = 0
+    loop
+        decreases budget - steps
+    {
+        if steps >= budget { break }
+        if Vec_u32.len(worklist) == 0 { break }
+        let cur = pop_last(mutable worklist)
+        flood_preds(mutable bodyset, mutable worklist, cfg, cur, header.raw, allocator)?
+        steps = steps + 1
+    }
+    return bodyset
+}
+
+
+function seed_latches(
+    bodyset: mutable IntMap_u32.IntMap,
+    worklist: mutable Vec_u32.Vec,
+    back_edges: Vec_BackEdge.Vec,
+    header: block_mod.BlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let n = Vec_BackEdge.len(back_edges)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let edge = Vec_BackEdge.at(back_edges, i)
+        if edge.header.raw == header.raw {
+            let latch = edge.source.raw
+            if !IntMap_u32.contains(bodyset, latch as i64) {
+                let _ = IntMap_u32.insert(mutable bodyset, latch as i64, 1 as u32, allocator)?
+                if latch != header.raw {
+                    Vec_u32.push(mutable worklist, latch, allocator)?
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function flood_preds(
+    bodyset: mutable IntMap_u32.IntMap,
+    worklist: mutable Vec_u32.Vec,
+    cfg: dom_mod.Cfg,
+    cur: u32,
+    header_raw: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic}
+{
+    if cur == header_raw { return () }
+    let preds = dom_mod.preds_of(cfg, cur)
+    let m = Vec_u32.len(preds)
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        let p = Vec_u32.at(preds, i)
+        if !IntMap_u32.contains(bodyset, p as i64) {
+            let _ = IntMap_u32.insert(mutable bodyset, p as i64, 1 as u32, allocator)?
+            if p != header_raw {
+                Vec_u32.push(mutable worklist, p, allocator)?
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function pop_last(worklist: mutable Vec_u32.Vec) -> u32 {
+    let m = Vec_u32.len(worklist)
+    if m == 0 { return 0 as u32 }
+    let last = Vec_u32.at(worklist, m - 1)
+    let _ = Vec_u32.pop(mutable worklist)
+    return last
+}
+
+
+function find_preheader(
+    cfg: dom_mod.Cfg,
+    bodyset: IntMap_u32.IntMap,
+    header: block_mod.BlockId,
+) -> Option_u32.Option
+    with {panic}
+{
+    var found: u32 = 0
+    var count: usize = 0
+    let preds = dom_mod.preds_of(cfg, header.raw)
+    let m = Vec_u32.len(preds)
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        let p = Vec_u32.at(preds, i)
+        if !IntMap_u32.contains(bodyset, p as i64) {
+            found = p
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count != 1 { return Option_u32.none }
+    if !dom_mod.is_reachable(cfg, found) { return Option_u32.none }
+    if !dom_mod.dominates(cfg, found, header.raw) { return Option_u32.none }
+    return Option_u32.some(value: found)
+}

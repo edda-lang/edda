@@ -1,0 +1,211 @@
+
+module lower.term.terminator.call.call
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+import mir.body.model as mir_body_mod
+import mir.term as mir_term_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.block as mir_block_mod
+import mir.layout.table as mir_layout_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as hlir_term_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.id.op as hlir_op_id_mod
+
+import resolve.build.builtins as builtins_mod
+
+import local.term.support.support as support_mod
+import local.term.support.place as place_mod
+import local.term.support.flags as flags_mod
+import local.flow.plan.plan as plan_mod
+import local.term.terminator.blockarg.blockarg as blockarg_mod
+
+
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public function lower_call(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    callee: mir_rvalue_mod.Operand,
+    args: Vec_Operand.Vec,
+    dest: mir_place_mod.Place,
+    return_: mir_block_mod.BlockId,
+    unwind: mir_term_mod.UnwindAction,
+    body: mir_body_mod.MirBody,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> hlir_term_mod.HlirTermKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let callee_val = place_mod.operand_ssa(mutable out, env, mutable ops, origin, callee, body, ty_interner, allocator)?
+    let arg_vals = blockarg_mod.lower_operand_vec(mutable out, env, mutable ops, origin, args, true, body, ty_interner, allocator)?
+    let dest_nproj = mir_place_mod.proj_len(dest)
+    let ty = if dest_nproj == (0 as usize) {
+        support_mod.local_ty(body, dest.local)
+    } else {
+        mir_place_mod.proj_at(dest, dest_nproj - (1 as usize)).result_ty
+    }
+    let result_val = hlir_body_mod.push_value(
+        mutable out,
+        take support_mod.fresh_op_result(ty),
+        allocator,
+    )?
+    let extern_fallible_call = callee_is_extern(callee, extern_defs) && unwind_is_handler(unwind)
+    let extern_ret_size = if callee_is_extern(callee, extern_defs) { small_extern_ret_size(ty, body) } else { 0 as u32 }
+    let flags = flags_mod.intrinsic_flags(intrinsic_of_callee(callee), extern_fallible_call, extern_ret_size)
+    let call_kind = if callee_is_fn_ref(callee) {
+        hlir_op_mod.HlirOpKind.call_(callee: callee_val, args: arg_vals)
+    } else {
+        hlir_op_mod.HlirOpKind.call_indirect(callee: callee_val, args: arg_vals)
+    }
+    let op = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: call_kind,
+        result_: result_val,
+        flags: flags,
+    }
+    let op_id = hlir_body_mod.push_op(mutable out, take op, allocator)?
+    support_mod.bind_op_result(mutable out, result_val, op_id)
+    Vec_OpId.push(mutable ops, take op_id, allocator)?
+    if dest_nproj == (0 as usize) {
+        support_mod.env_set(mutable env, dest.local, result_val)
+    } else {
+        place_mod.store_to_place(mutable out, env, mutable ops, origin, dest, result_val, body, allocator)?
+    }
+    match unwind {
+        case .handler(let err_bb) => {
+            let flag_val = hlir_body_mod.push_value(
+                mutable out,
+                take support_mod.fresh_op_result(ty),
+                allocator,
+            )?
+            let flag_op = hlir_op_mod.HlirOp {
+                origin: origin,
+                kind: hlir_op_mod.HlirOpKind.err_flag,
+                result_: flag_val,
+                flags: flags_mod.intrinsic_flags(hlir_op_mod.Intrinsic.none, false, 0 as u32),
+            }
+            let flag_id = hlir_body_mod.push_op(mutable out, take flag_op, allocator)?
+            support_mod.bind_op_result(mutable out, flag_val, flag_id)
+            Vec_OpId.push(mutable ops, take flag_id, allocator)?
+            return hlir_term_mod.HlirTermKind.branch(
+                cond: flag_val,
+                true_: blockarg_mod.block_id_of(err_bb),
+                true_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, err_bb, body, plan, ty_interner, allocator)?,
+                false_: blockarg_mod.block_id_of(return_),
+                false_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, return_, body, plan, ty_interner, allocator)?,
+            )
+        }
+        case _ => ()
+    }
+    return hlir_term_mod.HlirTermKind.goto_(
+        target: blockarg_mod.block_id_of(return_),
+        args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, return_, body, plan, ty_interner, allocator)?,
+    )
+}
+
+function callee_is_fn_ref(callee: mir_rvalue_mod.Operand) -> bool {
+    return match callee {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(_) => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function intrinsic_of_callee(callee: mir_rvalue_mod.Operand) -> hlir_op_mod.Intrinsic {
+    return match callee {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => intrinsic_of_def(def)
+            case _ => hlir_op_mod.Intrinsic.none
+        }
+        case _ => hlir_op_mod.Intrinsic.none
+    }
+}
+
+function callee_is_extern(callee: mir_rvalue_mod.Operand, extern_defs: IntMap_u32.IntMap) -> bool {
+    return match callee {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => match IntMap_u32.get(extern_defs, def.raw as i64) {
+                case .some(_) => true
+                case .none => false
+            }
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function unwind_is_handler(unwind: mir_term_mod.UnwindAction) -> bool {
+    return match unwind {
+        case .handler(_) => true
+        case _ => false
+    }
+}
+
+function small_extern_ret_size(ty: ty_mod.TyId, body: mir_body_mod.MirBody) -> u32 {
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let l) => if l.total_size > (0 as u32) && l.total_size <= (8 as u32) {
+            l.total_size
+        } else {
+            0 as u32
+        }
+        case .none => 0 as u32
+    }
+}
+
+function intrinsic_of_def(def: def_mod.DefId) -> hlir_op_mod.Intrinsic {
+    if def.raw == builtins_mod.syscall6_reserved().raw { return hlir_op_mod.Intrinsic.syscall }
+    if def.raw == builtins_mod.slice_addr_reserved().raw { return hlir_op_mod.Intrinsic.slice_addr }
+    if def.raw == builtins_mod.slice_from_raw_reserved().raw { return hlir_op_mod.Intrinsic.slice_from_raw }
+    if def.raw == builtins_mod.slice_from_raw_string_reserved().raw { return hlir_op_mod.Intrinsic.slice_from_raw }
+    if def.raw == builtins_mod.load_u8_reserved().raw { return hlir_op_mod.Intrinsic.load_(width: 1 as u32) }
+    if def.raw == builtins_mod.load_u16_reserved().raw { return hlir_op_mod.Intrinsic.load_(width: 2 as u32) }
+    if def.raw == builtins_mod.load_u32_reserved().raw { return hlir_op_mod.Intrinsic.load_(width: 4 as u32) }
+    if def.raw == builtins_mod.load_u64_reserved().raw { return hlir_op_mod.Intrinsic.load_(width: 8 as u32) }
+    if def.raw == builtins_mod.load_usize_reserved().raw { return hlir_op_mod.Intrinsic.load_(width: 8 as u32) }
+    if def.raw == builtins_mod.store_u8_reserved().raw { return hlir_op_mod.Intrinsic.store_(width: 1 as u32) }
+    if def.raw == builtins_mod.store_u16_reserved().raw { return hlir_op_mod.Intrinsic.store_(width: 2 as u32) }
+    if def.raw == builtins_mod.store_u32_reserved().raw { return hlir_op_mod.Intrinsic.store_(width: 4 as u32) }
+    if def.raw == builtins_mod.store_u64_reserved().raw { return hlir_op_mod.Intrinsic.store_(width: 8 as u32) }
+    if def.raw == builtins_mod.store_usize_reserved().raw { return hlir_op_mod.Intrinsic.store_(width: 8 as u32) }
+    if def.raw == builtins_mod.sqrt_f64_reserved().raw { return hlir_op_mod.Intrinsic.fsqrt }
+    if def.raw == builtins_mod.floor_f64_reserved().raw { return hlir_op_mod.Intrinsic.ffloor }
+    if def.raw == builtins_mod.ceil_f64_reserved().raw { return hlir_op_mod.Intrinsic.fceil }
+    if def.raw == builtins_mod.trunc_f64_reserved().raw { return hlir_op_mod.Intrinsic.ftrunc }
+    if def.raw == builtins_mod.string_from_raw_reserved().raw { return hlir_op_mod.Intrinsic.string_from_raw }
+    if def.raw == builtins_mod.f64_to_bits_reserved().raw { return hlir_op_mod.Intrinsic.bitcast(width: 8 as u32) }
+    if def.raw == builtins_mod.f64_from_bits_reserved().raw { return hlir_op_mod.Intrinsic.bitcast(width: 8 as u32) }
+    if def.raw == builtins_mod.f32_to_bits_reserved().raw { return hlir_op_mod.Intrinsic.bitcast(width: 4 as u32) }
+    if def.raw == builtins_mod.f32_from_bits_reserved().raw { return hlir_op_mod.Intrinsic.bitcast(width: 4 as u32) }
+    if def.raw == builtins_mod.codepoint_to_u32_reserved().raw { return hlir_op_mod.Intrinsic.bitcast(width: 4 as u32) }
+    if def.raw == builtins_mod.codepoint_from_u32_reserved().raw { return hlir_op_mod.Intrinsic.bitcast(width: 4 as u32) }
+    if def.raw == builtins_mod.fixdfti_reserved().raw { return hlir_op_mod.Intrinsic.float_to_wide }
+    if def.raw == builtins_mod.fixsfti_reserved().raw { return hlir_op_mod.Intrinsic.float_to_wide }
+    if def.raw == builtins_mod.fixunsdfti_reserved().raw { return hlir_op_mod.Intrinsic.float_to_wide }
+    if def.raw == builtins_mod.fixunssfti_reserved().raw { return hlir_op_mod.Intrinsic.float_to_wide }
+    if def.raw == builtins_mod.fixwrapdfti_reserved().raw { return hlir_op_mod.Intrinsic.float_to_wide }
+    if def.raw == builtins_mod.fixwrapsfti_reserved().raw { return hlir_op_mod.Intrinsic.float_to_wide }
+    return hlir_op_mod.Intrinsic.none
+}

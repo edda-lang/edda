@@ -1,0 +1,180 @@
+
+module uri.transform.normalize
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import uri.value
+import uri.codec.percent
+import uri.transform.resolve
+
+spec option.Option(String)
+spec option.Option(u16)
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _is_hex(c: u8) -> bool {
+    return (c >= 48 as u8 && c <= 57 as u8)
+        || (c >= 65 as u8 && c <= 70 as u8)
+        || (c >= 97 as u8 && c <= 102 as u8)
+}
+
+function _hex_value(c: u8) -> u32 {
+    if c >= 48 as u8 && c <= 57 as u8 {
+        return (c - 48 as u8) as u32
+    }
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return ((c - 97 as u8) as u32) + (10 as u32)
+    }
+    return ((c - 65 as u8) as u32) + (10 as u32)
+}
+
+function _to_upper_hex(c: u8) -> u8 {
+    if c >= 97 as u8 && c <= 102 as u8 {
+        return c -% (32 as u8)
+    }
+    return c
+}
+
+
+function _normalize_pct(src: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let n = src.len()
+    let buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0 as usize
+    var o: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = src[i]
+        if c != 37 as u8 {
+            buf[o] = c
+            o = o + 1 as usize
+            i = i + 1 as usize
+            continue
+        }
+        if i + 2 as usize >= n {
+            buf[o] = c
+            o = o + 1 as usize
+            i = i + 1 as usize
+            continue
+        }
+        let h = src[i + 1 as usize]
+        let l = src[i + 2 as usize]
+        if !_is_hex(h) || !_is_hex(l) {
+            buf[o] = c
+            o = o + 1 as usize
+            i = i + 1 as usize
+            continue
+        }
+        let v: u32 = (_hex_value(h) << (4 as u32)) | _hex_value(l)
+        let b: u8 = (v & (0xFF as u32)) as u8
+        if percent.is_unreserved(b) {
+            buf[o] = b
+            o = o + 1 as usize
+            i = i + 3 as usize
+        } else {
+            buf[o] = 37 as u8
+            buf[o + 1 as usize] = _to_upper_hex(h)
+            buf[o + 2 as usize] = _to_upper_hex(l)
+            o = o + 3 as usize
+            i = i + 3 as usize
+        }
+    }
+    return buf[0 as usize..<o]
+}
+
+function _normalize_pct_string(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = _normalize_pct(s.bytes(), allocator)?
+    return string.bytes_slice_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+function _normalize_pct_opt(
+    opt: Option_String, allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+{
+    return match opt {
+        case .some(let s) => {
+            let n = _normalize_pct_string(s, allocator)?
+            Option_String.some(value: n)
+        }
+        case .none => Option_String.none
+    }
+}
+
+
+function _lower_ascii(src: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = src.bytes()
+    let n = bytes.len()
+    let buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = bytes[i]
+        if c >= 65 as u8 && c <= 90 as u8 {
+            buf[i] = c +% (32 as u8)
+        } else {
+            buf[i] = c
+        }
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _normalize_host(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let pct = _normalize_pct_string(s, allocator)?
+    return _lower_ascii(pct, allocator)?
+}
+
+function _normalize_host_opt(
+    opt: Option_String, allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+{
+    return match opt {
+        case .some(let h) => {
+            let n = _normalize_host(h, allocator)?
+            Option_String.some(value: n)
+        }
+        case .none => Option_String.none
+    }
+}
+
+
+function _normalize_path(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let pct = _normalize_pct_string(s, allocator)?
+    return resolve.remove_dot_segments(pct, allocator)?
+}
+
+
+public function normalize(u: value.Uri, allocator: Allocator) -> value.Uri
+    with {allocator, err: alloc.AllocError}
+{
+    let scheme = _lower_ascii(u.scheme, allocator)?
+    let userinfo = _normalize_pct_opt(u.userinfo, allocator)?
+    let host = _normalize_host_opt(u.host, allocator)?
+    let path = _normalize_path(u.path, allocator)?
+    let query = _normalize_pct_opt(u.query, allocator)?
+    let fragment = _normalize_pct_opt(u.fragment, allocator)?
+    return value.Uri {
+        scheme: scheme,
+        userinfo: userinfo,
+        host: host,
+        port: u.port,
+        path: path,
+        query: query,
+        fragment: fragment,
+    }
+}

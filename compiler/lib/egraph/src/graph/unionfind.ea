@@ -1,0 +1,191 @@
+
+module egraph.graph.unionfind
+
+import std.mem.alloc
+import std.collections.vec
+import local.eclass as eclass_mod
+
+
+spec std.collections.vec.Vec(u32)
+
+
+derive debug for UnionFind
+
+
+public type UnionFind {
+    parent: Vec_u32.Vec
+    rank: Vec_u32.Vec
+    canon: Vec_u32.Vec
+    stamp: Vec_u32.Vec
+    gen: u32
+}
+
+
+public function new(out: init UnionFind, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit parent: Vec_u32.Vec
+    Vec_u32.new(init parent, allocator)?
+    Vec_u32.push(mutable parent, 0 as u32, allocator)?
+    uninit rank: Vec_u32.Vec
+    Vec_u32.new(init rank, allocator)?
+    Vec_u32.push(mutable rank, 0 as u32, allocator)?
+    uninit canon: Vec_u32.Vec
+    Vec_u32.new(init canon, allocator)?
+    Vec_u32.push(mutable canon, 0 as u32, allocator)?
+    uninit stamp: Vec_u32.Vec
+    Vec_u32.new(init stamp, allocator)?
+    Vec_u32.push(mutable stamp, 0 as u32, allocator)?
+    out = UnionFind {
+        parent: parent,
+        rank: rank,
+        canon: canon,
+        stamp: stamp,
+        gen: 1 as u32,
+    }
+}
+
+
+public function new_class(
+    uf: mutable UnionFind,
+    allocator: Allocator,
+) -> eclass_mod.EClassId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_u32.len(uf.parent) < 4294967295
+    requires Vec_u32.len(uf.rank) < 4294967295
+{
+    let raw = Vec_u32.len(uf.parent) as u32
+    Vec_u32.push(mutable uf.parent, raw, allocator)?
+    Vec_u32.push(mutable uf.rank, 0 as u32, allocator)?
+    Vec_u32.push(mutable uf.canon, 0 as u32, allocator)?
+    Vec_u32.push(mutable uf.stamp, 0 as u32, allocator)?
+    return eclass_mod.EClassId { raw: raw }
+}
+
+
+function invalidate(uf: mutable UnionFind) -> ()
+    with {panic}
+{
+    if uf.gen < 4294967295 {
+        uf.gen = uf.gen + 1
+        return
+    }
+    let n = Vec_u32.len(uf.stamp)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_u32.set_at(mutable uf.stamp, i, 0 as u32)
+        i = i + 1
+    }
+    uf.gen = 1 as u32
+}
+
+
+public function find(
+    uf: mutable UnionFind,
+    c: eclass_mod.EClassId,
+) -> eclass_mod.EClassId
+    with {panic}
+    requires (c.raw as usize) < Vec_u32.len(uf.parent)
+{
+    let cidx = c.raw as usize
+    if cidx < Vec_u32.len(uf.canon) && cidx < Vec_u32.len(uf.stamp) {
+        if Vec_u32.at(uf.stamp, cidx) == uf.gen {
+            return eclass_mod.EClassId { raw: Vec_u32.at(uf.canon, cidx) }
+        }
+    }
+    let cap = Vec_u32.len(uf.parent)
+    var current: u32 = c.raw
+    var steps: usize = 0
+    loop
+        decreases cap - steps
+    {
+        if steps >= cap { break }
+        if (current as usize) >= cap {
+            panic("union_find.find: parent index out of bounds")
+        }
+        let p = Vec_u32.at(uf.parent, current as usize)
+        if p == current { break }
+        current = p
+        steps = steps + 1
+    }
+    let root = current
+    var compress_current: u32 = c.raw
+    var compress_steps: usize = 0
+    loop
+        decreases cap - compress_steps
+    {
+        if compress_steps >= cap { break }
+        if (compress_current as usize) >= cap {
+            panic("union_find.find: parent index out of bounds")
+        }
+        let p = Vec_u32.at(uf.parent, compress_current as usize)
+        if p == compress_current { break }
+        Vec_u32.set_at(mutable uf.parent, compress_current as usize, root)
+        compress_current = p
+        compress_steps = compress_steps + 1
+    }
+    if cidx < Vec_u32.len(uf.canon) && cidx < Vec_u32.len(uf.stamp) {
+        Vec_u32.set_at(mutable uf.canon, cidx, root)
+        Vec_u32.set_at(mutable uf.stamp, cidx, uf.gen)
+    }
+    return eclass_mod.EClassId { raw: root }
+}
+
+
+public function union_classes(
+    uf: mutable UnionFind,
+    a: eclass_mod.EClassId,
+    b: eclass_mod.EClassId,
+) -> eclass_mod.EClassId
+    with {panic}
+    requires a.raw > 0
+    requires b.raw > 0
+    requires (a.raw as usize) < Vec_u32.len(uf.parent)
+    requires (b.raw as usize) < Vec_u32.len(uf.parent)
+{
+    let root_a = find(mutable uf, a)
+    let root_b = find(mutable uf, b)
+    if root_a.raw == root_b.raw { return root_a }
+    invalidate(mutable uf)
+    let cap = Vec_u32.len(uf.parent)
+    let cap_rank = Vec_u32.len(uf.rank)
+    if (root_a.raw as usize) >= cap || (root_a.raw as usize) >= cap_rank {
+        panic("union_find.union_classes: root_a index out of bounds")
+    }
+    if (root_b.raw as usize) >= cap || (root_b.raw as usize) >= cap_rank {
+        panic("union_find.union_classes: root_b index out of bounds")
+    }
+    let rank_a = Vec_u32.at(uf.rank, root_a.raw as usize)
+    let rank_b = Vec_u32.at(uf.rank, root_b.raw as usize)
+    if rank_a < rank_b {
+        Vec_u32.set_at(mutable uf.parent, root_a.raw as usize, root_b.raw)
+        return root_b
+    }
+    if rank_a > rank_b {
+        Vec_u32.set_at(mutable uf.parent, root_b.raw as usize, root_a.raw)
+        return root_a
+    }
+    Vec_u32.set_at(mutable uf.parent, root_b.raw as usize, root_a.raw)
+    if rank_a < 4294967295 {
+        Vec_u32.set_at(mutable uf.rank, root_a.raw as usize, rank_a + 1)
+    }
+    return root_a
+}
+
+
+public function same_class(
+    uf: mutable UnionFind,
+    a: eclass_mod.EClassId,
+    b: eclass_mod.EClassId,
+) -> bool
+    with {panic}
+    requires (a.raw as usize) < Vec_u32.len(uf.parent)
+    requires (b.raw as usize) < Vec_u32.len(uf.parent)
+{
+    let root_a = find(mutable uf, a)
+    let root_b = find(mutable uf, b)
+    return root_a.raw == root_b.raw
+}

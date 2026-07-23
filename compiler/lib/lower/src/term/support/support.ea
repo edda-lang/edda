@@ -1,0 +1,346 @@
+
+module lower.term.support.support
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+
+import mir.body.model as mir_body_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+import mir.layout.table as mir_layout_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.id.op as hlir_op_id_mod
+
+import local.term.support.flags as flags_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+
+spec std.core.option.Option(mir_layout_mod.AggLayout)
+spec std.core.option.Option(u32)
+
+
+public function new_local_env(
+    out: init Vec_ValueId.Vec,
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit env: Vec_ValueId.Vec
+    Vec_ValueId.new(init env, allocator)?
+    let n = Vec_Local.len(body.locals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_ValueId.push(mutable env, take hlir_value_mod.error(), allocator)?
+        i += 1
+    }
+    out = env
+}
+
+public function env_get(env: Vec_ValueId.Vec, local: mir_local_mod.LocalId) -> hlir_value_mod.ValueId {
+    let idx = local.raw as usize
+    if idx >= Vec_ValueId.len(env) { return hlir_value_mod.error() }
+    return Vec_ValueId.at(env, idx)
+}
+
+public function env_set(
+    env: mutable Vec_ValueId.Vec,
+    local: mir_local_mod.LocalId,
+    value: hlir_value_mod.ValueId,
+) -> ()
+{
+    env_set_at_index(mutable env, local.raw as usize, value)
+}
+
+public function env_set_at_index(
+    env: mutable Vec_ValueId.Vec,
+    idx: usize,
+    value: hlir_value_mod.ValueId,
+) -> ()
+{
+    if idx >= Vec_ValueId.len(env) { return }
+    Vec_ValueId.set_at(mutable env, idx, take value)
+}
+
+
+public function mint_params(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    body: mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_params_us = body.n_params as usize
+    let n_locals = Vec_Local.len(body.locals)
+    var i: usize = 0
+    loop decreases n_params_us - i {
+        if i >= n_params_us { break }
+        let local_idx = i + 2
+        if local_idx >= n_locals { break }
+        let local = Vec_Local.at(body.locals, local_idx)
+        let vid = hlir_body_mod.mint_param_value(mutable out, local.ty, allocator)?
+        env_set_at_index(mutable env, local_idx, vid)
+        match local.name {
+            case .some(let nm) => hlir_body_mod.push_debug_local(mutable out, vid.raw, nm, local.ty, allocator)?
+            case .none => ()
+        }
+        i += 1
+    }
+}
+
+
+public function aggregate_zero_size(
+    out: hlir_body_mod.HlirBody,
+    c: mir_rvalue_mod.Constant,
+) -> Option_u32.Option {
+    return match c.kind {
+        case .zero_init => match mir_layout_mod.lookup(out.agg_layouts, c.ty) {
+            case .some(let l) => Option_u32.some(value: l.total_size)
+            case .none => Option_u32.none
+        }
+        case _ => Option_u32.none
+    }
+}
+
+
+function materialize_stack_alloc(
+    out: mutable hlir_body_mod.HlirBody,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    ty: ty_mod.TyId,
+    bytes: u32,
+    allocator: Allocator,
+) -> hlir_value_mod.ValueId
+    with {allocator, err: alloc.AllocError}
+{
+    let result_val = hlir_body_mod.push_value(
+        mutable out,
+        take fresh_op_result(ty),
+        allocator,
+    )?
+    let op = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: hlir_op_mod.HlirOpKind.stack_alloc(bytes: bytes),
+        result_: result_val,
+        flags: flags_mod.default_flags(),
+    }
+    let op_id = hlir_body_mod.push_op(mutable out, take op, allocator)?
+    bind_op_result(mutable out, result_val, op_id)
+    Vec_OpId.push(mutable ops, take op_id, allocator)?
+    return result_val
+}
+
+
+public function materialize_literal(
+    out: mutable hlir_body_mod.HlirBody,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    c: mir_rvalue_mod.Constant,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_value_mod.ValueId
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    match aggregate_zero_size(out, c) {
+        case .some(let sz) => return materialize_stack_alloc(mutable out, mutable ops, origin, c.ty, sz, allocator)?
+        case .none => ()
+    }
+    let hconst = convert_constant(c, ty_interner)?
+    let result_val = hlir_body_mod.push_value(
+        mutable out,
+        take fresh_op_result(c.ty),
+        allocator,
+    )?
+    let op = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: hlir_op_mod.HlirOpKind.literal(c: hconst),
+        result_: result_val,
+        flags: flags_mod.default_flags(),
+    }
+    let op_id = hlir_body_mod.push_op(mutable out, take op, allocator)?
+    bind_op_result(mutable out, result_val, op_id)
+    Vec_OpId.push(mutable ops, take op_id, allocator)?
+    return result_val
+}
+
+public function place_value(
+    env: Vec_ValueId.Vec,
+    place: mir_place_mod.Place,
+) -> hlir_value_mod.ValueId
+    with {err: hlir_error_mod.HlirError}
+{
+    let local = require_bare_local(place, "MIR place with projection in operand position requires place -> SSA dataflow")?
+    let v = env_get(env, local)
+    if hlir_value_mod.is_error(v) {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR local read before definition during MIR -> HLIR lowering",
+        )
+    }
+    return v
+}
+
+public function operand_constant(
+    operand: mir_rvalue_mod.Operand,
+    ty_interner: ty_interner_mod.Interner,
+) -> hlir_op_mod.HConstant
+    with {err: hlir_error_mod.HlirError}
+{
+    return match operand {
+        case .constant(let c) => convert_constant(c, ty_interner)?
+        case .copy_(_, _) => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR use_ of a place requires a copy/move op rather than a literal (place -> SSA dataflow)",
+        )
+        case .move_(_, _) => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR use_ of a place requires a copy/move op rather than a literal (place -> SSA dataflow)",
+        )
+    }
+}
+
+public function convert_constant(
+    c: mir_rvalue_mod.Constant,
+    ty_interner: ty_interner_mod.Interner,
+) -> hlir_op_mod.HConstant
+    with {err: hlir_error_mod.HlirError}
+{
+    return match c.kind {
+        case .int_(let bits) => hlir_op_mod.HConstant.int_(value: bits as i128 wrapping, ty: c.ty)
+        case .bool_(let value) => hlir_op_mod.HConstant.bool_(value: value)
+        case .str_(let symbol) => hlir_op_mod.HConstant.string_(symbol: symbol)
+        case .unit_ => hlir_op_mod.HConstant.unit_
+        case .fn_ref(let def) => hlir_op_mod.HConstant.fn_ref(def: def)
+        case .float_(let bits, let width) => hlir_op_mod.HConstant.float_(bits: bits, width: width)
+        case .zero_init => zero_constant(c.ty, ty_interner, 16 as u32)?
+        case .aggregate(_) => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR aggregate constant requires place -> SSA dataflow",
+        )
+    }
+}
+
+public function zero_constant(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+) -> hlir_op_mod.HConstant
+    with {err: hlir_error_mod.HlirError}
+    decreases fuel
+{
+    if fuel == (0 as u32) {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR zero_init refinement chain exceeded classification fuel",
+        )
+    }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR zero_init constant carries an out-of-range type id",
+        )
+    }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(let p) => zero_primitive(p, ty)?
+        case .refined(let base, _) => zero_constant(base, ty_interner, fuel - (1 as u32))?
+        case _ => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR zero_init of an aggregate local requires place -> SSA dataflow",
+        )
+    }
+}
+
+function zero_primitive(
+    p: ty_kind_mod.PrimKind,
+    ty: ty_mod.TyId,
+) -> hlir_op_mod.HConstant
+    with {err: hlir_error_mod.HlirError}
+{
+    return match p {
+        case .f32_ => hlir_op_mod.HConstant.float_(bits: 0 as u64, width: mir_rvalue_mod.FloatWidth.f32_)
+        case .f64_ => hlir_op_mod.HConstant.float_(bits: 0 as u64, width: mir_rvalue_mod.FloatWidth.f64_)
+        case .bool_ => hlir_op_mod.HConstant.bool_(value: false)
+        case .unit_ => hlir_op_mod.HConstant.unit_
+        case .never_ => hlir_op_mod.HConstant.unit_
+        case .type_meta => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR zero_init of a comptime type-meta local is malformed",
+        )
+        case _ => hlir_op_mod.HConstant.int_(value: 0 as i128, ty: ty)
+    }
+}
+
+
+public function empty_value_vec(allocator: Allocator) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit values: Vec_ValueId.Vec
+    Vec_ValueId.new(init values, allocator)?
+    return values
+}
+
+
+public function require_bare_local(
+    place: mir_place_mod.Place,
+    message: String,
+) -> mir_local_mod.LocalId
+    with {err: hlir_error_mod.HlirError}
+{
+    if mir_place_mod.proj_len(place) > 0 {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: message,
+        )
+    }
+    return place.local
+}
+
+public function local_ty(body: mir_body_mod.MirBody, local: mir_local_mod.LocalId) -> ty_mod.TyId {
+    let idx = local.raw as usize
+    if idx >= Vec_Local.len(body.locals) { return ty_mod.error() }
+    let l = Vec_Local.at(body.locals, idx)
+    return l.ty
+}
+
+
+public function fresh_op_result(ty: ty_mod.TyId) -> hlir_body_mod.HlirValue {
+    return hlir_body_mod.HlirValue {
+        ty: ty,
+        def: hlir_body_mod.HlirValueDef.op_result(op: hlir_op_id_mod.error()),
+    }
+}
+
+public function bind_op_result(
+    out: mutable hlir_body_mod.HlirBody,
+    result_val: hlir_value_mod.ValueId,
+    op_id: hlir_op_id_mod.OpId,
+) -> ()
+{
+    let idx = hlir_value_mod.index(result_val)
+    if idx >= Vec_HlirValue.len(out.values) { return }
+    let existing = Vec_HlirValue.at(out.values, idx)
+    let patched = hlir_body_mod.HlirValue {
+        ty: existing.ty,
+        def: hlir_body_mod.HlirValueDef.op_result(op: op_id),
+    }
+    Vec_HlirValue.set_at(mutable out.values, idx, take patched)
+}

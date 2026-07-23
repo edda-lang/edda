@@ -1,0 +1,125 @@
+
+module std.os.process.drain
+
+import std.mem.alloc
+import std.os.raw
+import std.os.pages
+
+function read_file(handle: u64, buf: u64, n: u32, nread_out: u64, overlapped: u64) -> i32
+    extern "ReadFile" from "kernel32.dll"
+
+function close_handle(handle: u64) -> i32
+    extern "CloseHandle" from "kernel32.dll"
+
+type Sink {
+    base: u64
+    used: usize where used <= 1048576
+}
+
+public type TwoCaptured {
+    out: [u8]
+    err: [u8]
+}
+
+public function empty_two() -> TwoCaptured {
+    return TwoCaptured { out: "".bytes(), err: "".bytes() }
+}
+
+function sink_read(s: mutable Sink, fd: u64, sc: u64) -> bool {
+    let room: usize = 1048576 - s.used
+    let dst: u64 = if room > 0 { s.base +% (s.used as u64) } else { s.base }
+    let want: usize = if room > 0 { room } else { 1048576 }
+    comptime if target_has("windows") {
+        let ok: i32 = read_file(fd, dst, want as u32 wrapping, sc, 0)
+        if ok == 0 { return true }
+        let n: u32 = raw.load_u32(sc)
+        if n == 0 { return true }
+        if room > 0 {
+            let got: usize = n as usize
+            let take_n: usize = if got > room { room } else { got }
+            s.used = s.used + take_n
+        }
+        return false
+    } else {
+        let r: i64 = raw.syscall6(0, fd, dst, want as u64, 0, 0, 0)
+        if r <= 0 { return true }
+        if room > 0 {
+            let got: usize = r as usize
+            let take_n: usize = if got > room { room } else { got }
+            s.used = s.used + take_n
+        }
+        return false
+    }
+}
+
+function copy_out(base: u64, len: usize, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    if base == 0 { return "".bytes() }
+    if len == 0 { return "".bytes() }
+    let buf: [u8] = allocator.alloc_array(u8, len)?
+    var k: usize = 0
+    loop
+        decreases len - k
+    {
+        if k >= len { break }
+        buf[k] = raw.load_u8(base +% (k as u64))
+        k = k + 1
+    }
+    return buf
+}
+
+function copy_two(os: Sink, es: Sink, allocator: Allocator) -> TwoCaptured
+    with {allocator, err: alloc.AllocError}
+{
+    let ob: [u8] = copy_out(os.base, os.used, allocator)?
+    let eb: [u8] = copy_out(es.base, es.used, allocator)?
+    return TwoCaptured { out: ob, err: eb }
+}
+
+function unmap_all(ob: u64, eb: u64, sc: u64) -> () {
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(ob, 1048576)?
+        pages.unmap(eb, 1048576)?
+        pages.unmap(sc, 4096)?
+    }
+}
+
+public function drain_two(out_fd: u64, err_fd: u64, allocator: Allocator) -> TwoCaptured
+    with {allocator, err: pages.PageError}
+{
+    let ob: u64 = pages.map(1048576)?
+    let eb: u64 = pages.map(1048576)?
+    let sc: u64 = pages.map(4096)?
+    var os: Sink = Sink { base: ob, used: 0 }
+    var es: Sink = Sink { base: eb, used: 0 }
+    var od: bool = false
+    var ed: bool = false
+    var fuel: u64 = 16777216
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        if od && ed { break }
+        fuel = fuel - 1
+        if !od {
+            if sink_read(mutable os, out_fd, sc) { od = true }
+        }
+        if !ed {
+            if sink_read(mutable es, err_fd, sc) { ed = true }
+        }
+    }
+    let captured: TwoCaptured = handle err: alloc.AllocError as _a -> empty_two() {
+        copy_two(os, es, allocator)?
+    }
+    unmap_all(ob, eb, sc)
+    return captured
+}
+
+public function close_fd(fd: u64) -> () {
+    comptime if target_has("windows") {
+        let _ = close_handle(fd)
+    } else {
+        let _ = raw.syscall6(3, fd, 0, 0, 0, 0, 0)
+    }
+}

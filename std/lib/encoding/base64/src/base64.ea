@@ -1,0 +1,155 @@
+
+module std.encoding.base64
+import std.text.string
+
+import std.mem.alloc
+
+spec std.mem.alloc.Array(u8)
+
+
+public stable function encoded_length(byte_count: usize) -> usize
+    ensures result % 4 == 0
+    ensures result >= byte_count
+{
+    return ((byte_count + 2) / 3) * 4
+}
+
+public stable function decoded_length_upper_bound(string_len: usize where string_len % 4 == 0) -> usize
+    ensures result == (string_len / 4) * 3
+{
+    return (string_len / 4) * 3
+}
+
+
+public function encode(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: [u8] = Array_u8.alloc(allocator, encoded_length(bytes.len()))?
+    let _ = encode_into(bytes, mutable out, 0)
+    return string.from_owned_utf8(take out)
+}
+
+function b64_char(v: u8) -> u8 {
+    let idx: u8 = v & 0x3F
+    if idx < 26 { return 0x41 +% idx }
+    if idx < 52 { return 0x61 +% (idx -% 26) }
+    if idx < 62 { return 0x30 +% (idx -% 52) }
+    if idx == 62 { return 0x2B }
+    return 0x2F
+}
+
+public function encode_into(
+    bytes: [u8],
+    out: mutable [u8],
+    offset: usize where offset + encoded_length(bytes.len()) <= out.len(),
+) -> usize
+    ensures result == encoded_length(bytes.len())
+{
+    let n: usize = bytes.len()
+    let full: usize = n / 3
+    var k: usize = 0
+    loop
+        decreases full - k
+    {
+        if k >= full { break }
+        let b0: u8 = bytes[3 * k]
+        let b1: u8 = bytes[3 * k + 1]
+        let b2: u8 = bytes[3 * k + 2]
+        out[offset + 4 * k] = b64_char(b0 >> 2)
+        out[offset + 4 * k + 1] = b64_char(((b0 & 0x03) << 4) | (b1 >> 4))
+        out[offset + 4 * k + 2] = b64_char(((b1 & 0x0F) << 2) | (b2 >> 6))
+        out[offset + 4 * k + 3] = b64_char(b2 & 0x3F)
+        k = k + 1
+    }
+    let rem: usize = n - full * 3
+    if rem != 0 {
+        let o: usize = offset + 4 * full
+        let b0: u8 = bytes[3 * full]
+        out[o] = b64_char(b0 >> 2)
+        if rem == 1 {
+            out[o + 1] = b64_char((b0 & 0x03) << 4)
+            out[o + 2] = 0x3D
+            out[o + 3] = 0x3D
+        } else {
+            let b1: u8 = bytes[3 * full + 1]
+            out[o + 1] = b64_char(((b0 & 0x03) << 4) | (b1 >> 4))
+            out[o + 2] = b64_char((b1 & 0x0F) << 2)
+            out[o + 3] = 0x3D
+        }
+    }
+    return encoded_length(n)
+}
+
+
+public type Base64Error {
+    case malformed_length
+    case invalid_char
+    case invalid_padding
+}
+
+function b64_val(c: u8) -> u8
+    with {err: Base64Error}
+    ensures result < 64
+{
+    if c >= 0x41 && c <= 0x5A { return c - 0x41 }
+    if c >= 0x61 && c <= 0x7A { return c - 0x61 + 26 }
+    if c >= 0x30 && c <= 0x39 { return c - 0x30 + 52 }
+    if c == 0x2B { return 62 }
+    if c == 0x2F { return 63 }
+    raise Base64Error.invalid_char
+}
+
+public function decode(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: Base64Error}
+{
+    let bytes: [u8] = s.bytes()
+    if bytes.len() % 4 != 0 { raise Base64Error.malformed_length }
+    var out: [u8] = Array_u8.alloc(allocator, decoded_length_upper_bound(bytes.len()))?
+    let written: usize = decode_into(s, mutable out, 0)?
+    return out[..written]
+}
+
+public function decode_into(
+    s: String where s.len() % 4 == 0,
+    out: mutable [u8],
+    offset: usize where offset + decoded_length_upper_bound(s.len()) <= out.len(),
+) -> usize
+    with {err: Base64Error}
+    ensures result <= decoded_length_upper_bound(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let quads: usize = bytes.len() / 4
+    var written: usize = 0
+    var k: usize = 0
+    loop
+        decreases quads - k
+    {
+        if k >= quads { break }
+        let c0: u8 = bytes[4 * k]
+        let c1: u8 = bytes[4 * k + 1]
+        let c2: u8 = bytes[4 * k + 2]
+        let c3: u8 = bytes[4 * k + 3]
+        let v0: u8 = b64_val(c0)?
+        let v1: u8 = b64_val(c1)?
+        out[offset + 3 * k] = (v0 << 2) | (v1 >> 4)
+        written = written + 1
+        if c2 == 0x3D || c3 == 0x3D {
+            if k + 1 != quads { raise Base64Error.invalid_padding }
+            if c2 == 0x3D {
+                if c3 != 0x3D { raise Base64Error.invalid_padding }
+            } else {
+                let v2: u8 = b64_val(c2)?
+                out[offset + 3 * k + 1] = (v1 << 4) | (v2 >> 2)
+                written = written + 1
+            }
+        } else {
+            let v2: u8 = b64_val(c2)?
+            let v3: u8 = b64_val(c3)?
+            out[offset + 3 * k + 1] = (v1 << 4) | (v2 >> 2)
+            out[offset + 3 * k + 2] = (v2 << 6) | v3
+            written = written + 2
+        }
+        k = k + 1
+    }
+    return written
+}

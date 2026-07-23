@@ -1,0 +1,391 @@
+
+module std.text.str.atof
+
+import std.math.scalar
+
+public type AtofError {
+    case invalid_input
+}
+
+type DecState {
+    nd: usize
+    dp: i64
+    trunc: bool
+}
+
+type FloatFmt {
+    mantbits: i64
+    expbits: i64
+}
+
+function fmt_f64() -> FloatFmt {
+    return FloatFmt { mantbits: 52, expbits: 11 }
+}
+
+function fmt_f32() -> FloatFmt {
+    return FloatFmt { mantbits: 23, expbits: 8 }
+}
+
+function scratch_digits() -> usize {
+    return 800
+}
+
+function dget(digits: [u8], i: usize) -> u64 {
+    if i < digits.len() { return digits[i] as u64 }
+    return 0
+}
+
+function dset(digits: mutable [u8], i: usize, v: u64) -> () {
+    if i < digits.len() { digits[i] = v as u8 wrapping }
+}
+
+function trim(st: mutable DecState, digits: [u8]) -> () {
+    loop
+        decreases st.nd
+    {
+        if st.nd == 0 { break }
+        if dget(digits, st.nd - 1) != 0 { break }
+        st.nd = st.nd - 1
+    }
+}
+
+function right_shift1(st: mutable DecState, digits: mutable [u8]) -> () {
+    var r: usize = 0
+    var n: u64 = 0
+    var fuel: usize = st.nd + 2
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if n >= 2 { break }
+        if r >= st.nd {
+            if n == 0 {
+                st.nd = 0
+                st.dp = 0
+                return
+            }
+            n = n *% 10
+            r = r + 1
+        } else {
+            n = n *% 10 +% dget(digits, r)
+            r = r + 1
+        }
+    }
+    st.dp = st.dp -% ((r as i64) -% 1)
+    var w: usize = 0
+    var fuel2: usize = st.nd + 1
+    loop
+        decreases fuel2
+    {
+        if fuel2 == 0 { break }
+        fuel2 = fuel2 - 1
+        if r >= st.nd { break }
+        let c: u64 = dget(digits, r)
+        let dig: u64 = n >> 1
+        n = (n & 1) *% 10 +% c
+        dset(mutable digits, w, dig)
+        w = w + 1
+        r = r + 1
+    }
+    var fuel3: usize = 8
+    loop
+        decreases fuel3
+    {
+        if fuel3 == 0 { break }
+        fuel3 = fuel3 - 1
+        if n == 0 { break }
+        let dig: u64 = n >> 1
+        n = (n & 1) *% 10
+        if w < scratch_digits() {
+            dset(mutable digits, w, dig)
+            w = w + 1
+        } else if dig > 0 {
+            st.trunc = true
+        }
+    }
+    st.nd = w
+    trim(mutable st, digits)
+}
+
+function left_shift1(st: mutable DecState, digits: mutable [u8]) -> () {
+    var delta: usize = 0
+    if st.nd > 0 && dget(digits, 0) >= 5 { delta = 1 }
+    var r: i64 = (st.nd as i64 wrapping) -% 1
+    var n: u64 = 0
+    var fuel: usize = st.nd + 1
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if r < 0 { break }
+        n = n +% (dget(digits, r as usize) << 1)
+        let quo: u64 = n / 10
+        let rem: u64 = n -% quo *% 10
+        let w: usize = (r as usize) + delta
+        if w < scratch_digits() {
+            dset(mutable digits, w, rem)
+        } else if rem > 0 {
+            st.trunc = true
+        }
+        n = quo
+        r = r -% 1
+    }
+    if delta == 1 {
+        dset(mutable digits, 0, n -% (n / 10) *% 10)
+    }
+    st.nd = st.nd + delta
+    if st.nd > scratch_digits() { st.nd = scratch_digits() }
+    st.dp = st.dp +% (delta as i64)
+    trim(mutable st, digits)
+}
+
+function should_round_up(st: DecState, digits: [u8], p: i64) -> bool {
+    if p < 0 { return false }
+    let pu: usize = p as usize
+    if pu >= st.nd { return false }
+    if dget(digits, pu) == 5 && pu + 1 == st.nd {
+        if st.trunc { return true }
+        if pu == 0 { return false }
+        return dget(digits, pu - 1) % 2 != 0
+    }
+    return dget(digits, pu) >= 5
+}
+
+function rounded_integer(st: DecState, digits: [u8]) -> u64 {
+    if st.dp < 0 { return 0 }
+    if st.dp > 20 { return 0 }
+    let dpu: usize = st.dp as usize
+    var n: u64 = 0
+    var i: usize = 0
+    loop
+        decreases dpu - i
+    {
+        if i >= dpu { break }
+        var dig: u64 = 0
+        if i < st.nd { dig = dget(digits, i) }
+        n = n *% 10 +% dig
+        i = i + 1
+    }
+    if should_round_up(st, digits, st.dp) { n = n +% 1 }
+    return n
+}
+
+function sign_bits(fmt: FloatFmt, neg: bool) -> u64 {
+    if neg {
+        let one: u64 = 1
+        return one << ((fmt.mantbits + fmt.expbits) as u64)
+    }
+    return 0
+}
+
+function inf_bits(fmt: FloatFmt, neg: bool) -> u64 {
+    let one: u64 = 1
+    let exp_field_mask: u64 = (one << (fmt.expbits as u64)) -% 1
+    return sign_bits(fmt, neg) | (exp_field_mask << (fmt.mantbits as u64))
+}
+
+function nan_bits(fmt: FloatFmt) -> u64 {
+    let one: u64 = 1
+    let exp_field_mask: u64 = (one << (fmt.expbits as u64)) -% 1
+    return (exp_field_mask << (fmt.mantbits as u64)) | (one << ((fmt.mantbits - 1) as u64))
+}
+
+function float_bits(st: mutable DecState, digits: mutable [u8], neg: bool, fmt: FloatFmt) -> u64 {
+    let one: u64 = 1
+    let mantbits_u: u64 = fmt.mantbits as u64
+    let expbits_u: u64 = fmt.expbits as u64
+    let implicit: u64 = one << mantbits_u
+    let mant_overflow: u64 = one << (mantbits_u + 1)
+    let mant_mask: u64 = implicit -% 1
+    let exp_field_mask: u64 = (one << expbits_u) -% 1
+    let bias_pow: u64 = one << (expbits_u - 1)
+    let bias: i64 = (bias_pow as i64) -% 1
+    let minexp: i64 = 1 -% bias
+    let maxbiased: i64 = exp_field_mask as i64
+
+    if st.nd == 0 { return sign_bits(fmt, neg) }
+    if st.dp > 310 { return inf_bits(fmt, neg) }
+    if st.dp < -330 { return sign_bits(fmt, neg) }
+    var exp: i64 = 0
+    var fuel: usize = 1400
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if st.dp <= 0 { break }
+        right_shift1(mutable st, mutable digits)
+        exp = exp +% 1
+    }
+    fuel = 1400
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if st.nd == 0 { break }
+        if st.dp > 0 { break }
+        if st.dp == 0 && dget(digits, 0) >= 5 { break }
+        left_shift1(mutable st, mutable digits)
+        exp = exp -% 1
+    }
+    if st.nd == 0 { return sign_bits(fmt, neg) }
+    exp = exp -% 1
+    if exp < minexp {
+        var need: i64 = minexp -% exp
+        if need < 0 { need = 0 }
+        if need > 4000 { need = 4000 }
+        let need_u: usize = need as usize
+        var k: usize = 0
+        loop
+            decreases need_u - k
+        {
+            if k >= need_u { break }
+            right_shift1(mutable st, mutable digits)
+            k = k + 1
+        }
+        exp = exp +% need
+    }
+    if exp +% bias >= maxbiased { return inf_bits(fmt, neg) }
+    let shift_count: usize = (fmt.mantbits + 1) as usize
+    var k2: usize = 0
+    loop
+        decreases shift_count - k2
+    {
+        if k2 >= shift_count { break }
+        left_shift1(mutable st, mutable digits)
+        k2 = k2 + 1
+    }
+    var mant: u64 = rounded_integer(st, digits)
+    if mant == mant_overflow {
+        mant = mant >> 1
+        exp = exp +% 1
+        if exp +% bias >= maxbiased { return inf_bits(fmt, neg) }
+    }
+    if (mant & implicit) == 0 { exp = 0 -% bias }
+    let ebits: u64 = ((exp +% bias) as u64 wrapping) & exp_field_mask
+    return (mant & mant_mask) | (ebits << mantbits_u) | sign_bits(fmt, neg)
+}
+
+function ascii_lower(b: u8) -> u8 {
+    if b >= 65 && b <= 90 { return b + 32 }
+    return b
+}
+
+function matches_keyword(bytes: [u8], start: usize, word: String) -> bool {
+    let wb: [u8] = word.bytes()
+    if bytes.len() - start != wb.len() { return false }
+    var i: usize = 0
+    loop
+        decreases wb.len() - i
+    {
+        if i >= wb.len() { break }
+        if ascii_lower(bytes[start + i]) != wb[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+function parse_decimal(bytes: [u8], start: usize, st: mutable DecState, digits: mutable [u8]) -> ()
+    with {err: atof.AtofError}
+{
+    var i: usize = start
+    let n: usize = bytes.len()
+    var saw_dot: bool = false
+    var saw_digits: bool = false
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let c: u8 = bytes[i]
+        if c == 46 {
+            if saw_dot { raise AtofError.invalid_input }
+            saw_dot = true
+            st.dp = st.nd as i64 wrapping
+            i = i + 1
+            continue
+        }
+        if c >= 48 && c <= 57 {
+            saw_digits = true
+            if c == 48 && st.nd == 0 {
+                st.dp = st.dp -% 1
+                i = i + 1
+                continue
+            }
+            if st.nd < scratch_digits() {
+                dset(mutable digits, st.nd, (c - 48) as u64)
+                st.nd = st.nd + 1
+            } else if c != 48 {
+                st.trunc = true
+            }
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if !saw_digits { raise AtofError.invalid_input }
+    if !saw_dot { st.dp = st.nd as i64 wrapping }
+    if i < n && (bytes[i] == 101 || bytes[i] == 69) {
+        i = i + 1
+        var esign: i64 = 1
+        if i < n && bytes[i] == 43 { i = i + 1 }
+        else if i < n && bytes[i] == 45 {
+            esign = 0 -% 1
+            i = i + 1
+        }
+        if i >= n { raise AtofError.invalid_input }
+        if bytes[i] < 48 || bytes[i] > 57 { raise AtofError.invalid_input }
+        var e: i64 = 0
+        loop
+            decreases n - i
+        {
+            if i >= n { break }
+            let c: u8 = bytes[i]
+            if c < 48 || c > 57 { break }
+            if e < 10000 { e = e *% 10 +% ((c - 48) as i64) }
+            i = i + 1
+        }
+        st.dp = st.dp +% (esign *% e)
+    }
+    if i != n { raise AtofError.invalid_input }
+}
+
+function parse_to_bits(bytes: [u8], digits: mutable [u8], fmt: FloatFmt) -> u64
+    with {err: atof.AtofError}
+{
+    let n: usize = bytes.len()
+    if n == 0 { raise AtofError.invalid_input }
+    if digits.len() < scratch_digits() { raise AtofError.invalid_input }
+    var neg: bool = false
+    var start: usize = 0
+    if bytes[0] == 43 { start = 1 }
+    else if bytes[0] == 45 {
+        neg = true
+        start = 1
+    }
+    if start >= n { raise AtofError.invalid_input }
+    if matches_keyword(bytes, start, "inf") || matches_keyword(bytes, start, "infinity") {
+        return inf_bits(fmt, neg)
+    }
+    if matches_keyword(bytes, start, "nan") {
+        return nan_bits(fmt)
+    }
+    var st: DecState = DecState { nd: 0, dp: 0, trunc: false }
+    parse_decimal(bytes, start, mutable st, mutable digits)?
+    trim(mutable st, digits)
+    return float_bits(mutable st, mutable digits, neg, fmt)
+}
+
+public function parse_with_scratch(bytes: [u8], digits: mutable [u8]) -> f64
+    with {err: atof.AtofError}
+{
+    return scalar.f64_from_bits(parse_to_bits(bytes, mutable digits, fmt_f64())?)
+}
+
+public function parse_with_scratch_f32(bytes: [u8], digits: mutable [u8]) -> f32
+    with {err: atof.AtofError}
+{
+    return scalar.f32_from_bits(parse_to_bits(bytes, mutable digits, fmt_f32())? as u32)
+}

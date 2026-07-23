@@ -1,0 +1,252 @@
+
+module std.os.process.spawn
+
+import std.mem.alloc
+import std.os.raw
+import std.text.string
+import std.collections.vec
+import local.process
+import local.child.child
+import local.spawn.posix as spawn_posix
+import local.spawn.error as spawn_error
+import local.spawn.quote
+import local.spawn.envblock
+import local.caps.caps
+
+spec std.collections.vec.Vec(child.EnvPair)
+
+function create_process_w(
+    app_name: u64,
+    cmd_line: u64,
+    proc_attrs: u64,
+    thread_attrs: u64,
+    inherit_handles: i32,
+    creation_flags: u64,
+    environment: u64,
+    current_dir: u64,
+    startup_info: u64,
+    proc_info: u64,
+) -> i32
+    extern "CreateProcessW" from "kernel32.dll"
+
+function multi_byte_to_wide_char(
+    code_page: u64,
+    flags: u64,
+    multi_str: u64,
+    multi_len: i32,
+    wide_str: u64,
+    wide_len_: i32,
+) -> i32
+    extern "MultiByteToWideChar" from "kernel32.dll"
+
+function close_handle(handle: u64) -> i32
+    extern "CloseHandle" from "kernel32.dll"
+
+
+public function allowing(p: Subprocess, allowlist: [String]) -> Subprocess
+    with {p}
+    extern "__edda_subprocess_allowing"
+
+public function scoped_to(p: Subprocess, dir: String) -> Subprocess
+    with {p}
+    extern "__edda_subprocess_scoped_to"
+
+public function check(p: Subprocess, exe: String, cwd: String) -> i32
+    with {p}
+    extern "__edda_subprocess_check"
+
+
+public function zero_bytes(base: u64, n: u64) -> () {
+    var i: u64 = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        raw.store_u8(base +% i, 0)
+        i = i +% 1
+    }
+}
+
+function joined_command(exe: String, args: [String], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let qexe: String = quote.win_quoted(exe, allocator)?
+    var qargs: [String] = allocator.alloc_array(String, args.len())?
+    var q: usize = 0
+    loop
+        decreases args.len() - q
+    {
+        if q >= args.len() { break }
+        qargs[q] = quote.win_quoted(args[q], allocator)?
+        q = q + 1
+    }
+    var total: usize = qexe.bytes().len()
+    var i: usize = 0
+    loop
+        decreases qargs.len() - i
+    {
+        if i >= qargs.len() { break }
+        total = total + 1 + qargs[i].bytes().len()
+        i = i + 1
+    }
+    let buf: [u8] = allocator.alloc_array(u8, total + 1)?
+    var w: usize = 0
+    let eb: [u8] = qexe.bytes()
+    var k: usize = 0
+    loop
+        decreases eb.len() - k
+    {
+        if k >= eb.len() { break }
+        buf[w] = eb[k]
+        w = w + 1
+        k = k + 1
+    }
+    var j: usize = 0
+    loop
+        decreases qargs.len() - j
+    {
+        if j >= qargs.len() { break }
+        buf[w] = 0x20
+        w = w + 1
+        let ab: [u8] = qargs[j].bytes()
+        var m: usize = 0
+        loop
+            decreases ab.len() - m
+        {
+            if m >= ab.len() { break }
+            buf[w] = ab[m]
+            w = w + 1
+            m = m + 1
+        }
+        j = j + 1
+    }
+    buf[w] = 0
+    return string.from_owned_utf8(take buf)
+}
+
+public function utf8_to_wide(s: String, allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let sb: [u8] = s.bytes()
+    let cbuf: [u8] = allocator.alloc_array(u8, sb.len() + 1)?
+    var k: usize = 0
+    loop
+        decreases sb.len() - k
+    {
+        if k >= sb.len() { break }
+        cbuf[k] = sb[k]
+        k = k + 1
+    }
+    cbuf[sb.len()] = 0
+    let src: u64 = raw.slice_addr(cbuf)
+    let wlen: i32 = multi_byte_to_wide_char(65001, 0, src, -1, 0, 0)
+    if wlen <= 0 {
+        let empty: [u8] = allocator.alloc_array(u8, 2)?
+        raw.store_u16(raw.slice_addr(empty), 0)
+        return raw.slice_addr(empty)
+    }
+    let wbuf: [u8] = allocator.alloc_array(u8, (wlen as usize) * 2)?
+    let dst: u64 = raw.slice_addr(wbuf)
+    let _ = multi_byte_to_wide_char(65001, 0, src, -1, dst, wlen)
+    return dst
+}
+
+function spawn_windows(
+    bundle: take child.ChildSpec,
+    allocator: Allocator,
+) -> process.ChildHandle
+    with {allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let in_h = bundle.stdin_h
+    let out_h = bundle.stdout_h
+    let err_h = bundle.stderr_h
+    let fs_opt = bundle.fs_h
+    let env_opt = bundle.env_h
+    let exe: String = bundle.exe
+    let args: [String] = bundle.args
+    let cwd_w: u64 = match bundle.cwd {
+        case .some(let dir) => utf8_to_wide(dir, allocator)?
+        case .none => 0
+    }
+    let env_w: u64 = match env_opt {
+        case .some(let env) => if env.inherit {
+            envblock.build_env_block_merged_windows(Vec_EnvPair.as_slice(env.pairs), allocator)?
+        } else {
+            envblock.build_env_block_windows(Vec_EnvPair.as_slice(env.pairs), allocator)?
+        }
+        case .none => 0
+    }
+    let creation_flags: u64 = if env_w != 0 { 0x00000400 } else { 0 }
+
+    let h_in: u64 = match in_h {
+        case .some(let h) => caps.stdin_fd(take h)
+        case .none => caps.inherit_stdin()
+    }
+    let h_out: u64 = match out_h {
+        case .some(let h) => caps.stdout_fd(take h)
+        case .none => caps.inherit_stdout()
+    }
+    let h_err: u64 = match err_h {
+        case .some(let h) => caps.stderr_fd(take h)
+        case .none => caps.inherit_stderr()
+    }
+    match fs_opt {
+        case .some(let h) => { let _ = caps.rofs_fd(take h) }
+        case .none => ()
+    }
+
+    let cmd: String = joined_command(exe, args, allocator)?
+    let cmd_w: u64 = utf8_to_wide(cmd, allocator)?
+
+    let si: [u8] = allocator.alloc_array(u8, 104)?
+    let si_base: u64 = raw.slice_addr(si)
+    zero_bytes(si_base, 104)
+    raw.store_u32(si_base, 104)
+    raw.store_u32(si_base +% 60, 0x00000100)
+    raw.store_u64(si_base +% 80, h_in)
+    raw.store_u64(si_base +% 88, h_out)
+    raw.store_u64(si_base +% 96, h_err)
+
+    let pi: [u8] = allocator.alloc_array(u8, 24)?
+    let pi_base: u64 = raw.slice_addr(pi)
+    zero_bytes(pi_base, 24)
+
+    let ok: i32 = create_process_w(0, cmd_w, 0, 0, 1, creation_flags, env_w, cwd_w, si_base, pi_base)
+    if ok == 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "CreateProcessW failed")
+    }
+    let h_process: u64 = raw.load_u64(pi_base)
+    let h_thread: u64 = raw.load_u64(pi_base +% 8)
+    let _ = close_handle(h_thread)
+    return process.ChildHandle {
+        raw: h_process,
+        out_fd: process.no_capture_fd(),
+        err_fd: process.no_capture_fd(),
+    }
+}
+
+public function spawn(
+    p: Subprocess,
+    bundle: take child.ChildSpec,
+    allocator: Allocator,
+) -> process.ChildHandle
+    with {p, allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let exe: String = bundle.exe
+    let cwd: String = match bundle.cwd {
+        case .some(let dir) => dir
+        case .none => ""
+    }
+    let verdict: i32 = check(p, exe, cwd)
+    if verdict == -1 {
+        raise spawn_error.SpawnError.not_in_allowlist(exe: exe)
+    }
+    if verdict == -2 {
+        raise spawn_error.SpawnError.cwd_outside_scope(cwd: cwd)
+    }
+    comptime if target_has("windows") {
+        return spawn_windows(take bundle, allocator)?
+    } else {
+        return spawn_posix.spawn_posix(take bundle, allocator)?
+    }
+}

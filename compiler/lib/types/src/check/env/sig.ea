@@ -1,0 +1,152 @@
+
+module types.check.env.sig
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import syntax.ast.tree as ast_tree
+import hir.tree as hir_tree
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.pass.effect as effect_mod
+import types.effect.row as effect_row_mod
+
+
+derive eq, clone, debug for FnSig
+derive eq, clone, debug for ChkStability
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(symbol_mod.Symbol)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(FnSig)
+spec std.collections.hashmap.IntMap(def_mod.DefId)
+spec std.core.option.Option(def_mod.DefId)
+
+
+public type ChkStability {
+    case stable_
+    case unstable_
+    case unconstrained
+}
+
+
+public type FnSig {
+    name: symbol_mod.Symbol
+    params: Vec_TyId.Vec
+    param_names: Vec_Symbol.Vec
+    ret: ty_mod.TyId
+    effects: effect_mod.EffectRowId
+    refinements: Vec_RefinementClause.Vec
+    refinements_hir: Vec_HExpr.Vec
+    fn_type: ty_mod.TyId
+    effect_facts: effect_row_mod.EffectFacts
+    stability: ChkStability
+    has_by_ref_param: bool
+    leading_comptime_params: usize
+}
+
+
+public type MethodIndex {
+    by_key: IntMap_DefId.IntMap
+}
+
+
+function method_key(name_raw: u32, recv_raw: u32) -> i64 {
+    let hi = (name_raw as u64) << 32
+    let lo = recv_raw as u64
+    return (hi | lo) as i64 wrapping
+}
+
+
+public function build_method_index(
+    fn_signatures: Vec_FnSig.Vec,
+    allocator: Allocator,
+) -> MethodIndex
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var by_key = IntMap_DefId.new(allocator)?
+    let n = Vec_FnSig.len(fn_signatures)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let sig = Vec_FnSig.at(fn_signatures, i)
+        if Vec_TyId.len(sig.params) >= 1 as usize {
+            let p0 = Vec_TyId.at(sig.params, 0 as usize)
+            let key = method_key(sig.name.raw, p0.raw)
+            if !IntMap_DefId.contains(by_key, key) {
+                let _ = IntMap_DefId.insert(mutable by_key, key, def_mod.DefId { raw: i as u32 }, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return MethodIndex { by_key: by_key }
+}
+
+
+public function resolve_method_in_index(
+    index: MethodIndex,
+    receiver_ty: ty_mod.TyId,
+    name: symbol_mod.Symbol,
+) -> Option_DefId.Option {
+    if ty_mod.is_error(receiver_ty) {
+        return Option_DefId.none
+    }
+    if symbol_mod.is_empty(name) {
+        return Option_DefId.none
+    }
+    return IntMap_DefId.get(index.by_key, method_key(name.raw, receiver_ty.raw))
+}
+
+
+public function is_slice_ty(ty: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(ty) {
+        return false
+    }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .slice(_) => true
+        case _ => false
+    }
+}
+
+
+public function sym_is(interner: interner_mod.Interner, sym: symbol_mod.Symbol, target: String) -> bool
+    with {divergence}
+{
+    if (sym.raw as usize) >= interner_mod.slot_count(interner) {
+        return false
+    }
+    let bytes = interner_mod.lookup(interner, sym)
+    let tb = target.bytes()
+    let n = bytes.len()
+    if n != tb.len() {
+        return false
+    }
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        if bytes[i] != tb[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

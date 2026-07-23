@@ -1,0 +1,137 @@
+
+module ir.hlir.lower.term
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+
+import local.hlir.term as hlir_term_mod
+import local.hlir.id.region as hlir_region_mod
+
+import local.lir.term as lir_term_mod
+import local.lir.error as lir_error_mod
+import local.lir.id.region as lir_region_mod
+
+import local.hlir.lower.ids as lower_ids_mod
+
+
+spec std.collections.vec.Vec(hlir_term_mod.SwitchCase)
+spec std.collections.vec.Vec(lir_term_mod.LirSwitchCase)
+
+
+spec std.core.option.Option(hlir_region_mod.RegionId)
+spec std.core.option.Option(lir_region_mod.LirRegionId)
+
+
+public function lower_terminator(
+    t: hlir_term_mod.HlirTerminator,
+    allocator: Allocator,
+) -> lir_term_mod.LirTerminator
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let kind = lower_term_kind(t, allocator)?
+    return lir_term_mod.LirTerminator {
+        origin: t.origin,
+        kind: kind,
+    }
+}
+
+function lower_term_kind(
+    t: hlir_term_mod.HlirTerminator,
+    allocator: Allocator,
+) -> lir_term_mod.LirTermKind
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    return match t.kind {
+        case .goto_(let target, let args) => lir_term_mod.LirTermKind.jump(
+            target: lower_ids_mod.block_id_of(target),
+            args: lower_ids_mod.convert_value_id_vec(args, allocator)?,
+        )
+        case .branch(let cond, let true_, let true_args, let false_, let false_args) =>
+            lir_term_mod.LirTermKind.branch_if(
+                cond: lower_ids_mod.vreg_of_value(cond),
+                true_: lower_ids_mod.block_id_of(true_),
+                true_args: lower_ids_mod.convert_value_id_vec(true_args, allocator)?,
+                false_: lower_ids_mod.block_id_of(false_),
+                false_args: lower_ids_mod.convert_value_id_vec(false_args, allocator)?,
+            )
+        case .switch_(let discr, let targets) => lir_term_mod.LirTermKind.switch_(
+            discr: lower_ids_mod.vreg_of_value(discr),
+            targets: convert_switch_targets(targets, allocator)?,
+        )
+        case .return_(let values) => lir_term_mod.LirTermKind.return_(
+            values: lower_ids_mod.convert_value_id_vec(values, allocator)?,
+        )
+        case .unreachable_ => lir_term_mod.LirTermKind.unreachable_
+        case .raise_(let value, let unwind) => lir_term_mod.LirTermKind.raise_(
+            value: lower_ids_mod.vreg_of_value(value),
+            unwind: convert_unwind(unwind),
+        )
+        case .panic_(let message) => lir_term_mod.LirTermKind.panic_(
+            message: lower_ids_mod.vreg_of_value(message),
+        )
+        case .drop_(_, _, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "HlirTermKind.drop_ has no faithful LIR lowering yet: the destructor DefId has no Operand form (Operand is vreg | preg | imm, no fn-ref) and no fn-pointer TyId is reachable here to materialize it via constant_(fn_ref) into a typed vreg, and drop unwind has no LIR call-with-landing-pad terminator; not produced by MIR -> HLIR today",
+        )
+        case .coherence_enter(let body_entry, let exit) => lir_term_mod.LirTermKind.coherence_enter(
+            body_entry: lower_ids_mod.block_id_of(body_entry),
+            exit: lower_ids_mod.block_id_of(exit),
+        )
+        case .coherence_exit(let target) => lir_term_mod.LirTermKind.coherence_exit(
+            target: lower_ids_mod.block_id_of(target),
+        )
+    }
+}
+
+function convert_switch_targets(
+    targets: hlir_term_mod.SwitchTargets,
+    allocator: Allocator,
+) -> lir_term_mod.LirSwitchTargets
+    with {allocator, err: alloc.AllocError}
+{
+    uninit cases: Vec_LirSwitchCase.Vec
+    Vec_LirSwitchCase.new(init cases, allocator)?
+    let n = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_SwitchCase.at(targets.cases, i)
+        let lc = lir_term_mod.LirSwitchCase {
+            value: c.value,
+            target: lower_ids_mod.block_id_of(c.target),
+            args: lower_ids_mod.convert_value_id_vec(c.args, allocator)?,
+        }
+        Vec_LirSwitchCase.push(mutable cases, take lc, allocator)?
+        i += 1
+    }
+    return lir_term_mod.LirSwitchTargets {
+        cases: cases,
+        default: lower_ids_mod.block_id_of(targets.default),
+        default_args: lower_ids_mod.convert_value_id_vec(targets.default_args, allocator)?,
+    }
+}
+
+function convert_unwind(u: hlir_term_mod.UnwindAction) -> lir_term_mod.LirUnwindAction {
+    return match u {
+        case .continue_ => lir_term_mod.LirUnwindAction.continue_
+        case .unreachable_ => lir_term_mod.LirUnwindAction.unreachable_
+        case .cleanup(let target) => lir_term_mod.LirUnwindAction.cleanup(
+            target: lower_ids_mod.block_id_of(target),
+        )
+    }
+}
+
+
+public stable function convert_coherence_region(
+    src: Option_RegionId.Option,
+) -> Option_LirRegionId.Option {
+    return match src {
+        case .none => Option_LirRegionId.none
+        case .some(let r) => Option_LirRegionId.some(
+            value: lir_region_mod.LirRegionId { raw: r.raw },
+        )
+    }
+}

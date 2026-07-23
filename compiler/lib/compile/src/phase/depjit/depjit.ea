@@ -1,0 +1,243 @@
+
+module compile.phase.depjit.depjit
+
+import std.collections.vec
+import std.mem.alloc
+import cteval.builtin.target.reg.registry as cbi_registry_mod
+import hir.build.file as hir_file_mod
+import hir.def as def_mod
+import hir.item as hir_item
+import hir.tree as hir_tree
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import mir.file.store as mir_file_mod
+import resolve.ctx as resolve_ctx_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree
+import target.triple as triple_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import types.ty.interner as ty_interner_mod
+import local.instantiate.unroll.drive.drive as unroll_mod
+import local.phase.pipeline.lower as lower_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_file_mod.NodeKind)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(span_mod.Span)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(u32)
+
+
+public function copy_ast_files(
+    files: Vec_File.Vec,
+    allocator: Allocator,
+) -> Vec_File.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_File.Vec
+    Vec_File.new(init out, allocator)?
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        Vec_File.push(mutable out, take f, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+public function relower_dep_hir(
+    dep_ast: take Vec_File.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    dep_def_base: u32,
+    dep_decl_types: Vec_TypeOutput.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    interner: mutable interner_mod.Interner,
+    sym_alloc: Allocator,
+    scratch: Allocator,
+) -> Vec_HirFile.Vec
+    with {sym_alloc, scratch, divergence, err: alloc.AllocError}
+{
+    let raw = lower_mod.lower_to_hir(take dep_ast, output, dep_def_base, mutable interner, sym_alloc, scratch)?
+    let elided = unroll_mod.elide_comptime_if_files(
+        raw, dep_decl_types, ty_interner, effect_interner,
+        builtin_registry, triple, mutable interner, scratch,
+    )?
+    return elided.files
+}
+
+
+public function relower_one_dep_hir(
+    ast: take ast_file_mod.File,
+    output: resolve_ctx_mod.ResolveOutput,
+    dep_def_base: u32,
+    decl_type: take types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    builtin_registry: cbi_registry_mod.BuiltinRegistry,
+    triple: triple_mod.TargetTriple,
+    interner: mutable interner_mod.Interner,
+    sym_alloc: Allocator,
+    scratch: Allocator,
+) -> hir_file_mod.HirFile
+    with {sym_alloc, scratch, divergence, err: alloc.AllocError}
+{
+    uninit one_ast: Vec_File.Vec
+    Vec_File.new(init one_ast, scratch)?
+    Vec_File.push(mutable one_ast, take ast, scratch)?
+    uninit one_decl: Vec_TypeOutput.Vec
+    Vec_TypeOutput.new(init one_decl, scratch)?
+    Vec_TypeOutput.push(mutable one_decl, take decl_type, scratch)?
+    var files = relower_dep_hir(
+        take one_ast, output, dep_def_base, one_decl,
+        ty_interner, effect_interner, builtin_registry, triple,
+        mutable interner, sym_alloc, scratch,
+    )?
+    return Vec_HirFile.remove(mutable files, 0 as usize)
+}
+
+
+public function distill_mir_hir(
+    files: mutable Vec_MirFile.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nf = Vec_MirFile.len(files)
+    var i: usize = 0
+    loop decreases (nf - i) {
+        if i >= nf { break }
+        var mf = Vec_MirFile.at(files, i)
+        let nh = Vec_HirFile.len(mf.hir_files)
+        var j: usize = 1
+        loop decreases (nh - j) {
+            if j >= nh { break }
+            let hf = Vec_HirFile.at(mf.hir_files, j)
+            let slim = distill_hir_file(hf, allocator)?
+            Vec_HirFile.set_at(mutable mf.hir_files, j, take slim)
+            j = j + 1
+        }
+        Vec_MirFile.set_at(mutable files, i, take mf)
+        i = i + 1
+    }
+}
+
+
+function distill_hir_file(
+    hf: hir_file_mod.HirFile,
+    allocator: Allocator,
+) -> hir_file_mod.HirFile
+    with {allocator, err: alloc.AllocError}
+{
+    let nspan = Vec_Span.len(hf.node_spans)
+    uninit spans: Vec_Span.Vec
+    Vec_Span.with_capacity(init spans, nspan, allocator)?
+    var si: usize = 0
+    loop decreases (nspan - si) {
+        if si >= nspan { break }
+        Vec_Span.push(mutable spans, Vec_Span.at(hf.node_spans, si), allocator)?
+        si = si + 1
+    }
+    uninit items: Vec_HItem.Vec
+    Vec_HItem.new(init items, allocator)?
+    let ni = Vec_HItem.len(hf.items)
+    var ii: usize = 0
+    loop decreases (ni - ii) {
+        if ii >= ni { break }
+        let item = Vec_HItem.at(hf.items, ii)
+        let kind = match item.kind {
+            case .function_extern(let sig_box, let extern_name, let extern_span, let extern_dll) =>
+                hir_item.HItemKind.function_extern(sig: stub_sig_box(sig_box, allocator)?, extern_name: extern_name, extern_span: extern_span, extern_dll: extern_dll)
+            case _ => hir_item.HItemKind.module_decl
+        }
+        let slim_item = hir_item.HItem {
+            node_id: item.node_id,
+            def_id: item.def_id,
+            ast_item: item.ast_item,
+            kind: take kind,
+            has_comptime: item.has_comptime,
+        }
+        Vec_HItem.push(mutable items, take slim_item, allocator)?
+        ii = ii + 1
+    }
+    uninit kinds: Vec_NodeKind.Vec
+    Vec_NodeKind.new(init kinds, allocator)?
+    uninit mnames: Vec_Symbol.Vec
+    Vec_Symbol.new(init mnames, allocator)?
+    uninit mrecv: Vec_u32.Vec
+    Vec_u32.new(init mrecv, allocator)?
+    uninit fhint: Vec_u32.Vec
+    Vec_u32.new(init fhint, allocator)?
+    uninit istry: Vec_u32.Vec
+    Vec_u32.new(init istry, allocator)?
+    return hir_file_mod.HirFile {
+        source: hf.source,
+        items: take items,
+        node_spans: take spans,
+        node_kinds: take kinds,
+        node_method_names: take mnames,
+        node_method_recv: take mrecv,
+        node_for_hint: take fhint,
+        node_is_try: take istry,
+        next_node_id: hf.next_node_id,
+        next_def_id: hf.next_def_id,
+        saw_comptime: hf.saw_comptime,
+    }
+}
+
+
+function stub_sig_box(
+    sig_box: Box_HFnSignature.Box,
+    allocator: Allocator,
+) -> Box_HFnSignature.Box
+    with {allocator, err: alloc.AllocError}
+{
+    let sig = Box_HFnSignature.get(sig_box)
+    uninit og: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init og, allocator)?
+    uninit gs: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init gs, allocator)?
+    uninit cpd: Vec_DefId.Vec
+    Vec_DefId.new(init cpd, allocator)?
+    uninit ps: Vec_HParam.Vec
+    Vec_HParam.new(init ps, allocator)?
+    uninit rcs: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init rcs, allocator)?
+    uninit rhs: Vec_HExpr.Vec
+    Vec_HExpr.new(init rhs, allocator)?
+    let stub = hir_item.HFnSignature {
+        name: sig.name,
+        stability: sig.stability,
+        visibility: sig.visibility,
+        refinement_stable: sig.refinement_stable,
+        outbound_generics: take og,
+        generics: take gs,
+        comptime_param_defs: take cpd,
+        params: take ps,
+        return_mode: sig.return_mode,
+        return_ty: sig.return_ty,
+        effects: sig.effects,
+        refinements: take rcs,
+        refinements_hir: take rhs,
+    }
+    return Box_HFnSignature.new(take stub, allocator)?
+}

@@ -1,0 +1,239 @@
+
+module syntax.parse.attr
+
+import std.mem.alloc
+import std.collections.vec
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.attr as attr_ast
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+
+spec std.collections.vec.Vec(attr_ast.Attribute)
+spec std.collections.vec.Vec(attr_ast.AttrArg)
+spec std.mem.alloc.Box(attr_ast.AttrArg)
+
+
+public function parse_item_attributes(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (Vec_Attribute.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit attrs: Vec_Attribute.Vec
+    Vec_Attribute.new(init attrs, allocator)?
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .at => ()
+            case _ => break
+        }
+        let attr_r = parse_attribute(tokens, p, mutable diags, allocator)?
+        Vec_Attribute.push(mutable attrs, attr_r.0, allocator)?
+        p = attr_r.1
+    }
+    return (attrs, p)
+}
+
+public function parse_attribute(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (attr_ast.Attribute, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let at_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            if !symbol.is_attribute_whitelisted(sym) {
+                emit_unknown_attribute(mutable diags, id_span, allocator)?
+            }
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected attribute name after `@`", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: at_span }
+        }
+    }
+    uninit args: Vec_AttrArg.Vec
+    Vec_AttrArg.new(init args, allocator)?
+    var end_span: span_mod.Span = name.span
+    match util_mod.peek(tokens, p) {
+        case .l_paren => {
+            let args_r = parse_attr_arg_list(tokens, p + 1, mutable diags, allocator)?
+            args = args_r.0
+            p = args_r.1
+            end_span = util_mod.span_at(tokens, p - 1)
+        }
+        case _ => ()
+    }
+    let full_span = merge_spans(at_span, end_span)
+    let attr = attr_ast.Attribute {
+        span: full_span,
+        name: name,
+        args: args,
+    }
+    return (attr, p)
+}
+
+
+function parse_attr_arg_list(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (Vec_AttrArg.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_AttrArg.Vec
+    Vec_AttrArg.new(init args, allocator)?
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1; return (args, p) }
+        case .eof => { return (args, p) }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let arg_r = parse_attr_arg(tokens, p, mutable diags, allocator)?
+        Vec_AttrArg.push(mutable args, arg_r.0, allocator)?
+        p = arg_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` to close attribute arguments", allocator)?
+        }
+    }
+    return (args, p)
+}
+
+function parse_attr_arg(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (attr_ast.AttrArg, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    return match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => parse_ident_or_named(tokens, pos, sym, span, mutable diags, allocator)?
+        case .str(_) => parse_lit_arg(tokens, pos, mutable diags, allocator)?
+        case .int(_, _) => parse_lit_arg(tokens, pos, mutable diags, allocator)?
+        case .kw_true => parse_lit_arg(tokens, pos, mutable diags, allocator)?
+        case .kw_false => parse_lit_arg(tokens, pos, mutable diags, allocator)?
+        case _ => {
+            util_mod.emit_error(mutable diags, span, "expected attribute argument — identifier, literal, or `name: value`", allocator)?
+            let dummy_id = ident_mod.Ident { name: symbol.empty(), span: span }
+            (attr_ast.AttrArg.ident(dummy_id), pos + 1)
+        }
+    }
+}
+
+function parse_ident_or_named(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    sym: symbol.Symbol,
+    span: span_mod.Span,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (attr_ast.AttrArg, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let ident = ident_mod.Ident { name: sym, span: span }
+    return match util_mod.peek_at(tokens, pos, 1) {
+        case .colon => parse_named_arg(tokens, ident, span, pos + 2, mutable diags, allocator)?
+        case _ => (attr_ast.AttrArg.ident(ident), pos + 1)
+    }
+}
+
+function parse_named_arg(
+    tokens: [lexed_mod.Lexed],
+    key: ident_mod.Ident,
+    key_span: span_mod.Span,
+    value_pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (attr_ast.AttrArg, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let value_r = parse_attr_arg(tokens, value_pos, mutable diags, allocator)?
+    let value_kind = value_r.0
+    let value_span = match value_kind {
+        case .ident(let id) => id.span
+        case .lit(let s, _) => s
+        case .named(let s, _, _) => {
+            util_mod.emit_error(mutable diags, s, "nested named attribute arguments are not admitted — named args must wrap an identifier or a literal", allocator)?
+            s
+        }
+    }
+    let full_span = merge_spans(key_span, value_span)
+    let value_box = Box_AttrArg.new(value_kind, allocator)?
+    let arg = attr_ast.AttrArg.named(span: full_span, key: key, value: value_box)
+    return (arg, value_r.1)
+}
+
+function parse_lit_arg(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (attr_ast.AttrArg, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    return match util_mod.peek(tokens, pos) {
+        case .str(let sym) => (attr_ast.AttrArg.lit(span: span, value: attr_ast.AttrLit.str(sym: sym)), pos + 1)
+        case .int(let value, let base) => (attr_ast.AttrArg.lit(span: span, value: attr_ast.AttrLit.int(value: value, base: base)), pos + 1)
+        case .kw_true => (attr_ast.AttrArg.lit(span: span, value: attr_ast.AttrLit.bool(value: true)), pos + 1)
+        case .kw_false => (attr_ast.AttrArg.lit(span: span, value: attr_ast.AttrLit.bool(value: false)), pos + 1)
+        case _ => {
+            util_mod.emit_error(mutable diags, span, "expected literal attribute argument (string / integer / bool)", allocator)?
+            let dummy = attr_ast.AttrArg.lit(span: span, value: attr_ast.AttrLit.bool(value: false))
+            (dummy, pos + 1)
+        }
+    }
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}
+
+
+function emit_unknown_attribute(
+    diags: mutable diags_mod.Diagnostics,
+    span: span_mod.Span,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(code.unknown_attribute(), span, "unknown attribute — the `@`-namespace is a closed whitelist (`@layout @align @repr @abi @unverified @trust @deprecated @property @target_requires`); invariants go in `where`/`requires`/`ensures`, patterns in a `spec`, stability in the `stable`/`unstable` keywords")
+    diags_mod.emit(mutable diags, take d, allocator)?
+}

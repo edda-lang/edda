@@ -1,0 +1,91 @@
+
+module compile.check.runes.surface
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import source.map as source_map_mod
+import specs.address.contract as contract_mod
+import specs.address.hash as shash_mod
+import specs.gen.monomorphise.qualify.qualify as qualify_mod
+import syntax.ast.attr as attr_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import local.check.runes.util as util_mod
+import local.check.stablecontract.stablecontract as stablecontract_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(attr_mod.Attribute)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+
+
+public function hash_surface(
+    asts: Vec_File.Vec,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit lines: Vec_String.Vec
+    Vec_String.new(init lines, allocator)?
+    let n = Vec_File.len(asts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_surface_lines(Vec_File.at(asts, i), map, interner, mutable lines, allocator)?
+        i = i + 1
+    }
+    util_mod.sort_strings(mutable lines)
+    return util_mod.hex_hash_of(util_mod.join_lines(lines, allocator)?, allocator)?
+}
+
+
+function collect_surface_lines(
+    file: ast_file_mod.File,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    lines: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let segs = qualify_mod.invoker_module_segments(file.items, allocator)?
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .function_(let decl_box) => {
+                let decl = Box_FnDecl.get(decl_box)
+                if is_stable_fn(decl) {
+                    let qname = stablecontract_mod.qualified_name_of(segs, decl.name.name, interner, allocator)?
+                    let h = contract_mod.contract_hash(qname, decl, item.attributes, map, allocator)?
+                    let hex = shash_mod.to_hex(h, allocator)?
+                    let a = string.concat(qname, " ", allocator)?
+                    let line = string.concat(a, hex, allocator)?
+                    Vec_String.push(mutable lines, take line, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function is_stable_fn(decl: ast_item_mod.FnDecl) -> bool {
+    return match decl.stability {
+        case .some(let st) => match st {
+            case .stable_(let _since) => true
+            case .unstable_ => false
+        }
+        case .none => false
+    }
+}

@@ -1,0 +1,78 @@
+module debug.codeview.lines.lines
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import object.coff as coff_mod
+import debug.codeview.cursor.cursor as cursor_mod
+import debug.model as model_mod
+import debug.codeview.reloc.reloc as reloc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(model_mod.LineEntry)
+spec std.collections.vec.Vec(LineBlock)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+spec std.core.option.Option(u32)
+
+
+public type LineBlock {
+    symbol_index: u32
+    file_id: u32
+    entries: Vec_LineEntry.Vec
+}
+
+
+public function statement_bit() -> u32 {
+    return 0x80000000 as u32
+}
+
+
+public function parse_lines(
+    bytes: Vec_u8.Vec,
+    relocs: Vec_CoffRelocation.Vec,
+    payload_lo: usize,
+    payload_hi: usize,
+    allocator: Allocator,
+) -> LineBlock
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    let symbol_index = match reloc_mod.symbol_for_range(relocs, payload_lo, payload_hi) {
+        case .some(let s) => s
+        case .none => 0xffffffff as u32
+    }
+
+    var cur = cursor_mod.Cursor { pos: payload_lo }
+    let _secrel = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _section = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let _flags = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let _code_len = cursor_mod.read_u32_le(bytes, mutable cur)?
+
+    let file_id = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let n_lines = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _block_len = cursor_mod.read_u32_le(bytes, mutable cur)?
+
+    uninit entries: Vec_LineEntry.Vec
+    Vec_LineEntry.new(init entries, allocator)?
+
+    let count = n_lines as usize
+    var i: usize = 0
+    loop decreases count - i {
+        if i >= count { break }
+        if cur.pos >= payload_hi { break }
+        let code_offset = cursor_mod.read_u32_le(bytes, mutable cur)?
+        let line_flags = cursor_mod.read_u32_le(bytes, mutable cur)?
+        let line = line_flags & (0xffffff as u32)
+        let is_statement = (line_flags & statement_bit()) != (0 as u32)
+        Vec_LineEntry.push(
+            mutable entries,
+            model_mod.LineEntry { code_offset: code_offset, line: line, is_statement: is_statement },
+            allocator,
+        )?
+        i += 1
+    }
+
+    return LineBlock { symbol_index: symbol_index, file_id: file_id, entries: entries }
+}

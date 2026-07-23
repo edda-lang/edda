@@ -1,0 +1,547 @@
+
+module syntax.parse.item.generic.generic
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.item as item_ast
+import syntax.ast.ops as ops_mod
+import syntax.ast.literal as literal_mod
+import local.parse.util as util_mod
+import local.parse.ty.core.core as ty_mod
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(item_ast.GenericParam)
+spec std.collections.vec.Vec(item_ast.AdmitsConstraint)
+spec std.collections.vec.Vec(tree_mod.RefinementClause)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(item_ast.Item)
+spec std.core.option.Option(tree_mod.Ty)
+spec std.core.option.Option(item_ast.Stability)
+spec std.core.option.Option(ident_mod.Ident)
+
+derive eq, clone, debug for SpecDispatch
+
+public type SpecDispatch {
+    case declaration(decl: item_ast.Spec)
+    case invocation(inv: item_ast.SpecInvocation)
+}
+
+
+public function parse_spec_or_invocation(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    parse_item_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence}, depth: usize) -> (item_ast.Item, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (SpecDispatch, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    let path_r = parse_path(tokens, pos + 1, allocator)?
+    let p = path_r.1
+    match util_mod.peek(tokens, p) {
+        case .l_paren => ()
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `(` after spec name", allocator)?
+            let full_span = merge_spans(kw_span, path_r.0.span)
+            uninit args: Vec_Expr.Vec
+            Vec_Expr.new(init args, allocator)?
+            let inv = item_ast.SpecInvocation {
+                span: full_span,
+                path: path_r.0,
+                args: args,
+            }
+            return (SpecDispatch.invocation(inv: inv), p)
+        }
+    }
+    let is_decl = arglist_looks_like_declaration(tokens, p)
+    if is_decl {
+        let decl_r = parse_spec_declaration(tokens, kw_span, path_r.0, p, stability, visibility, mutable diags, allocator, parse_expr_fn, parse_item_fn, depth)?
+        return (SpecDispatch.declaration(decl: decl_r.0), decl_r.1)
+    }
+    let inv_r = parse_spec_invocation(tokens, kw_span, path_r.0, p, mutable diags, allocator, parse_expr_fn, depth)?
+    return (SpecDispatch.invocation(inv: inv_r.0), inv_r.1)
+}
+
+function arglist_looks_like_declaration(tokens: [lexed_mod.Lexed], pos: usize) -> bool {
+    let first = util_mod.peek_at(tokens, pos, 1)
+    let is_empty_or_comptime = match first {
+        case .r_paren => true
+        case .kw_comptime => true
+        case _ => false
+    }
+    if is_empty_or_comptime { return true }
+    return match first {
+        case .ident(_) => match util_mod.peek_at(tokens, pos, 2) {
+            case .colon => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+
+function parse_spec_declaration(
+    tokens: [lexed_mod.Lexed],
+    kw_span: span_mod.Span,
+    path: ident_mod.Path,
+    pos_at_lparen: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    parse_item_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence}, depth: usize) -> (item_ast.Item, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.Spec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let name = single_segment_or_dummy(path, mutable diags, allocator)?
+    var p = pos_at_lparen + 1
+    let generics_r = parse_spec_generics(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = generics_r.1
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` after spec parameters", allocator)?
+        }
+    }
+    let where_r = parse_spec_where_clauses(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = where_r.1
+    let body_r = parse_spec_body(tokens, p, mutable diags, allocator, parse_expr_fn, parse_item_fn, depth)?
+    p = body_r.1
+    let end_span = util_mod.span_at(tokens, p - 1)
+    let full_span = merge_spans(kw_span, end_span)
+    let decl = item_ast.Spec {
+        span: full_span,
+        stability: stability,
+        visibility: visibility,
+        name: name,
+        generics: generics_r.0,
+        where_clauses: where_r.0,
+        body: body_r.0,
+    }
+    return (decl, p)
+}
+
+function single_segment_or_dummy(
+    path: ident_mod.Path,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ident_mod.Ident
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if path.segments.len() != 1 {
+        util_mod.emit_error(mutable diags, path.span, "spec declaration name must be a single identifier", allocator)?
+    }
+    return match Vec_Ident.get(path.segments, 0) {
+        case .some(let s) => s
+        case .none => ident_mod.Ident { name: symbol.empty(), span: path.span }
+    }
+}
+
+
+function parse_spec_generics(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_GenericParam.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit generics: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init generics, allocator)?
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .r_paren => return (generics, p)
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let entry_r = parse_spec_generic_param(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_GenericParam.push(mutable generics, entry_r.0, allocator)?
+        p = entry_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    return (generics, p)
+}
+
+function parse_spec_generic_param(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.GenericParam, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    var p = pos
+    let is_comptime = match util_mod.peek(tokens, p) {
+        case .kw_comptime => true
+        case _ => false
+    }
+    if is_comptime { p = p + 1 }
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected spec parameter name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: start_span }
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .colon => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `:` after spec parameter name", allocator)?
+        }
+    }
+    let ty_r = ty_mod.parse_ty_no_where(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = ty_r.1
+    let admits_r = parse_admits_clause(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = admits_r.1
+    let end_span = ty_r.0.span
+    let full_span = merge_spans(start_span, end_span)
+    let kind = if is_comptime { item_ast.GenericKind.comptime_param } else { item_ast.GenericKind.type_param }
+    let entry = item_ast.GenericParam {
+        span: full_span,
+        kind: kind,
+        name: name,
+        ty: Option_Ty.some(value: ty_r.0),
+        admits: admits_r.0,
+    }
+    return (entry, p)
+}
+
+function parse_admits_clause(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_AdmitsConstraint.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit atoms: Vec_AdmitsConstraint.Vec
+    Vec_AdmitsConstraint.new(init atoms, allocator)?
+    match util_mod.peek(tokens, pos) {
+        case .kw_where => ()
+        case _ => return (atoms, pos)
+    }
+    var p = pos + 1
+    match util_mod.peek(tokens, p) {
+        case .ident(_) => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected generic-parameter name in `where ... provides ...` clause", allocator)?
+            return (atoms, p)
+        }
+    }
+    let is_provides = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => symbol.is_provides(sym)
+        case _ => false
+    }
+    if is_provides {
+        p = p + 1
+    } else {
+        util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `provides` after generic-parameter name in admits clause", allocator)?
+        return (atoms, p)
+    }
+    loop decreases (tokens.len() - p) {
+        let atom_r = parse_admits_atom(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_AdmitsConstraint.push(mutable atoms, atom_r.0, allocator)?
+        p = atom_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .r_brace => { break }
+                    case .gt => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    return (atoms, p)
+}
+
+function parse_admits_atom(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.AdmitsConstraint, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    let tok = util_mod.peek(tokens, pos)
+    return match tok {
+        case .plus => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.add), pos + 1)
+        case .minus => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.sub), pos + 1)
+        case .star => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.mul), pos + 1)
+        case .slash => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.div), pos + 1)
+        case .percent => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.mod), pos + 1)
+        case .eq_eq => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.eq), pos + 1)
+        case .bang_eq => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.ne), pos + 1)
+        case .lt => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.lt), pos + 1)
+        case .lt_eq => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.le), pos + 1)
+        case .gt => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.gt), pos + 1)
+        case .gt_eq => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.ge), pos + 1)
+        case .amp_amp => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.and), pos + 1)
+        case .pipe_pipe => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.or), pos + 1)
+        case .amp => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.bit_and), pos + 1)
+        case .pipe => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.bit_or), pos + 1)
+        case .caret => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.bit_xor), pos + 1)
+        case .lt_lt => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.shl), pos + 1)
+        case .gt_gt => (item_ast.AdmitsConstraint.op(span: span, op: ops_mod.BinOp.shr), pos + 1)
+        case .kw_true => (item_ast.AdmitsConstraint.lit(span: span, value: literal_mod.Literal.bool(value: true)), pos + 1)
+        case .kw_false => (item_ast.AdmitsConstraint.lit(span: span, value: literal_mod.Literal.bool(value: false)), pos + 1)
+        case .int(let v, let b) => (item_ast.AdmitsConstraint.lit(span: span, value: literal_mod.Literal.int(value: v, base: b)), pos + 1)
+        case .float(let s) => (item_ast.AdmitsConstraint.lit(span: span, value: literal_mod.Literal.float(sym: s)), pos + 1)
+        case .str(let s) => (item_ast.AdmitsConstraint.lit(span: span, value: literal_mod.Literal.str(sym: s)), pos + 1)
+        case .ident(let sym) => parse_member_atom(tokens, pos, sym, span, mutable diags, allocator, parse_expr_fn, depth)?
+        case _ => fallback_admits_atom_error(tokens, pos, span, mutable diags, allocator)?
+    }
+}
+
+function parse_member_atom(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    sym: symbol.Symbol,
+    id_span: span_mod.Span,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.AdmitsConstraint, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let name = ident_mod.Ident { name: sym, span: id_span }
+    match util_mod.peek_at(tokens, pos, 1) {
+        case .colon => {
+            let ty_r = ty_mod.parse_ty_no_where(tokens, pos + 2, mutable diags, allocator, parse_expr_fn, depth)?
+            let full_span = merge_spans(id_span, ty_r.0.span)
+            return (item_ast.AdmitsConstraint.member(span: full_span, name: name, ty: ty_r.0), ty_r.1)
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, id_span, "expected `:` after member name in `provides` atom (e.g. `next: function(T) -> Option_T`)", allocator)?
+            let err_ty = tree_mod.Ty { span: id_span, kind: tree_mod.TyKind.error }
+            return (item_ast.AdmitsConstraint.member(span: id_span, name: name, ty: err_ty), pos + 1)
+        }
+    }
+}
+
+function fallback_admits_atom_error(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    span: span_mod.Span,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (item_ast.AdmitsConstraint, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    util_mod.emit_error(mutable diags, span, "expected operator (`+`, `==`, etc.), literal (`0`, `true`, ...), or member shape (`name: Ty`) in `provides` atom", allocator)?
+    return (item_ast.AdmitsConstraint.lit(span: span, value: literal_mod.Literal.bool(value: false)), pos + 1)
+}
+
+
+function parse_spec_where_clauses(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_RefinementClause.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit clauses: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init clauses, allocator)?
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .kw_where => ()
+            case _ => break
+        }
+        let clause_r = ty_mod.parse_refinement_clause(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_RefinementClause.push(mutable clauses, clause_r.0, allocator)?
+        p = clause_r.1
+    }
+    return (clauses, p)
+}
+
+
+function parse_spec_body(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    parse_item_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence}, depth: usize) -> (item_ast.Item, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_Item.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .l_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `{` to open spec body", allocator)?
+            return (items, p)
+        }
+    }
+    loop decreases (tokens.len() - p) {
+        let stop = match util_mod.peek(tokens, p) {
+            case .r_brace => true
+            case .eof => true
+            case _ => false
+        }
+        if stop { break }
+        let iter_start = p
+        let item_r = parse_item_fn(tokens, p, mutable diags, allocator, parse_expr_fn, depth + 1)?
+        Vec_Item.push(mutable items, item_r.0, allocator)?
+        p = item_r.1
+        if p == iter_start { p = p + 1 }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `}` to close spec body", allocator)?
+        }
+    }
+    return (items, p)
+}
+
+
+function parse_spec_invocation(
+    tokens: [lexed_mod.Lexed],
+    kw_span: span_mod.Span,
+    path: ident_mod.Path,
+    pos_at_lparen: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.SpecInvocation, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_Expr.Vec
+    Vec_Expr.new(init args, allocator)?
+    var p = pos_at_lparen + 1
+    match util_mod.peek(tokens, p) {
+        case .r_paren => ()
+        case _ => {
+            loop decreases (tokens.len() - p) {
+                let arg_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+                Vec_Expr.push(mutable args, arg_r.0, allocator)?
+                p = arg_r.1
+                match util_mod.peek(tokens, p) {
+                    case .comma => {
+                        p = p + 1
+                        match util_mod.peek(tokens, p) {
+                            case .r_paren => { break }
+                            case .eof => { break }
+                            case _ => ()
+                        }
+                    }
+                    case _ => break
+                }
+            }
+        }
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` after spec arguments", allocator)?
+        }
+    }
+    let full_span = merge_spans(kw_span, close_span)
+    let inv = item_ast.SpecInvocation {
+        span: full_span,
+        path: path,
+        args: args,
+    }
+    return (inv, p)
+}
+
+
+function parse_path(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    allocator: Allocator,
+) -> (ident_mod.Path, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    var p = pos
+    let start_span = util_mod.span_at(tokens, p)
+    var last_span = start_span
+    let first = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => ident_mod.Ident { name: sym, span: start_span }
+        case _ => ident_mod.Ident { name: symbol.empty(), span: start_span }
+    }
+    Vec_Ident.push(mutable segments, first, allocator)?
+    p = p + 1
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .dot => ()
+            case _ => break
+        }
+        match util_mod.peek_at(tokens, p, 1) {
+            case .ident(let sym) => {
+                let seg_span = util_mod.span_at(tokens, p + 1)
+                let seg = ident_mod.Ident { name: sym, span: seg_span }
+                Vec_Ident.push(mutable segments, seg, allocator)?
+                last_span = seg_span
+                p = p + 2
+            }
+            case _ => break
+        }
+    }
+    let path_span = merge_spans(start_span, last_span)
+    return (ident_mod.Path { segments: segments, span: path_span }, p)
+}
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

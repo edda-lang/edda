@@ -1,0 +1,302 @@
+
+module structmap.analyze.metric.shape.cluster
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import local.data.model as model
+
+spec std.collections.vec.Vec(u8)
+spec std.core.option.Option(usize)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.ModuleEntry)
+spec std.collections.vec.Vec(ClusterReport)
+spec std.collections.vec.Vec(FilenameCluster)
+
+
+public type ClusterReport {
+    directory: String
+    clusters: Vec_FilenameCluster.Vec
+    underscore_filenames: Vec_String.Vec
+}
+
+public type FilenameCluster {
+    leading_token: String
+    members: Vec_String.Vec
+}
+
+
+public function analyze_clusters(
+    tree: model.Tree,
+    out: mutable Vec_ClusterReport.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let dir_path = Vec_String.at(tree.paths, i)
+        uninit basenames: Vec_String.Vec
+        Vec_String.new(init basenames, allocator)?
+        collect_basenames(tree, i, mutable basenames, allocator)?
+        uninit clusters: Vec_FilenameCluster.Vec
+        Vec_FilenameCluster.new(init clusters, allocator)?
+        cluster_by_leading_token(basenames, mutable clusters, allocator)?
+        uninit underscored: Vec_String.Vec
+        Vec_String.new(init underscored, allocator)?
+        collect_underscored(basenames, mutable underscored, allocator)?
+        Vec_ClusterReport.push(
+            mutable out,
+            ClusterReport {
+                directory: clone_str(dir_path, allocator)?,
+                clusters: clusters,
+                underscore_filenames: underscored,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+}
+
+
+function collect_basenames(
+    tree: model.Tree,
+    dir_idx: usize,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_ModuleEntry.len(tree.modules)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let r = Vec_ModuleEntry.at(tree.modules, i)
+        if r.dir_idx == dir_idx && ends_with_ea(r.file) && !already_in(out, r.file) {
+            Vec_String.push(mutable out, clone_str(r.file, allocator)?, allocator)?
+        }
+        i += 1
+    }
+}
+
+function cluster_by_leading_token(
+    basenames: Vec_String.Vec,
+    out: mutable Vec_FilenameCluster.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(basenames)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let name = Vec_String.at(basenames, i)
+        let token = leading_token_of(name, allocator)?
+        if string_byte_len(token) >= 2 && !cluster_exists(out, token) {
+            uninit members: Vec_String.Vec
+            Vec_String.new(init members, allocator)?
+            collect_for_token(basenames, token, mutable members, allocator)?
+            if Vec_String.len(members) >= 2 {
+                Vec_FilenameCluster.push(
+                    mutable out,
+                    FilenameCluster {
+                        leading_token: clone_str(token, allocator)?,
+                        members: members,
+                    },
+                    allocator,
+                )?
+            }
+        }
+        i += 1
+    }
+}
+
+function collect_underscored(
+    basenames: Vec_String.Vec,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(basenames)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let name = Vec_String.at(basenames, i)
+        if stem_contains_underscore(name) {
+            Vec_String.push(mutable out, clone_str(name, allocator)?, allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function leading_token_of(name: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = name.bytes()
+    let stem_end = stem_end_byte(bytes)
+    let underscore = first_underscore_in(bytes, stem_end)
+    let take_n = match underscore {
+        case .some(let pos) => pos
+        case .none => stem_end
+    }
+    let buf: [u8] = allocator.alloc_array(u8, take_n)?
+    var i: usize = 0
+    loop
+        decreases take_n - i
+    {
+        if i >= take_n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function first_underscore_in(bytes: [u8], stop: usize) -> Option_usize.Option {
+    let n: usize = bytes.len()
+    let bound = if stop > n { n } else { stop }
+    var i: usize = 0
+    loop
+        decreases bound - i
+    {
+        if i >= bound { break }
+        if bytes[i] == 0x5F {
+            return Option_usize.some(value: i)
+        }
+        i += 1
+    }
+    return Option_usize.none()
+}
+
+function stem_contains_underscore(name: String) -> bool {
+    let bytes = name.bytes()
+    let stop = stem_end_byte(bytes)
+    var i: usize = 0
+    loop
+        decreases stop - i
+    {
+        if i >= stop { break }
+        if bytes[i] == 0x5F { return true }
+        i += 1
+    }
+    return false
+}
+
+function stem_end_byte(bytes: [u8]) -> usize {
+    let n: usize = bytes.len()
+    if n >= 3 && bytes[n - 3] == 0x2E && bytes[n - 2] == 0x65 && bytes[n - 1] == 0x61 {
+        return n - 3
+    }
+    if n >= 5 && bytes[n - 5] == 0x2E && bytes[n - 4] == 0x65 && bytes[n - 3] == 0x64 && bytes[n - 2] == 0x64 && bytes[n - 1] == 0x61 {
+        return n - 5
+    }
+    return n
+}
+
+function ends_with_ea(name: String) -> bool {
+    let bytes = name.bytes()
+    let n: usize = bytes.len()
+    if n >= 3 && bytes[n - 3] == 0x2E && bytes[n - 2] == 0x65 && bytes[n - 1] == 0x61 { return true }
+    if n >= 5 && bytes[n - 5] == 0x2E && bytes[n - 4] == 0x65 && bytes[n - 3] == 0x64 && bytes[n - 2] == 0x64 && bytes[n - 1] == 0x61 { return true }
+    return false
+}
+
+
+function collect_for_token(
+    basenames: Vec_String.Vec,
+    token: String,
+    out: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(basenames)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let name = Vec_String.at(basenames, i)
+        let candidate = leading_token_of(name, allocator)?
+        if string_equals(candidate, token) {
+            Vec_String.push(mutable out, clone_str(name, allocator)?, allocator)?
+        }
+        i += 1
+    }
+}
+
+function cluster_exists(clusters: Vec_FilenameCluster.Vec, token: String) -> bool {
+    let n: usize = Vec_FilenameCluster.len(clusters)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if string_equals(Vec_FilenameCluster.at(clusters, i).leading_token, token) { return true }
+        i += 1
+    }
+    return false
+}
+
+function already_in(vs: Vec_String.Vec, s: String) -> bool {
+    let n: usize = Vec_String.len(vs)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if string_equals(Vec_String.at(vs, i), s) { return true }
+        i += 1
+    }
+    return false
+}
+
+function string_equals(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    if an != bn { return false }
+    var i: usize = 0
+    loop
+        decreases an - i
+    {
+        if i >= an { break }
+        if ab[i] != bb[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function string_byte_len(s: String) -> usize {
+    return s.bytes().len()
+}
+
+function clone_str(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}

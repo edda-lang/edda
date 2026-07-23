@@ -1,0 +1,209 @@
+
+module lower.lower
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import std.core.fmt as fmt_mod
+
+import span.loc.pos.span as span_mod
+import hir.build.file as hir_file_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import types.ty.interner as ty_interner_mod
+
+import mir.file.store as mir_file_mod
+import mir.body.model as mir_body_mod
+import mir.id.hir as hir_id_mod
+
+import ir.hlir.tree.node.file as hlir_file_mod
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.attrs as hlir_attrs_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+
+import local.term.support.support as support_mod
+import local.body.transcribe as transcribe_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.hashmap.IntMap(u32)
+
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(span_mod.Span)
+
+
+public function lower(
+    out: init hlir_body_mod.HlirBody,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let entry_origin = entry_block_node_origin(body)
+
+    uninit staging: hlir_body_mod.HlirBody
+    hlir_body_mod.new_body(
+        init staging,
+        body.def_id,
+        body.origin_file,
+        entry_origin,
+        hlir_attrs_mod.with_err_bymem(hlir_attrs_mod.from_effect_facts(body.effect_facts), body.err_bymem),
+        symbol_mod.empty(),
+        allocator,
+    )?
+
+    var staged: hlir_body_mod.HlirBody = hlir_body_mod.set_agg_layouts(take staging, body.agg_layouts)
+
+    uninit env: Vec_ValueId.Vec
+    support_mod.new_local_env(init env, body, allocator)?
+
+    support_mod.mint_params(mutable staged, mutable env, body, allocator)?
+    transcribe_mod.transcribe_blocks(mutable staged, mutable env, body, ty_interner, extern_defs, allocator)?
+    out = staged
+}
+
+
+public function lower_file(
+    out: init hlir_file_mod.HlirFile,
+    file: mir_file_mod.MirFile,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit staging: hlir_file_mod.HlirFile
+    hlir_file_mod.new(init staging, allocator)?
+    copy_hir_files(mutable staging, file, allocator)?
+    lower_all_bodies(mutable staging, file, ty_interner, file.extern_defs, allocator)?
+    out = staging
+}
+
+
+function copy_hir_files(
+    out: mutable hlir_file_mod.HlirFile,
+    file: mir_file_mod.MirFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(file.hir_files)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        let hf = Vec_HirFile.at(file.hir_files, i)
+        Vec_HirFile.push(mutable out.hir_files, take hf, allocator)?
+        i += 1
+    }
+}
+
+function lower_all_bodies(
+    out: mutable hlir_file_mod.HlirFile,
+    file: mir_file_mod.MirFile,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let n = Vec_MirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let mbody = Vec_MirBody.at(file.bodies, i)
+        let prior = handle err: hlir_error_mod.HlirError as e -> {
+            let resolved = resolve_lowering_error(e, mbody, file.hir_files, allocator)?
+            raise resolved
+        } {
+            lower_and_register(mutable out, mbody, ty_interner, extern_defs, allocator)?
+        }
+        match prior {
+            case .some(_) => {
+                let dup_err = internal_lowering_error(mbody, file.hir_files, "duplicate DefId encountered during MIR -> HLIR file lowering", allocator)?
+                raise dup_err
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+}
+
+function resolve_span_for_body(
+    mbody: mir_body_mod.MirBody,
+    hir_files: Vec_HirFile.Vec,
+) -> span_mod.Span {
+    let idx = hir_id_mod.index(mbody.origin_file)
+    if idx >= Vec_HirFile.len(hir_files) { return span_mod.dummy() }
+    let hf = Vec_HirFile.at(hir_files, idx)
+    return match hir_file_mod.span_of_opt(hf, entry_block_node_origin(mbody)) {
+        case .some(let s) => s
+        case .none => span_mod.dummy()
+    }
+}
+
+function def_id_suffix(mbody: mir_body_mod.MirBody, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat(" (failing def_id=", fmt_mod.usize_to_string(def_mod.index(mbody.def_id), allocator)?, allocator)?
+    return string.concat(head, ")", allocator)?
+}
+
+function internal_lowering_error(
+    mbody: mir_body_mod.MirBody,
+    hir_files: Vec_HirFile.Vec,
+    message: String,
+    allocator: Allocator,
+) -> hlir_error_mod.HlirError
+    with {allocator, err: alloc.AllocError}
+{
+    let tagged = string.concat(message, def_id_suffix(mbody, allocator)?, allocator)?
+    return hlir_error_mod.HlirError.internal_lowering_invariant(
+        at: resolve_span_for_body(mbody, hir_files),
+        message: tagged,
+    )
+}
+
+function resolve_lowering_error(
+    e: hlir_error_mod.HlirError,
+    mbody: mir_body_mod.MirBody,
+    hir_files: Vec_HirFile.Vec,
+    allocator: Allocator,
+) -> hlir_error_mod.HlirError
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .internal_lowering_invariant(_, let message) => internal_lowering_error(mbody, hir_files, message, allocator)?
+        case .unsupported_mir_form(_, _) => e
+    }
+}
+
+function lower_and_register(
+    out: mutable hlir_file_mod.HlirFile,
+    mbody: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> Option_u32.Option
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit hbody: hlir_body_mod.HlirBody
+    lower(init hbody, mbody, ty_interner, extern_defs, allocator)?
+    return hlir_file_mod.register_body(mutable out, take hbody, allocator)?
+}
+
+
+function entry_block_node_origin(body: mir_body_mod.MirBody) -> node_mod.NodeId {
+    let n = Vec_BasicBlock.len(body.blocks)
+    if n < 2 { return node_mod.error() }
+    let entry = Vec_BasicBlock.at(body.blocks, 1)
+    return entry.node_id_origin
+}

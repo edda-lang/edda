@@ -1,0 +1,395 @@
+
+module std.os.process.spawn.posix
+
+import std.mem.alloc
+import std.os.raw
+import std.collections.vec
+import local.process
+import local.child.child
+import local.spawn.error as spawn_error
+import local.caps.caps
+
+spec std.collections.vec.Vec(child.EnvPair)
+
+public function build_argv(exe: String, args: [String], allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = args.len()
+    let ptrs: [u8] = allocator.alloc_array(u8, (n + 2) * 8)?
+    let pbase: u64 = raw.slice_addr(ptrs)
+
+    let eb: [u8] = exe.bytes()
+    let ec: [u8] = allocator.alloc_array(u8, eb.len() + 1)?
+    var k: usize = 0
+    loop
+        decreases eb.len() - k
+    {
+        if k >= eb.len() { break }
+        ec[k] = eb[k]
+        k = k + 1
+    }
+    ec[eb.len()] = 0
+    raw.store_u64(pbase, raw.slice_addr(ec))
+
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let ab: [u8] = args[i].bytes()
+        let ac: [u8] = allocator.alloc_array(u8, ab.len() + 1)?
+        var m: usize = 0
+        loop
+            decreases ab.len() - m
+        {
+            if m >= ab.len() { break }
+            ac[m] = ab[m]
+            m = m + 1
+        }
+        ac[ab.len()] = 0
+        raw.store_u64(pbase +% (((i + 1) as u64) *% 8), raw.slice_addr(ac))
+        i = i + 1
+    }
+    raw.store_u64(pbase +% (((n + 1) as u64) *% 8), 0)
+    return pbase
+}
+
+function build_envp_posix(pairs: [child.EnvPair], allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = pairs.len()
+    let ptrs: [u8] = allocator.alloc_array(u8, (n + 1) * 8)?
+    let pbase: u64 = raw.slice_addr(ptrs)
+
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let kb: [u8] = pairs[i].key.bytes()
+        let vb: [u8] = pairs[i].value.bytes()
+        let entry_len: usize = kb.len() + 1 + vb.len() + 1
+        let entry: [u8] = allocator.alloc_array(u8, entry_len)?
+        var w: usize = 0
+        var k: usize = 0
+        loop
+            decreases kb.len() - k
+        {
+            if k >= kb.len() { break }
+            entry[w] = kb[k]
+            w = w + 1
+            k = k + 1
+        }
+        entry[w] = 0x3D
+        w = w + 1
+        var m: usize = 0
+        loop
+            decreases vb.len() - m
+        {
+            if m >= vb.len() { break }
+            entry[w] = vb[m]
+            w = w + 1
+            m = m + 1
+        }
+        entry[w] = 0
+        raw.store_u64(pbase +% ((i as u64) *% 8), raw.slice_addr(entry))
+        i = i + 1
+    }
+    raw.store_u64(pbase +% ((n as u64) *% 8), 0)
+    return pbase
+}
+
+function count_env_entries(addr: u64, used: usize) -> usize {
+    var count: usize = 0
+    var i: usize = 0
+    loop
+        decreases used - i
+    {
+        if i >= used { break }
+        if raw.load_u8(addr +% (i as u64)) == 0 { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+type EnvBuf {
+    base: u64
+    used: usize
+}
+
+function read_self_environ(allocator: Allocator) -> EnvBuf
+    with {allocator, err: alloc.AllocError}
+{
+    let p: [u8] = "/proc/self/environ".bytes()
+    let path: [u8] = allocator.alloc_array(u8, p.len() + 1)?
+    var k: usize = 0
+    loop
+        decreases p.len() - k
+    {
+        if k >= p.len() { break }
+        path[k] = p[k]
+        k = k + 1
+    }
+    path[p.len()] = 0
+    let fd: i64 = raw.syscall6(257, 0xFFFFFFFFFFFFFF9C, raw.slice_addr(path), 0, 0, 0, 0)
+    if fd < 0 { return EnvBuf { base: 0, used: 0 } }
+
+    let cap: usize = 2097152
+    let buf: [u8] = allocator.alloc_array(u8, cap)?
+    let base: u64 = raw.slice_addr(buf)
+    var used: usize = 0
+    var fuel: u64 = 2097153
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        if used >= cap { break }
+        let r: i64 = raw.syscall6(0, fd as u64, base +% (used as u64), (cap - used) as u64, 0, 0, 0)
+        if r <= 0 { break }
+        let room: usize = cap - used
+        let got: usize = r as usize
+        let take_n: usize = if got > room { room } else { got }
+        used = used + take_n
+    }
+    let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+    return EnvBuf { base: base, used: used }
+}
+
+public function build_envp_inherit_posix(allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let env: EnvBuf = read_self_environ(allocator)?
+    if env.base == 0 {
+        let empty: [u8] = allocator.alloc_array(u8, 8)?
+        raw.store_u64(raw.slice_addr(empty), 0)
+        return raw.slice_addr(empty)
+    }
+    let base: u64 = env.base
+    let used: usize = env.used
+
+    let n: usize = count_env_entries(base, used)
+    let ptrs: [u8] = allocator.alloc_array(u8, (n + 1) * 8)?
+    let pbase: u64 = raw.slice_addr(ptrs)
+    var idx: usize = 0
+    var start: usize = 0
+    var i: usize = 0
+    loop
+        decreases used - i
+    {
+        if i >= used { break }
+        if raw.load_u8(base +% (i as u64)) == 0 {
+            if idx < n {
+                raw.store_u64(pbase +% ((idx as u64) *% 8), base +% (start as u64))
+                idx = idx + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    raw.store_u64(pbase +% ((n as u64) *% 8), 0)
+    return pbase
+}
+
+function keep_parent_entry_posix(base: u64, start: usize, end: usize, pairs: [child.EnvPair]) -> bool {
+    var eq: usize = start
+    var found: bool = false
+    var j: usize = start + 1
+    loop
+        decreases end - j
+    {
+        if j >= end { break }
+        if !found && raw.load_u8(base +% (j as u64)) == 0x3D {
+            eq = j
+            found = true
+        }
+        j = j + 1
+    }
+    if !found { return true }
+    let klen: usize = eq - start
+    var t: usize = 0
+    loop
+        decreases pairs.len() - t
+    {
+        if t >= pairs.len() { break }
+        let kb: [u8] = pairs[t].key.bytes()
+        if kb.len() == klen {
+            var same: bool = true
+            var c: usize = 0
+            loop
+                decreases klen - c
+            {
+                if c >= klen { break }
+                if raw.load_u8(base +% ((start + c) as u64)) != kb[c] { same = false }
+                c = c + 1
+            }
+            if same { return false }
+        }
+        t = t + 1
+    }
+    return true
+}
+
+public function build_envp_merged_posix(pairs: [child.EnvPair], allocator: Allocator) -> u64
+    with {allocator, err: alloc.AllocError}
+{
+    let env: EnvBuf = read_self_environ(allocator)?
+    if env.base == 0 { return build_envp_posix(pairs, allocator)? }
+    let base: u64 = env.base
+    let used: usize = env.used
+
+    var kept: usize = 0
+    var i: usize = 0
+    var start: usize = 0
+    loop
+        decreases used - i
+    {
+        if i >= used { break }
+        if raw.load_u8(base +% (i as u64)) == 0 {
+            if i > start && keep_parent_entry_posix(base, start, i, pairs) {
+                kept = kept + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+
+    let n: usize = kept + pairs.len()
+    let ptrs: [u8] = allocator.alloc_array(u8, (n + 1) * 8)?
+    let pbase: u64 = raw.slice_addr(ptrs)
+    var idx: usize = 0
+    i = 0
+    start = 0
+    loop
+        decreases used - i
+    {
+        if i >= used { break }
+        if raw.load_u8(base +% (i as u64)) == 0 {
+            if i > start && keep_parent_entry_posix(base, start, i, pairs) {
+                if idx < n {
+                    raw.store_u64(pbase +% ((idx as u64) *% 8), base +% (start as u64))
+                    idx = idx + 1
+                }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+
+    var t: usize = 0
+    loop
+        decreases pairs.len() - t
+    {
+        if t >= pairs.len() { break }
+        let kb: [u8] = pairs[t].key.bytes()
+        let vb: [u8] = pairs[t].value.bytes()
+        let entry_len: usize = kb.len() + 1 + vb.len() + 1
+        let entry: [u8] = allocator.alloc_array(u8, entry_len)?
+        var w: usize = 0
+        var k: usize = 0
+        loop
+            decreases kb.len() - k
+        {
+            if k >= kb.len() { break }
+            entry[w] = kb[k]
+            w = w + 1
+            k = k + 1
+        }
+        entry[w] = 0x3D
+        w = w + 1
+        var m: usize = 0
+        loop
+            decreases vb.len() - m
+        {
+            if m >= vb.len() { break }
+            entry[w] = vb[m]
+            w = w + 1
+            m = m + 1
+        }
+        entry[w] = 0
+        if idx < n {
+            raw.store_u64(pbase +% ((idx as u64) *% 8), raw.slice_addr(entry))
+            idx = idx + 1
+        }
+        t = t + 1
+    }
+    raw.store_u64(pbase +% ((n as u64) *% 8), 0)
+    return pbase
+}
+
+public function spawn_posix(
+    bundle: take child.ChildSpec,
+    allocator: Allocator,
+) -> process.ChildHandle
+    with {allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let in_h = bundle.stdin_h
+    let out_h = bundle.stdout_h
+    let err_h = bundle.stderr_h
+    let fs_opt = bundle.fs_h
+    let env_opt = bundle.env_h
+    let exe: String = bundle.exe
+    let args: [String] = bundle.args
+    match bundle.cwd {
+        case .some(let _dir) => ()
+        case .none => ()
+    }
+
+    let h_in: u64 = match in_h {
+        case .some(let h) => caps.stdin_fd(take h)
+        case .none => 0
+    }
+    let h_out: u64 = match out_h {
+        case .some(let h) => caps.stdout_fd(take h)
+        case .none => 1
+    }
+    let h_err: u64 = match err_h {
+        case .some(let h) => caps.stderr_fd(take h)
+        case .none => 2
+    }
+    match fs_opt {
+        case .some(let h) => { let _ = caps.rofs_fd(take h) }
+        case .none => ()
+    }
+
+    let eb: [u8] = exe.bytes()
+    let ec: [u8] = allocator.alloc_array(u8, eb.len() + 1)?
+    var k: usize = 0
+    loop
+        decreases eb.len() - k
+    {
+        if k >= eb.len() { break }
+        ec[k] = eb[k]
+        k = k + 1
+    }
+    ec[eb.len()] = 0
+    let exe_ptr: u64 = raw.slice_addr(ec)
+    let argv: u64 = build_argv(exe, args, allocator)?
+
+    let envp: u64 = match env_opt {
+        case .some(let env) => if env.inherit {
+            build_envp_merged_posix(Vec_EnvPair.as_slice(env.pairs), allocator)?
+        } else {
+            build_envp_posix(Vec_EnvPair.as_slice(env.pairs), allocator)?
+        }
+        case .none => build_envp_inherit_posix(allocator)?
+    }
+
+    let pid: i64 = raw.syscall6(57, 0, 0, 0, 0, 0, 0)
+    if pid < 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "fork failed")
+    }
+    if pid == 0 {
+        if h_in != 0 { let _ = raw.syscall6(33, h_in, 0, 0, 0, 0, 0) }
+        if h_out != 1 { let _ = raw.syscall6(33, h_out, 1, 0, 0, 0, 0) }
+        if h_err != 2 { let _ = raw.syscall6(33, h_err, 2, 0, 0, 0, 0) }
+        let _ = raw.syscall6(59, exe_ptr, argv, envp, 0, 0, 0)
+        let _ = raw.syscall6(60, 127, 0, 0, 0, 0, 0)
+        raise spawn_error.SpawnError.spawn_failed(reason: "execve failed")
+    }
+    return process.ChildHandle {
+        raw: pid as u64,
+        out_fd: process.no_capture_fd(),
+        err_fd: process.no_capture_fd(),
+    }
+}

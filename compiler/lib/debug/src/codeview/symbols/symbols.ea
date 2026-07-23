@@ -1,0 +1,281 @@
+module debug.codeview.symbols.symbols
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import object.coff as coff_mod
+import object.bytes as bytes_mod
+import object.coff.codeview.emit.encode as encode_mod
+import debug.codeview.cursor.cursor as cursor_mod
+import debug.model as model_mod
+import debug.codeview.reloc.reloc as reloc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(model_mod.LineEntry)
+spec std.collections.vec.Vec(model_mod.LocalVar)
+spec std.collections.vec.Vec(model_mod.VerificationFact)
+spec std.collections.vec.Vec(model_mod.DebugFunction)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+spec std.core.option.Option(u32)
+
+
+public function s_gproc32() -> u16 {
+    return 0x1110 as u16
+}
+
+public function s_frameproc() -> u16 {
+    return 0x1012 as u16
+}
+
+public function s_end() -> u16 {
+    return 0x0006 as u16
+}
+
+public function s_local() -> u16 {
+    return 0x113e as u16
+}
+
+public function s_defrange_fp() -> u16 {
+    return 0x1142 as u16
+}
+
+public function local_flag_param() -> u16 {
+    return 0x0001 as u16
+}
+
+public function s_verification_fact() -> u16 {
+    return 0x1170 as u16
+}
+
+public function fact_kind_to_u16(kind: model_mod.FactKind) -> u16 {
+    if kind == model_mod.FactKind.effect_active { return 0 as u16 }
+    if kind == model_mod.FactKind.refinement_proven { return 1 as u16 }
+    if kind == model_mod.FactKind.consumption { return 2 as u16 }
+    if kind == model_mod.FactKind.handle_state { return 3 as u16 }
+    return 4 as u16
+}
+
+function fact_kind_from_u16(v: u16) -> model_mod.FactKind
+    with {err: model_mod.DebugError}
+{
+    if v == (0 as u16) { return model_mod.FactKind.effect_active }
+    if v == (1 as u16) { return model_mod.FactKind.refinement_proven }
+    if v == (2 as u16) { return model_mod.FactKind.consumption }
+    if v == (3 as u16) { return model_mod.FactKind.handle_state }
+    if v == (4 as u16) { return model_mod.FactKind.typestate }
+    raise model_mod.DebugError.malformed
+}
+
+
+public function write_verification_fact(
+    out: mutable Vec_u8.Vec,
+    fact: model_mod.VerificationFact,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let rec_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, s_verification_fact(), allocator)?
+    bytes_mod.push_u16_le(mutable out, fact_kind_to_u16(fact.kind), allocator)?
+    bytes_mod.push_u32_le(mutable out, fact.local_index, allocator)?
+    bytes_mod.push_u32_le(mutable out, fact.range_start, allocator)?
+    bytes_mod.push_u32_le(mutable out, fact.range_len, allocator)?
+    encode_mod.push_cstr(mutable out, fact.detail, allocator)?
+    encode_mod.pad_to_4(mutable out, allocator)?
+    encode_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - rec_start) as u32 wrapping)
+}
+
+
+public function parse_symbols(
+    bytes: Vec_u8.Vec,
+    relocs: Vec_CoffRelocation.Vec,
+    payload_lo: usize,
+    payload_hi: usize,
+    funcs: mutable Vec_DebugFunction.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    var cur = cursor_mod.Cursor { pos: payload_lo }
+    let span = if payload_hi > payload_lo { payload_hi - payload_lo } else { 0 as usize }
+    var step: usize = 0
+    loop decreases span - step {
+        if step >= span { break }
+        if cur.pos >= payload_hi { break }
+        let len_pos = cur.pos
+        let reclen = cursor_mod.read_u16_le(bytes, mutable cur)?
+        let rec_start = cur.pos
+        let kind = cursor_mod.read_u16_le(bytes, mutable cur)?
+        let rec_end = rec_start + (reclen as usize)
+        if kind == s_gproc32() {
+            let fn_ = parse_function(bytes, relocs, mutable cur, len_pos, rec_end, payload_hi, allocator)?
+            Vec_DebugFunction.push(mutable funcs, take fn_, allocator)?
+        } else {
+            cursor_mod.seek(mutable cur, rec_end)
+            cursor_mod.align_to_4(mutable cur)
+        }
+        step += 1
+    }
+}
+
+
+function parse_function(
+    bytes: Vec_u8.Vec,
+    relocs: Vec_CoffRelocation.Vec,
+    cur: mutable cursor_mod.Cursor,
+    rec_len_pos: usize,
+    rec_end: usize,
+    payload_hi: usize,
+    allocator: Allocator,
+) -> model_mod.DebugFunction
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    let symbol_index = match reloc_mod.symbol_for_range(relocs, rec_len_pos, rec_end) {
+        case .some(let s) => s
+        case .none => 0xffffffff as u32
+    }
+    let _p_parent = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _p_end = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _p_next = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let code_len = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _dbg_start = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _dbg_end = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _typind = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _offset = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let _segment = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let _pflags = cursor_mod.read_u8(bytes, mutable cur)?
+    let name = cursor_mod.read_cstr(bytes, mutable cur, allocator)?
+    cursor_mod.seek(mutable cur, rec_end)
+    cursor_mod.align_to_4(mutable cur)
+
+    uninit locals: Vec_LocalVar.Vec
+    Vec_LocalVar.new(init locals, allocator)?
+    uninit facts: Vec_VerificationFact.Vec
+    Vec_VerificationFact.new(init facts, allocator)?
+
+    let span = if payload_hi > cur.pos { payload_hi - cur.pos } else { 0 as usize }
+    var step: usize = 0
+    loop decreases span - step {
+        if step >= span { break }
+        if cur.pos >= payload_hi { break }
+        let rl = cursor_mod.read_u16_le(bytes, mutable cur)?
+        let rs = cur.pos
+        let k = cursor_mod.read_u16_le(bytes, mutable cur)?
+        let re = rs + (rl as usize)
+        if k == s_end() {
+            cursor_mod.seek(mutable cur, re)
+            cursor_mod.align_to_4(mutable cur)
+            break
+        } else if k == s_local() {
+            read_local(bytes, mutable cur, re, payload_hi, mutable locals, allocator)?
+        } else if k == s_verification_fact() {
+            read_fact(bytes, mutable cur, re, mutable facts, allocator)?
+        } else {
+            cursor_mod.seek(mutable cur, re)
+            cursor_mod.align_to_4(mutable cur)
+        }
+        step += 1
+    }
+
+    uninit lines: Vec_LineEntry.Vec
+    Vec_LineEntry.new(init lines, allocator)?
+    return model_mod.DebugFunction {
+        symbol_index: symbol_index,
+        name: name,
+        code_len: code_len,
+        file_id: 0 as u32,
+        file_path: "unknown",
+        lines: lines,
+        locals: locals,
+        facts: facts,
+    }
+}
+
+
+function read_local(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    rec_end: usize,
+    payload_hi: usize,
+    locals: mutable Vec_LocalVar.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    let type_index = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let flags = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let name = cursor_mod.read_cstr(bytes, mutable cur, allocator)?
+    cursor_mod.seek(mutable cur, rec_end)
+    cursor_mod.align_to_4(mutable cur)
+    let is_param = (flags & local_flag_param()) != (0 as u16)
+
+    var frame_disp: i32 = 0
+    var range_len: u32 = 0
+    if cur.pos < payload_hi {
+        let rlp = cur.pos
+        let rl = cursor_mod.read_u16_le(bytes, mutable cur)?
+        let rs = cur.pos
+        let k = cursor_mod.read_u16_le(bytes, mutable cur)?
+        let re = rs + (rl as usize)
+        if k == s_defrange_fp() {
+            frame_disp = cursor_mod.read_i32_le(bytes, mutable cur)?
+            let _secrel = cursor_mod.read_u32_le(bytes, mutable cur)?
+            let _section = cursor_mod.read_u16_le(bytes, mutable cur)?
+            range_len = cursor_mod.read_u16_le(bytes, mutable cur)? as u32
+            cursor_mod.seek(mutable cur, re)
+            cursor_mod.align_to_4(mutable cur)
+        } else {
+            cursor_mod.seek(mutable cur, rlp)
+        }
+    }
+
+    Vec_LocalVar.push(
+        mutable locals,
+        take model_mod.LocalVar {
+            name: name,
+            type_index: type_index,
+            is_param: is_param,
+            frame_disp: frame_disp,
+            range_start: 0 as u32,
+            range_len: range_len,
+        },
+        allocator,
+    )?
+}
+
+
+function read_fact(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    rec_end: usize,
+    facts: mutable Vec_VerificationFact.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    let kind_raw = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let kind = fact_kind_from_u16(kind_raw)?
+    let local_index = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let range_start = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let range_len = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let detail = cursor_mod.read_cstr(bytes, mutable cur, allocator)?
+    cursor_mod.seek(mutable cur, rec_end)
+    cursor_mod.align_to_4(mutable cur)
+
+    Vec_VerificationFact.push(
+        mutable facts,
+        take model_mod.VerificationFact {
+            kind: kind,
+            local_index: local_index,
+            detail: detail,
+            range_start: range_start,
+            range_len: range_len,
+        },
+        allocator,
+    )?
+}

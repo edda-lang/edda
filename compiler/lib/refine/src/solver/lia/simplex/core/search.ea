@@ -1,0 +1,114 @@
+
+module refine.solver.lia.simplex.core.search
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.rational.scalar as rat_mod
+import local.solver.lia.simplex.tableau.tableau as tab_mod
+import local.solver.lia.simplex.core.simplex as simplex_mod
+
+
+spec std.collections.vec.Vec(lit_mod.Lit)
+
+
+public type SearchOutcome {
+    case feasible(model: tab_mod.Tableau)
+    case infeasible(explanation: Vec_Lit.Vec)
+    case unknown
+}
+
+
+public type SearchBudget {
+    nodes: usize
+}
+
+
+public function new_budget(total_nodes: usize) -> SearchBudget {
+    return SearchBudget { nodes: total_nodes }
+}
+
+
+public function solve(t: tab_mod.Tableau, fuel: usize, budget: mutable SearchBudget, allocator: Allocator) -> SearchOutcome
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var work = tab_mod.clone_tableau(t, allocator)?
+    let r = simplex_mod.check(mutable work, allocator)?
+    return match r {
+        case .infeasible(let e) => SearchOutcome.infeasible(explanation: e)
+        case .unknown => SearchOutcome.unknown
+        case .feasible => branch(work, fuel, mutable budget, allocator)?
+    }
+}
+
+
+function branch(work: tab_mod.Tableau, fuel: usize, budget: mutable SearchBudget, allocator: Allocator) -> SearchOutcome
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let bv = tab_mod.first_fractional(work)
+    if bv >= work.n {
+        let m = tab_mod.clone_tableau(work, allocator)?
+        return SearchOutcome.feasible(model: m)
+    }
+    if fuel == 0 {
+        return SearchOutcome.unknown
+    }
+    if budget.nodes == 0 {
+        return SearchOutcome.unknown
+    }
+    budget.nodes = budget.nodes - 1
+    let v = tab_mod.value_of(work, bv)
+    let fl = rat_mod.floor_rat(v)
+    let cl = rat_mod.ceil_rat(v)
+    if !fl.ok || !cl.ok {
+        return SearchOutcome.unknown
+    }
+    let cut = lit_mod.Lit { code: 0 }
+    var down = tab_mod.clone_tableau(work, allocator)?
+    tab_mod.set_upper(mutable down, bv, fl.value, cut)
+    let r1 = solve(down, fuel - 1, mutable budget, allocator)?
+    let r1_feasible = match r1 {
+        case .feasible(_) => true
+        case _ => false
+    }
+    if r1_feasible {
+        return r1
+    }
+    if budget.nodes == 0 {
+        return SearchOutcome.unknown
+    }
+    var up = tab_mod.clone_tableau(work, allocator)?
+    tab_mod.set_lower(mutable up, bv, cl.value, cut)
+    let r2 = solve(up, fuel - 1, mutable budget, allocator)?
+    return combine(r1, r2, work, allocator)?
+}
+
+
+function combine(
+    r1: SearchOutcome,
+    r2: SearchOutcome,
+    work: tab_mod.Tableau,
+    allocator: Allocator,
+) -> SearchOutcome
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match r2 {
+        case .feasible(_) => return r2
+        case _ => {}
+    }
+    let inf1 = match r1 {
+        case .infeasible(_) => true
+        case _ => false
+    }
+    let inf2 = match r2 {
+        case .infeasible(_) => true
+        case _ => false
+    }
+    if inf1 {
+        if inf2 {
+            let e = tab_mod.collect_asserted_bounds(work, allocator)?
+            return SearchOutcome.infeasible(explanation: e)
+        }
+    }
+    return SearchOutcome.unknown
+}

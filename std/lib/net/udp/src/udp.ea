@@ -1,0 +1,170 @@
+
+module std.net.udp
+import std.text.string
+
+import std.os.raw
+import std.os.pages
+import std.mem.alloc
+import std.net.ip
+import std.net.dns
+import std.text.itoa
+import std.net.socket
+
+
+public affine type UdpSocket {
+    handle_: u64
+}
+
+
+function map_errno(code: i64) -> socket.SocketError {
+    if code == -111 { return socket.SocketError.connection_refused }
+    if code == -104 { return socket.SocketError.connection_reset }
+    if code == -103 { return socket.SocketError.connection_aborted }
+    if code == -113 { return socket.SocketError.host_unreachable }
+    if code == -101 { return socket.SocketError.network_unreachable }
+    if code == -110 { return socket.SocketError.timeout }
+    if code == -98 { return socket.SocketError.address_in_use }
+    if code == -99 { return socket.SocketError.address_not_available }
+    if code == -32 { return socket.SocketError.broken_pipe }
+    if code == -11 { return socket.SocketError.would_block }
+    if code == -107 { return socket.SocketError.not_connected }
+    if code == -12 { return socket.SocketError.out_of_memory }
+    return socket.SocketError.os_error(code: code as i32 wrapping)
+}
+
+function release_page(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, 4096)?
+    }
+}
+
+function close_fd(fd: u64) -> () {
+    let _ = raw.syscall6(3, fd, 0, 0, 0, 0, 0)
+}
+
+function fill_sockaddr_in(pg: u64, addr: ip.Ipv4Addr, port: u16) -> () {
+    raw.store_u8(pg, 2)
+    raw.store_u8(pg +% 1, 0)
+    raw.store_u8(pg +% 2, (port >> 8) as u8)
+    raw.store_u8(pg +% 3, (port & 0xFF) as u8)
+    raw.store_u8(pg +% 4, addr.a)
+    raw.store_u8(pg +% 5, addr.b)
+    raw.store_u8(pg +% 6, addr.c)
+    raw.store_u8(pg +% 7, addr.d)
+    var i: u64 = 8
+    loop
+        decreases 16 - i
+    {
+        if i >= 16 { break }
+        raw.store_u8(pg +% i, 0)
+        i = i + 1
+    }
+}
+
+function resolve_via_dns(net: Network, fs: ReadOnlyFilesystem, host: String) -> ip.Ipv4Addr
+    with {net, fs, err: socket.SocketError}
+{
+    return handle err: dns.DnsError as _e -> (raise socket.SocketError.dns_lookup_failed(host: host)) {
+        dns.resolve_v4(net, fs, host)?
+    }
+}
+
+function resolve_addr(net: Network, fs: ReadOnlyFilesystem, host: String) -> ip.Ipv4Addr
+    with {net, fs, err: socket.SocketError}
+{
+    return handle err: ip.ParseAddrError as _e -> (resolve_via_dns(net, fs, host)?) {
+        ip.parse_v4(host.bytes())?
+    }
+}
+
+function format_ipv4(a: u8, b: u8, c: u8, d: u8, allocator: Allocator) -> String
+    with {allocator, err: socket.SocketError}
+{
+    let dca: usize = itoa.digit_count_u64(a as u64)
+    let dcb: usize = itoa.digit_count_u64(b as u64)
+    let dcc: usize = itoa.digit_count_u64(c as u64)
+    let dcd: usize = itoa.digit_count_u64(d as u64)
+    let len: usize = dca + dcb + dcc + dcd + 3
+    var out: [u8] = handle err: alloc.AllocError as _e -> (raise socket.SocketError.out_of_memory) {
+        allocator.alloc_array(u8, len)?
+    }
+    handle err: itoa.ItoaError as _e -> (raise socket.SocketError.out_of_memory) {
+        let _ = itoa.write_u64(a as u64, mutable out, 0)?
+        out[dca] = 0x2E
+        let ob: usize = dca + 1
+        let _ = itoa.write_u64(b as u64, mutable out, ob)?
+        out[ob + dcb] = 0x2E
+        let oc: usize = ob + dcb + 1
+        let _ = itoa.write_u64(c as u64, mutable out, oc)?
+        out[oc + dcc] = 0x2E
+        let od: usize = oc + dcc + 1
+        let _ = itoa.write_u64(d as u64, mutable out, od)?
+    }
+    return string.from_owned_utf8(take out)
+}
+
+
+public function bind(net: Network, fs: ReadOnlyFilesystem, host: String, port: u16) -> UdpSocket
+    with {net, fs, err: socket.SocketError}
+{
+    let addr: ip.Ipv4Addr = resolve_addr(net, fs, host)?
+    let fd: i64 = raw.syscall6(41, 2, 2, 0, 0, 0, 0)
+    if fd < 0 { raise map_errno(fd) }
+    let pg: u64 = handle err: pages.PageError as _e -> {
+        close_fd(fd as u64)
+        raise socket.SocketError.out_of_memory
+    } { pages.map(4096)? }
+    raw.store_u32(pg, 1)
+    let _ = raw.syscall6(54, fd as u64, 1, 2, pg, 4, 0)
+    fill_sockaddr_in(pg, addr, port)
+    let rb: i64 = raw.syscall6(49, fd as u64, pg, 16, 0, 0, 0)
+    release_page(pg)
+    if rb < 0 {
+        close_fd(fd as u64)
+        raise map_errno(rb)
+    }
+    return UdpSocket { handle_: fd as u64 }
+}
+
+
+public function send_to(s: mutable UdpSocket, net: Network, fs: ReadOnlyFilesystem, data: [u8], host: String, port: u16) -> usize
+    with {net, fs, err: socket.SocketError}
+{
+    let addr: ip.Ipv4Addr = resolve_addr(net, fs, host)?
+    let pg: u64 = handle err: pages.PageError as _e -> (raise socket.SocketError.out_of_memory) {
+        pages.map(4096)?
+    }
+    fill_sockaddr_in(pg, addr, port)
+    let r: i64 = raw.syscall6(44, s.handle_, raw.slice_addr(data), data.len() as u64, 0, pg, 16)
+    release_page(pg)
+    if r < 0 { raise map_errno(r) }
+    return r as usize
+}
+
+public function recv_from(s: mutable UdpSocket, net: Network, buf: mutable [u8], allocator: Allocator) -> (usize, String, u16)
+    with {net, allocator, err: socket.SocketError}
+{
+    let pg: u64 = handle err: pages.PageError as _e -> (raise socket.SocketError.out_of_memory) {
+        pages.map(4096)?
+    }
+    raw.store_u32(pg +% 16, 16)
+    let r: i64 = raw.syscall6(45, s.handle_, raw.slice_addr(buf), buf.len() as u64, 0, pg, pg +% 16)
+    if r < 0 {
+        release_page(pg)
+        raise map_errno(r)
+    }
+    let a: u8 = raw.load_u8(pg +% 4)
+    let b: u8 = raw.load_u8(pg +% 5)
+    let c: u8 = raw.load_u8(pg +% 6)
+    let d: u8 = raw.load_u8(pg +% 7)
+    let sport: u16 = ((raw.load_u8(pg +% 2) as u16) << 8) | (raw.load_u8(pg +% 3) as u16)
+    release_page(pg)
+    let host: String = format_ipv4(a, b, c, d, allocator)?
+    return (r as usize, host, sport)
+}
+
+
+public function close(s: take UdpSocket) -> () {
+    close_fd(s.handle_)
+}

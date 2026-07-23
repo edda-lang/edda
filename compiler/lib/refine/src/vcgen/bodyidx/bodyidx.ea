@@ -1,0 +1,347 @@
+
+module refine.vcgen.bodyidx.bodyidx
+
+import std.collections.vec
+import std.mem.alloc
+import mir.body.model as mir_body
+import mir.id.block as block_mod
+import mir.id.local as local_mod
+import mir.stmt as stmt_mod
+import mir.term as mterm_mod
+import mir.place as place_mod
+
+
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_body.Local)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(block_mod.BlockId)
+
+
+public type BodyIndex {
+    in_edges: Vec_usize.Vec
+    pred_count: Vec_usize.Vec
+    pred_last: Vec_usize.Vec
+    def_block: Vec_usize.Vec
+    def_stmt: Vec_usize.Vec
+}
+
+
+public type DefSite {
+    found: bool
+    block: usize
+    stmt: usize
+}
+
+
+public function build(body: mir_body.MirBody, allocator: Allocator) -> BodyIndex
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var in_edges = filled(nb, 0 as usize, allocator)?
+    var bi: usize = 0
+    loop
+        decreases (nb - bi)
+    {
+        if bi >= nb {
+            break
+        }
+        let bb = Vec_BasicBlock.at(body.blocks, bi)
+        add_edges(bb.terminator, mutable in_edges)
+        bi = bi + 1
+    }
+    var pred_count = filled(nb, 0 as usize, allocator)?
+    var pred_last = filled(nb, 0 as usize, allocator)?
+    var pi: usize = 0
+    loop
+        decreases (nb - pi)
+    {
+        if pi >= nb {
+            break
+        }
+        if is_live(in_edges, pi) {
+            let pb = Vec_BasicBlock.at(body.blocks, pi)
+            add_preds(pb.terminator, pi, mutable pred_count, mutable pred_last)
+        }
+        pi = pi + 1
+    }
+    let nl = Vec_Local.len(body.locals)
+    var def_block = filled(nl, nb, allocator)?
+    var def_stmt = filled(nl, 0 as usize, allocator)?
+    scan_defs(body, nb, nl, mutable def_block, mutable def_stmt)
+    return BodyIndex {
+        in_edges: in_edges,
+        pred_count: pred_count,
+        pred_last: pred_last,
+        def_block: def_block,
+        def_stmt: def_stmt,
+    }
+}
+
+
+public function is_live(in_edges: Vec_usize.Vec, bi: usize) -> bool {
+    if bi == block_mod.index(block_mod.entry()) {
+        return true
+    }
+    if bi >= Vec_usize.len(in_edges) {
+        return false
+    }
+    return Vec_usize.at(in_edges, bi) > 0
+}
+
+
+public function pred_lookup_count(idx: BodyIndex, cur: usize) -> usize {
+    if cur >= Vec_usize.len(idx.pred_count) {
+        return 0
+    }
+    return Vec_usize.at(idx.pred_count, cur)
+}
+
+
+public function pred_lookup_last(idx: BodyIndex, cur: usize) -> usize {
+    if cur >= Vec_usize.len(idx.pred_last) {
+        return 0
+    }
+    return Vec_usize.at(idx.pred_last, cur)
+}
+
+
+public function def_site(idx: BodyIndex, local_id: local_mod.LocalId) -> DefSite {
+    let li = local_mod.index(local_id)
+    if li >= Vec_usize.len(idx.def_block) {
+        return DefSite { found: false, block: 0, stmt: 0 }
+    }
+    let b = Vec_usize.at(idx.def_block, li)
+    if b >= Vec_usize.len(idx.in_edges) {
+        return DefSite { found: false, block: 0, stmt: 0 }
+    }
+    if li >= Vec_usize.len(idx.def_stmt) {
+        return DefSite { found: false, block: 0, stmt: 0 }
+    }
+    return DefSite { found: true, block: b, stmt: Vec_usize.at(idx.def_stmt, li) }
+}
+
+
+function filled(n: usize, value: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.new(init out, allocator)?
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let v = value
+        Vec_usize.push(mutable out, take v, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function bump(counts: mutable Vec_usize.Vec, b: block_mod.BlockId) -> () {
+    let t = block_mod.index(b)
+    if t >= Vec_usize.len(counts) {
+        return
+    }
+    let c = Vec_usize.at(counts, t) + 1
+    Vec_usize.set_at(mutable counts, t, take c)
+}
+
+
+function bump_unwind(counts: mutable Vec_usize.Vec, u: mterm_mod.UnwindAction) -> () {
+    match u {
+        case .handler(let blk) => bump(mutable counts, blk)
+        case _ => {}
+    }
+}
+
+
+function add_edges(term: mterm_mod.Terminator, counts: mutable Vec_usize.Vec) -> () {
+    match term.kind {
+        case .goto_(let t) => bump(mutable counts, t)
+        case .branch(_, let tr, let fa) => {
+            bump(mutable counts, tr)
+            bump(mutable counts, fa)
+        }
+        case .switch_(_, let tgts) => {
+            bump(mutable counts, tgts.otherwise_)
+            let n = Vec_BlockId.len(tgts.targets)
+            var i: usize = 0
+            loop
+                decreases (n - i)
+            {
+                if i >= n {
+                    break
+                }
+                bump(mutable counts, Vec_BlockId.at(tgts.targets, i))
+                i = i + 1
+            }
+        }
+        case .return_ => {}
+        case .unreachable_ => {}
+        case .raise_(_, let unwind) => bump_unwind(mutable counts, unwind)
+        case .panic_(_) => {}
+        case .call_(_, _, _, let ret, let unwind) => {
+            bump(mutable counts, ret)
+            bump_unwind(mutable counts, unwind)
+        }
+        case .drop_(_, let tgt, let unwind) => {
+            bump(mutable counts, tgt)
+            bump_unwind(mutable counts, unwind)
+        }
+        case .coherence_enter(let be, let ex) => {
+            bump(mutable counts, be)
+            bump(mutable counts, ex)
+        }
+        case .coherence_exit(let tgt) => bump(mutable counts, tgt)
+        case .spawn_(_, _, _, _, let ret, let unwind) => {
+            bump(mutable counts, ret)
+            bump_unwind(mutable counts, unwind)
+        }
+        case .await_(_, _, let ret, let unwind) => {
+            bump(mutable counts, ret)
+            bump_unwind(mutable counts, unwind)
+        }
+    }
+}
+
+
+function record_pred(
+    source: usize,
+    b: block_mod.BlockId,
+    pred_count: mutable Vec_usize.Vec,
+    pred_last: mutable Vec_usize.Vec,
+) -> () {
+    let t = block_mod.index(b)
+    if t >= Vec_usize.len(pred_count) {
+        return
+    }
+    if t >= Vec_usize.len(pred_last) {
+        return
+    }
+    let c = Vec_usize.at(pred_count, t) + 1
+    Vec_usize.set_at(mutable pred_count, t, take c)
+    let s = source
+    Vec_usize.set_at(mutable pred_last, t, take s)
+}
+
+
+function record_pred_unwind(
+    source: usize,
+    u: mterm_mod.UnwindAction,
+    pred_count: mutable Vec_usize.Vec,
+    pred_last: mutable Vec_usize.Vec,
+) -> () {
+    match u {
+        case .handler(let blk) => record_pred(source, blk, mutable pred_count, mutable pred_last)
+        case _ => {}
+    }
+}
+
+
+function add_preds(
+    term: mterm_mod.Terminator,
+    source: usize,
+    pred_count: mutable Vec_usize.Vec,
+    pred_last: mutable Vec_usize.Vec,
+) -> () {
+    match term.kind {
+        case .goto_(let t) => record_pred(source, t, mutable pred_count, mutable pred_last)
+        case .branch(_, let tr, let fa) => {
+            record_pred(source, tr, mutable pred_count, mutable pred_last)
+            record_pred(source, fa, mutable pred_count, mutable pred_last)
+        }
+        case .switch_(_, let tgts) => {
+            record_pred(source, tgts.otherwise_, mutable pred_count, mutable pred_last)
+            let n = Vec_BlockId.len(tgts.targets)
+            var i: usize = 0
+            loop
+                decreases (n - i)
+            {
+                if i >= n {
+                    break
+                }
+                record_pred(source, Vec_BlockId.at(tgts.targets, i), mutable pred_count, mutable pred_last)
+                i = i + 1
+            }
+        }
+        case .return_ => {}
+        case .unreachable_ => {}
+        case .raise_(_, let unwind) => record_pred_unwind(source, unwind, mutable pred_count, mutable pred_last)
+        case .panic_(_) => {}
+        case .call_(_, _, _, let ret, let unwind) => {
+            record_pred(source, ret, mutable pred_count, mutable pred_last)
+            record_pred_unwind(source, unwind, mutable pred_count, mutable pred_last)
+        }
+        case .drop_(_, let tgt, let unwind) => {
+            record_pred(source, tgt, mutable pred_count, mutable pred_last)
+            record_pred_unwind(source, unwind, mutable pred_count, mutable pred_last)
+        }
+        case .coherence_enter(let be, let ex) => {
+            record_pred(source, be, mutable pred_count, mutable pred_last)
+            record_pred(source, ex, mutable pred_count, mutable pred_last)
+        }
+        case .coherence_exit(let tgt) => record_pred(source, tgt, mutable pred_count, mutable pred_last)
+        case .spawn_(_, _, _, _, let ret, let unwind) => {
+            record_pred(source, ret, mutable pred_count, mutable pred_last)
+            record_pred_unwind(source, unwind, mutable pred_count, mutable pred_last)
+        }
+        case .await_(_, _, let ret, let unwind) => {
+            record_pred(source, ret, mutable pred_count, mutable pred_last)
+            record_pred_unwind(source, unwind, mutable pred_count, mutable pred_last)
+        }
+    }
+}
+
+
+function scan_defs(
+    body: mir_body.MirBody,
+    nb: usize,
+    nl: usize,
+    def_block: mutable Vec_usize.Vec,
+    def_stmt: mutable Vec_usize.Vec,
+) -> () {
+    var bi: usize = 0
+    loop
+        decreases (nb - bi)
+    {
+        if bi >= nb {
+            break
+        }
+        if bi >= Vec_BasicBlock.len(body.blocks) {
+            break
+        }
+        let bb = Vec_BasicBlock.at(body.blocks, bi)
+        let ns = Vec_Statement.len(bb.statements)
+        var si: usize = 0
+        loop
+            decreases (ns - si)
+        {
+            if si >= ns {
+                break
+            }
+            match Vec_Statement.at(bb.statements, si).kind {
+                case .assign(let dest, _) => {
+                    if place_mod.proj_len(dest) == 0 {
+                        let li = local_mod.index(dest.local)
+                        if li < nl && li < Vec_usize.len(def_block) && li < Vec_usize.len(def_stmt) {
+                            if Vec_usize.at(def_block, li) >= nb {
+                                let db = bi
+                                Vec_usize.set_at(mutable def_block, li, take db)
+                                let ds = si
+                                Vec_usize.set_at(mutable def_stmt, li, take ds)
+                            }
+                        }
+                    }
+                }
+                case _ => {}
+            }
+            si = si + 1
+        }
+        bi = bi + 1
+    }
+}

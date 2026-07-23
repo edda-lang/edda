@@ -1,0 +1,180 @@
+
+module structmap.render.toon
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+
+spec std.collections.vec.Vec(u8)
+
+
+public function push_byte(buf: mutable Vec_u8.Vec, b: u8, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_u8.push(mutable buf, b, allocator)?
+}
+
+public function push_str(buf: mutable Vec_u8.Vec, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_u8.extend_from_slice(mutable buf, s.bytes(), allocator)?
+}
+
+public function push_u32_decimal(buf: mutable Vec_u8.Vec, n: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if n == 0 {
+        Vec_u8.push(mutable buf, 0x30, allocator)?
+        return
+    }
+    let start: usize = Vec_u8.len(buf)
+    var v: u32 = n
+    loop
+        decreases v
+    {
+        if v == 0 { break }
+        let digit: u8 = ((v % 10) as u8) + 0x30
+        Vec_u8.push(mutable buf, digit, allocator)?
+        v = v / 10
+    }
+    reverse_range(mutable buf, start, Vec_u8.len(buf))
+}
+
+function reverse_range(buf: mutable Vec_u8.Vec, lo: usize, hi: usize) -> ()
+    requires lo <= hi
+    requires hi <= Vec_u8.len(buf)
+{
+    var i: usize = lo
+    var j: usize = hi
+    loop
+        decreases j - i
+    {
+        if i + 1 >= j { break }
+        j -= 1
+        Vec_u8.swap(mutable buf, i, j)
+        i += 1
+    }
+}
+
+public function push_usize_decimal(buf: mutable Vec_u8.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= 4294967295
+{
+    push_u32_decimal(mutable buf, n as u32, allocator)?
+}
+
+
+public function push_quoted(buf: mutable Vec_u8.Vec, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    if n == 0 {
+        Vec_u8.push(mutable buf, 0x22, allocator)?
+        Vec_u8.push(mutable buf, 0x22, allocator)?
+        return
+    }
+    if !needs_quoting(bytes, n) {
+        push_str(mutable buf, s, allocator)?
+        return
+    }
+    write_quoted(mutable buf, bytes, n, allocator)?
+}
+
+
+public function push_pipe_join(buf: mutable Vec_u8.Vec, parts: [String], allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = parts.len()
+    var k: usize = 0
+    loop
+        decreases n - k
+    {
+        if k >= n { break }
+        if k > 0 {
+            Vec_u8.push(mutable buf, 0x20, allocator)?
+            Vec_u8.push(mutable buf, 0x7C, allocator)?
+            Vec_u8.push(mutable buf, 0x20, allocator)?
+        }
+        push_str(mutable buf, parts[k], allocator)?
+        k += 1
+    }
+}
+
+
+public function finish_string(buf: take Vec_u8.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes: [u8] = Vec_u8.into_array(take buf, allocator)?
+    return string.from_owned_utf8(take bytes)
+}
+
+
+function needs_quoting(bytes: [u8], n: usize) -> bool
+    requires n > 0
+    requires n == bytes.len()
+{
+    if bytes[0] == 0x20 { return true }
+    if bytes[n - 1] == 0x20 { return true }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if is_toon_special(bytes[i]) { return true }
+        i += 1
+    }
+    return false
+}
+
+function is_toon_special(b: u8) -> bool {
+    if b == 0x2C { return true }
+    if b == 0x22 { return true }
+    if b == 0x0A { return true }
+    if b == 0x0D { return true }
+    if b == 0x23 { return true }
+    if b == 0x7B { return true }
+    if b == 0x7D { return true }
+    if b == 0x5B { return true }
+    if b == 0x5D { return true }
+    if b == 0x3A { return true }
+    return false
+}
+
+
+function write_quoted(buf: mutable Vec_u8.Vec, bytes: [u8], n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n == bytes.len()
+{
+    Vec_u8.push(mutable buf, 0x22, allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let b = bytes[i]
+        if b == 0x22 {
+            Vec_u8.push(mutable buf, 0x5C, allocator)?
+            Vec_u8.push(mutable buf, 0x22, allocator)?
+        } else {
+            if b == 0x5C {
+                Vec_u8.push(mutable buf, 0x5C, allocator)?
+                Vec_u8.push(mutable buf, 0x5C, allocator)?
+            } else {
+                if b == 0x0A {
+                    Vec_u8.push(mutable buf, 0x5C, allocator)?
+                    Vec_u8.push(mutable buf, 0x6E, allocator)?
+                } else {
+                    if b == 0x0D {
+                        Vec_u8.push(mutable buf, 0x5C, allocator)?
+                        Vec_u8.push(mutable buf, 0x72, allocator)?
+                    } else {
+                        Vec_u8.push(mutable buf, b, allocator)?
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    Vec_u8.push(mutable buf, 0x22, allocator)?
+}

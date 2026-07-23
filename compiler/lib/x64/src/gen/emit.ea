@@ -1,0 +1,339 @@
+
+module x64.gen.emit
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.op as lir_op_mod
+import ir.hlir.op as hlir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.runtime as runtime_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.control.branch as branch_mod
+import ir.emitted as etypes_mod
+import local.emit.types as x64types_mod
+import local.emit.arith.binary.binary as arith_mod
+import local.emit.value.value.emit as value_mod
+import local.emit.value.convert.emit as convert_mod
+import local.emit.arith.unary.unary as unary_mod
+import local.emit.value.constant.emit as constant_mod
+import local.emit.terminators.terminators as terminators_mod
+import local.emit.regsel as regsel_mod
+import local.emit.fixup as fixup_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_body_mod.LirCalleeSave)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(etypes_mod.EmittedReloc)
+spec std.collections.vec.Vec(x64types_mod.BranchFixup)
+spec std.collections.vec.Vec(etypes_mod.LineRow)
+
+
+public function emit_body(
+    out: init Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit code: Vec_u8.Vec
+    Vec_u8.with_capacity(init code, Vec_LirOp.len(body.ops) *| 8, allocator)?
+    uninit relocs: Vec_EmittedReloc.Vec
+    Vec_EmittedReloc.new(init relocs, allocator)?
+    uninit lines: Vec_LineRow.Vec
+    Vec_LineRow.new(init lines, allocator)?
+    emit_core(mutable code, mutable relocs, mutable lines, body, allocator)?
+    out = code
+}
+
+
+public function emit_body_full(
+    out: init etypes_mod.EmittedFn,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit code: Vec_u8.Vec
+    Vec_u8.with_capacity(init code, Vec_LirOp.len(body.ops) *| 8, allocator)?
+    uninit relocs: Vec_EmittedReloc.Vec
+    Vec_EmittedReloc.new(init relocs, allocator)?
+    uninit lines: Vec_LineRow.Vec
+    Vec_LineRow.new(init lines, allocator)?
+    emit_core(mutable code, mutable relocs, mutable lines, body, allocator)?
+    out = etypes_mod.EmittedFn {
+        code: code,
+        relocations: relocs,
+        lines: etypes_mod.LineTable {
+            file: body.origin_file,
+            rows: lines,
+        },
+        debug_locals: body.debug_locals,
+        debug_slots: body.debug_slots,
+    }
+}
+
+
+function emit_core(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    lines: mutable Vec_LineRow.Vec,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    uninit fixups: Vec_BranchFixup.Vec
+    Vec_BranchFixup.new(init fixups, allocator)?
+
+    init_block_offsets(mutable offsets, body, allocator)?
+    emit_prologue(mutable code, mutable relocs, body, allocator)?
+
+    let n_blocks = Vec_LirBlock.len(body.blocks)
+    if n_blocks > 1 {
+        record_line(mutable lines, 0, Vec_LirBlock.at(body.blocks, 1).node_id_origin, allocator)?
+    }
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        record_offset(mutable offsets, b, Vec_u8.len(code))?
+        emit_block(mutable code, mutable fixups, mutable relocs, mutable lines, body, b, allocator)?
+        b += 1
+    }
+
+    fixup_mod.resolve_fixups(mutable code, fixups, offsets)?
+}
+
+
+function init_block_offsets(
+    offsets: mutable Vec_u32.Vec,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LirBlock.len(body.blocks)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u32.push(mutable offsets, 0, allocator)?
+        i += 1
+    }
+}
+
+function record_offset(
+    offsets: mutable Vec_u32.Vec,
+    idx: usize,
+    value: usize,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    if idx >= Vec_u32.len(offsets) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: block offset index out of range",
+        )
+    }
+    Vec_u32.set_at(mutable offsets, idx, value as u32 wrapping)
+}
+
+
+function emit_prologue(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    branch_mod.encode_push_r64(mutable code, regs_mod.Gp64Reg.rbp, allocator)?
+    alu_mod.encode_mov_rm_r(mutable code, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rbp, regs_mod.Gp64Reg.rsp, allocator)?
+    let sz = frame_size(body)
+    if sz > (4096 as i32) {
+        alu_mod.encode_mov_r32_imm32(mutable code, regs_mod.Gp64Reg.rax, sz, allocator)?
+        branch_mod.encode_call_rel32(mutable code, 0 as i32, allocator)?
+        let site = fixup_mod.tail_site(code)?
+        fixup_mod.record_reloc(mutable relocs, site, etypes_mod.RelocTarget.runtime_symbol(fn_: runtime_mod.RuntimeFn.chkstk), etypes_mod.RelocKind.rel32, allocator)?
+        alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.sub_, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rsp, regs_mod.Gp64Reg.rax, allocator)?
+    } else {
+        alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.sub_, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rsp, sz, allocator)?
+    }
+    let n = Vec_LirCalleeSave.len(body.callee_saved)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let cs = Vec_LirCalleeSave.at(body.callee_saved, i)
+        let reg = regsel_mod.preg_gp(lir_reg_mod.PReg { raw: cs.preg_raw })?
+        alu_mod.encode_mov_mem_r(mutable code, regs_mod.OpSize.qword_, regs_mod.Gp64Reg.rbp, cs.frame_disp, reg, allocator)?
+        i += 1
+    }
+}
+
+function frame_size(body: lir_body_mod.LirBody) -> i32 {
+    return align16_u32(body.frame_size) as i32
+}
+
+function align16_u32(value: u32) -> u32 {
+    let rem = value % (16 as u32)
+    if rem == (0 as u32) { return value }
+    return (value - rem) + (16 as u32)
+}
+
+
+function emit_block(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_BranchFixup.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    lines: mutable Vec_LineRow.Vec,
+    body: lir_body_mod.LirBody,
+    block_idx: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    let block = Vec_LirBlock.at(body.blocks, block_idx)
+    let n_ops = Vec_LirOpId.len(block.ops)
+    var i: usize = 0
+    loop decreases n_ops - i {
+        if i >= n_ops { break }
+        let op_id = Vec_LirOpId.at(block.ops, i)
+        emit_op_by_id(mutable code, mutable relocs, mutable lines, body, op_id, allocator)?
+        i += 1
+    }
+    record_line(mutable lines, Vec_u8.len(code), block.terminator.origin, allocator)?
+    terminators_mod.emit_terminator(mutable code, mutable fixups, body, block_idx, allocator)?
+}
+
+
+function emit_op_by_id(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    lines: mutable Vec_LineRow.Vec,
+    body: lir_body_mod.LirBody,
+    op_id: lir_op_id_mod.LirOpId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let idx = op_id.raw as usize
+    if idx == 0 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: block.ops references sentinel op id 0",
+        )
+    }
+    if idx >= Vec_LirOp.len(body.ops) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: op id out of range",
+        )
+    }
+    let op = Vec_LirOp.at(body.ops, idx)
+    record_line(mutable lines, Vec_u8.len(code), op.origin, allocator)?
+    emit_op(mutable code, mutable relocs, body, op, allocator)?
+}
+
+
+function record_line(
+    lines: mutable Vec_LineRow.Vec,
+    offset: usize,
+    node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LineRow.len(lines)
+    if n > 0 {
+        let last = Vec_LineRow.at(lines, n - 1)
+        if node_mod.index(last.node) == node_mod.index(node) { return }
+    }
+    Vec_LineRow.push(
+        mutable lines,
+        etypes_mod.LineRow {
+            code_offset: offset as u32 wrapping,
+            node: node,
+        },
+        allocator,
+    )?
+}
+
+function emit_op(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LirOp,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match op.kind {
+        case .mov(let src, let dst) => value_mod.emit_mov(mutable code, body, src, dst, allocator)?
+        case .copy_(let src, let dst) => value_mod.emit_copy(mutable code, body, src, dst, allocator)?
+        case .constant_(let c, let dst) => constant_mod.emit_constant(mutable code, mutable relocs, body, c, dst, allocator)?
+        case .binary(let bop, let lhs, let rhs, let dst) => arith_mod.emit_binary(mutable code, body, bop, op.flags, lhs, rhs, dst, allocator)?
+        case .unary(let uop, let operand, let dst) => unary_mod.emit_unary(mutable code, body, uop, operand, dst, allocator)?
+        case .convert_(let src, let to_width, let to_signed, let kind, let dst) => convert_mod.emit_convert(mutable code, body, src, to_width, to_signed, kind, dst, allocator)?
+        case .load(let addr, let dst, let width) => value_mod.emit_load(mutable code, body, addr, dst, width, allocator)?
+        case .store(let value, let addr, let width) => value_mod.emit_store(mutable code, body, value, addr, width, allocator)?
+        case .call_(let callee, _, let return_) => {
+            if hlir_op_mod.is_syscall(op.flags) {
+                branch_mod.encode_syscall(mutable code, allocator)?
+            } else {
+                value_mod.emit_call(mutable code, body, callee, return_, allocator)?
+            }
+        }
+        case .call_indirect(_, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: call_indirect must be lowered to a direct call_ via fat-value field extraction by regalloc.materialize before emit",
+        )
+        case .make_closure(_, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: make_closure must be lowered to fn-value materialization by regalloc.materialize before emit",
+        )
+        case .stack_addr(_, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "x64.gen.emit: stack_addr must be lowered to an address computation by regalloc.materialize before emit",
+        )
+        case .err_flag(let dst) => {
+            let dg = regsel_mod.vreg_gp(body, dst)?
+            branch_mod.encode_setcc_rm8(mutable code, branch_mod.Cond.b_, dg, allocator)?
+            alu_mod.encode_movzx_r_rm8(mutable code, regs_mod.OpSize.qword_, dg, dg, allocator)?
+        }
+        case .cmov_carry(let src, let dst, let when_set) => {
+            let sg = regsel_mod.vreg_gp(body, src)?
+            let dg = regsel_mod.vreg_gp(body, dst)?
+            let cc = if when_set { branch_mod.Cond.b_ } else { branch_mod.Cond.ae_ }
+            branch_mod.encode_cmovcc_r_rm(mutable code, cc, dg, sg, allocator)?
+        }
+        case .bounds_check(let index, let len) => {
+            let ix = match regsel_mod.resolve_gp_operand(body, index)? {
+                case .reg(let r) => r
+                case .imm32(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+                    at: span_mod.dummy(),
+                    message: "x64.gen.emit: bounds_check index operand must be a register",
+                )
+            }
+            match regsel_mod.resolve_gp_operand(body, len)? {
+                case .reg(let lr) => alu_mod.encode_alu_rm_r(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, ix, lr, allocator)?
+                case .imm32(let v) => alu_mod.encode_alu_rm_imm(mutable code, alu_mod.AluOp.cmp_, regs_mod.OpSize.qword_, ix, v, allocator)?
+            }
+            branch_mod.encode_jcc_rel8(mutable code, branch_mod.Cond.b_, 2 as i8, allocator)?
+            branch_mod.encode_ud2(mutable code, allocator)?
+        }
+    }
+}

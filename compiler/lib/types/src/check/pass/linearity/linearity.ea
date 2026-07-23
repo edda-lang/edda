@@ -1,0 +1,184 @@
+
+module types.check.pass.linearity.linearity
+
+import std.mem.alloc
+import std.collections.vec
+import hir.item as hir_item
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(Lin)
+
+
+derive eq, clone, debug for Lin
+derive clone, debug for LinTable
+
+
+public type Lin {
+    case none_
+    case affine_
+    case linear_
+}
+
+
+public type LinTable {
+    entries: Vec_Lin.Vec
+}
+
+
+public function build_lin_table(
+    items: Vec_HItem.Vec,
+    allocator: Allocator,
+) -> LinTable
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit entries: Vec_Lin.Vec
+    Vec_Lin.new(init entries, allocator)?
+    collect(items, mutable entries, allocator)?
+    return LinTable { entries: entries }
+}
+
+
+function collect(
+    items: Vec_HItem.Vec,
+    entries: mutable Vec_Lin.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                let sig = Box_HTypeSignature.get(sig_box)
+                let lin = lin_of_sig(sig)
+                record_at_def(mutable entries, item.def_id, lin, allocator)?
+            }
+            case .spec_decl(_, let inner) => {
+                collect(inner, mutable entries, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function lin_of_sig(sig: hir_item.HTypeSignature) -> Lin {
+    return match sig.linearity {
+        case .some(let l) => match l {
+            case .affine_ => Lin.affine_
+            case .linear_ => Lin.linear_
+        }
+        case .none => Lin.none_
+    }
+}
+
+
+function record_at_def(
+    entries: mutable Vec_Lin.Vec,
+    def_id: def_mod.DefId,
+    lin: Lin,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def_id) {
+        return
+    }
+    let target = def_mod.index(def_id)
+    loop {
+        let len = Vec_Lin.len(entries)
+        if len >= target { break }
+        Vec_Lin.push(mutable entries, Lin.none_, allocator)?
+    }
+    let current = Vec_Lin.len(entries)
+    if current == target {
+        Vec_Lin.push(mutable entries, lin, allocator)?
+    } else {
+        Vec_Lin.set_at(mutable entries, target, lin)
+    }
+}
+
+
+function lin_at_def(table: LinTable, def: def_mod.DefId) -> Lin {
+    if def_mod.is_error(def) {
+        return Lin.none_
+    }
+    let i = def_mod.index(def)
+    if i >= Vec_Lin.len(table.entries) {
+        return Lin.none_
+    }
+    return Vec_Lin.at(table.entries, i)
+}
+
+
+function lin_of_ty(
+    table: LinTable,
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> Lin
+    with {divergence}
+{
+    if ty_mod.is_error(ty) {
+        return Lin.none_
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, ty)
+    return match cty {
+        case .record(let def) => lin_at_def(table, def)
+        case .sum_(let def) => lin_at_def(table, def)
+        case .refined(let base, _) => lin_of_ty(table, base, ty_interner)
+        case _ => Lin.none_
+    }
+}
+
+
+public function is_linear(
+    table: LinTable,
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    return match lin_of_ty(table, ty, ty_interner) {
+        case .linear_ => true
+        case _ => false
+    }
+}
+
+
+public function is_affine(
+    table: LinTable,
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    return match lin_of_ty(table, ty, ty_interner) {
+        case .affine_ => true
+        case _ => false
+    }
+}
+
+
+public function is_linear_or_affine(
+    table: LinTable,
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    return match lin_of_ty(table, ty, ty_interner) {
+        case .none_ => false
+        case _ => true
+    }
+}

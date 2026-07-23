@@ -1,0 +1,141 @@
+
+module compile.check.runes.effects
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import source.map as source_map_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree_mod
+import local.check.runes.util as util_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_tree_mod.EffectMember)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+
+
+public function hash_effects(asts: Vec_File.Vec, map: source_map_mod.SourceMap, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit entries: Vec_String.Vec
+    Vec_String.new(init entries, allocator)?
+    let n = Vec_File.len(asts)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_effect_entries(Vec_File.at(asts, i), map, mutable entries, allocator)?
+        i = i + 1
+    }
+    util_mod.sort_strings(mutable entries)
+    return util_mod.hex_hash_of(util_mod.join_lines(entries, allocator)?, allocator)?
+}
+
+
+function collect_effect_entries(
+    file: ast_file_mod.File,
+    map: source_map_mod.SourceMap,
+    entries: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(file.items, i)
+        match item.kind {
+            case .function_(let decl_box) => {
+                let decl = Box_FnDecl.get(decl_box)
+                if is_public_fn(decl) {
+                    match decl.effects {
+                        case .some(let row) => collect_row_entries(row, map, mutable entries, allocator)?
+                        case .none => ()
+                    }
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function is_public_fn(decl: ast_item_mod.FnDecl) -> bool {
+    return match decl.visibility {
+        case .public_ => true
+        case .module_ => false
+    }
+}
+
+
+function collect_row_entries(
+    row: ast_tree_mod.EffectRow,
+    map: source_map_mod.SourceMap,
+    entries: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_EffectMember.len(row.members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = render_member(Vec_EffectMember.at(row.members, i), map, allocator)?
+        push_unique(mutable entries, take entry, allocator)?
+        i = i + 1
+    }
+}
+
+
+function render_member(member: ast_tree_mod.EffectMember, map: source_map_mod.SourceMap, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match member {
+        case .capability(let name) => text_of(map, name.span, allocator)?
+        case .named(let name, let ty) => {
+            let a = text_of(map, name.span, allocator)?
+            let b = string.concat(a, ": ", allocator)?
+            let ty_text = text_of(map, ty.span, allocator)?
+            string.concat(b, ty_text, allocator)?
+        }
+        case .spread(let path) => text_of(map, path.span, allocator)?
+        case .graded(let kind, let bound) => {
+            let a = text_of(map, kind.span, allocator)?
+            let b = string.concat(a, "(", allocator)?
+            let bound_expr = Box_Expr.get(bound)
+            let bound_text = text_of(map, bound_expr.span, allocator)?
+            let c = string.concat(b, bound_text, allocator)?
+            string.concat(c, ")", allocator)?
+        }
+    }
+}
+
+
+function text_of(map: source_map_mod.SourceMap, sp: span_mod.Span, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = source_map_mod.span_text(map, sp)
+    return string.bytes_slice_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+
+function push_unique(entries: mutable Vec_String.Vec, entry: take String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(Vec_String.at(entries, i), entry) {
+            return
+        }
+        i = i + 1
+    }
+    Vec_String.push(mutable entries, take entry, allocator)?
+}

@@ -1,0 +1,308 @@
+
+module compile.check.runes.resolve.archive.archive
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import std.archive.tar
+import std.compress.zstd
+import cache.addr.hash as chash_mod
+import diagnostics.emit.collection as diags_mod
+import manifest.model.lockfile.lockfile as lf_mod
+import local.check.runes.resolve.tamper.tamper as tamper_mod
+import local.check.runes.util as util_mod
+import local.check.runes.resolve.effecthash.effecthash as effecthash_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(tar.Entry)
+spec std.core.option.Option(lf_mod.Rune)
+
+
+public function build_rune_from_archive(
+    rfs: ReadOnlyFilesystem,
+    archive_path: String,
+    dep_name: String,
+    descriptor: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_Rune.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let bytes = fs.read_bytes(rfs, archive_path, allocator)?
+    let rune_hash = blake3_hex(bytes, allocator)?
+    return handle err: zstd.ZstdError as _ze -> Option_Rune.none {
+        handle err: tar.TarError as _te -> Option_Rune.none {
+            assemble_rune(bytes, take rune_hash, dep_name, descriptor, mutable diags, allocator)?
+        }
+    }
+}
+
+
+function assemble_rune(
+    bytes: [u8],
+    rune_hash: take String,
+    dep_name: String,
+    descriptor: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_Rune.Option
+    with {allocator, err: alloc.AllocError, err: zstd.ZstdError, err: tar.TarError}
+{
+    let tar_bytes = zstd.decompress(bytes, allocator)?
+    let manifest_opt = read_entry_text(tar_bytes, "manifest.toml", allocator)?
+    let manifest_text = match manifest_opt {
+        case .none => raise tar.TarError.truncated_data
+        case .some(let t) => t
+    }
+    let surface_hash = compute_surface_hash(tar_bytes, allocator)?
+    let effect_hash = effecthash_mod.compute_effect_hash(tar_bytes, allocator)?
+    let hashes_opt = read_entry_text(tar_bytes, "hashes.toon", allocator)?
+    if !tamper_mod.declared_hashes_match(dep_name, hashes_opt, surface_hash, effect_hash, mutable diags, allocator)? {
+        return Option_Rune.none
+    }
+    let version = read_version(manifest_text, allocator)?
+    let deps = read_deps(manifest_text, allocator)?
+    let publisher_key = read_publisher_key(tar_bytes, allocator)?
+    let publisher_sig = read_publisher_sig(tar_bytes, allocator)?
+    let name_owned = string.clone(dep_name, allocator)?
+    let source_owned = string.clone(descriptor, allocator)?
+    let r = lf_mod.rune_of(
+        take name_owned,
+        take version,
+        take source_owned,
+        take rune_hash,
+        take surface_hash,
+        take effect_hash,
+        take publisher_key,
+        take publisher_sig,
+        take deps,
+    )
+    return Option_Rune.some(value: r)
+}
+
+
+function blake3_hex(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let h = chash_mod.hash_bytes(bytes, allocator)?
+    let hex = chash_mod.to_hex_string(h, allocator)?
+    return string.concat("blake3:", hex, allocator)?
+}
+
+
+function compute_surface_hash(tar_bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    uninit acc: Vec_u8.Vec
+    Vec_u8.new(init acc, allocator)?
+    let fuel = tar.count_entries(tar_bytes)?
+    let total = tar_bytes.len()
+    var off: usize = 0
+    var i: usize = 0
+    loop decreases (fuel - i) {
+        if i >= fuel { break }
+        if off >= total { break }
+        match tar.entry_at(tar_bytes, off)? {
+            case .none => break
+            case .some(let e) => {
+                if tar.is_regular_file(e) {
+                    let nm = tar.entry_name(tar_bytes, e, allocator)?
+                    if string.starts_with(nm, "surface/") {
+                        Vec_u8.extend_from_slice(mutable acc, tar.entry_data(tar_bytes, e)?, allocator)?
+                    }
+                }
+                off = tar.next_offset(e)
+                i = i + 1
+            }
+        }
+    }
+    let arr = Vec_u8.into_array(take acc, allocator)?
+    let h = chash_mod.hash_bytes(arr, allocator)?
+    let hex = chash_mod.to_hex_string(h, allocator)?
+    return string.concat("blake3:", hex, allocator)?
+}
+
+
+function read_entry_text(tar_bytes: [u8], name: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    match tar.find_entry(tar_bytes, name)? {
+        case .none => return Option_String.none
+        case .some(let e) => {
+            let data = tar.entry_data(tar_bytes, e)?
+            let s = string.bytes_slice_to_string(data, 0, data.len(), allocator)?
+            return Option_String.some(value: s)
+        }
+    }
+}
+
+
+
+
+function read_publisher_key(tar_bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    match read_entry_text(tar_bytes, "publisher.key", allocator)? {
+        case .none => return ""
+        case .some(let text) => {
+            match token_from(text, "ed25519:", allocator)? {
+                case .some(let tok) => return tok
+                case .none => return string.trim(text, allocator)?
+            }
+        }
+    }
+}
+
+
+function read_publisher_sig(tar_bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, err: tar.TarError}
+{
+    match tar.find_entry(tar_bytes, "signature.bin")? {
+        case .none => return ""
+        case .some(let e) => {
+            let data = tar.entry_data(tar_bytes, e)?
+            let hex = bytes_to_hex(data, allocator)?
+            return string.concat("ed25519:", hex, allocator)?
+        }
+    }
+}
+
+
+function read_version(manifest_text: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let lines = string.split(manifest_text, "\n", allocator)?
+    let n = lines.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let line = string.trim(lines[i], allocator)?
+        if string.starts_with(line, "version") {
+            match util_mod.extract_quoted(line, allocator)? {
+                case .none => ()
+                case .some(let v) => return v
+            }
+        }
+        i = i + 1
+    }
+    return "0.0.0"
+}
+
+
+function read_deps(manifest_text: String, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let lines = string.split(manifest_text, "\n", allocator)?
+    let n = lines.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let line = string.trim(lines[i], allocator)?
+        if string.starts_with(line, "[dependencies.") {
+            match dep_name_from_header(line, allocator)? {
+                case .none => ()
+                case .some(let nm) => {
+                    if !contains_str(out, nm) {
+                        let owned = string.clone(nm, allocator)?
+                        Vec_String.push(mutable out, take owned, allocator)?
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    util_mod.sort_strings(mutable out)
+    return out
+}
+
+
+function dep_name_from_header(line: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let lb = line.bytes()
+    let n = lb.len()
+    let prefix_len: usize = 14
+    if n <= prefix_len {
+        return Option_String.none
+    }
+    var end: usize = prefix_len
+    loop decreases (n - end) {
+        if end >= n { break }
+        let c = lb[end]
+        if c == 46 || c == 93 { break }
+        end = end + 1
+    }
+    if end <= prefix_len {
+        return Option_String.none
+    }
+    let nm = string.bytes_slice_to_string(lb, prefix_len, end, allocator)?
+    return Option_String.some(value: nm)
+}
+
+
+function token_from(line: String, prefix: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    match string.find(line, prefix) {
+        case .none => return Option_String.none
+        case .some(let start) => {
+            let lb = line.bytes()
+            let n = lb.len()
+            var end: usize = start
+            loop decreases (n - end) {
+                if end >= n { break }
+                let c = lb[end]
+                if c == 32 || c == 9 || c == 10 || c == 13 || c == 34 { break }
+                end = end + 1
+            }
+            let tok = string.bytes_slice_to_string(lb, start, end, allocator)?
+            return Option_String.some(value: tok)
+        }
+    }
+}
+
+
+function bytes_to_hex(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    let n = bytes.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = bytes[i]
+        Vec_u8.push(mutable out, nibble_hex(b / 16), allocator)?
+        Vec_u8.push(mutable out, nibble_hex(b % 16), allocator)?
+        i = i + 1
+    }
+    let arr = Vec_u8.into_array(take out, allocator)?
+    return string.from_owned_utf8(take arr)
+}
+
+
+function nibble_hex(n: u8) -> u8
+    requires n < 16
+{
+    return if n < 10 { n + 48 } else { (n - 10) + 97 }
+}
+
+
+function contains_str(items: Vec_String.Vec, name: String) -> bool {
+    let n = Vec_String.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        if string.equals(Vec_String.at(items, i), name) {
+            return true
+        }
+        i = i + 1
+    }
+}

@@ -1,0 +1,217 @@
+
+module resolve.bind.lookup.lookup
+
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import syntax.ast.item as ast_item
+import syntax.ast.ident as ast_ident
+import hir.def as def_mod
+import local.ctx as ctx_mod
+import local.cteval.builtins as cbi_mod
+import local.bind.lookup.env.scopes.stack as scope_mod
+import local.paths.imports as imports_mod
+import local.paths.path as path_mod
+
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(imports_mod.ImportEntry)
+
+
+public function resolve_value(ctx: ctx_mod.ResolveCtx, stack: scope_mod.ScopeStack, p: ast_ident.Path, interner: interner_mod.Interner, allocator: Allocator) -> def_mod.DefId
+    with {allocator, err: alloc.AllocError}
+{
+    let n = path_mod.path_len(p)
+    if n == 0 as usize {
+        return def_mod.error()
+    }
+    let head = first_seg_name(p)
+    if n == 1 as usize {
+        match scope_mod.lookup(stack, head) {
+            case .some(let local_def) => return local_def
+            case .none => ()
+        }
+        match imports_mod.lookup(ctx_mod.current_imports(ctx), head) {
+            case .some(let e) => {
+                if e.is_selected {
+                    return ctx_mod.lookup_path(ctx, e.path)
+                }
+            }
+            case .none => ()
+        }
+        let sib = ctx_mod.lookup_in_current_module(ctx, head)
+        if !def_mod.is_error(sib) {
+            return sib
+        }
+        return ctx_mod.lookup_single(ctx, head, interner)
+    }
+    match imports_mod.lookup(ctx_mod.current_imports(ctx), head) {
+        case .some(let e) => {
+            if !e.is_selected {
+                let full = append_rest(e.path, p, allocator)?
+                return ctx_mod.lookup_path(ctx, full)
+            }
+        }
+        case .none => ()
+    }
+    let inst_full = ctx_mod.instance_full(ctx, ctx_mod.current_module(ctx), head)
+    if inst_full.raw != (0 as u32) && inst_full.raw != head.raw {
+        let tsegs = translate_head(p, inst_full, allocator)?
+        let td = ctx_mod.lookup_path(ctx, tsegs)
+        if !def_mod.is_error(td) {
+            return td
+        }
+    }
+    let segs = path_to_syms(p, allocator)?
+    let d = ctx_mod.lookup_path(ctx, segs)
+    if !def_mod.is_error(d) {
+        return d
+    }
+    let sa = resolve_self_alias(ctx, p, head, allocator)?
+    if !def_mod.is_error(sa) {
+        return sa
+    }
+    if n == 2 as usize && slice.eq_u8(interner_mod.lookup(interner, head), "target".bytes()) {
+        let member = Vec_Ident.at(p.segments, 1).name
+        return cbi_mod.lookup_target_member(ctx_mod.comptime_builtins(ctx), member, interner)
+    }
+    return def_mod.error()
+}
+
+
+function resolve_self_alias(ctx: ctx_mod.ResolveCtx, p: ast_ident.Path, head: symbol.Symbol, allocator: Allocator) -> def_mod.DefId
+    with {allocator, err: alloc.AllocError}
+{
+    let mods = ctx_mod.current_module_path(ctx)
+    let mn = Vec_Symbol.len(mods)
+    if mn == 0 as usize {
+        return def_mod.error()
+    }
+    let leaf = Vec_Symbol.at(mods, mn - 1)
+    if leaf.raw != head.raw {
+        return def_mod.error()
+    }
+    uninit full: Vec_Symbol.Vec
+    Vec_Symbol.new(init full, allocator)?
+    var i: usize = 0
+    loop decreases (mn - i) {
+        if i >= mn { break }
+        Vec_Symbol.push(mutable full, Vec_Symbol.at(mods, i), allocator)?
+        i = i + 1
+    }
+    let pn = Vec_Ident.len(p.segments)
+    var j: usize = 1
+    loop decreases (pn - j) {
+        if j >= pn { break }
+        Vec_Symbol.push(mutable full, Vec_Ident.at(p.segments, j).name, allocator)?
+        j = j + 1
+    }
+    return ctx_mod.lookup_path(ctx, full)
+}
+
+
+public function value_is_scope_local(stack: scope_mod.ScopeStack, p: ast_ident.Path) -> bool {
+    if path_mod.path_len(p) != 1 as usize {
+        return false
+    }
+    return match scope_mod.lookup(stack, first_seg_name(p)) {
+        case .some(_) => true
+        case .none => false
+    }
+}
+
+
+public function module_path_of(items: Vec_Item.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .module_(let m) => return path_to_syms(m.path, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+    uninit empty: Vec_Symbol.Vec
+    Vec_Symbol.new(init empty, allocator)?
+    return empty
+}
+
+
+public function first_sym(mp: Vec_Symbol.Vec) -> symbol.Symbol {
+    if Vec_Symbol.len(mp) == 0 as usize {
+        return symbol.empty()
+    }
+    return Vec_Symbol.at(mp, 0)
+}
+
+
+function first_seg_name(p: ast_ident.Path) -> symbol.Symbol {
+    if Vec_Ident.len(p.segments) == 0 as usize {
+        return symbol.empty()
+    }
+    return Vec_Ident.at(p.segments, 0).name
+}
+
+
+function path_to_syms(p: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function translate_head(p: ast_ident.Path, full: symbol.Symbol, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    Vec_Symbol.push(mutable out, full, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 1
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function append_rest(base: Vec_Symbol.Vec, p: ast_ident.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let bn = Vec_Symbol.len(base)
+    var i: usize = 0
+    loop decreases (bn - i) {
+        if i >= bn { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(base, i), allocator)?
+        i = i + 1
+    }
+    let pn = Vec_Ident.len(p.segments)
+    var j: usize = 1
+    loop decreases (pn - j) {
+        if j >= pn { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, j).name, allocator)?
+        j = j + 1
+    }
+    return out
+}

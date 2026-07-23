@@ -1,0 +1,362 @@
+
+module compile.phase.pipeline.ffi.consistency
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import intern.interner as interner_mod
+import types.check as types_check_mod
+import types.check.env.sig as sig_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import symname.lib as symname_mod
+
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(sig_mod.FnSig)
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(i32)
+spec std.collections.vec.Vec(ExternDecl)
+
+
+public type ExternDecl {
+    name: symbol_mod.Symbol
+    def_id: def_mod.DefId
+    extern_span: span_mod.Span
+    dll: Option_Symbol
+}
+
+
+public function check_extern_consistency(
+    hir_files: Vec_HirFile.Vec,
+    dep_files: Vec_HirFile.Vec,
+    decl_only_files: Vec_HirFile.Vec,
+    decls: types_check_mod.DeclTables,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit seen: Vec_ExternDecl.Vec
+    Vec_ExternDecl.new(init seen, allocator)?
+    collect_externs(hir_files, mutable seen, allocator)?
+    collect_externs(dep_files, mutable seen, allocator)?
+    collect_externs(decl_only_files, mutable seen, allocator)?
+    report_conflicts(seen, decls, interner, ty_interner, mutable diags, allocator)?
+}
+
+
+public function collect_externs(
+    files: Vec_HirFile.Vec,
+    seen: mutable Vec_ExternDecl.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(files)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = Vec_HirFile.at(files, i)
+        collect_file_externs(f.items, mutable seen, allocator)?
+        i += 1
+    }
+}
+
+
+function collect_file_externs(
+    items: Vec_HItem.Vec,
+    seen: mutable Vec_ExternDecl.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        let item = Vec_HItem.at(items, j)
+        match item.kind {
+            case .function_extern(_, let name, let sp, let dll) => {
+                if !symbol_mod.is_empty(name) && !contains_def(seen, item.def_id) {
+                    let d = ExternDecl { name: name, def_id: item.def_id, extern_span: sp, dll: dll }
+                    Vec_ExternDecl.push(mutable seen, take d, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        j += 1
+    }
+}
+
+
+public function contains_def(seen: Vec_ExternDecl.Vec, def_id: def_mod.DefId) -> bool {
+    let n = Vec_ExternDecl.len(seen)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_ExternDecl.at(seen, i).def_id.raw == def_id.raw {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+
+public function report_conflicts(
+    seen: Vec_ExternDecl.Vec,
+    decls: types_check_mod.DeclTables,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_ExternDecl.len(seen)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let cur = Vec_ExternDecl.at(seen, i)
+        match first_prior(seen, i, cur.name) {
+            case .some(let pj) => {
+                let prev = Vec_ExternDecl.at(seen, pj)
+                if !decls_consistent(prev, cur, decls, ty_interner, allocator)? {
+                    emit_conflict(mutable diags, cur, interner, allocator)?
+                }
+            }
+            case .none => ()
+        }
+        i += 1
+    }
+}
+
+
+function first_prior(
+    seen: Vec_ExternDecl.Vec,
+    upto: usize,
+    name: symbol_mod.Symbol,
+) -> Option_usize {
+    var j: usize = 0
+    loop decreases upto - j {
+        if j >= upto { break }
+        if Vec_ExternDecl.at(seen, j).name.raw == name.raw {
+            return Option_usize.some(value: j)
+        }
+        j += 1
+    }
+    return Option_usize.none
+}
+
+
+function decls_consistent(
+    prev: ExternDecl,
+    cur: ExternDecl,
+    decls: types_check_mod.DeclTables,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if !dll_eq(prev.dll, cur.dll) {
+        return false
+    }
+    match sig_of(decls, prev.def_id) {
+        case .some(let ps) => match sig_of(decls, cur.def_id) {
+            case .some(let cs) => return sig_abi_compatible(ps, cs, ty_interner, allocator)?
+            case .none         => return true
+        }
+        case .none => return true
+    }
+}
+
+
+function sig_of(
+    decls: types_check_mod.DeclTables,
+    def_id: def_mod.DefId,
+) -> Option_FnSig {
+    let idx = def_mod.index(def_id)
+    if idx >= Vec_FnSig.len(decls.fn_signatures) {
+        return Option_FnSig.none
+    }
+    return Option_FnSig.some(value: Vec_FnSig.at(decls.fn_signatures, idx))
+}
+
+
+function sig_abi_compatible(
+    a: sig_mod.FnSig,
+    b: sig_mod.FnSig,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let av = visible_param_classes(a, ty_interner, allocator)?
+    let bv = visible_param_classes(b, ty_interner, allocator)?
+    let an = Vec_i32.len(av)
+    let bn = Vec_i32.len(bv)
+    if an != bn {
+        return false
+    }
+    var i: usize = 0
+    loop decreases an - i {
+        if i >= an { break }
+        if classes_conflict(Vec_i32.at(av, i), Vec_i32.at(bv, i)) {
+            return false
+        }
+        i += 1
+    }
+    return !classes_conflict(abi_class(a.ret, ty_interner, 8), abi_class(b.ret, ty_interner, 8))
+}
+
+
+function visible_param_classes(
+    s: sig_mod.FnSig,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_i32.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_i32.Vec
+    Vec_i32.new(init out, allocator)?
+    let n = Vec_TyId.len(s.params)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let t = Vec_TyId.at(s.params, i)
+        if !is_abi_erased(t, ty_interner, 8) {
+            Vec_i32.push(mutable out, abi_class(t, ty_interner, 8), allocator)?
+        }
+        i += 1
+    }
+    return out
+}
+
+
+function classes_conflict(a: i32, b: i32) -> bool {
+    if a < 1 || b < 1 {
+        return false
+    }
+    return a != b
+}
+
+
+function abi_class(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: usize,
+) -> i32
+    with {divergence}
+    decreases fuel
+{
+    if fuel == 0 {
+        return 0
+    }
+    if ty_mod.is_error(ty) {
+        return 0
+    }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return 0
+    }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(let p)     => prim_class(p)
+        case .refined(let base, _) => abi_class(base, ty_interner, fuel - 1)
+        case _                     => 0
+    }
+}
+
+
+function prim_class(p: ty_kind_mod.PrimKind) -> i32 {
+    return match p {
+        case .f32_ => 2
+        case .f64_ => 2
+        case _     => 1
+    }
+}
+
+
+function is_abi_erased(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: usize,
+) -> bool
+    with {divergence}
+    decreases fuel
+{
+    if fuel == 0 {
+        return false
+    }
+    if ty_mod.is_error(ty) {
+        return false
+    }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .capability(_)        => true
+        case .refined(let base, _) => is_abi_erased(base, ty_interner, fuel - 1)
+        case .primitive(let p)     => prim_is_erased(p)
+        case _                     => false
+    }
+}
+
+
+function prim_is_erased(p: ty_kind_mod.PrimKind) -> bool {
+    return match p {
+        case .unit_     => true
+        case .never_    => true
+        case .type_meta => true
+        case _          => false
+    }
+}
+
+
+function dll_eq(a: Option_Symbol, b: Option_Symbol) -> bool {
+    match a {
+        case .some(let sa) => match b {
+            case .some(let sb) => return sa.raw == sb.raw
+            case .none         => return false
+        }
+        case .none => match b {
+            case .some(_) => return false
+            case .none    => return true
+        }
+    }
+}
+
+
+function emit_conflict(
+    diags: mutable diags_mod.Diagnostics,
+    cur: ExternDecl,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let sym = symname_mod.extern_symbol(cur.name, interner, allocator)?
+    let head = string.concat("conflicting extern import of '", sym, allocator)?
+    let msg = string.concat(head, "': another function_extern imports the same symbol with an incompatible ABI (differing argument count, register class, or extern_dll); both bind to one object symbol with a single ABI, silently miscompiling the mismatched caller.", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.conflicting_extern_signature(), cur.extern_span, msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

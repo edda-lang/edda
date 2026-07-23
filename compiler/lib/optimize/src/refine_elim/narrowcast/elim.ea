@@ -1,0 +1,188 @@
+
+module optimize.refine_elim.narrowcast.elim
+
+import std.collections.vec
+
+import types.pass.ty as ty_mod
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.id.block as mir_block_mod
+import local.refine_elim.facts.facts as facts_mod
+import local.refine_elim.proven.proven as proven_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Obligation)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+
+public type OptCastRvalue {
+    case some(rv: mir_rvalue_mod.Rvalue)
+    case none
+}
+
+
+public function elim_narrowing_cast_checks(
+    body: mutable mir_body_mod.MirBody,
+    sf: facts_mod.SiteFacts,
+    proven: proven_mod.ProvenSet,
+) -> ()
+{
+    let n = Vec_Obligation.len(body.obligations)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ob = Vec_Obligation.at(body.obligations, i)
+        elim_obligation(mutable body, sf, proven, ob)
+        i = i + 1
+    }
+}
+
+
+function elim_obligation(
+    body: mutable mir_body_mod.MirBody,
+    sf: facts_mod.SiteFacts,
+    proven: proven_mod.ProvenSet,
+    ob: mir_body_mod.Obligation,
+) -> ()
+{
+    let kind = mir_body_mod.ObligationKind.narrowing_cast_range
+    if !facts_mod.kind_matches(ob.kind, kind) {
+        return
+    }
+    let block = ob.block
+    let s_idx = ob.stmt_index as usize
+    if !facts_mod.site_is_proven(body, sf, proven, block, s_idx, kind) {
+        return
+    }
+    let b_idx = mir_block_mod.index(block)
+    let new_value = wrapped_rvalue_at(body, b_idx, s_idx)
+    match new_value {
+        case .some(let rv) => write_back(mutable body, b_idx, s_idx, rv)
+        case .none => return
+    }
+}
+
+
+function wrapped_rvalue_at(
+    body: mir_body_mod.MirBody,
+    b_idx: usize,
+    s_idx: usize,
+) -> OptCastRvalue
+{
+    if b_idx >= Vec_BasicBlock.len(body.blocks) {
+        return OptCastRvalue.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b_idx)
+    if s_idx >= Vec_Statement.len(bb.statements) {
+        return OptCastRvalue.none
+    }
+    let stmt = Vec_Statement.at(bb.statements, s_idx)
+    return match stmt.kind {
+        case .assign(_, let value) => wrapped_from_rvalue(value)
+        case .storage_live(_) => OptCastRvalue.none
+        case .storage_dead(_) => OptCastRvalue.none
+        case .nop_ => OptCastRvalue.none
+    }
+}
+
+
+function wrapped_from_rvalue(value: mir_rvalue_mod.Rvalue) -> OptCastRvalue {
+    return match value {
+        case .cast(let operand, let from, let to, let kind) =>
+            wrapped_from_cast(operand, from, to, kind)
+        case .use_(_) => OptCastRvalue.none
+        case .binary(_, _, _) => OptCastRvalue.none
+        case .unary(_, _) => OptCastRvalue.none
+        case .aggregate(_, _, _) => OptCastRvalue.none
+        case .ref_(_, _) => OptCastRvalue.none
+        case .len(_) => OptCastRvalue.none
+        case .discriminant(_) => OptCastRvalue.none
+        case .make_closure(_, _) => OptCastRvalue.none
+    }
+}
+
+
+function wrapped_from_cast(
+    operand: mir_rvalue_mod.Operand,
+    from: ty_mod.TyId,
+    to: ty_mod.TyId,
+    kind: mir_rvalue_mod.CastKind,
+) -> OptCastRvalue {
+    if !cast_is_trapping_narrowing(kind) {
+        return OptCastRvalue.none
+    }
+    let new_kind = wrap_cast(kind)
+    let rv = mir_rvalue_mod.Rvalue.cast(operand: operand, from: from, to: to, kind: new_kind)
+    return OptCastRvalue.some(rv: rv)
+}
+
+
+function cast_is_trapping_narrowing(kind: mir_rvalue_mod.CastKind) -> bool {
+    return match kind {
+        case .int_to_int(let mode) => mode_is_trapping(mode)
+        case .float_to_int(let mode) => mode_is_trapping(mode)
+        case .int_to_float => false
+        case .float_to_float => false
+        case .bool_to_int => false
+    }
+}
+
+
+function mode_is_trapping(mode: mir_rvalue_mod.OverflowMode) -> bool {
+    return match mode {
+        case .trapping => true
+        case .wrapping_ => false
+        case .saturating_ => false
+        case .checked_ => false
+    }
+}
+
+
+function wrap_cast(kind: mir_rvalue_mod.CastKind) -> mir_rvalue_mod.CastKind {
+    return match kind {
+        case .int_to_int(_) =>
+            mir_rvalue_mod.CastKind.int_to_int(mode: mir_rvalue_mod.OverflowMode.wrapping_)
+        case .float_to_int(_) =>
+            mir_rvalue_mod.CastKind.float_to_int(mode: mir_rvalue_mod.OverflowMode.wrapping_)
+        case _ => kind
+    }
+}
+
+
+function write_back(
+    body: mutable mir_body_mod.MirBody,
+    b_idx: usize,
+    s_idx: usize,
+    new_value: mir_rvalue_mod.Rvalue,
+) -> ()
+{
+    if b_idx >= Vec_BasicBlock.len(body.blocks) {
+        return
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, b_idx)
+    if s_idx >= Vec_Statement.len(bb.statements) {
+        return
+    }
+    let stmt = Vec_Statement.at(bb.statements, s_idx)
+    let new_kind = match stmt.kind {
+        case .assign(let dest, _) =>
+            mir_stmt_mod.MStmtKind.assign(dest: dest, value: new_value)
+        case .storage_live(_) => stmt.kind
+        case .storage_dead(_) => stmt.kind
+        case .nop_ => stmt.kind
+    }
+    let new_stmt = mir_stmt_mod.Statement {
+        origin: stmt.origin,
+        kind: new_kind,
+    }
+    var new_stmts: Vec_Statement.Vec = bb.statements
+    Vec_Statement.set_at(mutable new_stmts, s_idx, take new_stmt)
+    let new_bb = mir_body_mod.BasicBlock {
+        node_id_origin: bb.node_id_origin,
+        statements: new_stmts,
+        terminator: bb.terminator,
+        coherence_region: bb.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, b_idx, take new_bb)
+}

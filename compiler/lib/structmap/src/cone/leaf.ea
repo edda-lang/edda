@@ -1,0 +1,191 @@
+
+module structmap.cone.leaf
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import hir.def as def_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import types.effect.row as effect_row_mod
+import local.data.conekey as conekey
+import local.render.toon as toon
+import local.render.sig.signature as signature
+import local.walk.core.util as util
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_tree.EffectMember)
+spec std.collections.vec.Vec(ast_tree.Param)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+spec std.core.option.Option(ast_tree.EffectRow)
+
+
+function render_member(
+    member: ast_tree.EffectMember,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    signature.effect_member_to(mutable buf, member, interner, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}
+
+
+function member_name_is(name: ast_ident.Ident, interner: interner_mod.Interner, target: String) -> bool
+    with {divergence}
+{
+    if sym_mod.is_empty(name.name) { return false }
+    if (name.name.raw as usize) >= interner_mod.slot_count(interner) { return false }
+    return util.bytes_equals_ascii(interner_mod.lookup(interner, name.name), target)
+}
+
+
+function is_keyword_cap(name: ast_ident.Ident, interner: interner_mod.Interner) -> bool
+    with {divergence}
+{
+    return member_name_is(name, interner, "panic")
+        || member_name_is(name, interner, "divergence")
+        || member_name_is(name, interner, "cancellation")
+        || member_name_is(name, interner, "nondet")
+}
+
+
+function is_param_name(fd: ast_item_mod.FnDecl, name: ast_ident.Ident) -> bool {
+    let ps = fd.params
+    let n: usize = Vec_Param.len(ps)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if Vec_Param.at(ps, i).name.name.raw == name.name.raw { return true }
+        i += 1
+    }
+    return false
+}
+
+
+function collect_typed_err_yield(
+    out_t: types_check_mod.TypeOutput,
+    def_id: def_mod.DefId,
+    effect_interner: effect_interner_mod.Interner,
+    err_tyids: mutable Vec_u32.Vec,
+    yield_tyids: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match types_check_mod.signature_of(out_t, def_id) {
+        case .none => false
+        case .some(let sig) => {
+            let id = sig.effects
+            if (id.raw as usize) >= effect_interner_mod.slot_count(effect_interner) {
+                return true
+            }
+            let crow = effect_interner_mod.lookup(effect_interner, id)
+            let n: usize = Vec_CEntry.len(crow.entries)
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                match Vec_CEntry.at(crow.entries, i) {
+                    case .err_(let ty) => Vec_u32.push(mutable err_tyids, ty.raw, allocator)?
+                    case .yield_(let ty) => Vec_u32.push(mutable yield_tyids, ty.raw, allocator)?
+                    case _ => ()
+                }
+                i += 1
+            }
+            true
+        }
+    }
+}
+
+
+public function build_cone_leaf(
+    out: mutable Vec_String.Vec,
+    fd: ast_item_mod.FnDecl,
+    type_outputs: Vec_TypeOutput.Vec,
+    file_idx: usize,
+    def_id: def_mod.DefId,
+    effect_interner: effect_interner_mod.Interner,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let row = match fd.effects {
+        case .none => { return }
+        case .some(let r) => r
+    }
+    uninit err_tyids: Vec_u32.Vec
+    Vec_u32.new(init err_tyids, allocator)?
+    uninit yield_tyids: Vec_u32.Vec
+    Vec_u32.new(init yield_tyids, allocator)?
+    var has_typed: bool = false
+    if !def_mod.is_error(def_id) && file_idx < Vec_TypeOutput.len(type_outputs) {
+        let out_t = Vec_TypeOutput.at(type_outputs, file_idx)
+        has_typed = collect_typed_err_yield(
+            out_t, def_id, effect_interner, mutable err_tyids, mutable yield_tyids, allocator,
+        )?
+    }
+    let en: usize = Vec_u32.len(err_tyids)
+    let yn: usize = Vec_u32.len(yield_tyids)
+    let n: usize = Vec_EffectMember.len(row.members)
+    var i: usize = 0
+    var err_idx: usize = 0
+    var yield_idx: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let member = Vec_EffectMember.at(row.members, i)
+        i += 1
+        match member {
+            case .capability(let name) => {
+                if sym_mod.is_empty(name.name) {
+                    Vec_String.push(mutable out, conekey.plain_item("panic", allocator)?, allocator)?
+                } else if is_keyword_cap(name, interner) || is_param_name(fd, name) {
+                    let disp = render_member(member, interner, allocator)?
+                    Vec_String.push(mutable out, conekey.plain_item(disp, allocator)?, allocator)?
+                }
+            }
+            case .named(let name, _) => {
+                let disp = render_member(member, interner, allocator)?
+                if sym_mod.is_empty(name.name) || member_name_is(name, interner, "yield") {
+                    let item = if has_typed && yield_idx < yn {
+                        conekey.tagged_item(121 as u8, Vec_u32.at(yield_tyids, yield_idx), disp, allocator)?
+                    } else {
+                        conekey.plain_item(disp, allocator)?
+                    }
+                    yield_idx += 1
+                    Vec_String.push(mutable out, item, allocator)?
+                } else if member_name_is(name, interner, "err") {
+                    let item = if has_typed && err_idx < en {
+                        conekey.tagged_item(101 as u8, Vec_u32.at(err_tyids, err_idx), disp, allocator)?
+                    } else {
+                        conekey.plain_item(disp, allocator)?
+                    }
+                    err_idx += 1
+                    Vec_String.push(mutable out, item, allocator)?
+                }
+            }
+            case .graded(_, _) => {
+                let disp = render_member(member, interner, allocator)?
+                Vec_String.push(mutable out, conekey.plain_item(disp, allocator)?, allocator)?
+            }
+            case .spread(_) => ()
+        }
+    }
+}

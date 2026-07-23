@@ -1,0 +1,314 @@
+
+module std.os.fs.rt
+import std.text.string
+
+import std.os.raw
+import std.os.pages
+import std.mem.rt as mem_rt
+import std.mem.alloc
+import std.text.utf8
+import local.fs as fs_mod
+
+
+function at_fdcwd() -> u64 {
+    return 0xFFFFFFFFFFFFFF9C
+}
+
+function page_size() -> usize {
+    return 4096
+}
+
+function map_errno(code: i64, path: String) -> fs_mod.FsError {
+    if code == -2 { return fs_mod.FsError.not_found(path: path) }
+    if code == -13 { return fs_mod.FsError.permission_denied(path: path) }
+    if code == -17 { return fs_mod.FsError.already_exists(path: path) }
+    if code == -21 { return fs_mod.FsError.is_a_directory(path: path) }
+    if code == -20 { return fs_mod.FsError.not_a_directory(path: path) }
+    return fs_mod.FsError.os_error(code: code as i32 wrapping)
+}
+
+function scratch_page(path: String) -> u64
+    with {err: fs_mod.FsError}
+{
+    if path.bytes().len() + 1 > 2048 { raise fs_mod.FsError.other }
+    return handle err: pages.PageError as _e -> (raise fs_mod.FsError.other) {
+        pages.map(page_size())?
+    }
+}
+
+function copy_cstr(pg: u64, path: String) -> () {
+    let b: [u8] = path.bytes()
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        raw.store_u8(pg +% (i as u64), b[i])
+        i = i + 1
+    }
+    raw.store_u8(pg +% (b.len() as u64), 0)
+}
+
+function release_page(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, page_size())?
+    }
+}
+
+function openat_path(pg: u64, flags: u64, mode: u64) -> i64 {
+    return raw.syscall6(257, at_fdcwd(), pg, flags, mode, 0, 0)
+}
+
+function close_fd(fd: i64) -> () {
+    if fd < 0 { return }
+    let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+}
+
+function file_size(fd: i64, pg: u64) -> i64 {
+    let r: i64 = raw.syscall6(5, fd as u64, pg +% 2048, 0, 0, 0, 0)
+    if r != 0 { return r }
+    return raw.load_u64(pg +% 2048 +% 48) as i64
+}
+
+function read_all(fd: i64, dst: u64, total: u64) -> bool {
+    var done: u64 = 0
+    var fuel: u64 = total +% 1
+    loop
+        decreases fuel
+    {
+        if done >= total { return true }
+        if fuel == 0 { return false }
+        fuel = fuel - 1
+        let r: i64 = raw.syscall6(0, fd as u64, dst +% done, total -% done, 0, 0, 0)
+        if r <= 0 { return false }
+        let got: u64 = r as u64
+        if got > total -% done { return false }
+        done = done +% got
+    }
+}
+
+function write_all(fd: i64, src: u64, total: u64) -> bool {
+    var done: u64 = 0
+    var fuel: u64 = total +% 1
+    loop
+        decreases fuel
+    {
+        if done >= total { return true }
+        if fuel == 0 { return false }
+        fuel = fuel - 1
+        let r: i64 = raw.syscall6(1, fd as u64, src +% done, total -% done, 0, 0, 0)
+        if r <= 0 { return false }
+        let sent: u64 = r as u64
+        if sent > total -% done { return false }
+        done = done +% sent
+    }
+}
+
+function alloc_bytes(heap: u64, n: usize) -> [u8]
+    with {err: fs_mod.FsError}
+{
+    return handle err: alloc.AllocError as _e -> (raise fs_mod.FsError.other) {
+        mem_rt.alloc_array_raw(heap, 1, 1, n)?
+    }
+}
+
+function read_file_bytes(heap: u64, path: String) -> [u8]
+    with {err: fs_mod.FsError}
+{
+    let pg: u64 = scratch_page(path)?
+    copy_cstr(pg, path)
+    let fd: i64 = openat_path(pg, 0, 0)
+    if fd < 0 {
+        release_page(pg)
+        raise map_errno(fd, path)
+    }
+    let size: i64 = file_size(fd, pg)
+    if size < 0 {
+        close_fd(fd)
+        release_page(pg)
+        raise map_errno(size, path)
+    }
+    let out: [u8] = handle err: fs_mod.FsError as e -> {
+        close_fd(fd)
+        release_page(pg)
+        raise e
+    } { alloc_bytes(heap, size as usize)? }
+    let ok: bool = read_all(fd, raw.slice_addr(out), size as u64)
+    close_fd(fd)
+    release_page(pg)
+    if !ok { raise fs_mod.FsError.other }
+    return out
+}
+
+@abi("__edda_fs_read_bytes")
+public function fs_read_bytes(rfs_cap: u64, alloc_cap: u64, path: String) -> [u8]
+    with {err: fs_mod.FsError}
+{
+    return read_file_bytes(alloc_cap, path)?
+}
+
+@abi("__edda_fs_read_to_string")
+public function fs_read_to_string(rfs_cap: u64, alloc_cap: u64, path: String) -> String
+    with {err: fs_mod.FsError}
+{
+    let bytes: [u8] = read_file_bytes(alloc_cap, path)?
+    if !utf8.validate(bytes) { raise fs_mod.FsError.invalid_utf8 }
+    return string.from_owned_utf8(take bytes)
+}
+
+@abi("__edda_fs_exists")
+public function fs_exists(rfs_cap: u64, path: String) -> bool {
+    let pg: u64 = handle err: fs_mod.FsError as _e -> 0 { scratch_page(path)? }
+    if pg == 0 { return false }
+    copy_cstr(pg, path)
+    let r: i64 = raw.syscall6(269, at_fdcwd(), pg, 0, 0, 0, 0)
+    release_page(pg)
+    return r == 0
+}
+
+@abi("__edda_fs_dev_id")
+public function stat_dev_id(rfs_cap: u64, path: String) -> u64 {
+    let pg: u64 = handle err: fs_mod.FsError as _e -> 0 { scratch_page(path)? }
+    if pg == 0 { return 0 }
+    copy_cstr(pg, path)
+    let statbuf: u64 = pg +% 2048
+    let r: i64 = raw.syscall6(262, at_fdcwd(), pg, statbuf, 0, 0, 0)
+    let dev: u64 = raw.load_u64(statbuf)
+    release_page(pg)
+    if r != 0 { return 0 }
+    return dev
+}
+
+function write_file_bytes(path: String, src: u64, total: u64, flags: u64) -> ()
+    with {err: fs_mod.FsError}
+{
+    let pg: u64 = scratch_page(path)?
+    copy_cstr(pg, path)
+    let fd: i64 = openat_path(pg, flags, 0x1A4)
+    if fd < 0 {
+        release_page(pg)
+        raise map_errno(fd, path)
+    }
+    let ok: bool = write_all(fd, src, total)
+    close_fd(fd)
+    release_page(pg)
+    if !ok { raise fs_mod.FsError.other }
+}
+
+@abi("__edda_fs_write_bytes")
+public function fs_write_bytes(wfs_cap: u64, path: String, contents: [u8]) -> ()
+    with {err: fs_mod.FsError}
+{
+    write_file_bytes(path, raw.slice_addr(contents), contents.len() as u64, 0x241)?
+}
+
+@abi("__edda_fs_write_string")
+public function fs_write_string(wfs_cap: u64, path: String, contents: String) -> ()
+    with {err: fs_mod.FsError}
+{
+    let b: [u8] = contents.bytes()
+    write_file_bytes(path, raw.slice_addr(b), b.len() as u64, 0x241)?
+}
+
+@abi("__edda_fs_create")
+public function fs_create(wfs_cap: u64, path: String) -> ()
+    with {err: fs_mod.FsError}
+{
+    write_file_bytes(path, 0, 0, 0x241)?
+}
+
+@abi("__edda_fs_create_dir_all")
+public function fs_create_dir_all(wfs_cap: u64, path: String) -> ()
+    with {err: fs_mod.FsError}
+{
+    let pg: u64 = scratch_page(path)?
+    copy_cstr(pg, path)
+    let b: [u8] = path.bytes()
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        if b[i] == 0x2F && i > 0 {
+            raw.store_u8(pg +% (i as u64), 0)
+            let r: i64 = raw.syscall6(258, at_fdcwd(), pg, 0x1ED, 0, 0, 0)
+            raw.store_u8(pg +% (i as u64), 0x2F)
+            if r != 0 && r != -17 {
+                release_page(pg)
+                raise map_errno(r, path)
+            }
+        }
+        i = i + 1
+    }
+    let last: i64 = raw.syscall6(258, at_fdcwd(), pg, 0x1ED, 0, 0, 0)
+    release_page(pg)
+    if last != 0 && last != -17 { raise map_errno(last, path) }
+}
+
+@abi("__edda_fs_rename")
+public function fs_rename(wfs_cap: u64, from_path: String, to_path: String) -> ()
+    with {err: fs_mod.FsError}
+{
+    if from_path.bytes().len() + 1 > 2048 || to_path.bytes().len() + 1 > 2048 {
+        raise fs_mod.FsError.other
+    }
+    let pg: u64 = scratch_page(from_path)?
+    copy_cstr(pg, from_path)
+    let to_off: u64 = pg +% 2048
+    let tb: [u8] = to_path.bytes()
+    var i: usize = 0
+    loop
+        decreases tb.len() - i
+    {
+        if i >= tb.len() { break }
+        raw.store_u8(to_off +% (i as u64), tb[i])
+        i = i + 1
+    }
+    raw.store_u8(to_off +% (tb.len() as u64), 0)
+    let r: i64 = raw.syscall6(264, at_fdcwd(), pg, at_fdcwd(), to_off, 0, 0)
+    release_page(pg)
+    if r != 0 { raise map_errno(r, from_path) }
+}
+
+@abi("__edda_fs_remove")
+public function fs_remove(wfs_cap: u64, path: String) -> ()
+    with {err: fs_mod.FsError}
+{
+    let pg: u64 = scratch_page(path)?
+    copy_cstr(pg, path)
+    var r: i64 = raw.syscall6(263, at_fdcwd(), pg, 0, 0, 0, 0)
+    if r == -21 || r == -13 || r == -1 {
+        let r2: i64 = raw.syscall6(263, at_fdcwd(), pg, 0x200, 0, 0, 0)
+        if r2 != -20 { r = r2 }
+    }
+    release_page(pg)
+    if r != 0 { raise map_errno(r, path) }
+}
+
+@abi("__edda_cwd")
+public function cwd(alloc_cap: u64) -> String {
+    let pg: u64 = handle err: fs_mod.FsError as _e -> 0 { scratch_page("")? }
+    if pg == 0 { return "" }
+    let r: i64 = raw.syscall6(79, pg, page_size() as u64, 0, 0, 0, 0)
+    if r <= 1 {
+        release_page(pg)
+        return ""
+    }
+    let n: usize = (r as usize) - 1
+    let out: [u8] = handle err: fs_mod.FsError as _e -> {
+        release_page(pg)
+        return ""
+    } { alloc_bytes(alloc_cap, n)? }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        out[i] = raw.load_u8(pg +% (i as u64))
+        i = i + 1
+    }
+    release_page(pg)
+    if !utf8.validate(out) { return "" }
+    return string.from_owned_utf8(take out)
+}

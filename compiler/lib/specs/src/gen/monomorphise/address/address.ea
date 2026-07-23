@@ -1,0 +1,376 @@
+
+module specs.gen.monomorphise.address.address
+
+import std.collections.vec
+import std.collections.slice
+import std.core.option
+import std.mem.alloc
+import cteval.res.output as cteval_out_mod
+import cteval.state.value as value_mod
+import intern.interner as sym_interner_mod
+import intern.symbol as sym_mod
+import manifest.lex.toml.val.values as values_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.ident as ast_ident_mod
+import syntax.ast.tree as tree_mod
+import types.effect.interner as row_interner_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.encode as encode_mod
+import local.encode.bytes as bytes_mod
+import local.error as err_mod
+import local.address.finalize as finalize_mod
+import local.address.hash as hash_mod
+import local.gen.build.output as output_mod
+import local.gen.typaths as typaths_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+spec std.core.option.Option(ty_mod.TyId)
+
+
+public function is_alloc_box_path(
+    path: ast_ident_mod.Path,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let rendered = render_path_bytes(path, sym_interner, allocator)?
+    return slice.eq_u8(rendered, "std.mem.alloc.Box".bytes())
+}
+
+
+public function is_compare_eq_path(
+    path: ast_ident_mod.Path,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let rendered = render_path_bytes(path, sym_interner, allocator)?
+    return slice.eq_u8(rendered, "std.core.compare.eq".bytes())
+}
+
+
+public function is_fmt_debug_path(
+    path: ast_ident_mod.Path,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let rendered = render_path_bytes(path, sym_interner, allocator)?
+    return slice.eq_u8(rendered, "std.core.fmt.debug".bytes())
+}
+
+
+public function eq_target_of(
+    entry: cteval_out_mod.SpecArgEntry,
+    ty_interner: ty_interner_mod.Interner,
+) -> Option_TyId.Option {
+    if Vec_ComptimeValue.len(entry.args) != 1 {
+        return Option_TyId.none
+    }
+    return match Vec_ComptimeValue.at(entry.args, 0) {
+        case .type_meta(let t) => {
+            if ty_mod.is_error(t) {
+                return Option_TyId.none
+            }
+            if ty_mod.index(t) >= ty_interner_mod.slot_count(ty_interner) {
+                return Option_TyId.none
+            }
+            match ty_interner_mod.lookup(ty_interner, t) {
+                case .record(_) => Option_TyId.some(value: t)
+                case .sum_(_) => Option_TyId.some(value: t)
+                case _ => Option_TyId.none
+            }
+        }
+        case _ => Option_TyId.none
+    }
+}
+
+
+public function ty_path_arg_exprs(
+    tp: typaths_mod.TyPath,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> Vec_Expr.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    let n = Vec_Symbol.len(tp.segs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Ident.push(mutable segs, ast_ident_mod.Ident { name: Vec_Symbol.at(tp.segs, i), span: at }, allocator)?
+        i = i + 1
+    }
+    let path_expr = tree_mod.Expr {
+        span: at,
+        kind: tree_mod.ExprKind.path(path: ast_ident_mod.Path { segments: segs, span: at }),
+    }
+    uninit exprs: Vec_Expr.Vec
+    Vec_Expr.new(init exprs, allocator)?
+    Vec_Expr.push(mutable exprs, take path_expr, allocator)?
+    return exprs
+}
+
+
+public function eq_suffixed_name(
+    base: sym_mod.Symbol,
+    h: hash_mod.SpecHash,
+    sym_interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> sym_mod.Symbol
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let base_str = render_symbol_string(base, sym_interner, allocator)?
+    let hex = render_prefix_hex(h, allocator)?
+    return sym_interner_mod.intern(mutable sym_interner, f"{base_str}__{hex}", allocator)?
+}
+
+
+public function encode_arg_vec(
+    args: Vec_ComptimeValue.Vec,
+    at: span_mod.Span,
+    sym_interner: sym_interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    ty_paths: typaths_mod.TyPathMap,
+    row_interner: row_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let n = Vec_ComptimeValue.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let v = Vec_ComptimeValue.at(args, i)
+        encode_mod.encode_value(
+            mutable buf, v, at,
+            allocator, ty_interner, ty_paths, row_interner, sym_interner,
+        )?
+        i = i + 1
+    }
+    return buf
+}
+
+
+public function compose_and_finalise(
+    name_bytes: [u8],
+    arg_bytes: take Vec_u8.Vec,
+    allocator: Allocator,
+) -> hash_mod.SpecHash
+    with {allocator, err: alloc.AllocError}
+{
+    uninit composed: Vec_u8.Vec
+    Vec_u8.new(init composed, allocator)?
+
+    let name_len_u32 = name_bytes.len() as u32
+    bytes_mod.put_u32_le(mutable composed, name_len_u32, allocator)?
+    bytes_mod.put_bytes(mutable composed, name_bytes, allocator)?
+
+    let arg_len_u32 = Vec_u8.len(arg_bytes) as u32
+    bytes_mod.put_u32_le(mutable composed, arg_len_u32, allocator)?
+    let arg_slice = Vec_u8.into_array(take arg_bytes, allocator)?
+    bytes_mod.put_bytes(mutable composed, arg_slice, allocator)?
+
+    let composed_slice = Vec_u8.into_array(take composed, allocator)?
+    return finalize_mod.finalize(composed_slice, allocator)?
+}
+
+
+public function render_segments_bytes(
+    segs: Vec_Symbol.Vec,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit name: Vec_u8.Vec
+    Vec_u8.new(init name, allocator)?
+    let n = Vec_Symbol.len(segs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i > 0 {
+            bytes_mod.put_u8(mutable name, 46 as u8, allocator)?
+        }
+        let seg_bytes = sym_interner_mod.lookup(sym_interner, Vec_Symbol.at(segs, i))
+        bytes_mod.put_bytes(mutable name, seg_bytes, allocator)?
+        i = i + 1
+    }
+    return Vec_u8.into_array(take name, allocator)?
+}
+
+
+public function render_path_bytes(
+    path: ast_ident_mod.Path,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit name: Vec_u8.Vec
+    Vec_u8.new(init name, allocator)?
+    let n = Vec_Ident.len(path.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i > 0 {
+            bytes_mod.put_u8(mutable name, 46 as u8, allocator)?
+        }
+        let id = Vec_Ident.at(path.segments, i)
+        let seg_bytes = sym_interner_mod.lookup(sym_interner, id.name)
+        bytes_mod.put_bytes(mutable name, seg_bytes, allocator)?
+        i = i + 1
+    }
+    return Vec_u8.into_array(take name, allocator)?
+}
+
+
+function hash_equal(a: hash_mod.SpecHash, b: hash_mod.SpecHash) -> bool {
+    return a.w0 == b.w0 && a.w1 == b.w1 && a.w2 == b.w2 && a.w3 == b.w3
+}
+
+
+public function check_short_name_collision(
+    out: mutable output_mod.SpecOutput,
+    short_name: sym_mod.Symbol,
+    new_hash: hash_mod.SpecHash,
+    at: span_mod.Span,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match output_mod.short_name_existing(out, short_name) {
+        case .some(let existing_hash) => {
+            if !hash_equal(existing_hash, new_hash) {
+                let new_prefix = render_prefix_hex(new_hash, allocator)?
+                let other_prefix = render_prefix_hex(existing_hash, allocator)?
+                let name = render_symbol_string(short_name, sym_interner, allocator)?
+                output_mod.push_failure(
+                    mutable out,
+                    err_mod.SpecError.short_name_collision(
+                        at: at,
+                        short_name: name,
+                        this_prefix: new_prefix,
+                        other_prefix: other_prefix,
+                    ),
+                    allocator,
+                )?
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+public function path_segments(
+    path: ast_ident_mod.Path,
+    allocator: Allocator,
+) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    let n = Vec_Ident.len(path.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(path.segments, i)
+        Vec_Symbol.push(mutable segs, id.name, allocator)?
+        i = i + 1
+    }
+    return segs
+}
+
+
+public function render_path_string(
+    path: ast_ident_mod.Path,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let slice = render_path_bytes(path, sym_interner, allocator)?
+    return values_mod.bytes_to_string(slice, 0, slice.len(), allocator)?
+}
+
+
+public function render_prefix_hex(
+    h: hash_mod.SpecHash,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let prefix: u64 = hash_mod.prefix_48(h)
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    var i: usize = 0
+    loop decreases ((12 as usize) - i) {
+        if i >= (12 as usize) { break }
+        let shift_amount: u64 = (((11 as usize) - i) * (4 as usize)) as u64
+        let nibble_u64: u64 = (prefix >> shift_amount) & (15 as u64)
+        let nibble: u8 = nibble_u64 as u8
+        bytes_mod.put_u8(mutable buf, nibble_to_hex(nibble), allocator)?
+        i = i + (1 as usize)
+    }
+    let slice = Vec_u8.into_array(take buf, allocator)?
+    return values_mod.bytes_to_string(slice, 0, slice.len(), allocator)?
+}
+
+
+function nibble_to_hex(n: u8) -> u8
+    requires n < 16
+{
+    return if n < (10 as u8) {
+        n + (48 as u8)
+    } else {
+        (n - (10 as u8)) + (97 as u8)
+    }
+}
+
+
+public function render_symbol_string(
+    sym: sym_mod.Symbol,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = sym_interner_mod.lookup(sym_interner, sym)
+    return values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+
+public function clone_arg_vec(
+    args: Vec_ComptimeValue.Vec,
+    allocator: Allocator,
+) -> Vec_ComptimeValue.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_ComptimeValue.Vec
+    Vec_ComptimeValue.new(init out, allocator)?
+    let n = Vec_ComptimeValue.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let v = Vec_ComptimeValue.at(args, i)
+        Vec_ComptimeValue.push(mutable out, v, allocator)?
+        i = i + 1
+    }
+    return out
+}

@@ -1,0 +1,262 @@
+
+module inspect.run
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import manifest.manifest as manifest_mod
+import mir.file.store as mir_file_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as resolve_specsurface_mod
+import resolve.bind.lookup.env.walk.uses as resolve_uses_mod
+import resolve.build.drive.surface.walk.binding.walker as resolve_walker_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import target.triple as triple_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import compile.setup.env.discover as discover_mod
+import compile.stdlib.resolve as resolve_mod
+import compile.instantiate.iter.enumerate.enumerate as enumerate_mod
+import compile.setup.env.load.load as load_mod
+import compile.phase.pipeline.parse as parse_mod
+import compile.phase.pipeline.lower as lower_mod
+import compile.setup.env.load.triple as triple_phase_mod
+import compile.phase.analyze.analyze as analyze_mod
+import compile.trace.trace as trace_mod
+import driver.render.render as render_mod
+import driver.exit as exit_mod
+import local.cli as cli_mod
+import local.dump as dump_mod
+import specs.cachectx as cachectx_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(diag_mod.Diagnostic)
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(triple_mod.TargetTriple)
+spec std.core.option.Option(cli_mod.InspectArgs)
+
+
+public function run_inspect(
+    args: [String],
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    clock: MonotonicClock,
+    errout: Stderr,
+    workspace_root: String,
+    allocator: Allocator,
+) -> i32
+    with {wfs, rfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit map: source_map_mod.SourceMap
+    source_map_mod.new_map(init map, allocator)?
+
+    uninit diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init diags, allocator)?
+
+    let parsed_opt = cli_mod.parse_args(args, mutable diags, allocator)?
+    let parsed = match parsed_opt {
+        case .some(let p) => p
+        case .none => {
+            render_mod.render_diagnostics(errout, diags, map, allocator)?
+            return exit_mod.exit_code_of(diags)
+        }
+    }
+
+    let scoped = rfs.scoped_to(workspace_root)
+
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    drive(parsed, scoped, wfs, workspace_root, mutable map, mutable interner, clock, errout, mutable diags, allocator)?
+
+    render_mod.render_diagnostics(errout, diags, map, allocator)?
+    interner_mod.dispose(take interner)
+    return exit_mod.exit_code_of(diags)
+}
+
+
+function drive(
+    parsed: cli_mod.InspectArgs,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    workspace_root: String,
+    map: mutable source_map_mod.SourceMap,
+    interner: mutable interner_mod.Interner,
+    clock: MonotonicClock,
+    errout: Stderr,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    let manifest_opt = load_mod.manifest_load(rfs, mutable map, workspace_root, mutable diags, allocator)?
+    let manifest = match manifest_opt {
+        case .some(let m) => m
+        case .none => return
+    }
+    let triple_opt = triple_phase_mod.resolve_triple_from_manifest(manifest, mutable diags, allocator)?
+    let stdlib_lib_opt = resolve_mod.resolve_stdlib_lib(rfs, workspace_root, parsed.stdlib_root, mutable diags, allocator)?
+    let stdlib_lib = match stdlib_lib_opt {
+        case .some(let l) => l
+        case .none => return
+    }
+
+    let fn_filter = match parsed.fn_name {
+        case .some(let s) => Option_Symbol.some(value: interner_mod.intern(mutable interner, s, allocator)?)
+        case .none => Option_Symbol.none
+    }
+
+    let target_paths = single_path_array(parsed.file, allocator)?
+    enumerate_mod.enumerate(rfs, target_paths, mutable map, allocator)?
+    let stdlib_files = discover_mod.stdlib_sources(rfs, stdlib_lib, allocator)?
+    let stdlib_array = Vec_String.into_array(take stdlib_files, allocator)?
+    enumerate_mod.enumerate(rfs, stdlib_array, mutable map, allocator)?
+
+    let files = parse_mod.parse_sources(map, mutable interner, mutable diags, allocator)?
+    let rank = cli_mod.stage_rank(parsed.stage)
+    if rank == 0 {
+        if Vec_File.len(files) != 0 as usize {
+            let target_ast = Vec_File.at(files, 0 as usize)
+            dump_mod.dump_ast(errout, target_ast, fn_filter, allocator)?
+        }
+        return
+    }
+
+    uninit ctx: resolve_ctx_mod.ResolveCtx
+    resolve_ctx_mod.new_ctx(init ctx, allocator)?
+    let wl = resolve_walker_mod.new_derive_whitelist(mutable interner, allocator)?
+    let cat = resolve_specsurface_mod.walk_package_with_catalogue(mutable ctx, files, wl, interner, allocator)?
+    resolve_specsurface_mod.register_invocations(mutable ctx, cat, files, mutable interner, allocator)?
+    resolve_uses_mod.walk_uses(mutable ctx, files, interner, allocator)?
+    drain_diagnostics(mutable diags, ctx.diags.items, allocator)?
+    let output = resolve_ctx_mod.finish(take ctx)
+    let hir_files = lower_mod.lower_to_hir(take files, output, output.next_def_id, mutable interner, allocator, allocator)?
+
+    if rank == 1 {
+        if Vec_HirFile.len(hir_files) != 0 as usize {
+            let target_hir = Vec_HirFile.at(hir_files, 0 as usize)
+            dump_mod.dump_hir(errout, target_hir, fn_filter, allocator)?
+        }
+        return
+    }
+
+    match triple_opt {
+        case .none => emit_no_triple(mutable diags, allocator)?
+        case .some(let triple) =>
+            check_and_dump(rank, take hir_files, take output, cat, triple, rfs, wfs, mutable interner, clock, errout, mutable diags, mutable map, allocator)?
+    }
+}
+
+
+function check_and_dump(
+    rank: u32,
+    hir_files: take Vec_HirFile.Vec,
+    output: take resolve_ctx_mod.ResolveOutput,
+    cat: resolve_specsurface_mod.SpecCatalogue,
+    triple: triple_mod.TargetTriple,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    interner: mutable interner_mod.Interner,
+    clock: MonotonicClock,
+    errout: Stderr,
+    diags: mutable diags_mod.Diagnostics,
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence}
+{
+    uninit ty_interner: ty_interner_mod.Interner
+    ty_interner_mod.new_interner(init ty_interner, allocator)?
+    uninit effect_interner: effect_interner_mod.Interner
+    effect_interner_mod.new_interner(init effect_interner, allocator)?
+
+    uninit dep_hir_files: Vec_HirFile.Vec
+    Vec_HirFile.new(init dep_hir_files, allocator)?
+    uninit dep_ast: Vec_File.Vec
+    Vec_File.new(init dep_ast, allocator)?
+    let dep_def_base = output.next_def_id
+    var spec_cache_ctx = cachectx_mod.disabled()
+    let analysis = analyze_mod.analyze_seed(
+        take hir_files, take dep_hir_files, take dep_ast, dep_def_base, allocator, take output, cat, triple, true, rfs, wfs, trace_mod.off(), clock, errout, mutable spec_cache_ctx,
+        mutable interner, mutable ty_interner, mutable effect_interner, mutable diags, mutable map, allocator,
+    )?
+
+    if rank == 2 {
+        if Vec_HirFile.len(analysis.hir_files) != 0 as usize {
+            let target_hir = Vec_HirFile.at(analysis.hir_files, 0 as usize)
+            let target_to = Vec_TypeOutput.at(analysis.type_outputs, 0 as usize)
+            dump_mod.dump_types(errout, target_hir, target_to, ty_interner, allocator)?
+        }
+    } else {
+        let lowered = analyze_mod.lower_instances_build(
+            take analysis, triple, trace_mod.off(), clock, errout,
+            interner, mutable ty_interner, mutable effect_interner, mutable diags, allocator,
+        )?
+        if Vec_MirFile.len(lowered.mir_files) != 0 as usize {
+            let target_mir = Vec_MirFile.at(lowered.mir_files, 0 as usize)
+            dump_mod.dump_mir(errout, target_mir, interner, allocator)?
+        }
+    }
+
+    ty_interner_mod.dispose(take ty_interner)
+    effect_interner_mod.dispose(take effect_interner)
+}
+
+
+function single_path_array(p: String, allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit v: Vec_String.Vec
+    Vec_String.new(init v, allocator)?
+    let owned = string.clone(p, allocator)?
+    Vec_String.push(mutable v, take owned, allocator)?
+    return Vec_String.into_array(take v, allocator)?
+}
+
+
+function emit_no_triple(
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.cli_error(), span_mod.dummy(), "stages `types` and `mir` require a resolvable target triple in the manifest")
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function drain_diagnostics(
+    target: mutable diags_mod.Diagnostics,
+    source: Vec_Diagnostic.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Diagnostic.len(source)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let d = Vec_Diagnostic.at(source, i)
+        diags_mod.emit(mutable target, take d, allocator)?
+        i = i + 1
+    }
+}

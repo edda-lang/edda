@@ -1,0 +1,110 @@
+module cteval.builtin.target.layout.reflect.introspect
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import hir.def as def_mod
+import intern.symbol
+import target.triple as triple_mod
+import local.builtin.target.layout.compute.engine as compute_mod
+
+
+public type CountResult {
+    case ok(value: usize)
+    case unsupported(message: String)
+}
+
+public type NameResult {
+    case ok(name: symbol.Symbol)
+    case out_of_range(got: usize, max: usize)
+    case unsupported(message: String)
+}
+
+public type TypeResult {
+    case ok(ty: ty_mod.TyId)
+    case out_of_range(got: usize, max: usize)
+    case unsupported(message: String)
+}
+
+
+public function field_type_from_table(
+    def: def_mod.DefId,
+    i: usize,
+    out: check_mod.TypeOutput,
+) -> TypeResult {
+    let n = check_mod.field_ty_count(out, def)
+    if i >= n {
+        return TypeResult.out_of_range(got: i, max: n)
+    }
+    return TypeResult.ok(ty: check_mod.field_ty_at(out, def, i))
+}
+
+public function record_field_count(
+    def: def_mod.DefId,
+    out: check_mod.TypeOutput,
+) -> CountResult {
+    return CountResult.ok(value: check_mod.field_ty_count(out, def))
+}
+
+public function sum_variant_count(
+    def: def_mod.DefId,
+    out: check_mod.TypeOutput,
+) -> CountResult {
+    return CountResult.ok(value: check_mod.variant_count_of(out, def))
+}
+
+public function record_field_name(
+    def: def_mod.DefId,
+    i: usize,
+    out: check_mod.TypeOutput,
+) -> NameResult {
+    return match check_mod.field_name_at(out, def, 0 as u32, i) {
+        case .some(let sym) => NameResult.ok(name: sym)
+        case .none => NameResult.out_of_range(got: i, max: check_mod.field_ty_count(out, def))
+    }
+}
+
+public function sum_variant_name(
+    def: def_mod.DefId,
+    i: usize,
+    out: check_mod.TypeOutput,
+) -> NameResult {
+    return match check_mod.variant_name_at(out, def, i) {
+        case .some(let sym) => NameResult.ok(name: sym)
+        case .none => NameResult.out_of_range(got: i, max: check_mod.variant_count_of(out, def))
+    }
+}
+
+public function record_offset_of(
+    def: def_mod.DefId,
+    field_name: symbol.Symbol,
+    ty_interner: ty_interner_mod.Interner,
+    out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> CountResult
+    with {divergence}
+{
+    let target_idx = match check_mod.field_name_index(out, def, 0 as u32, field_name) {
+        case .some(let k) => k as usize
+        case .none =>
+            return CountResult.unsupported(message: "offset_of: the record has no field with the given name (the field-name identifier does not match any declared field)")
+    }
+    var acc: compute_mod.Layout = compute_mod.Layout { size: 0 as usize, align: 1 as usize }
+    var i: usize = 0
+    loop decreases (target_idx - i) {
+        if i >= target_idx { break }
+        let fty = check_mod.field_ty_at(out, def, i)
+        let fl = match compute_mod.compute_layout(fty, ty_interner, out, triple) {
+            case .ok(let l) => l
+            case .unsupported(let msg) => return CountResult.unsupported(message: msg)
+        }
+        acc = compute_mod.fold_layout(acc, fl)
+        i = i + 1
+    }
+    let target_fty = check_mod.field_ty_at(out, def, target_idx)
+    let target_fl = match compute_mod.compute_layout(target_fty, ty_interner, out, triple) {
+        case .ok(let l) => l
+        case .unsupported(let msg) => return CountResult.unsupported(message: msg)
+    }
+    return CountResult.ok(value: compute_mod.align_up_to(acc.size, target_fl.align))
+}

@@ -1,0 +1,207 @@
+
+module lower.term.terminator.terminator
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import types.ty.interner as ty_interner_mod
+
+import mir.body.model as mir_body_mod
+import mir.term as mir_term_mod
+import mir.id.block as mir_block_mod
+import mir.id.local as mir_local_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.term as hlir_term_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.id.op as hlir_op_id_mod
+
+import local.term.support.support as support_mod
+import local.term.support.place as place_mod
+import local.flow.plan.plan as plan_mod
+import local.term.terminator.call.call as call_mod
+import local.term.terminator.spawn.spawn as spawn_mod
+import local.term.terminator.blockarg.blockarg as blockarg_mod
+
+
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+spec std.collections.vec.Vec(hlir_term_mod.SwitchCase)
+spec std.collections.vec.Vec(mir_block_mod.BlockId)
+spec std.collections.vec.Vec(u128)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public function lower_terminator(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    term: mir_term_mod.Terminator,
+    body: mir_body_mod.MirBody,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> hlir_term_mod.HlirTerminator
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let kind = lower_term_kind(mutable out, mutable env, mutable ops, term, body, plan, ty_interner, extern_defs, allocator)?
+    return hlir_term_mod.HlirTerminator {
+        origin: term.origin,
+        kind: kind,
+    }
+}
+
+function lower_term_kind(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    term: mir_term_mod.Terminator,
+    body: mir_body_mod.MirBody,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    extern_defs: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> hlir_term_mod.HlirTermKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    return match term.kind {
+        case .return_ => hlir_term_mod.HlirTermKind.return_(
+            values: return_values(env, allocator)?,
+        )
+        case .goto_(let target) => hlir_term_mod.HlirTermKind.goto_(
+            target: blockarg_mod.block_id_of(target),
+            args: blockarg_mod.args_for_target(mutable out, env, mutable ops, term.origin, target, body, plan, ty_interner, allocator)?,
+        )
+        case .branch(let cond, let true_, let false_) => hlir_term_mod.HlirTermKind.branch(
+            cond: place_mod.operand_ssa(mutable out, env, mutable ops, term.origin, cond, body, ty_interner, allocator)?,
+            true_: blockarg_mod.block_id_of(true_),
+            true_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, term.origin, true_, body, plan, ty_interner, allocator)?,
+            false_: blockarg_mod.block_id_of(false_),
+            false_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, term.origin, false_, body, plan, ty_interner, allocator)?,
+        )
+        case .switch_(let discr, let targets) => hlir_term_mod.HlirTermKind.switch_(
+            discr: place_mod.operand_ssa(mutable out, env, mutable ops, term.origin, discr, body, ty_interner, allocator)?,
+            targets: lower_switch_targets(mutable out, env, mutable ops, term.origin, targets, body, plan, ty_interner, allocator)?,
+        )
+        case .call_(let callee, let args, let dest, let return_, let unwind) => call_mod.lower_call(
+            mutable out,
+            mutable env,
+            mutable ops,
+            term.origin,
+            callee,
+            args,
+            dest,
+            return_,
+            unwind,
+            body,
+            plan,
+            ty_interner,
+            extern_defs,
+            allocator,
+        )?
+        case .unreachable_ => hlir_term_mod.HlirTermKind.unreachable_
+        case .panic_(let message) => hlir_term_mod.HlirTermKind.panic_(
+            message: place_mod.operand_ssa(mutable out, env, mutable ops, term.origin, message, body, ty_interner, allocator)?,
+        )
+        case .raise_(let value, let unwind) => hlir_term_mod.HlirTermKind.raise_(
+            value: place_mod.operand_ssa(mutable out, env, mutable ops, term.origin, value, body, ty_interner, allocator)?,
+            unwind: convert_unwind(unwind),
+        )
+        case .coherence_enter(let body_entry, let exit) => hlir_term_mod.HlirTermKind.coherence_enter(
+            body_entry: blockarg_mod.block_id_of(body_entry),
+            exit: blockarg_mod.block_id_of(exit),
+        )
+        case .coherence_exit(let target) => hlir_term_mod.HlirTermKind.coherence_exit(
+            target: blockarg_mod.block_id_of(target),
+        )
+        case .spawn_(let child, let args, let group_local, let handle_dest, let return_, let unwind) => spawn_mod.lower_spawn(
+            mutable out,
+            mutable env,
+            mutable ops,
+            term.origin,
+            child,
+            args,
+            group_local,
+            handle_dest,
+            return_,
+            unwind,
+            body,
+            plan,
+            ty_interner,
+            allocator,
+        )?
+        case _ => raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR drop_/await_ terminator has no MIR -> HLIR lowering: await desugars to a task_await call at HIR, and drop has no destructor lowering yet",
+        )
+    }
+}
+
+function lower_switch_targets(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    targets: mir_term_mod.SwitchTargets,
+    body: mir_body_mod.MirBody,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_term_mod.SwitchTargets
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit cases: Vec_SwitchCase.Vec
+    Vec_SwitchCase.new(init cases, allocator)?
+    let n = Vec_u128.len(targets.values)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let value = Vec_u128.at(targets.values, i)
+        if i >= Vec_BlockId.len(targets.targets) { break }
+        let target = Vec_BlockId.at(targets.targets, i)
+        let case_ = hlir_term_mod.SwitchCase {
+            value: value as i128 wrapping,
+            target: blockarg_mod.block_id_of(target),
+            args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, target, body, plan, ty_interner, allocator)?,
+        }
+        Vec_SwitchCase.push(mutable cases, take case_, allocator)?
+        i += 1
+    }
+    return hlir_term_mod.SwitchTargets {
+        cases: cases,
+        default: blockarg_mod.block_id_of(targets.otherwise_),
+        default_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, targets.otherwise_, body, plan, ty_interner, allocator)?,
+    }
+}
+
+function return_values(
+    env: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit values: Vec_ValueId.Vec
+    Vec_ValueId.new(init values, allocator)?
+    let ret = support_mod.env_get(env, mir_local_mod.LocalId { raw: 1 })
+    if hlir_value_mod.is_error(ret) {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR return reached without a defined return-value local during MIR -> HLIR lowering",
+        )
+    }
+    Vec_ValueId.push(mutable values, take ret, allocator)?
+    return values
+}
+
+function convert_unwind(u: mir_term_mod.UnwindAction) -> hlir_term_mod.UnwindAction {
+    return match u {
+        case .propagate => hlir_term_mod.UnwindAction.continue_
+        case .unreachable_ => hlir_term_mod.UnwindAction.unreachable_
+        case .handler(let block) => hlir_term_mod.UnwindAction.cleanup(target: blockarg_mod.block_id_of(block))
+    }
+}

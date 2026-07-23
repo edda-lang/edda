@@ -1,0 +1,437 @@
+
+module syntax.parse.item.nominal.nominal
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.item as item_ast
+import local.parse.util as util_mod
+import local.parse.ty.core.core as ty_mod
+
+spec std.collections.vec.Vec(item_ast.GenericParam)
+spec std.collections.vec.Vec(item_ast.TypeField)
+spec std.collections.vec.Vec(item_ast.Variant)
+spec std.collections.vec.Vec(tree_mod.Ty)
+spec std.core.option.Option(tree_mod.Expr)
+spec std.core.option.Option(item_ast.Stability)
+spec std.core.option.Option(item_ast.Linearity)
+
+
+public function parse_type_decl(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    linearity: Option_Linearity.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.TypeDecl, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    let name_r = expect_type_name(tokens, p, mutable diags, allocator)?
+    p = name_r.1
+    match util_mod.peek(tokens, p) {
+        case .l_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `{` to open type body", allocator)?
+        }
+    }
+    let body_r = parse_type_body(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = body_r.1
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `}` to close type body", allocator)?
+        }
+    }
+    uninit empty_generics: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init empty_generics, allocator)?
+    let full_span = merge_spans(kw_span, close_span)
+    let decl = item_ast.TypeDecl {
+        span: full_span,
+        stability: stability,
+        visibility: visibility,
+        linearity: linearity,
+        name: name_r.0,
+        generics: empty_generics,
+        kind: body_r.0,
+        synthesize_box_ptr: false,
+    }
+    return (decl, p)
+}
+
+function expect_type_name(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (ident_mod.Ident, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    return match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => (ident_mod.Ident { name: sym, span: span }, pos + 1)
+        case _ => {
+            util_mod.emit_error(mutable diags, span, "expected type name", allocator)?
+            (ident_mod.Ident { name: symbol.empty(), span: span }, pos)
+        }
+    }
+}
+
+
+function parse_type_body(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.TypeDeclKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let after_trivia = util_mod.skip_doc_trivia(tokens, pos)
+    return match util_mod.peek(tokens, after_trivia) {
+        case .kw_case => parse_sum_body(tokens, after_trivia, mutable diags, allocator, parse_expr_fn, depth)?
+        case _ => parse_product_body(tokens, after_trivia, mutable diags, allocator, parse_expr_fn, depth)?
+    }
+}
+
+
+function parse_product_body(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.TypeDeclKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit fields: Vec_TypeField.Vec
+    Vec_TypeField.new(init fields, allocator)?
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        p = util_mod.skip_doc_trivia(tokens, p)
+        let stop = match util_mod.peek(tokens, p) {
+            case .r_brace => true
+            case .eof => true
+            case _ => false
+        }
+        if stop { break }
+        let iter_start = p
+        let field_r = parse_type_field(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_TypeField.push(mutable fields, field_r.0, allocator)?
+        p = field_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => { p = p + 1 }
+            case _ => ()
+        }
+        if p == iter_start {
+            p = p + 1
+        }
+    }
+    return (item_ast.TypeDeclKind.product(fields: fields), p)
+}
+
+function parse_type_field(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.TypeField, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    var p = pos
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, start_span, "expected field name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: start_span }
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .colon => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `:` after field name", allocator)?
+        }
+    }
+    let ty_r = ty_mod.parse_ty_no_where(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = ty_r.1
+    var refinement: Option_Expr.Option = Option_Expr.none
+    var end_span: span_mod.Span = ty_r.0.span
+    match util_mod.peek(tokens, p) {
+        case .kw_where => {
+            let pred_r = parse_expr_fn(tokens, p + 1, mutable diags, allocator, depth + 1)?
+            end_span = pred_r.0.span
+            refinement = Option_Expr.some(value: pred_r.0)
+            p = pred_r.1
+        }
+        case _ => ()
+    }
+    let full_span = merge_spans(start_span, end_span)
+    let field = item_ast.TypeField {
+        span: full_span,
+        name: name,
+        ty: ty_r.0,
+        refinement: refinement,
+    }
+    return (field, p)
+}
+
+
+function parse_sum_body(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.TypeDeclKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit variants: Vec_Variant.Vec
+    Vec_Variant.new(init variants, allocator)?
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        p = util_mod.skip_doc_trivia(tokens, p)
+        match util_mod.peek(tokens, p) {
+            case .kw_case => { p = p + 1 }
+            case _ => break
+        }
+        let iter_start = p - 1
+        let variant_r = parse_variant(tokens, iter_start, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_Variant.push(mutable variants, variant_r.0, allocator)?
+        p = variant_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => { p = p + 1 }
+            case _ => ()
+        }
+    }
+    return (item_ast.TypeDeclKind.sum(variants: variants), p)
+}
+
+function parse_variant(
+    tokens: [lexed_mod.Lexed],
+    case_pos: usize,
+    name_pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.Variant, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let case_span = util_mod.span_at(tokens, case_pos)
+    var p = name_pos
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected variant name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: case_span }
+        }
+    }
+    let payload_r = parse_variant_payload(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    let end_span = util_mod.span_at(tokens, payload_r.1 - 1)
+    let full_span = merge_spans(case_span, end_span)
+    let variant = item_ast.Variant {
+        span: full_span,
+        name: name,
+        payload: payload_r.0,
+    }
+    return (variant, payload_r.1)
+}
+
+function parse_variant_payload(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.VariantPayload, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match util_mod.peek(tokens, pos) {
+        case .l_paren => parse_paren_payload(tokens, pos, mutable diags, allocator, parse_expr_fn, depth)?
+        case .l_brace => parse_brace_payload(tokens, pos, mutable diags, allocator, parse_expr_fn, depth)?
+        case _ => (item_ast.VariantPayload.unit, pos)
+    }
+}
+
+function parse_paren_payload(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.VariantPayload, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let p = pos + 1
+    let is_struct = match util_mod.peek(tokens, p) {
+        case .ident(_) => match util_mod.peek_at(tokens, p, 1) {
+            case .colon => true
+            case _ => false
+        }
+        case _ => false
+    }
+    if is_struct {
+        let fields_r = parse_struct_payload_fields_paren(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        return (item_ast.VariantPayload.struct_(fields: fields_r.0), fields_r.1)
+    }
+    let tys_r = parse_tuple_payload_tys(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    return (item_ast.VariantPayload.tuple(elements: tys_r.0), tys_r.1)
+}
+
+function parse_brace_payload(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.VariantPayload, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit fields: Vec_TypeField.Vec
+    Vec_TypeField.new(init fields, allocator)?
+    var p = pos + 1
+    loop decreases (tokens.len() - p) {
+        p = util_mod.skip_doc_trivia(tokens, p)
+        let stop = match util_mod.peek(tokens, p) {
+            case .r_brace => true
+            case .eof => true
+            case _ => false
+        }
+        if stop { break }
+        let iter_start = p
+        let field_r = parse_type_field(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_TypeField.push(mutable fields, field_r.0, allocator)?
+        p = field_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => { p = p + 1 }
+            case _ => ()
+        }
+        if p == iter_start { p = p + 1 }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `}` after variant fields", allocator)?
+        }
+    }
+    return (item_ast.VariantPayload.struct_(fields: fields), p)
+}
+
+function parse_struct_payload_fields_paren(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_TypeField.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit fields: Vec_TypeField.Vec
+    Vec_TypeField.new(init fields, allocator)?
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        let field_r = parse_type_field(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_TypeField.push(mutable fields, field_r.0, allocator)?
+        p = field_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` after variant fields", allocator)?
+        }
+    }
+    return (fields, p)
+}
+
+function parse_tuple_payload_tys(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (Vec_Ty.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit tys: Vec_Ty.Vec
+    Vec_Ty.new(init tys, allocator)?
+    var p = pos
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1; return (tys, p) }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let ty_r = ty_mod.parse_ty_no_where(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+        Vec_Ty.push(mutable tys, ty_r.0, allocator)?
+        p = ty_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `)` after variant payload", allocator)?
+        }
+    }
+    return (tys, p)
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

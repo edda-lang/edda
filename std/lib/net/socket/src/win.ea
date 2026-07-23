@@ -1,0 +1,180 @@
+
+module std.net.socket.win
+
+import std.os.raw
+import std.os.pages
+import local.shared
+
+function wsa_startup(version: u32, data: u64) -> i32
+    extern "WSAStartup" from "ws2_32.dll"
+
+function ws_socket(af: i32, type_: i32, protocol: i32) -> u64
+    extern "socket" from "ws2_32.dll"
+
+function ws_bind(s: u64, name: u64, namelen: i32) -> i32
+    extern "bind" from "ws2_32.dll"
+
+function ws_listen(s: u64, backlog: i32) -> i32
+    extern "listen" from "ws2_32.dll"
+
+function ws_accept(s: u64, addr: u64, addrlen: u64) -> u64
+    extern "accept" from "ws2_32.dll"
+
+function ws_connect(s: u64, name: u64, namelen: i32) -> i32
+    extern "connect" from "ws2_32.dll"
+
+function ws_recv(s: u64, buf: u64, len_: i32, flags: i32) -> i32
+    extern "recv" from "ws2_32.dll"
+
+function ws_send(s: u64, buf: u64, len_: i32, flags: i32) -> i32
+    extern "send" from "ws2_32.dll"
+
+function ws_setsockopt(s: u64, level: i32, optname: i32, optval: u64, optlen: i32) -> i32
+    extern "setsockopt" from "ws2_32.dll"
+
+function ws_shutdown(s: u64, how: i32) -> i32
+    extern "shutdown" from "ws2_32.dll"
+
+function ws_closesocket(s: u64) -> i32
+    extern "closesocket" from "ws2_32.dll"
+
+function ws_last_error() -> i32
+    extern "WSAGetLastError" from "ws2_32.dll"
+
+function wsa_err() -> i64 {
+    return 0 - (ws_last_error() as i64)
+}
+
+function ensure_started() -> () {
+    comptime if target_has("windows") {
+        let pg: u64 = handle err: pages.PageError as _e -> (return ()) { pages.map(4096)? }
+        let _ = wsa_startup(0x0202, pg)
+        shared.release_page(pg)
+    } else {
+        return ()
+    }
+}
+
+public function op_socket() -> i64 {
+    comptime if target_has("windows") {
+        ensure_started()
+        let s: u64 = ws_socket(2, 1, 6)
+        if s == 0xFFFFFFFFFFFFFFFF { return wsa_err() }
+        return s as i64 wrapping
+    } else {
+        return -38
+    }
+}
+
+public function op_connect(fd: u64, addr_ptr: u64) -> i64 {
+    comptime if target_has("windows") {
+        let r: i32 = ws_connect(fd, addr_ptr, 16)
+        if r == 0 { return 0 }
+        return wsa_err()
+    } else {
+        return -38
+    }
+}
+
+public function op_bind(fd: u64, addr_ptr: u64) -> i64 {
+    comptime if target_has("windows") {
+        let r: i32 = ws_bind(fd, addr_ptr, 16)
+        if r == 0 { return 0 }
+        return wsa_err()
+    } else {
+        return -38
+    }
+}
+
+public function op_listen(fd: u64) -> i64 {
+    comptime if target_has("windows") {
+        let r: i32 = ws_listen(fd, 128)
+        if r == 0 { return 0 }
+        return wsa_err()
+    } else {
+        return -38
+    }
+}
+
+public function op_accept(fd: u64) -> i64 {
+    comptime if target_has("windows") {
+        let s: u64 = ws_accept(fd, 0, 0)
+        if s == 0xFFFFFFFFFFFFFFFF { return wsa_err() }
+        return s as i64 wrapping
+    } else {
+        return -38
+    }
+}
+
+public function op_recv(fd: u64, buf_ptr: u64, len_: u64) -> i64 {
+    comptime if target_has("windows") {
+        let n: i32 = ws_recv(fd, buf_ptr, len_ as i32 wrapping, 0)
+        if n < 0 { return wsa_err() }
+        return n as i64
+    } else {
+        return -38
+    }
+}
+
+public function op_send(fd: u64, buf_ptr: u64, len_: u64) -> i64 {
+    comptime if target_has("windows") {
+        let n: i32 = ws_send(fd, buf_ptr, len_ as i32 wrapping, 0)
+        if n < 0 { return wsa_err() }
+        return n as i64
+    } else {
+        return -38
+    }
+}
+
+public function op_shutdown(fd: u64, how: u64) -> i64 {
+    comptime if target_has("windows") {
+        let r: i32 = ws_shutdown(fd, how as i32 wrapping)
+        if r == 0 { return 0 }
+        return wsa_err()
+    } else {
+        return -38
+    }
+}
+
+public function op_close(fd: u64) -> () {
+    comptime if target_has("windows") {
+        let _ = ws_closesocket(fd)
+    } else {
+        return ()
+    }
+}
+
+function set_opt_u32(fd: u64, level: i32, optname: i32, value: u32) -> i64 {
+    comptime if target_has("windows") {
+        let pg: u64 = handle err: pages.PageError as _e -> (return -12) { pages.map(4096)? }
+        raw.store_u32(pg, value)
+        let r: i32 = ws_setsockopt(fd, level, optname, pg, 4)
+        shared.release_page(pg)
+        if r == 0 { return 0 }
+        return wsa_err()
+    } else {
+        return -38
+    }
+}
+
+public function op_set_reuseaddr(fd: u64) -> i64 {
+    return set_opt_u32(fd, 0xFFFF, 0x0004, 1)
+}
+
+public function op_set_nodelay(fd: u64, enabled: bool) -> i64 {
+    let v: u32 = if enabled { 1 } else { 0 }
+    return set_opt_u32(fd, 6, 0x0001, v)
+}
+
+public function op_set_keepalive(fd: u64, enabled: bool) -> i64 {
+    let v: u32 = if enabled { 1 } else { 0 }
+    return set_opt_u32(fd, 0xFFFF, 0x0008, v)
+}
+
+public function op_set_read_timeout(fd: u64, millis: u32) -> i64 {
+    return set_opt_u32(fd, 0xFFFF, 0x1006, millis)
+}
+
+public function op_set_write_timeout(fd: u64, millis: u32) -> i64 {
+    return set_opt_u32(fd, 0xFFFF, 0x1005, millis)
+}

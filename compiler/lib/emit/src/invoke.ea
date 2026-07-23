@@ -1,0 +1,64 @@
+
+module emit.invoke
+
+import std.collections.vec
+import std.mem.alloc
+import std.os.process.spawn as spawn_mod
+import std.os.process.spawn.error as spawn_error_mod
+import std.os.process.wait as wait_mod
+import std.os.process.child as child_spec_mod
+import local.error as error_mod
+import local.plan as plan_mod
+import local.tool as tool_mod
+
+spec std.collections.vec.Vec(String)
+
+public function run(
+    p: Subprocess,
+    tool_path: take String,
+    plan: plan_mod.EmitPlan,
+    allocator: Allocator,
+) -> wait_mod.ExitOutcome
+    with {p, allocator, err: error_mod.EmitError, err: spawn_error_mod.SpawnError, err: wait_mod.WaitError, err: alloc.AllocError}
+{
+    let argv_vec = plan_mod.argv(plan, allocator)?
+    let argv = Vec_String.into_array(take argv_vec, allocator)?
+    let spec_init = child_spec_mod.of(take tool_path, take argv)
+    let spec_built = child_spec_mod.build(take spec_init)
+    let child = spawn_mod.spawn(p, take spec_built, allocator)?
+    return wait_mod.wait(take child)?
+}
+
+public function into_success(o: wait_mod.ExitOutcome, t: tool_mod.Tool) -> ()
+    with {err: error_mod.EmitError}
+{
+    let tname = tool_mod.tool_name(t)
+    return match o {
+        case .exited(let code) where code == 0 => ()
+        case .exited(let code)                 => raise error_mod.EmitError.tool_exited_nonzero(tool_name: tname, exit_code: code)
+        case .signaled(let sig)                => raise error_mod.EmitError.tool_exited_nonzero(tool_name: tname, exit_code: sig)
+        case .wait_failed(let r)               => raise error_mod.EmitError.wait_failed(tool_name: tname, reason: r)
+    }
+}
+
+
+public function emit(p: Subprocess, plan: plan_mod.EmitPlan, allocator: Allocator) -> ()
+    with {p, allocator, err: error_mod.EmitError, err: spawn_error_mod.SpawnError, err: wait_mod.WaitError, err: alloc.AllocError}
+{
+    let allow_name = plan_mod.tool(plan)
+    let spawn_name = plan_mod.tool(plan)
+    let p = restrict_to_tool(p, take allow_name, allocator)?
+    let outcome = run(p, take spawn_name, plan, allocator)?
+    into_success(outcome, tool_mod.Tool.llc)?
+}
+
+
+function restrict_to_tool(p: Subprocess, tool_name: take String, allocator: Allocator) -> Subprocess
+    with {p, allocator, err: alloc.AllocError}
+{
+    uninit allow: Vec_String.Vec
+    Vec_String.new(init allow, allocator)?
+    Vec_String.push(mutable allow, take tool_name, allocator)?
+    let allowlist = Vec_String.into_array(take allow, allocator)?
+    return spawn_mod.allowing(p, allowlist)
+}

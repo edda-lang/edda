@@ -1,0 +1,149 @@
+module optimize.linear_reuse.transform.affinedrop
+
+import std.mem.alloc
+import std.collections.vec
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+import mir.id.block as mir_block_mod
+import local.linear_reuse.analysis as analysis_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+public function optimize_body(out: init mir_body_mod.MirBody, body: mir_body_mod.MirBody, allocator: Allocator) -> () with {allocator, err: alloc.AllocError}
+{
+    uninit a: analysis_mod.Analysis
+    analysis_mod.analyze(init a, body, allocator)?
+
+    uninit new_locals: Vec_Local.Vec
+    Vec_Local.new(init new_locals, allocator)?
+    copy_locals(mutable new_locals, body, allocator)?
+
+    uninit new_blocks: Vec_BasicBlock.Vec
+    Vec_BasicBlock.new(init new_blocks, allocator)?
+    rebuild_blocks(mutable new_blocks, a, body, allocator)?
+
+    out = mir_body_mod.MirBody {
+        def_id: body.def_id,
+        name: body.name,
+        origin_file: body.origin_file,
+        locals: new_locals,
+        n_params: body.n_params,
+        blocks: new_blocks,
+        obligations: body.obligations,
+        function_trust: body.function_trust,
+        effect_facts: body.effect_facts,
+        agg_layouts: body.agg_layouts,
+        requires_assumptions: body.requires_assumptions,
+        err_bymem: body.err_bymem
+    }
+}
+
+function copy_locals(out: mutable Vec_Local.Vec, body: mir_body_mod.MirBody, allocator: Allocator) -> () with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Local.len(body.locals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let l = Vec_Local.at(body.locals, i)
+        let copied = mir_body_mod.Local {
+            ty: l.ty,
+            mutability: l.mutability,
+            consumption: l.consumption,
+            name: l.name,
+            origin: l.origin
+        }
+        Vec_Local.push(mutable out, take copied, allocator)?
+        i += 1
+    }
+}
+
+function rebuild_blocks(out: mutable Vec_BasicBlock.Vec, a: analysis_mod.Analysis, body: mir_body_mod.MirBody, allocator: Allocator) -> () with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_BasicBlock.len(body.blocks)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let bb = Vec_BasicBlock.at(body.blocks, i)
+        let bid = mir_block_mod.BlockId { raw: i as u32 }
+
+        uninit new_stmts: Vec_Statement.Vec
+        Vec_Statement.new(init new_stmts, allocator)?
+        copy_statements(mutable new_stmts, bb, allocator)?
+
+        let new_term = rewrite_terminator(a, body, bb.terminator, bid)
+
+        let rebuilt = mir_body_mod.BasicBlock {
+            node_id_origin: bb.node_id_origin,
+            statements: new_stmts,
+            terminator: new_term,
+            coherence_region: bb.coherence_region
+        }
+        Vec_BasicBlock.push(mutable out, take rebuilt, allocator)?
+        i += 1
+    }
+}
+
+function copy_statements(out: mutable Vec_Statement.Vec, bb: mir_body_mod.BasicBlock, allocator: Allocator) -> () with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Statement.len(bb.statements)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = Vec_Statement.at(bb.statements, i)
+        let copied = mir_stmt_mod.Statement { origin: s.origin, kind: s.kind }
+        Vec_Statement.push(mutable out, take copied, allocator)?
+        i += 1
+    }
+}
+
+function rewrite_terminator(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, term: mir_term_mod.Terminator, b: mir_block_mod.BlockId) -> mir_term_mod.Terminator
+{
+    return match term.kind {
+        case .drop_(let place, let target, _) =>
+            elide_or_keep_drop(a, body, term, place, target, b)
+        case _ => term
+    }
+}
+
+function elide_or_keep_drop(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, term: mir_term_mod.Terminator, place: mir_place_mod.Place, target: mir_block_mod.BlockId, b: mir_block_mod.BlockId) -> mir_term_mod.Terminator
+{
+    if drop_can_elide(a, body, place, b) {
+        return mir_term_mod.Terminator {
+            origin: term.origin,
+            kind: mir_term_mod.TermKind.goto_(target: target)
+        }
+    }
+    return term
+}
+
+function drop_can_elide(a: analysis_mod.Analysis, body: mir_body_mod.MirBody, place: mir_place_mod.Place, b: mir_block_mod.BlockId) -> bool
+{
+    if !analysis_mod.bare_local_of(place) {
+        return false
+    }
+    let id = place.local
+    if mir_local_mod.is_error(id) {
+        return false
+    }
+    let idx = last_stmt_index(body, b)
+    return analysis_mod.affine_early_drop_eligible(a, body, id, b, idx)
+}
+
+function last_stmt_index(body: mir_body_mod.MirBody, b: mir_block_mod.BlockId) -> usize
+{
+    let bi = mir_block_mod.index(b)
+    if bi >= Vec_BasicBlock.len(body.blocks) {
+        return 0
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, bi)
+    let n = Vec_Statement.len(bb.statements)
+    if n == 0 {
+        return 0
+    }
+    return n - 1
+}

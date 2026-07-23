@@ -1,0 +1,393 @@
+
+module structmap.analyze.analyze
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import local.data.model as model
+import local.data.conekey as conekey
+import local.walk.calls.callsort as callsort_mod
+import local.analyze.lists as lists_mod
+import local.analyze.metric.callgraph.callgraph as callgraph_mod
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(lists_mod.StringList)
+spec std.collections.vec.Vec(lists_mod.UsizeList)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.hashmap.StringMap(usize)
+spec std.core.option.Option(usize)
+
+
+public function compute_effect_cones(tree: mutable model.Tree, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_FunctionEntry.len(tree.functions)
+    if n == 0 { return }
+    uninit qnames: Vec_String.Vec
+    Vec_String.new(init qnames, allocator)?
+    uninit declared: Vec_StringList.Vec
+    Vec_StringList.new(init declared, allocator)?
+    uninit callees: Vec_UsizeList.Vec
+    Vec_UsizeList.new(init callees, allocator)?
+    callgraph_mod.collect_function_index(tree, mutable qnames, mutable declared, mutable callees, allocator)?
+    uninit key_table: Vec_String.Vec
+    Vec_String.new(init key_table, allocator)?
+    uninit cones: Vec_UsizeList.Vec
+    Vec_UsizeList.new(init cones, allocator)?
+    intern_declared(declared, mutable key_table, mutable cones, allocator)?
+    solve_cones(callees, mutable cones, allocator)?
+    apply_cones(mutable tree, cones, key_table, allocator)?
+}
+
+
+function intern_declared(
+    declared: Vec_StringList.Vec,
+    key_table: mutable Vec_String.Vec,
+    cones: mutable Vec_UsizeList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var interned = StringMap_usize.new(allocator)?
+    let n: usize = Vec_StringList.len(declared)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let d_w = Vec_StringList.at(declared, i)
+        let dn: usize = Vec_String.len(d_w.items)
+        uninit set: Vec_usize.Vec
+        Vec_usize.new(init set, allocator)?
+        var m: usize = 0
+        loop
+            decreases dn - m
+        {
+            if m >= dn { break }
+            let id = intern_key(mutable interned, mutable key_table, Vec_String.at(d_w.items, m), allocator)?
+            sorted_insert(mutable set, id, allocator)?
+            m += 1
+        }
+        Vec_UsizeList.push(mutable cones, lists_mod.UsizeList { items: set }, allocator)?
+        i += 1
+    }
+}
+
+
+function intern_key(
+    interned: mutable StringMap_usize.StringMap,
+    key_table: mutable Vec_String.Vec,
+    member: String,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let sb = member.bytes()
+    let sn: usize = sb.len()
+    let raw: usize = conekey.key_len(sb)
+    let k: usize = if raw > sn { sn } else { raw }
+    match StringMap_usize.get_bytes(interned, sb[0..<k]) {
+        case .some(let id) => { return id }
+        case .none => ()
+    }
+    let id: usize = Vec_String.len(key_table)
+    let buf: [u8] = allocator.alloc_array(u8, k)?
+    var i: usize = 0
+    loop
+        decreases k - i
+    {
+        if i >= k { break }
+        buf[i] = sb[i]
+        i += 1
+    }
+    let key = string.from_owned_utf8(take buf)
+    let vid = id
+    let _ = StringMap_usize.insert(mutable interned, key, take vid, allocator)?
+    Vec_String.push(mutable key_table, clone_str(member, allocator)?, allocator)?
+    return id
+}
+
+
+function sorted_insert(set: mutable Vec_usize.Vec, id: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_usize.len(set)
+    var pos: usize = 0
+    loop
+        decreases n - pos
+    {
+        if pos >= n { break }
+        let v = Vec_usize.at(set, pos)
+        if v == id { return }
+        if v > id { break }
+        pos += 1
+    }
+    Vec_usize.insert(mutable set, pos, id, allocator)?
+}
+
+
+function solve_cones(
+    callees: Vec_UsizeList.Vec,
+    cones: mutable Vec_UsizeList.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_UsizeList.len(cones)
+    if n == 0 { return }
+    let callers = build_callers(callees, n, allocator)?
+    uninit queue: Vec_usize.Vec
+    Vec_usize.new(init queue, allocator)?
+    uninit queued: Vec_u8.Vec
+    Vec_u8.new(init queued, allocator)?
+    var s: usize = 0
+    loop
+        decreases n - s
+    {
+        if s >= n { break }
+        Vec_usize.push(mutable queue, s, allocator)?
+        Vec_u8.push(mutable queued, 1 as u8, allocator)?
+        s += 1
+    }
+    var head: usize = 0
+    loop {
+        if head >= Vec_usize.len(queue) { break }
+        let j = Vec_usize.at(queue, head)
+        head += 1
+        if j < n {
+            Vec_u8.set_at(mutable queued, j, 0 as u8)
+            drain_node(j, callers, mutable cones, mutable queue, mutable queued, allocator)?
+        }
+    }
+}
+
+
+function build_callers(callees: Vec_UsizeList.Vec, n: usize, allocator: Allocator) -> Vec_UsizeList.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit callers: Vec_UsizeList.Vec
+    Vec_UsizeList.new(init callers, allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        uninit slot: Vec_usize.Vec
+        Vec_usize.new(init slot, allocator)?
+        Vec_UsizeList.push(mutable callers, lists_mod.UsizeList { items: slot }, allocator)?
+        i += 1
+    }
+    let en: usize = Vec_UsizeList.len(callees)
+    let bound: usize = if en < n { en } else { n }
+    var k: usize = 0
+    loop
+        decreases bound - k
+    {
+        if k >= bound { break }
+        let edges_w = Vec_UsizeList.at(callees, k)
+        let edge_n: usize = Vec_usize.len(edges_w.items)
+        var e: usize = 0
+        loop
+            decreases edge_n - e
+        {
+            if e >= edge_n { break }
+            let j = Vec_usize.at(edges_w.items, e)
+            if j != k && j < n {
+                var caller_w = Vec_UsizeList.at(callers, j)
+                Vec_usize.push(mutable caller_w.items, k, allocator)?
+                Vec_UsizeList.set_at(mutable callers, j, take caller_w)
+            }
+            e += 1
+        }
+        k += 1
+    }
+    return callers
+}
+
+
+function drain_node(
+    j: usize,
+    callers: Vec_UsizeList.Vec,
+    cones: mutable Vec_UsizeList.Vec,
+    queue: mutable Vec_usize.Vec,
+    queued: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if j >= Vec_UsizeList.len(callers) { return }
+    let callers_w = Vec_UsizeList.at(callers, j)
+    let cn: usize = Vec_usize.len(callers_w.items)
+    let qn: usize = Vec_u8.len(queued)
+    var c: usize = 0
+    loop
+        decreases cn - c
+    {
+        if c >= cn { break }
+        let k = Vec_usize.at(callers_w.items, c)
+        let added = union_into(mutable cones, k, j, allocator)?
+        if added && k < qn && Vec_u8.at(queued, k) == 0 as u8 {
+            Vec_usize.push(mutable queue, k, allocator)?
+            Vec_u8.set_at(mutable queued, k, 1 as u8)
+        }
+        c += 1
+    }
+}
+
+
+function union_into(
+    cones: mutable Vec_UsizeList.Vec,
+    target: usize,
+    source: usize,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_UsizeList.len(cones)
+    if target >= n || source >= n || target == source { return false }
+    let src_w = Vec_UsizeList.at(cones, source)
+    let tgt_w = Vec_UsizeList.at(cones, target)
+    let missing: usize = count_missing(tgt_w.items, src_w.items)
+    if missing == 0 { return false }
+    let merged = merge_sorted(tgt_w.items, src_w.items, missing, allocator)?
+    Vec_UsizeList.set_at(mutable cones, target, lists_mod.UsizeList { items: merged })
+    return true
+}
+
+
+function count_missing(target: Vec_usize.Vec, source: Vec_usize.Vec) -> usize {
+    let tn: usize = Vec_usize.len(target)
+    let sn: usize = Vec_usize.len(source)
+    var ti: usize = 0
+    var si: usize = 0
+    var missing: usize = 0
+    loop
+        decreases sn - si
+    {
+        if si >= sn { break }
+        let sv = Vec_usize.at(source, si)
+        loop
+            decreases tn - ti
+        {
+            if ti >= tn { break }
+            if Vec_usize.at(target, ti) >= sv { break }
+            ti += 1
+        }
+        if ti >= tn {
+            missing += 1
+        } else {
+            if Vec_usize.at(target, ti) != sv { missing += 1 }
+        }
+        si += 1
+    }
+    return missing
+}
+
+
+function merge_sorted(target: Vec_usize.Vec, source: Vec_usize.Vec, extra: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let tn: usize = Vec_usize.len(target)
+    let sn: usize = Vec_usize.len(source)
+    uninit out: Vec_usize.Vec
+    Vec_usize.with_capacity(init out, tn + extra, allocator)?
+    var ti: usize = 0
+    var si: usize = 0
+    loop
+        decreases sn - si
+    {
+        if si >= sn { break }
+        let sv = Vec_usize.at(source, si)
+        loop
+            decreases tn - ti
+        {
+            if ti >= tn { break }
+            let tv = Vec_usize.at(target, ti)
+            if tv >= sv { break }
+            Vec_usize.push(mutable out, tv, allocator)?
+            ti += 1
+        }
+        if ti < tn && Vec_usize.at(target, ti) == sv {
+            ti += 1
+        }
+        Vec_usize.push(mutable out, sv, allocator)?
+        si += 1
+    }
+    loop
+        decreases tn - ti
+    {
+        if ti >= tn { break }
+        Vec_usize.push(mutable out, Vec_usize.at(target, ti), allocator)?
+        ti += 1
+    }
+    return out
+}
+
+
+function apply_cones(
+    tree: mutable model.Tree,
+    cones: Vec_UsizeList.Vec,
+    key_table: Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_FunctionEntry.len(tree.functions)
+    let cn: usize = Vec_UsizeList.len(cones)
+    let bound: usize = if n < cn { n } else { cn }
+    var i: usize = 0
+    loop
+        decreases bound - i
+    {
+        if i >= bound { break }
+        var f = Vec_FunctionEntry.at(tree.functions, i)
+        let displays = displays_of(Vec_UsizeList.at(cones, i).items, key_table, allocator)?
+        f.effect_cone = callsort_mod.sort_and_dedup(take displays, allocator)?
+        Vec_FunctionEntry.set_at(mutable tree.functions, i, take f)
+        i += 1
+    }
+}
+
+
+function displays_of(v: Vec_usize.Vec, key_table: Vec_String.Vec, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n: usize = Vec_usize.len(v)
+    let kn: usize = Vec_String.len(key_table)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let id = Vec_usize.at(v, i)
+        if id < kn {
+            Vec_String.push(mutable out, conekey.display_of(Vec_String.at(key_table, id), allocator)?, allocator)?
+        }
+        i += 1
+    }
+    return out
+}
+
+
+function clone_str(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}

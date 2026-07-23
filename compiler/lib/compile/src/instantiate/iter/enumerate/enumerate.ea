@@ -1,0 +1,94 @@
+
+module compile.instantiate.iter.enumerate.enumerate
+
+import std.collections.hashmap
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import source.map as source_map_mod
+import source.read as source_read_mod
+import source.file as src_file_mod
+
+
+spec std.collections.hashmap.StringMap(usize)
+spec std.collections.vec.Vec(usize)
+spec std.core.option.Option(usize)
+
+
+public function enumerate(
+    rfs: ReadOnlyFilesystem,
+    source_paths: [String],
+    map: mutable source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit scratch: Vec_usize.Vec
+    Vec_usize.new(init scratch, allocator)?
+    enumerate_collect(rfs, source_paths, mutable map, mutable scratch, allocator)?
+}
+
+
+public function enumerate_collect(
+    rfs: ReadOnlyFilesystem,
+    source_paths: [String],
+    map: mutable source_map_mod.SourceMap,
+    run_files: mutable Vec_usize.Vec,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    var seen = StringMap_usize.new(allocator)?
+    let existing = source_map_mod.file_count(map)
+    var j: usize = 0
+    loop decreases (existing - j) {
+        if j >= existing {
+            break
+        }
+        let norm = normalize_path(src_file_mod.name(source_map_mod.file_at(map, j)), allocator)?
+        let _ = StringMap_usize.insert(mutable seen, norm, j, allocator)?
+        j = j + 1 as usize
+    }
+    let n = source_paths.len()
+    var i: usize = 0
+    loop decreases (n - i + 1) as usize {
+        if i >= n {
+            break
+        }
+        let norm = normalize_path(source_paths[i], allocator)?
+        match StringMap_usize.get(seen, norm) {
+            case .some(let idx) => Vec_usize.push(mutable run_files, idx, allocator)?
+            case .none => {
+                let idx = source_map_mod.file_count(map)
+                let path_copy = string.concat(source_paths[i], "", allocator)?
+                let _id = source_read_mod.read_file(rfs, mutable map, take path_copy, allocator)?
+                let _ = StringMap_usize.insert(mutable seen, norm, idx, allocator)?
+                Vec_usize.push(mutable run_files, idx, allocator)?
+            }
+        }
+        i = i + 1 as usize
+    }
+}
+
+function normalize_path(p: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = p.bytes()
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        buf[i] = normalize_separator(bytes[i])
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function normalize_separator(c: u8) -> u8 {
+    return if c == 0x5C { 0x2F } else { c }
+}

@@ -1,0 +1,357 @@
+
+module cteval.res.output
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import std.math.scalar as scalar_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import syntax.ast.ops as ast_ops_mod
+import types.pass.effect as effect_mod
+import types.pass.ty as ty_mod
+import local.error as err_mod
+import local.state.value as value_mod
+
+
+spec std.collections.vec.Vec(err_mod.ComptimeError)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(SpecArgEntry)
+spec std.collections.vec.Vec(EvaluatedEntry)
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(value_mod.ComptimeValue)
+
+
+derive eq, debug for SpecArgEntry
+derive eq, debug for EvaluatedEntry
+
+
+public type ComptimeOutput {
+    evaluated: u32
+    failures: Vec_ComptimeError.Vec
+    spec_invocation_args: Vec_SpecArgEntry.Vec
+    evaluated_values: Vec_EvaluatedEntry.Vec
+    evaluated_fat: Vec_ComptimeValue.Vec
+    spec_args_index: IntMap_u32.IntMap
+    evaluated_index: IntMap_u32.IntMap
+}
+
+public type SpecArgEntry {
+    node_id: node_mod.NodeId
+    args: Vec_ComptimeValue.Vec
+}
+
+public type EvaluatedEntry {
+    bits: u64
+    node_id: node_mod.NodeId
+    extra: u32
+    tag: u8
+}
+
+
+public function new(out: init ComptimeOutput, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit fs: Vec_ComptimeError.Vec
+    Vec_ComptimeError.new(init fs, allocator)?
+    uninit args_table: Vec_SpecArgEntry.Vec
+    Vec_SpecArgEntry.new(init args_table, allocator)?
+    uninit values_table: Vec_EvaluatedEntry.Vec
+    Vec_EvaluatedEntry.new(init values_table, allocator)?
+    uninit fat_table: Vec_ComptimeValue.Vec
+    Vec_ComptimeValue.new(init fat_table, allocator)?
+    let spec_idx = IntMap_u32.new(allocator)?
+    let eval_idx = IntMap_u32.new(allocator)?
+    out = ComptimeOutput {
+        evaluated: 0 as u32,
+        failures: fs,
+        spec_invocation_args: args_table,
+        evaluated_values: values_table,
+        evaluated_fat: fat_table,
+        spec_args_index: spec_idx,
+        evaluated_index: eval_idx,
+    }
+}
+
+
+public function record_evaluated(out: mutable ComptimeOutput) -> ()
+    requires out.evaluated < 4294967295
+{
+    out.evaluated = out.evaluated + 1 as u32
+}
+
+public function push_failure(
+    out: mutable ComptimeOutput,
+    failure: take err_mod.ComptimeError,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_ComptimeError.push(mutable out.failures, take failure, allocator)?
+}
+
+
+public stable function total(out: ComptimeOutput) -> usize
+    requires (out.evaluated as usize) + Vec_ComptimeError.len(out.failures) <= 18446744073709551615
+{
+    return (out.evaluated as usize) + Vec_ComptimeError.len(out.failures)
+}
+
+public stable function ok(out: ComptimeOutput) -> bool {
+    return Vec_ComptimeError.len(out.failures) == 0
+}
+
+
+public function record_spec_invocation_args(
+    out: mutable ComptimeOutput,
+    node_id: node_mod.NodeId,
+    args: take Vec_ComptimeValue.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let idx_u: u32 = Vec_SpecArgEntry.len(out.spec_invocation_args) as u32
+    let _ = IntMap_u32.insert(
+        mutable out.spec_args_index,
+        node_id.raw as i64,
+        take idx_u,
+        allocator,
+    )?
+    Vec_SpecArgEntry.push(
+        mutable out.spec_invocation_args,
+        SpecArgEntry { node_id: node_id, args: args },
+        allocator,
+    )?
+}
+
+public function spec_invocation_args_index(
+    out: ComptimeOutput,
+    node_id: node_mod.NodeId,
+) -> Option_usize.Option
+{
+    return match IntMap_u32.get(out.spec_args_index, node_id.raw as i64) {
+        case .some(let idx) => Option_usize.some(value: idx as usize)
+        case .none          => Option_usize.none
+    }
+}
+
+
+public function record_evaluated_value(
+    out: mutable ComptimeOutput,
+    node_id: node_mod.NodeId,
+    value: take value_mod.ComptimeValue,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let idx_u: u32 = Vec_EvaluatedEntry.len(out.evaluated_values) as u32
+    let _ = IntMap_u32.insert(
+        mutable out.evaluated_index,
+        node_id.raw as i64,
+        take idx_u,
+        allocator,
+    )?
+    var tag: u8 = 6 as u8
+    var bits: u64 = 0 as u64
+    var extra: u32 = 0 as u32
+    var fat: bool = false
+    match value {
+        case .bool_(let b) => {
+            tag = 0 as u8
+            bits = if b { 1 as u64 } else { 0 as u64 }
+        }
+        case .int_signed(let v, let w) => {
+            tag = 1 as u8
+            bits = v as u64 wrapping
+            extra = width_ordinal(w)
+        }
+        case .int_unsigned(let v, let w) => {
+            tag = 2 as u8
+            bits = v
+            extra = width_ordinal(w)
+        }
+        case .float_f32(let f) => {
+            tag = 3 as u8
+            bits = scalar_mod.f32_to_bits(f) as u64
+        }
+        case .float_f64(let f) => {
+            tag = 4 as u8
+            bits = scalar_mod.f64_to_bits(f)
+        }
+        case .string_(let s) => {
+            tag = 5 as u8
+            bits = s.raw as u64
+        }
+        case .unit_ => {
+            tag = 6 as u8
+        }
+        case .type_meta(let t) => {
+            tag = 7 as u8
+            bits = t.raw as u64
+        }
+        case .module_meta(let nm) => {
+            tag = 8 as u8
+            bits = nm.raw as u64
+        }
+        case .effect_row(let r) => {
+            tag = 9 as u8
+            bits = r.raw as u64
+        }
+        case .function_meta(let d) => {
+            tag = 10 as u8
+            bits = d.raw as u64
+        }
+        case .doc_importance(let imp) => {
+            tag = 11 as u8
+            bits = importance_ordinal(imp)
+        }
+        case .parameter_meta(let nm, let t, let md) => {
+            tag = parameter_tag(md)
+            bits = nm.raw as u64
+            extra = t.raw
+        }
+        case .list_(_) => {
+            tag = 16 as u8
+            extra = Vec_ComptimeValue.len(out.evaluated_fat) as u32
+            fat = true
+        }
+    }
+    if fat {
+        Vec_ComptimeValue.push(mutable out.evaluated_fat, take value, allocator)?
+    }
+    Vec_EvaluatedEntry.push(
+        mutable out.evaluated_values,
+        EvaluatedEntry { bits: bits, node_id: node_id, extra: extra, tag: tag },
+        allocator,
+    )?
+}
+
+public function evaluated_value_of(
+    out: ComptimeOutput,
+    node_id: node_mod.NodeId,
+) -> Option_ComptimeValue.Option
+{
+    let n = Vec_EvaluatedEntry.len(out.evaluated_values)
+    let i: usize = match IntMap_u32.get(out.evaluated_index, node_id.raw as i64) {
+        case .some(let idx) => idx as usize
+        case .none          => n
+    }
+    if i < n {
+        let e = Vec_EvaluatedEntry.at(out.evaluated_values, i)
+        return Option_ComptimeValue.some(value: decode_entry(out, e))
+    }
+    return Option_ComptimeValue.none
+}
+
+
+function parameter_tag(mode: ast_ops_mod.ParamMode) -> u8 {
+    return match mode {
+        case .default  => 12 as u8
+        case .mutable_ => 13 as u8
+        case .take_    => 14 as u8
+        case .init_    => 15 as u8
+    }
+}
+
+function width_ordinal(w: value_mod.IntWidth) -> u32 {
+    return match w {
+        case .w8    => 0 as u32
+        case .w16   => 1 as u32
+        case .w32   => 2 as u32
+        case .w64   => 3 as u32
+        case .wsize => 4 as u32
+    }
+}
+
+function width_of_ordinal(o: u32) -> value_mod.IntWidth {
+    return match o {
+        case 0 => value_mod.IntWidth.w8
+        case 1 => value_mod.IntWidth.w16
+        case 2 => value_mod.IntWidth.w32
+        case 3 => value_mod.IntWidth.w64
+        case _ => value_mod.IntWidth.wsize
+    }
+}
+
+function importance_ordinal(d: value_mod.DocImportance) -> u64 {
+    return match d {
+        case .high   => 0 as u64
+        case .medium => 1 as u64
+        case .low    => 2 as u64
+        case .none_  => 3 as u64
+    }
+}
+
+function importance_of_ordinal(o: u64) -> value_mod.DocImportance {
+    return match o {
+        case 0 => value_mod.DocImportance.high
+        case 1 => value_mod.DocImportance.medium
+        case 2 => value_mod.DocImportance.low
+        case _ => value_mod.DocImportance.none_
+    }
+}
+
+function parameter_value(e: EvaluatedEntry, mode: ast_ops_mod.ParamMode) -> value_mod.ComptimeValue {
+    return value_mod.ComptimeValue.parameter_meta(
+        name: symbol_mod.from_raw(e.bits as u32 wrapping),
+        ty: ty_mod.TyId { raw: e.extra },
+        mode: mode,
+    )
+}
+
+function fat_value_at(out: ComptimeOutput, idx: u32) -> value_mod.ComptimeValue {
+    let n = Vec_ComptimeValue.len(out.evaluated_fat)
+    let i: usize = idx as usize
+    if i < n {
+        return Vec_ComptimeValue.at(out.evaluated_fat, i)
+    }
+    return value_mod.ComptimeValue.unit_
+}
+
+function decode_entry(out: ComptimeOutput, e: EvaluatedEntry) -> value_mod.ComptimeValue {
+    return match e.tag {
+        case 0 => value_mod.ComptimeValue.bool_(value: e.bits != 0)
+        case 1 => value_mod.ComptimeValue.int_signed(
+            value: e.bits as i64 wrapping,
+            width: width_of_ordinal(e.extra),
+        )
+        case 2 => value_mod.ComptimeValue.int_unsigned(
+            value: e.bits,
+            width: width_of_ordinal(e.extra),
+        )
+        case 3 => value_mod.ComptimeValue.float_f32(
+            value: scalar_mod.f32_from_bits(e.bits as u32 wrapping),
+        )
+        case 4 => value_mod.ComptimeValue.float_f64(
+            value: scalar_mod.f64_from_bits(e.bits),
+        )
+        case 5 => value_mod.ComptimeValue.string_(
+            value: symbol_mod.from_raw(e.bits as u32 wrapping),
+        )
+        case 7 => value_mod.ComptimeValue.type_meta(
+            ty: ty_mod.TyId { raw: e.bits as u32 wrapping },
+        )
+        case 8 => value_mod.ComptimeValue.module_meta(
+            name: symbol_mod.from_raw(e.bits as u32 wrapping),
+        )
+        case 9 => value_mod.ComptimeValue.effect_row(
+            row: effect_mod.EffectRowId { raw: e.bits as u32 wrapping },
+        )
+        case 10 => value_mod.ComptimeValue.function_meta(
+            def: def_mod.from_raw(e.bits as u32 wrapping),
+        )
+        case 11 => value_mod.ComptimeValue.doc_importance(
+            value: importance_of_ordinal(e.bits),
+        )
+        case 12 => parameter_value(e, ast_ops_mod.ParamMode.default)
+        case 13 => parameter_value(e, ast_ops_mod.ParamMode.mutable_)
+        case 14 => parameter_value(e, ast_ops_mod.ParamMode.take_)
+        case 15 => parameter_value(e, ast_ops_mod.ParamMode.init_)
+        case 16 => fat_value_at(out, e.extra)
+        case _ => value_mod.ComptimeValue.unit_
+    }
+}

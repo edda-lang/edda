@@ -1,0 +1,184 @@
+module base58.codec
+
+import std.mem.alloc
+import std.crypto.hash.sha256
+import std.text.string
+import local.alphabet
+
+
+public function encode(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    var zeros: usize = 0
+    loop decreases n - zeros {
+        if zeros >= n { break }
+        if bytes[zeros] != 0 as u8 { break }
+        zeros += 1
+    }
+    let rest = n - zeros
+    let size = rest * 138 / 100 + 1
+    var buf: [u8] = allocator.alloc_array(u8, size)?
+    var z: usize = 0
+    loop decreases size - z {
+        if z >= size { break }
+        buf[z] = 0 as u8
+        z += 1
+    }
+    var i: usize = zeros
+    loop decreases n - i {
+        if i >= n { break }
+        var carry: u32 = bytes[i] as u32
+        var j: usize = size
+        loop decreases j {
+            if j == 0 { break }
+            j -= 1
+            carry = carry + 256 as u32 * (buf[j] as u32)
+            buf[j] = (carry % 58 as u32) as u8
+            carry = carry / 58 as u32
+        }
+        i += 1
+    }
+    var lead: usize = 0
+    loop decreases size - lead {
+        if lead >= size { break }
+        if buf[lead] != 0 as u8 { break }
+        lead += 1
+    }
+    let out_len = zeros + (size - lead)
+    var out: [u8] = allocator.alloc_array(u8, out_len)?
+    var p: usize = 0
+    loop decreases zeros - p {
+        if p >= zeros { break }
+        out[p] = 0x31 as u8
+        p += 1
+    }
+    var w: usize = zeros
+    loop decreases out_len - w {
+        if w >= out_len { break }
+        let src = lead + (w - zeros)
+        out[w] = alphabet.digit_char(buf[src] % 58 as u8)
+        w += 1
+    }
+    return string.from_owned_utf8(take out)
+}
+
+public function decode(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alphabet.Base58Error, err: alloc.AllocError}
+{
+    let chars = s.bytes()
+    let n = chars.len()
+    var ones: usize = 0
+    loop decreases n - ones {
+        if ones >= n { break }
+        if chars[ones] != 0x31 as u8 { break }
+        ones += 1
+    }
+    let rest = n - ones
+    let size = rest * 733 / 1000 + 1
+    var buf: [u8] = allocator.alloc_array(u8, size)?
+    var z: usize = 0
+    loop decreases size - z {
+        if z >= size { break }
+        buf[z] = 0 as u8
+        z += 1
+    }
+    var i: usize = ones
+    loop decreases n - i {
+        if i >= n { break }
+        let dv = alphabet.digit_value(chars[i])
+        if dv >= 58 as u8 { raise alphabet.Base58Error.invalid_char(at: i) }
+        var carry: u32 = dv as u32
+        var j: usize = size
+        loop decreases j {
+            if j == 0 { break }
+            j -= 1
+            carry = carry + 58 as u32 * (buf[j] as u32)
+            buf[j] = (carry % 256 as u32) as u8
+            carry = carry / 256 as u32
+        }
+        i += 1
+    }
+    var lead: usize = 0
+    loop decreases size - lead {
+        if lead >= size { break }
+        if buf[lead] != 0 as u8 { break }
+        lead += 1
+    }
+    let out_len = ones + (size - lead)
+    var out: [u8] = allocator.alloc_array(u8, out_len)?
+    var p: usize = 0
+    loop decreases ones - p {
+        if p >= ones { break }
+        out[p] = 0 as u8
+        p += 1
+    }
+    var w: usize = ones
+    loop decreases out_len - w {
+        if w >= out_len { break }
+        let src = lead + (w - ones)
+        out[w] = buf[src]
+        w += 1
+    }
+    return out
+}
+
+function _checksum_prefix(data: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    var d1: [u8] = allocator.alloc_array(u8, 32 as usize)?
+    sha256.sha256(data, mutable d1, 0 as usize)
+    var d2: [u8] = allocator.alloc_array(u8, 32 as usize)?
+    sha256.sha256(d1, mutable d2, 0 as usize)
+    var out: [u8] = allocator.alloc_array(u8, 4 as usize)?
+    out[0] = d2[0]
+    out[1] = d2[1]
+    out[2] = d2[2]
+    out[3] = d2[3]
+    return out
+}
+
+public function encode_check(payload: [u8], version: u8, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let plen = payload.len()
+    let body_len = plen + 1
+    let total = plen + 5
+    var full: [u8] = allocator.alloc_array(u8, total)?
+    full[0] = version
+    var i: usize = 0
+    loop decreases plen - i {
+        if i >= plen { break }
+        full[1 + i] = payload[i]
+        i += 1
+    }
+    let check = _checksum_prefix(full[0 as usize..<body_len], allocator)?
+    full[body_len] = check[0]
+    full[body_len + 1] = check[1]
+    full[body_len + 2] = check[2]
+    full[body_len + 3] = check[3]
+    return encode(full, allocator)?
+}
+
+public function decode_check(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alphabet.Base58Error, err: alloc.AllocError}
+{
+    let raw = decode(s, allocator)?
+    let m = raw.len()
+    if m < 5 as usize { raise alphabet.Base58Error.bad_checksum }
+    let body_len = m - 4
+    let check = _checksum_prefix(raw[0 as usize..<body_len], allocator)?
+    if check[0] != raw[body_len] { raise alphabet.Base58Error.bad_checksum }
+    if check[1] != raw[body_len + 1] { raise alphabet.Base58Error.bad_checksum }
+    if check[2] != raw[body_len + 2] { raise alphabet.Base58Error.bad_checksum }
+    if check[3] != raw[body_len + 3] { raise alphabet.Base58Error.bad_checksum }
+    let out_len = body_len - 1
+    var out: [u8] = allocator.alloc_array(u8, out_len)?
+    var i: usize = 0
+    loop decreases out_len - i {
+        if i >= out_len { break }
+        out[i] = raw[1 + i]
+        i += 1
+    }
+    return out
+}

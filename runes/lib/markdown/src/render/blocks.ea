@@ -1,0 +1,284 @@
+module markdown.render.blocks
+
+import std.mem.alloc
+import std.collections.vec
+import markdown.escape.sink as esc
+import markdown.render.inline as inline
+import markdown.lines.scan as line_mod
+
+spec vec.Vec(line_mod.Line)
+
+public function to_html(md: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let lines = line_mod.split(md.bytes(), allocator)?
+    let nlines = Vec_Line.len(lines)
+    var sink = esc.new(allocator)?
+    emit_blocks(mutable sink, lines, nlines, allocator)?
+    return esc.finish(sink, allocator)?
+}
+
+function emit_blocks(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var i: usize = 0
+    loop
+        decreases nlines - i
+    {
+        if i >= nlines { break }
+        i = emit_block_at(mutable s, lines, nlines, i, allocator)?
+    }
+}
+
+function emit_block_at(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    i: usize where i < nlines,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+    ensures result > i
+{
+    let ln = Vec_Line.at(lines, i)
+    if line_mod.is_blank(ln) {
+        return i + 1
+    }
+    if line_mod.is_fence(ln) {
+        return consume_fence(mutable s, lines, nlines, i, allocator)?
+    }
+    if line_mod.is_hr(ln) {
+        esc.push_raw(mutable s, "<hr />\n", allocator)?
+        return i + 1
+    }
+    let hlevel = line_mod.heading_level(ln)
+    if hlevel >= 1 && hlevel <= 6 {
+        emit_heading(mutable s, ln, hlevel, allocator)?
+        return i + 1
+    }
+    if line_mod.is_ul_item(ln) {
+        return consume_ul(mutable s, lines, nlines, i, allocator)?
+    }
+    if line_mod.is_ol_item(ln) {
+        return consume_ol(mutable s, lines, nlines, i, allocator)?
+    }
+    if line_mod.is_blockquote(ln) {
+        return consume_blockquote(mutable s, lines, nlines, i, allocator)?
+    }
+    return consume_paragraph(mutable s, lines, nlines, i, allocator)?
+}
+
+function emit_heading(
+    s: mutable esc.Sink,
+    ln: line_mod.Line,
+    level: usize where level >= 1 && level <= 6,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let body = line_mod.content(ln, line_mod.heading_content_lo(ln, level), allocator)?
+    esc.push_raw(mutable s, open_heading(level), allocator)?
+    inline.render(mutable s, body.bytes(), allocator)?
+    esc.push_raw(mutable s, close_heading(level), allocator)?
+}
+
+function open_heading(level: usize where level >= 1 && level <= 6) -> String {
+    return match level {
+        case 1 => "<h1>"
+        case 2 => "<h2>"
+        case 3 => "<h3>"
+        case 4 => "<h4>"
+        case 5 => "<h5>"
+        case _ => "<h6>"
+    }
+}
+
+function close_heading(level: usize where level >= 1 && level <= 6) -> String {
+    return match level {
+        case 1 => "</h1>\n"
+        case 2 => "</h2>\n"
+        case 3 => "</h3>\n"
+        case 4 => "</h4>\n"
+        case 5 => "</h5>\n"
+        case _ => "</h6>\n"
+    }
+}
+
+function consume_fence(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    start: usize where start < nlines,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+    ensures result > start
+{
+    esc.push_raw(mutable s, "<pre><code>", allocator)?
+    var i: usize = start + 1
+    loop
+        decreases nlines - i
+    {
+        if i >= nlines { break }
+        let ln = Vec_Line.at(lines, i)
+        if line_mod.is_fence(ln) {
+            i += 1
+            break
+        }
+        esc.push_escaped_bytes(mutable s, line_mod.line_bytes(ln), allocator)?
+        esc.push_byte(mutable s, 10 as u8, allocator)?
+        i += 1
+    }
+    esc.push_raw(mutable s, "</code></pre>\n", allocator)?
+    return i
+}
+
+function consume_ul(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    start: usize where start < nlines,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+    ensures result > start
+{
+    esc.push_raw(mutable s, "<ul>\n", allocator)?
+    var i: usize = start
+    loop
+        decreases nlines - i
+    {
+        if i >= nlines { break }
+        let ln = Vec_Line.at(lines, i)
+        if !line_mod.is_ul_item(ln) { break }
+        emit_list_item(mutable s, ln, line_mod.ul_content_lo(ln), allocator)?
+        i += 1
+    }
+    esc.push_raw(mutable s, "</ul>\n", allocator)?
+    return i
+}
+
+function consume_ol(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    start: usize where start < nlines,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+    ensures result > start
+{
+    esc.push_raw(mutable s, "<ol>\n", allocator)?
+    var i: usize = start
+    loop
+        decreases nlines - i
+    {
+        if i >= nlines { break }
+        let ln = Vec_Line.at(lines, i)
+        if !line_mod.is_ol_item(ln) { break }
+        emit_list_item(mutable s, ln, line_mod.ol_content_lo(ln), allocator)?
+        i += 1
+    }
+    esc.push_raw(mutable s, "</ol>\n", allocator)?
+    return i
+}
+
+function emit_list_item(
+    s: mutable esc.Sink,
+    ln: line_mod.Line,
+    content_lo: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let body = line_mod.content(ln, content_lo, allocator)?
+    esc.push_raw(mutable s, "<li>", allocator)?
+    inline.render(mutable s, body.bytes(), allocator)?
+    esc.push_raw(mutable s, "</li>\n", allocator)?
+}
+
+function consume_blockquote(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    start: usize where start < nlines,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+    ensures result > start
+{
+    esc.push_raw(mutable s, "<blockquote>\n", allocator)?
+    var i: usize = start
+    loop
+        decreases nlines - i
+    {
+        if i >= nlines { break }
+        let ln = Vec_Line.at(lines, i)
+        if !line_mod.is_blockquote(ln) { break }
+        emit_blockquote_line(mutable s, ln, allocator)?
+        i += 1
+    }
+    esc.push_raw(mutable s, "</blockquote>\n", allocator)?
+    return i
+}
+
+function emit_blockquote_line(
+    s: mutable esc.Sink,
+    ln: line_mod.Line,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let body = line_mod.content(ln, line_mod.bq_content_lo(ln), allocator)?
+    esc.push_raw(mutable s, "<p>", allocator)?
+    inline.render(mutable s, body.bytes(), allocator)?
+    esc.push_raw(mutable s, "</p>\n", allocator)?
+}
+
+function consume_paragraph(
+    s: mutable esc.Sink,
+    lines: Vec_Line.Vec,
+    nlines: usize where nlines == Vec_Line.len(lines),
+    start: usize where start < nlines,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+    ensures result > start
+{
+    esc.push_raw(mutable s, "<p>", allocator)?
+    var i: usize = start
+    loop
+        decreases nlines - i
+    {
+        if i >= nlines { break }
+        let ln = Vec_Line.at(lines, i)
+        if !line_mod.is_paragraph_line(ln) { break }
+        if i > start {
+            esc.push_raw(mutable s, "\n", allocator)?
+        }
+        emit_paragraph_line(mutable s, ln, allocator)?
+        i += 1
+    }
+    esc.push_raw(mutable s, "</p>\n", allocator)?
+    return i
+}
+
+function emit_paragraph_line(
+    s: mutable esc.Sink,
+    ln: line_mod.Line,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let hard = line_mod.has_hard_break(ln)
+    let body = line_mod.content(ln, 0 as usize, allocator)?
+    inline.render(mutable s, body.bytes(), allocator)?
+    if hard {
+        esc.push_raw(mutable s, "<br />", allocator)?
+    }
+}

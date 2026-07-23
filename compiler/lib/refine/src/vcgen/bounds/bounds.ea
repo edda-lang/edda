@@ -1,0 +1,283 @@
+
+module refine.vcgen.bounds.bounds
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.symbol as symbol_mod
+import mir.body.model as mir_body
+import mir.id.block as block_mod
+import mir.id.local as local_mod
+import mir.rvalue as rvalue_mod
+import mir.stmt as stmt_mod
+import mir.place as place_mod
+import types.ty.interner as ty_interner_mod
+import local.smt.term as term_mod
+import local.smt.render.sort as sort_mod
+import local.vcgen.term.term as vterm_mod
+import local.vcgen.bounds.locals as locals_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+
+
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_body.Local)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(place_mod.Place)
+spec std.core.option.Option(local_mod.LocalId)
+
+
+public function vc_bounds(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    obligation: mir_body.Obligation,
+    ty_interner: ty_interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let bi = block_mod.index(obligation.block)
+    if bi >= Vec_BasicBlock.len(body.blocks) {
+        return Option_SmtTerm.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, bi)
+    let si = obligation.stmt_index as usize
+    if si >= Vec_Statement.len(bb.statements) {
+        return Option_SmtTerm.none
+    }
+    let stmt = Vec_Statement.at(bb.statements, si)
+    let place = match find_place(stmt, obligation.kind) {
+        case .some(let p) => p
+        case .none => return Option_SmtTerm.none
+    }
+    return match obligation.kind {
+        case .index_in_bounds => index_vc_for_place(body, idx, place, ty_interner, len_sym, allocator)?
+        case .slice_subrange_in_bounds => subrange_vc_for_place(body, idx, place, ty_interner, len_sym, allocator)?
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function find_place(stmt: stmt_mod.Statement, kind: mir_body.ObligationKind) -> Option_Place.Option {
+    return match stmt.kind {
+        case .assign(let dest, let value) => {
+            if place_matches(dest, kind) {
+                Option_Place.some(value: dest)
+            } else {
+                find_in_rvalue(value, kind)
+            }
+        }
+        case _ => Option_Place.none
+    }
+}
+
+
+function find_in_rvalue(value: rvalue_mod.Rvalue, kind: mir_body.ObligationKind) -> Option_Place.Option {
+    return match value {
+        case .use_(let op) => find_in_operand(op, kind)
+        case .binary(_, let lhs, let rhs) => match find_in_operand(lhs, kind) {
+            case .some(let p) => Option_Place.some(value: p)
+            case .none => find_in_operand(rhs, kind)
+        }
+        case .unary(_, let op) => find_in_operand(op, kind)
+        case .cast(let op, _, _, _) => find_in_operand(op, kind)
+        case .ref_(_, let pl) => {
+            if place_matches(pl, kind) {
+                Option_Place.some(value: pl)
+            } else {
+                Option_Place.none
+            }
+        }
+        case _ => Option_Place.none
+    }
+}
+
+
+function find_in_operand(op: rvalue_mod.Operand, kind: mir_body.ObligationKind) -> Option_Place.Option {
+    return match op {
+        case .copy_(let pl, _) => {
+            if place_matches(pl, kind) {
+                Option_Place.some(value: pl)
+            } else {
+                Option_Place.none
+            }
+        }
+        case .move_(let pl, _) => {
+            if place_matches(pl, kind) {
+                Option_Place.some(value: pl)
+            } else {
+                Option_Place.none
+            }
+        }
+        case .constant(_) => Option_Place.none
+    }
+}
+
+
+function place_matches(place: place_mod.Place, kind: mir_body.ObligationKind) -> bool {
+    if place_mod.proj_len(place) != 1 {
+        return false
+    }
+    return match place_mod.proj_at(place, 0).kind {
+        case .index(_, _) => match kind {
+            case .index_in_bounds => true
+            case _ => false
+        }
+        case .slice_subrange(_, _, _) => match kind {
+            case .slice_subrange_in_bounds => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+
+function index_vc_for_place(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    place: place_mod.Place,
+    ty_interner: ty_interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if place_mod.proj_len(place) != 1 {
+        return Option_SmtTerm.none
+    }
+    return match place_mod.proj_at(place, 0).kind {
+        case .index(let idx_local, _) => index_vc_term(body, idx, place.local, idx_local, ty_interner, len_sym, allocator)?
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function subrange_vc_for_place(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    place: place_mod.Place,
+    ty_interner: ty_interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if place_mod.proj_len(place) != 1 {
+        return Option_SmtTerm.none
+    }
+    return match place_mod.proj_at(place, 0).kind {
+        case .slice_subrange(let lo_local, let hi_local, _) =>
+            subrange_vc_term(body, idx, place.local, lo_local, hi_local, ty_interner, len_sym, allocator)?
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function index_vc_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    slice_local: local_mod.LocalId,
+    idx_local: local_mod.LocalId,
+    ty_interner: ty_interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let idx_lo = match locals_mod.resolve_local_term(body, idx, idx_local) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let idx_hi = match locals_mod.resolve_local_term(body, idx, idx_local) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let len_t = match slice_len_term(body, idx, slice_local, ty_interner, len_sym, allocator)? {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let lower = vterm_mod.mk_bin(term_mod.SmtOp.le, take term_mod.SmtTerm.numeral(value: 0 as i128), take idx_lo, allocator)?
+    let upper = vterm_mod.mk_bin(term_mod.SmtOp.lt, take idx_hi, take len_t, allocator)?
+    return Option_SmtTerm.some(value: vterm_mod.mk_bin(term_mod.SmtOp.and_, take lower, take upper, allocator)?)
+}
+
+
+function subrange_vc_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    slice_local: local_mod.LocalId,
+    lo_local: local_mod.LocalId,
+    hi_local: local_mod.LocalId,
+    ty_interner: ty_interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let lo_a = match locals_mod.resolve_local_term(body, idx, lo_local) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let lo_b = match locals_mod.resolve_local_term(body, idx, lo_local) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let hi_a = match locals_mod.resolve_local_term(body, idx, hi_local) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let hi_b = match locals_mod.resolve_local_term(body, idx, hi_local) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let len_t = match slice_len_term(body, idx, slice_local, ty_interner, len_sym, allocator)? {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let nonneg = vterm_mod.mk_bin(term_mod.SmtOp.le, take term_mod.SmtTerm.numeral(value: 0 as i128), take lo_a, allocator)?
+    let ordered = vterm_mod.mk_bin(term_mod.SmtOp.le, take lo_b, take hi_a, allocator)?
+    let bounded = vterm_mod.mk_bin(term_mod.SmtOp.le, take hi_b, take len_t, allocator)?
+    let tail = vterm_mod.mk_bin(term_mod.SmtOp.and_, take ordered, take bounded, allocator)?
+    return Option_SmtTerm.some(value: vterm_mod.mk_bin(term_mod.SmtOp.and_, take nonneg, take tail, allocator)?)
+}
+
+
+function slice_len_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    slice_local: local_mod.LocalId,
+    ty_interner: ty_interner_mod.Interner,
+    len_sym: Option_Symbol.Option,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let sym = match len_sym {
+        case .some(let s) => s
+        case .none => return Option_SmtTerm.none
+    }
+    let named = match locals_mod.named_slice_local(body, idx, slice_local) {
+        case .some(let l) => l
+        case .none => return Option_SmtTerm.none
+    }
+    let idx = local_mod.index(named)
+    if idx >= Vec_Local.len(body.locals) {
+        return Option_SmtTerm.none
+    }
+    let local = Vec_Local.at(body.locals, idx)
+    let name = match local.name {
+        case .some(let nm) => nm
+        case .none => return Option_SmtTerm.none
+    }
+    let slice_sort = match sort_mod.sort_of(local.ty, ty_interner, allocator)? {
+        case .ok(let s) => s
+        case .unsupported(_) => return Option_SmtTerm.none
+    }
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take term_mod.SmtTerm.var_(name: name, sort: slice_sort), allocator)?
+    return Option_SmtTerm.some(value: term_mod.SmtTerm.app(op: term_mod.SmtOp.udf(name: sym), args: args))
+}

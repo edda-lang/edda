@@ -1,0 +1,258 @@
+
+module regalloc.live.solve.solve
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.lir.tree.body as lir_body_mod
+import local.scan.step.walk as walk_mod
+import local.live.defuse.bits as bits_mod
+
+
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+
+
+spec std.core.option.Option(usize)
+
+
+public function run(
+    live_in: mutable Vec_u64.Vec,
+    live_out: mutable Vec_u64.Vec,
+    def_set: Vec_u64.Vec,
+    use_set: Vec_u64.Vec,
+    body: lir_body_mod.LirBody,
+    n_blocks: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit order: Vec_usize.Vec
+    build_postorder(init order, body, n_blocks, allocator)?
+
+    var fuel: usize = n_blocks + 1
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        let changed = pass(mutable live_in, mutable live_out, def_set, use_set, body, order, n_blocks, n_vregs, allocator)?
+        if !changed { break }
+    }
+}
+
+
+function build_postorder(
+    out: init Vec_usize.Vec,
+    body: lir_body_mod.LirBody,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit acc: Vec_usize.Vec
+    Vec_usize.new(init acc, allocator)?
+    if n_blocks <= 1 {
+        out = acc
+        return
+    }
+
+    uninit visited: Vec_bool.Vec
+    bits_mod.new_bools(init visited, n_blocks, allocator)?
+    uninit stk_block: Vec_usize.Vec
+    Vec_usize.new(init stk_block, allocator)?
+    uninit stk_next: Vec_usize.Vec
+    Vec_usize.new(init stk_next, allocator)?
+    uninit succs: Vec_u32.Vec
+    Vec_u32.new(init succs, allocator)?
+
+    let edges = count_edges(body, n_blocks, allocator)?
+    Vec_bool.set_at(mutable visited, 1, true)
+    Vec_usize.push(mutable stk_block, 1, allocator)?
+    Vec_usize.push(mutable stk_next, 0, allocator)?
+
+    var fuel: usize = edges + n_blocks + n_blocks + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        let depth = Vec_usize.len(stk_block)
+        if depth == 0 { break }
+        let top = Vec_usize.at(stk_block, depth - 1)
+        let ni = Vec_usize.at(stk_next, depth - 1)
+        let block = Vec_LirBlock.at(body.blocks, top)
+        Vec_u32.clear(mutable succs)
+        walk_mod.collect_successors(block.terminator, mutable succs, allocator)?
+        if ni < Vec_u32.len(succs) {
+            Vec_usize.set_at(mutable stk_next, depth - 1, ni + 1)
+            let s = Vec_u32.at(succs, ni) as usize
+            if s < n_blocks {
+                if !Vec_bool.at(visited, s) {
+                    Vec_bool.set_at(mutable visited, s, true)
+                    Vec_usize.push(mutable stk_block, s, allocator)?
+                    Vec_usize.push(mutable stk_next, 0, allocator)?
+                }
+            }
+        } else {
+            Vec_usize.push(mutable acc, top, allocator)?
+            let _ = Vec_usize.pop(mutable stk_block)
+            let _ = Vec_usize.pop(mutable stk_next)
+        }
+    }
+
+    var u: usize = 1
+    loop decreases n_blocks - u {
+        if u >= n_blocks { break }
+        if !Vec_bool.at(visited, u) {
+            Vec_usize.push(mutable acc, u, allocator)?
+        }
+        u += 1
+    }
+
+    out = acc
+}
+
+
+function count_edges(
+    body: lir_body_mod.LirBody,
+    n_blocks: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    uninit succs: Vec_u32.Vec
+    Vec_u32.new(init succs, allocator)?
+    var total: usize = 0
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        let block = Vec_LirBlock.at(body.blocks, b)
+        Vec_u32.clear(mutable succs)
+        walk_mod.collect_successors(block.terminator, mutable succs, allocator)?
+        total += Vec_u32.len(succs)
+        b += 1
+    }
+    return total
+}
+
+
+function pass(
+    live_in: mutable Vec_u64.Vec,
+    live_out: mutable Vec_u64.Vec,
+    def_set: Vec_u64.Vec,
+    use_set: Vec_u64.Vec,
+    body: lir_body_mod.LirBody,
+    order: Vec_usize.Vec,
+    n_blocks: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    var changed = false
+    let n = Vec_usize.len(order)
+    var k: usize = 0
+    loop decreases n - k {
+        if k >= n { break }
+        let bb = Vec_usize.at(order, k)
+        let c = update_block(mutable live_in, mutable live_out, def_set, use_set, body, bb, n_blocks, n_vregs, allocator)?
+        if c { changed = true }
+        k += 1
+    }
+    return changed
+}
+
+
+function update_block(
+    live_in: mutable Vec_u64.Vec,
+    live_out: mutable Vec_u64.Vec,
+    def_set: Vec_u64.Vec,
+    use_set: Vec_u64.Vec,
+    body: lir_body_mod.LirBody,
+    b: usize,
+    n_blocks: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    var changed = false
+    uninit succs: Vec_u32.Vec
+    Vec_u32.new(init succs, allocator)?
+    let block = Vec_LirBlock.at(body.blocks, b)
+    walk_mod.collect_successors(block.terminator, mutable succs, allocator)?
+
+    let c1 = union_succ_into_out(mutable live_out, live_in, succs, b, n_blocks, n_vregs)
+    if c1 { changed = true }
+    let c2 = update_in_from_out(mutable live_in, live_out, use_set, def_set, b, n_vregs)
+    if c2 { changed = true }
+    return changed
+}
+
+
+function union_succ_into_out(
+    live_out: mutable Vec_u64.Vec,
+    live_in: Vec_u64.Vec,
+    succs: Vec_u32.Vec,
+    b: usize,
+    n_blocks: usize,
+    n_vregs: usize,
+) -> bool
+{
+    var changed = false
+    let wpb = bits_mod.words_per_block(n_vregs)
+    let ns = Vec_u32.len(succs)
+    var i: usize = 0
+    loop decreases ns - i {
+        if i >= ns { break }
+        let s = Vec_u32.at(succs, i) as usize
+        if s < n_blocks {
+            var w: usize = 0
+            loop decreases wpb - w {
+                if w >= wpb { break }
+                let in_w = bits_mod.word_at(live_in, s, w, wpb)
+                let old = bits_mod.word_at(live_out, b, w, wpb)
+                let merged = old | in_w
+                if merged != old {
+                    bits_mod.set_word(mutable live_out, b, w, wpb, merged)
+                    changed = true
+                }
+                w += 1
+            }
+        }
+        i += 1
+    }
+    return changed
+}
+
+
+function update_in_from_out(
+    live_in: mutable Vec_u64.Vec,
+    live_out: Vec_u64.Vec,
+    use_set: Vec_u64.Vec,
+    def_set: Vec_u64.Vec,
+    b: usize,
+    n_vregs: usize,
+) -> bool
+{
+    var changed = false
+    let wpb = bits_mod.words_per_block(n_vregs)
+    var w: usize = 0
+    loop decreases wpb - w {
+        if w >= wpb { break }
+        let use_w = bits_mod.word_at(use_set, b, w, wpb)
+        let out_w = bits_mod.word_at(live_out, b, w, wpb)
+        let def_w = bits_mod.word_at(def_set, b, w, wpb)
+        let want = use_w | (out_w & (~def_w))
+        let old = bits_mod.word_at(live_in, b, w, wpb)
+        let merged = old | want
+        if merged != old {
+            bits_mod.set_word(mutable live_in, b, w, wpb, merged)
+            changed = true
+        }
+        w += 1
+    }
+    return changed
+}

@@ -1,0 +1,378 @@
+
+module refine.solver.lia.simplex.core.simplex
+
+import std.collections.vec
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.rational.scalar as rat_mod
+import local.solver.rational.compare as ratcmp_mod
+import local.solver.lia.simplex.tableau.tableau as tab_mod
+
+
+spec std.collections.vec.Vec(rat_mod.Rational)
+spec std.collections.vec.Vec(tab_mod.Row)
+spec std.collections.vec.Vec(lit_mod.Lit)
+
+
+type PivotRow {
+    ok: bool
+    coeffs: Vec_Rational.Vec
+}
+
+
+function recip(a: rat_mod.Rational) -> rat_mod.RatResult {
+    return rat_mod.div_checked(rat_mod.one(), a)
+}
+
+
+function can_increase(t: tab_mod.Tableau, j: usize) -> bool {
+    let b = tab_mod.bound_of(t, j)
+    if !b.has_upper {
+        return true
+    }
+    return ratcmp_mod.lt(tab_mod.value_of(t, j), b.upper)
+}
+
+
+function can_decrease(t: tab_mod.Tableau, j: usize) -> bool {
+    let b = tab_mod.bound_of(t, j)
+    if !b.has_lower {
+        return true
+    }
+    return ratcmp_mod.gt(tab_mod.value_of(t, j), b.lower)
+}
+
+
+function build_pivot_row(t: tab_mod.Tableau, i: usize, j: usize, allocator: Allocator) -> PivotRow
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let row = tab_mod.row_at(t, i)
+    let a = tab_mod.row_coeff(row, j)
+    let b = row.basic
+    uninit nr: Vec_Rational.Vec
+    Vec_Rational.new(init nr, allocator)?
+    var k: usize = 0
+    loop
+        decreases (t.n - k)
+    {
+        if k >= t.n {
+            break
+        }
+        var c = rat_mod.zero()
+        if k == b {
+            let r = recip(a)
+            if !r.ok {
+                return PivotRow { ok: false, coeffs: nr }
+            }
+            c = r.value
+        } else {
+            if k != j {
+                let q = rat_mod.div_checked(tab_mod.row_coeff(row, k), a)
+                if !q.ok {
+                    return PivotRow { ok: false, coeffs: nr }
+                }
+                let nq = rat_mod.neg_checked(q.value)
+                if !nq.ok {
+                    return PivotRow { ok: false, coeffs: nr }
+                }
+                c = nq.value
+            }
+        }
+        Vec_Rational.push(mutable nr, take c, allocator)?
+        k = k + 1
+    }
+    return PivotRow { ok: true, coeffs: nr }
+}
+
+
+function substitute_row(t: mutable tab_mod.Tableau, r: usize, i: usize, j: usize, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let rrow = tab_mod.row_at(t, r)
+    let arj = tab_mod.row_coeff(rrow, j)
+    if rat_mod.is_zero(arj) {
+        return true
+    }
+    let pivrow = tab_mod.row_at(t, i)
+    uninit nc: Vec_Rational.Vec
+    Vec_Rational.new(init nc, allocator)?
+    var k: usize = 0
+    loop
+        decreases (t.n - k)
+    {
+        if k >= t.n {
+            break
+        }
+        var c2 = rat_mod.zero()
+        if k != j {
+            let old_c = tab_mod.row_coeff(rrow, k)
+            let p = rat_mod.mul_checked(arj, tab_mod.row_coeff(pivrow, k))
+            if !p.ok {
+                return false
+            }
+            let s = rat_mod.add_checked(old_c, p.value)
+            if !s.ok {
+                return false
+            }
+            c2 = s.value
+        }
+        Vec_Rational.push(mutable nc, take c2, allocator)?
+        k = k + 1
+    }
+    let updated = tab_mod.Row {
+        basic: rrow.basic,
+        coeffs: nc,
+    }
+    Vec_Row.set_at(mutable t.rows, r, take updated)
+    return true
+}
+
+
+function pivot(t: mutable tab_mod.Tableau, i: usize, j: usize, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let old = tab_mod.row_at(t, i)
+    let b = old.basic
+    let newrow = build_pivot_row(t, i, j, allocator)?
+    if !newrow.ok {
+        return false
+    }
+    let nrow = tab_mod.Row {
+        basic: j,
+        coeffs: newrow.coeffs,
+    }
+    Vec_Row.set_at(mutable t.rows, i, take nrow)
+    tab_mod.set_basic(mutable t, b, false)
+    tab_mod.set_basic(mutable t, j, true)
+    let m = tab_mod.row_count(t)
+    var r: usize = 0
+    loop
+        decreases (m - r)
+    {
+        if r >= m {
+            break
+        }
+        if r != i {
+            let sub_ok = substitute_row(mutable t, r, i, j, allocator)?
+            if !sub_ok {
+                return false
+            }
+        }
+        r = r + 1
+    }
+    return true
+}
+
+
+function pivot_and_update(t: mutable tab_mod.Tableau, i: usize, j: usize, target: rat_mod.Rational, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let row = tab_mod.row_at(t, i)
+    let b = row.basic
+    let a = tab_mod.row_coeff(row, j)
+    let vb = tab_mod.value_of(t, b)
+    let diff = rat_mod.sub_checked(target, vb)
+    if !diff.ok {
+        return false
+    }
+    let theta_r = rat_mod.div_checked(diff.value, a)
+    if !theta_r.ok {
+        return false
+    }
+    let theta = theta_r.value
+    tab_mod.set_value(mutable t, b, target)
+    let vj = tab_mod.value_of(t, j)
+    let nvj = rat_mod.add_checked(vj, theta)
+    if !nvj.ok {
+        return false
+    }
+    tab_mod.set_value(mutable t, j, nvj.value)
+    let m = tab_mod.row_count(t)
+    var r: usize = 0
+    loop
+        decreases (m - r)
+    {
+        if r >= m {
+            break
+        }
+        if r != i {
+            let rr = tab_mod.row_at(t, r)
+            let arj = tab_mod.row_coeff(rr, j)
+            if !rat_mod.is_zero(arj) {
+                let vbr = tab_mod.value_of(t, rr.basic)
+                let delta = rat_mod.mul_checked(arj, theta)
+                if !delta.ok {
+                    return false
+                }
+                let nvbr = rat_mod.add_checked(vbr, delta.value)
+                if !nvbr.ok {
+                    return false
+                }
+                tab_mod.set_value(mutable t, rr.basic, nvbr.value)
+            }
+        }
+        r = r + 1
+    }
+    return pivot(mutable t, i, j, allocator)?
+}
+
+
+function find_entering(t: tab_mod.Tableau, row: tab_mod.Row, increase: bool) -> usize {
+    var j: usize = 0
+    loop
+        decreases (t.n - j)
+    {
+        if j >= t.n {
+            break
+        }
+        if !tab_mod.is_basic_var(t, j) {
+            let arj = tab_mod.row_coeff(row, j)
+            if !rat_mod.is_zero(arj) {
+                let pos = rat_mod.is_pos(arj)
+                let suitable = if increase {
+                    if pos { can_increase(t, j) } else { can_decrease(t, j) }
+                } else {
+                    if pos { can_decrease(t, j) } else { can_increase(t, j) }
+                }
+                if suitable {
+                    return j
+                }
+            }
+        }
+        j = j + 1
+    }
+    return t.n
+}
+
+
+function explain_conflict(t: tab_mod.Tableau, sel_row: usize, increase: bool, allocator: Allocator) -> Vec_Lit.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit expl: Vec_Lit.Vec
+    Vec_Lit.new(init expl, allocator)?
+    let row = tab_mod.row_at(t, sel_row)
+    let b = row.basic
+    let bnd_b = tab_mod.bound_of(t, b)
+    let viol = if increase { bnd_b.lower_lit } else { bnd_b.upper_lit }
+    Vec_Lit.push(mutable expl, take viol, allocator)?
+    var j: usize = 0
+    loop
+        decreases (t.n - j)
+    {
+        if j >= t.n {
+            break
+        }
+        if !tab_mod.is_basic_var(t, j) {
+            let arj = tab_mod.row_coeff(row, j)
+            if !rat_mod.is_zero(arj) {
+                push_blocking(mutable expl, t, j, increase, rat_mod.is_pos(arj), allocator)?
+            }
+        }
+        j = j + 1
+    }
+    return expl
+}
+
+
+function push_blocking(
+    expl: mutable Vec_Lit.Vec,
+    t: tab_mod.Tableau,
+    j: usize,
+    increase: bool,
+    pos: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bnd = tab_mod.bound_of(t, j)
+    let use_upper = if increase { pos } else { !pos }
+    if use_upper {
+        if bnd.has_upper {
+            Vec_Lit.push(mutable expl, take bnd.upper_lit, allocator)?
+        }
+    } else {
+        if bnd.has_lower {
+            Vec_Lit.push(mutable expl, take bnd.lower_lit, allocator)?
+        }
+    }
+}
+
+
+function pivot_budget() -> usize {
+    return 10000
+}
+
+
+public function check(t: mutable tab_mod.Tableau, allocator: Allocator) -> tab_mod.LiaResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var fuel: usize = pivot_budget()
+    loop {
+        if fuel == 0 {
+            return tab_mod.LiaResult.unknown
+        }
+        fuel = fuel - 1
+        let m = tab_mod.row_count(t)
+        var found: bool = false
+        var sel_row: usize = 0
+        var sel_basic: usize = 0
+        var increase: bool = false
+        var r: usize = 0
+        loop
+            decreases (m - r)
+        {
+            if r >= m {
+                break
+            }
+            let row = tab_mod.row_at(t, r)
+            let b = row.basic
+            let vb = tab_mod.value_of(t, b)
+            let bnd = tab_mod.bound_of(t, b)
+            if tab_mod.below_lower(bnd, vb) {
+                if !found {
+                    found = true
+                    sel_row = r
+                    sel_basic = b
+                    increase = true
+                } else {
+                    if b < sel_basic {
+                        sel_row = r
+                        sel_basic = b
+                        increase = true
+                    }
+                }
+            } else {
+                if tab_mod.above_upper(bnd, vb) {
+                    if !found {
+                        found = true
+                        sel_row = r
+                        sel_basic = b
+                        increase = false
+                    } else {
+                        if b < sel_basic {
+                            sel_row = r
+                            sel_basic = b
+                            increase = false
+                        }
+                    }
+                }
+            }
+            r = r + 1
+        }
+        if !found {
+            return tab_mod.LiaResult.feasible
+        }
+        let row = tab_mod.row_at(t, sel_row)
+        let j = find_entering(t, row, increase)
+        if j >= t.n {
+            let expl = explain_conflict(t, sel_row, increase, allocator)?
+            return tab_mod.LiaResult.infeasible(explanation: expl)
+        }
+        let bnd = tab_mod.bound_of(t, sel_basic)
+        let target = if increase { bnd.lower } else { bnd.upper }
+        let pivot_ok = pivot_and_update(mutable t, sel_row, j, target, allocator)?
+        if !pivot_ok {
+            return tab_mod.LiaResult.unknown
+        }
+    }
+}

@@ -1,0 +1,83 @@
+
+module optimize.lib
+
+import std.collections.vec
+import std.mem.alloc as alloc
+
+import mir.file.store as mir_file_mod
+import mir.body.model as mir_body_mod
+import refine.discharge.output as refine_output_mod
+import types.ty.interner as ty_interner_mod
+
+import local.refine_elim.facts.facts as facts_mod
+import local.refine_elim.proven.proven as proven_mod
+import local.refine_elim.transform.transform as transform_mod
+import local.refine_elim.narrow.narrow as narrow_mod
+import local.refine_elim.narrow.plan.plan as plan_mod
+import local.refine_elim.narrow.rewrite.rewrite as cascade_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(plan_mod.NarrowPlan)
+
+
+public function run_refine_elim(
+    mir_file: mutable mir_file_mod.MirFile,
+    refine_output: refine_output_mod.RefineOutput,
+    it_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let proven = proven_mod.from_refine(refine_output, allocator)?
+    if !facts_mod.elision_enabled(refine_output) {
+        transform_mod.transform(mutable mir_file, refine_output, proven, allocator)?
+        return
+    }
+    let plans = compute_plans(mir_file, mutable it_interner, allocator)?
+    transform_mod.transform(mutable mir_file, refine_output, proven, allocator)?
+    apply_plans(mutable mir_file, plans, allocator)?
+}
+
+
+function compute_plans(
+    mir_file: mir_file_mod.MirFile,
+    it_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_NarrowPlan.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_MirBody.len(mir_file.bodies)
+    uninit plans: Vec_NarrowPlan.Vec
+    Vec_NarrowPlan.new(init plans, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let body = Vec_MirBody.at(mir_file.bodies, i)
+        let plan = narrow_mod.analyze(body, mutable it_interner, allocator)?
+        Vec_NarrowPlan.push(mutable plans, take plan, allocator)?
+        i = i + 1
+    }
+    return plans
+}
+
+
+function apply_plans(
+    mir_file: mutable mir_file_mod.MirFile,
+    plans: Vec_NarrowPlan.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_MirBody.len(mir_file.bodies)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i >= Vec_NarrowPlan.len(plans) { break }
+        var body: mir_body_mod.MirBody = Vec_MirBody.at(mir_file.bodies, i)
+        let plan = Vec_NarrowPlan.at(plans, i)
+        cascade_mod.apply(mutable body, plan, allocator)?
+        Vec_MirBody.set_at(mutable mir_file.bodies, i, take body)
+        i = i + 1
+    }
+}

@@ -1,0 +1,176 @@
+
+module structmap.walk.emit.types
+
+import std.mem.alloc
+import std.collections.vec
+import source.map as source_map_mod
+import span.file as file_mod
+import intern.symbol as sym_mod
+import intern.interner as interner_mod
+import syntax.ast.item as ast_item_mod
+import local.data.model as model
+import local.render.toon as toon
+import local.render.expr.exprtext as exprtext
+import local.walk.core.util as util
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+spec std.collections.vec.Vec(ast_item_mod.Variant)
+spec std.collections.vec.Vec(model.TypeEntry)
+spec std.collections.vec.Vec(model.InvariantEntry)
+
+
+public function push_type_decl(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    start_line: u32,
+    end_line: u32,
+    td: ast_item_mod.TypeDecl,
+    file_rel: String,
+    file_id: file_mod.FileId,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let name = util.sym_to_string(td.name.name, interner, allocator)?
+    let kind = match td.kind {
+        case .product(_) => model.TypeKind.struct_()
+        case .sum(_)     => model.TypeKind.enum_()
+    }
+    let fov = render_fields_or_variants(td.kind, interner, allocator)?
+    uninit refinements_v: Vec_String.Vec
+    Vec_String.new(init refinements_v, allocator)?
+    push_type_decl_invariants(
+        mutable tree, dir_idx, name, file_rel, file_id, td.kind,
+        mutable refinements_v, interner, source_map, allocator,
+    )?
+    uninit generics_v: Vec_String.Vec
+    Vec_String.new(init generics_v, allocator)?
+    Vec_TypeEntry.push(
+        mutable tree.types_,
+        model.TypeEntry {
+            dir_idx: dir_idx,
+            name: name,
+            kind: kind,
+            file: util.clone_str(file_rel, allocator)?,
+            line: start_line,
+            end: end_line,
+            visibility: util.vis_to_map(td.visibility),
+            stability: util.stability_to_map(td.stability),
+            generics: generics_v,
+            fields_or_variants: fov,
+            refinements: refinements_v,
+        },
+        allocator,
+    )?
+}
+
+function push_type_decl_invariants(
+    tree: mutable model.Tree,
+    dir_idx: usize,
+    name: String,
+    file_rel: String,
+    file_id: file_mod.FileId,
+    kind: ast_item_mod.TypeDeclKind,
+    refinements_out: mutable Vec_String.Vec,
+    interner: interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match kind {
+        case .product(let fields) => {
+            let n: usize = Vec_TypeField.len(fields)
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                let f = Vec_TypeField.at(fields, i)
+                match f.refinement {
+                    case .some(let pred) => {
+                        let pred_text = exprtext.expr_text(pred, interner, allocator)?
+                        let rule = compose_field_rule(f.name.name, pred_text, interner, allocator)?
+                        Vec_InvariantEntry.push(
+                            mutable tree.invariants,
+                            model.InvariantEntry {
+                                dir_idx: dir_idx,
+                                target: util.clone_str(name, allocator)?,
+                                file: util.clone_str(file_rel, allocator)?,
+                                line: util.line_of(source_map, file_id, f.span),
+                                rule: util.clone_str(rule, allocator)?,
+                            },
+                            allocator,
+                        )?
+                        Vec_String.push(mutable refinements_out, rule, allocator)?
+                    }
+                    case .none => ()
+                }
+                i += 1
+            }
+        }
+        case .sum(_) => ()
+    }
+}
+
+function compose_field_rule(
+    field_name: sym_mod.Symbol,
+    pred_text: String,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    util.push_sym(mutable buf, field_name, interner, allocator)?
+    toon.push_str(mutable buf, ": ", allocator)?
+    toon.push_str(mutable buf, pred_text, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}
+
+function render_fields_or_variants(
+    kind: ast_item_mod.TypeDeclKind,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    match kind {
+        case .product(let fields) => {
+            let n: usize = Vec_TypeField.len(fields)
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                if i > 0 {
+                    toon.push_byte(mutable buf, 0x20, allocator)?
+                }
+                util.push_sym(mutable buf, Vec_TypeField.at(fields, i).name.name, interner, allocator)?
+                i += 1
+            }
+        }
+        case .sum(let variants) => {
+            let n: usize = Vec_Variant.len(variants)
+            var i: usize = 0
+            loop
+                decreases n - i
+            {
+                if i >= n { break }
+                if i > 0 {
+                    toon.push_byte(mutable buf, 0x20, allocator)?
+                }
+                util.push_sym(mutable buf, Vec_Variant.at(variants, i).name.name, interner, allocator)?
+                i += 1
+            }
+        }
+    }
+    return toon.finish_string(take buf, allocator)?
+}

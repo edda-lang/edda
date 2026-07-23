@@ -1,0 +1,116 @@
+
+module lower.term.terminator.blockarg.blockarg
+
+import std.mem.alloc
+import std.collections.vec
+
+import hir.node as node_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+import mir.body.model as mir_body_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.id.block as mir_block_mod
+import mir.id.local as mir_local_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.id.op as hlir_op_id_mod
+import ir.hlir.id.block as hlir_block_mod
+
+import local.term.support.support as support_mod
+import local.term.support.place as place_mod
+import local.flow.plan.plan as plan_mod
+
+
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+
+public function args_for_target(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    target: mir_block_mod.BlockId,
+    body: mir_body_mod.MirBody,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit values: Vec_ValueId.Vec
+    Vec_ValueId.new(init values, allocator)?
+    let block = target.raw as usize
+    let start = plan_mod.params_start(plan, block)
+    let end = plan_mod.params_end(plan, block)
+    var k = start
+    loop decreases end - k {
+        if k >= end { break }
+        let local = mir_local_mod.LocalId { raw: plan_mod.param_local_at(plan, k) }
+        let held = support_mod.env_get(env, local)
+        let v = if hlir_value_mod.is_error(held) {
+            materialize_zero(mutable out, mutable ops, origin, support_mod.local_ty(body, local), ty_interner, allocator)?
+        } else {
+            held
+        }
+        Vec_ValueId.push(mutable values, take v, allocator)?
+        k += 1
+    }
+    return values
+}
+
+function materialize_zero(
+    out: mutable hlir_body_mod.HlirBody,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_value_mod.ValueId
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let c = mir_rvalue_mod.Constant {
+        ty: ty,
+        kind: mir_rvalue_mod.ConstantKind.zero_init,
+    }
+    return support_mod.materialize_literal(mutable out, mutable ops, origin, c, ty_interner, allocator)?
+}
+
+public function lower_operand_vec(
+    out: mutable hlir_body_mod.HlirBody,
+    env: Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    args: Vec_Operand.Vec,
+    forward_pointee_args: bool,
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_ValueId.Vec
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    uninit values: Vec_ValueId.Vec
+    Vec_ValueId.new(init values, allocator)?
+    let n = Vec_Operand.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let operand = Vec_Operand.at(args, i)
+        let v = if forward_pointee_args {
+            place_mod.arg_operand_ssa(mutable out, env, mutable ops, origin, operand, body, ty_interner, allocator)?
+        } else {
+            place_mod.operand_ssa(mutable out, env, mutable ops, origin, operand, body, ty_interner, allocator)?
+        }
+        Vec_ValueId.push(mutable values, take v, allocator)?
+        i += 1
+    }
+    return values
+}
+
+public function block_id_of(b: mir_block_mod.BlockId) -> hlir_block_mod.BlockId {
+    return hlir_block_mod.BlockId { raw: b.raw }
+}

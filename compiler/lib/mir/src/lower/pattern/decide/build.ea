@@ -1,0 +1,240 @@
+module mir.lower.pattern.decide.build
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.node as node_mod
+import intern.symbol as symbol_mod
+import syntax.ast.literal as literal_mod
+import types.pass.ty as ty_mod
+import local.place as place_mod
+import local.rvalue as rvalue_mod
+import local.body.model as body_mod
+import local.stmt as stmt_mod
+import local.id.local as local_mod
+import local.lower.build.ctx.builder as builder_mod
+
+
+spec std.collections.vec.Vec(place_mod.Projection)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(symbol_mod.Symbol)
+
+
+public function project_into_local(
+    builder: mutable builder_mod.LowerCtx,
+    base_local: local_mod.LocalId,
+    kind: place_mod.ProjectionKind,
+    elem_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let dest = builder_mod.alloc_local(
+        mutable builder,
+        elem_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    var src_place = builder_mod.local_place(base_local)
+    place_mod.push_projection(
+        mutable src_place,
+        place_mod.Projection { kind: kind, result_ty: elem_ty },
+        allocator,
+    )?
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(dest),
+            value: rvalue_mod.Rvalue.use_(
+                operand: rvalue_mod.Operand.copy_(place: src_place, ty: elem_ty),
+            ),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    return dest
+}
+
+public function materialize_discriminant(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    discr_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let dl = builder_mod.alloc_local(
+        mutable builder,
+        discr_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let dstmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(dl),
+            value: rvalue_mod.Rvalue.discriminant(place: builder_mod.local_place(scrut_local)),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take dstmt, allocator)?
+    return dl
+}
+
+public function const_true(bool_ty: ty_mod.TyId) -> rvalue_mod.Operand {
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: bool_ty,
+            kind: rvalue_mod.ConstantKind.bool_(value: true),
+        },
+    )
+}
+
+public function materialize_bool(
+    builder: mutable builder_mod.LowerCtx,
+    value: rvalue_mod.Rvalue,
+    bool_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    let t = builder_mod.alloc_local(
+        mutable builder,
+        bool_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(dest: builder_mod.local_place(t), value: value),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    return rvalue_mod.Operand.copy_(place: builder_mod.local_place(t), ty: bool_ty)
+}
+
+public function lit_to_operand(lit: literal_mod.Literal, ty: ty_mod.TyId) -> rvalue_mod.Operand
+    with {panic}
+{
+    return match lit {
+        case .int(let v, _) => rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant { ty: ty, kind: rvalue_mod.ConstantKind.int_(bits: v) },
+        )
+        case .bool(let v) => rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant { ty: ty, kind: rvalue_mod.ConstantKind.bool_(value: v) },
+        )
+        case .str(let sym) => rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant { ty: ty, kind: rvalue_mod.ConstantKind.str_(symbol: sym) },
+        )
+        case _ => panic("walker.lit_to_operand: float/f_string/unit literal patterns deferred — int/bool/str only (match-tail residue)")
+    }
+}
+
+public function materialize_len(
+    builder: mutable builder_mod.LowerCtx,
+    slice_local: local_mod.LocalId,
+    usize_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let l = builder_mod.alloc_local(
+        mutable builder,
+        usize_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(l),
+            value: rvalue_mod.Rvalue.len(place: builder_mod.local_place(slice_local)),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    return l
+}
+
+public function materialize_usize_const(
+    builder: mutable builder_mod.LowerCtx,
+    n: u128,
+    usize_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let l = builder_mod.alloc_local(
+        mutable builder,
+        usize_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let const_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant { ty: usize_ty, kind: rvalue_mod.ConstantKind.int_(bits: n) },
+    )
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(l),
+            value: rvalue_mod.Rvalue.use_(operand: const_op),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    return l
+}
+
+public function materialize_index_from_end(
+    builder: mutable builder_mod.LowerCtx,
+    len_local: local_mod.LocalId,
+    off: u128,
+    usize_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError}
+{
+    let len_op = rvalue_mod.Operand.copy_(place: builder_mod.local_place(len_local), ty: usize_ty)
+    let off_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant { ty: usize_ty, kind: rvalue_mod.ConstantKind.int_(bits: off) },
+    )
+    let l = builder_mod.alloc_local(
+        mutable builder,
+        usize_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(l),
+            value: rvalue_mod.Rvalue.binary(
+                op: rvalue_mod.MBinOp.sub(mode: rvalue_mod.OverflowMode.trapping),
+                lhs: len_op,
+                rhs: off_op,
+            ),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    return l
+}
+

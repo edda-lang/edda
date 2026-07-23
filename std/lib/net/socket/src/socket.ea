@@ -1,0 +1,296 @@
+
+module std.net.socket
+
+import std.os.raw
+import std.os.pages
+import std.net.ip
+import std.net.dns
+import local.shared
+import local.linux
+import local.win
+
+
+public type SocketError {
+    case connection_refused
+    case connection_reset
+    case connection_aborted
+    case host_unreachable
+    case network_unreachable
+    case timeout
+    case address_in_use
+    case address_not_available
+    case dns_lookup_failed(host: String)
+    case broken_pipe
+    case would_block
+    case not_connected
+    case unexpected_eof
+    case out_of_memory
+    case os_error(code: i32)
+}
+
+
+public affine type Connection {
+    handle_: u64
+}
+
+
+public affine type Listener {
+    handle_: u64
+}
+
+
+public type Shutdown {
+    case read_half
+    case write_half
+    case both
+}
+
+
+public function bind_localhost(net: Network, port: u16) -> LocalhostNetwork
+    with {net}
+    extern "__edda_net_bind_localhost"
+
+public function restrict_to(net: Network, hosts: [String]) -> RestrictedNetwork
+    with {net}
+    extern "__edda_net_restrict_to"
+
+
+function map_linux(code: i64) -> SocketError {
+    if code == -111 { return SocketError.connection_refused }
+    if code == -104 { return SocketError.connection_reset }
+    if code == -103 { return SocketError.connection_aborted }
+    if code == -113 { return SocketError.host_unreachable }
+    if code == -101 { return SocketError.network_unreachable }
+    if code == -110 { return SocketError.timeout }
+    if code == -98 { return SocketError.address_in_use }
+    if code == -99 { return SocketError.address_not_available }
+    if code == -32 { return SocketError.broken_pipe }
+    if code == -11 { return SocketError.would_block }
+    if code == -107 { return SocketError.not_connected }
+    if code == -12 { return SocketError.out_of_memory }
+    return SocketError.os_error(code: code as i32 wrapping)
+}
+
+function map_wsa(code: i64) -> SocketError {
+    if code == 10061 { return SocketError.connection_refused }
+    if code == 10054 { return SocketError.connection_reset }
+    if code == 10053 { return SocketError.connection_aborted }
+    if code == 10065 { return SocketError.host_unreachable }
+    if code == 10051 { return SocketError.network_unreachable }
+    if code == 10060 { return SocketError.timeout }
+    if code == 10048 { return SocketError.address_in_use }
+    if code == 10049 { return SocketError.address_not_available }
+    if code == 10058 { return SocketError.broken_pipe }
+    if code == 10035 { return SocketError.would_block }
+    if code == 10057 { return SocketError.not_connected }
+    if code == 8 { return SocketError.out_of_memory }
+    return SocketError.os_error(code: code as i32 wrapping)
+}
+
+function map_errno(code: i64) -> SocketError {
+    comptime if target_has("windows") {
+        return map_wsa(0 - code)
+    } else {
+        return map_linux(code)
+    }
+}
+
+
+function b_socket() -> i64 {
+    comptime if target_has("windows") { return win.op_socket() } else { return linux.op_socket() }
+}
+
+function b_connect(fd: u64, addr_ptr: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_connect(fd, addr_ptr) } else { return linux.op_connect(fd, addr_ptr) }
+}
+
+function b_bind(fd: u64, addr_ptr: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_bind(fd, addr_ptr) } else { return linux.op_bind(fd, addr_ptr) }
+}
+
+function b_listen(fd: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_listen(fd) } else { return linux.op_listen(fd) }
+}
+
+function b_accept(fd: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_accept(fd) } else { return linux.op_accept(fd) }
+}
+
+function b_recv(fd: u64, buf_ptr: u64, len_: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_recv(fd, buf_ptr, len_) } else { return linux.op_recv(fd, buf_ptr, len_) }
+}
+
+function b_send(fd: u64, buf_ptr: u64, len_: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_send(fd, buf_ptr, len_) } else { return linux.op_send(fd, buf_ptr, len_) }
+}
+
+function b_shutdown(fd: u64, how: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_shutdown(fd, how) } else { return linux.op_shutdown(fd, how) }
+}
+
+function b_close(fd: u64) -> () {
+    comptime if target_has("windows") { win.op_close(fd) } else { linux.op_close(fd) }
+}
+
+function b_set_reuseaddr(fd: u64) -> i64 {
+    comptime if target_has("windows") { return win.op_set_reuseaddr(fd) } else { return linux.op_set_reuseaddr(fd) }
+}
+
+function b_set_nodelay(fd: u64, enabled: bool) -> i64 {
+    comptime if target_has("windows") { return win.op_set_nodelay(fd, enabled) } else { return linux.op_set_nodelay(fd, enabled) }
+}
+
+function b_set_keepalive(fd: u64, enabled: bool) -> i64 {
+    comptime if target_has("windows") { return win.op_set_keepalive(fd, enabled) } else { return linux.op_set_keepalive(fd, enabled) }
+}
+
+function b_set_read_timeout(fd: u64, millis: u32) -> i64 {
+    comptime if target_has("windows") { return win.op_set_read_timeout(fd, millis) } else { return linux.op_set_read_timeout(fd, millis) }
+}
+
+function b_set_write_timeout(fd: u64, millis: u32) -> i64 {
+    comptime if target_has("windows") { return win.op_set_write_timeout(fd, millis) } else { return linux.op_set_write_timeout(fd, millis) }
+}
+
+
+function resolve_via_dns(net: Network, fs: ReadOnlyFilesystem, host: String) -> ip.Ipv4Addr
+    with {net, fs, err: SocketError}
+{
+    return handle err: dns.DnsError as _e -> (raise SocketError.dns_lookup_failed(host: host)) {
+        dns.resolve_v4(net, fs, host)?
+    }
+}
+
+function resolve_addr(net: Network, fs: ReadOnlyFilesystem, host: String) -> ip.Ipv4Addr
+    with {net, fs, err: SocketError}
+{
+    return handle err: ip.ParseAddrError as _e -> (resolve_via_dns(net, fs, host)?) {
+        ip.parse_v4(host.bytes())?
+    }
+}
+
+
+public function dial(net: Network, fs: ReadOnlyFilesystem, host: String, port: u16) -> Connection
+    with {net, fs, err: SocketError}
+{
+    let addr: ip.Ipv4Addr = resolve_addr(net, fs, host)?
+    let fd_raw: i64 = b_socket()
+    if fd_raw < 0 { raise map_errno(fd_raw) }
+    let fd: u64 = fd_raw as u64
+    let pg: u64 = handle err: pages.PageError as _e -> {
+        b_close(fd)
+        raise SocketError.out_of_memory
+    } { pages.map(4096)? }
+    shared.fill_sockaddr_in(pg, addr, port)
+    let r: i64 = b_connect(fd, pg)
+    shared.release_page(pg)
+    if r < 0 {
+        b_close(fd)
+        raise map_errno(r)
+    }
+    return Connection { handle_: fd }
+}
+
+
+public function listen(net: Network, fs: ReadOnlyFilesystem, host: String, port: u16) -> Listener
+    with {net, fs, err: SocketError}
+{
+    let addr: ip.Ipv4Addr = resolve_addr(net, fs, host)?
+    let fd_raw: i64 = b_socket()
+    if fd_raw < 0 { raise map_errno(fd_raw) }
+    let fd: u64 = fd_raw as u64
+    let pg: u64 = handle err: pages.PageError as _e -> {
+        b_close(fd)
+        raise SocketError.out_of_memory
+    } { pages.map(4096)? }
+    let _ = b_set_reuseaddr(fd)
+    shared.fill_sockaddr_in(pg, addr, port)
+    let rb: i64 = b_bind(fd, pg)
+    shared.release_page(pg)
+    if rb < 0 {
+        b_close(fd)
+        raise map_errno(rb)
+    }
+    let rl: i64 = b_listen(fd)
+    if rl < 0 {
+        b_close(fd)
+        raise map_errno(rl)
+    }
+    return Listener { handle_: fd }
+}
+
+public function accept(listener: mutable Listener) -> Connection
+    with {err: SocketError}
+{
+    let r: i64 = b_accept(listener.handle_)
+    if r < 0 { raise map_errno(r) }
+    return Connection { handle_: r as u64 }
+}
+
+
+public function read(conn: mutable Connection, buf: mutable [u8]) -> usize
+    with {err: SocketError}
+{
+    let r: i64 = b_recv(conn.handle_, raw.slice_addr(buf), buf.len() as u64)
+    if r < 0 { raise map_errno(r) }
+    return r as usize
+}
+
+public function write(conn: mutable Connection, data: [u8]) -> usize
+    with {err: SocketError}
+{
+    let r: i64 = b_send(conn.handle_, raw.slice_addr(data), data.len() as u64)
+    if r < 0 { raise map_errno(r) }
+    return r as usize
+}
+
+
+public function set_read_timeout(conn: mutable Connection, millis: u32) -> ()
+    with {err: SocketError}
+{
+    let r: i64 = b_set_read_timeout(conn.handle_, millis)
+    if r < 0 { raise map_errno(r) }
+}
+
+public function set_write_timeout(conn: mutable Connection, millis: u32) -> ()
+    with {err: SocketError}
+{
+    let r: i64 = b_set_write_timeout(conn.handle_, millis)
+    if r < 0 { raise map_errno(r) }
+}
+
+public function set_nodelay(conn: mutable Connection, enabled: bool) -> ()
+    with {err: SocketError}
+{
+    let r: i64 = b_set_nodelay(conn.handle_, enabled)
+    if r < 0 { raise map_errno(r) }
+}
+
+public function set_keepalive(conn: mutable Connection, enabled: bool) -> ()
+    with {err: SocketError}
+{
+    let r: i64 = b_set_keepalive(conn.handle_, enabled)
+    if r < 0 { raise map_errno(r) }
+}
+
+
+public function shutdown(conn: mutable Connection, half: Shutdown) -> ()
+    with {err: SocketError}
+{
+    let how: u64 = match half {
+        case .read_half => 0
+        case .write_half => 1
+        case .both => 2
+    }
+    let r: i64 = b_shutdown(conn.handle_, how)
+    if r < 0 { raise map_errno(r) }
+}
+
+
+public function close(conn: take Connection) -> () {
+    b_close(conn.handle_)
+}
+
+public function close_listener(listener: take Listener) -> () {
+    b_close(listener.handle_)
+}

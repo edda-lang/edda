@@ -1,0 +1,120 @@
+
+module hermod.fetch.client.client
+
+import std.mem.alloc
+import std.crypto.x509.chain as x509_chain
+import local.error
+import local.message.request as request_mod
+import local.message.response as response_mod
+import local.uri.types as uri_mod
+import local.transport.client.client as transport_mod
+import local.fetch.build as build_mod
+
+public type FetchClient {
+    trust_store: x509_chain.TrustStore
+    now_unix_seconds: i64
+}
+
+public function fetch_client_new(
+    trust_store: x509_chain.TrustStore,
+    now_unix_seconds: i64,
+) -> FetchClient {
+    return FetchClient {
+        trust_store: trust_store,
+        now_unix_seconds: now_unix_seconds,
+    }
+}
+
+public function fetch_client_from_pem(
+    roots_pem: [u8],
+    now_unix_seconds: i64,
+    allocator: mutable Allocator,
+) -> FetchClient
+    with {allocator, err: x509_chain.ChainError}
+{
+    var store = x509_chain.trust_store_new(allocator)?
+    x509_chain.trust_store_add_pem(mutable store, roots_pem)?
+    return FetchClient {
+        trust_store: store,
+        now_unix_seconds: now_unix_seconds,
+    }
+}
+
+public function fetch_client_close(fc: take FetchClient) -> () {
+    x509_chain.trust_store_close(take fc.trust_store)
+}
+
+public function fetch_send(
+    fc: FetchClient,
+    req: request_mod.Request,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    random: Random,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {net, fs, random, allocator, err: error.TransportError, err: error.CodecError, err: alloc.AllocError}
+{
+    let u = request_mod.request_uri(req)
+    let client = transport_mod.client_for(uri_mod.uri_host(u), uri_mod.uri_port(u))
+    return if uri_mod.uri_is_https(u) {
+        transport_mod.client_send_tls(
+            client,
+            req,
+            net,
+            fs,
+            random,
+            fc.trust_store,
+            fc.now_unix_seconds,
+            mutable allocator,
+        )?
+    } else {
+        transport_mod.client_send(client, req, net, fs, mutable allocator)?
+    }
+}
+
+public function fetch_get(
+    fc: FetchClient,
+    url: String,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    random: Random,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {
+        net,
+        fs,
+        random,
+        allocator,
+        err: error.UriError,
+        err: alloc.AllocError,
+        err: error.TransportError,
+        err: error.CodecError,
+    }
+{
+    let req = build_mod.fetch_build_get(url, mutable allocator)?
+    return fetch_send(fc, req, net, fs, random, mutable allocator)?
+}
+
+public function fetch_post(
+    fc: FetchClient,
+    url: String,
+    body_bytes: [u8],
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    random: Random,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {
+        net,
+        fs,
+        random,
+        allocator,
+        err: error.UriError,
+        err: alloc.AllocError,
+        err: error.TransportError,
+        err: error.CodecError,
+    }
+{
+    let req = build_mod.fetch_build_post(url, body_bytes, mutable allocator)?
+    return fetch_send(fc, req, net, fs, random, mutable allocator)?
+}

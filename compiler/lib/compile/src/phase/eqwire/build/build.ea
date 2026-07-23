@@ -1,0 +1,442 @@
+
+module compile.phase.eqwire.build.build
+
+import std.collections.hashmap
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import hir.build.file as hir_file_mod
+import hir.def as def_mod
+import hir.item as hir_item_mod
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import mir.lower.eqmap.targets as eqmap_mod
+import specs.gen.build.output as spec_output_mod
+import syntax.ast.ident as ast_ident_mod
+import types.pass.ty as ty_mod
+import types.pass.effect as effect_pass_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import types.check as types_check_mod
+
+
+spec std.mem.alloc.Box(hir_item_mod.HFnSignature)
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(hir_item_mod.HParam)
+spec std.collections.vec.Vec(spec_output_mod.SpecOutput)
+spec std.collections.vec.Vec(spec_output_mod.EqPair)
+spec std.collections.vec.Vec(spec_output_mod.CollEqPair)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(u32)
+
+spec std.collections.hashmap.IntMap(Vec_u32)
+spec std.core.option.Option(Vec_u32)
+spec std.core.option.Option(ty_mod.TyId)
+
+
+public function drain_eq_pairs(
+    outs: Vec_SpecOutput.Vec,
+    allocator: Allocator,
+) -> Vec_EqPair.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit pairs: Vec_EqPair.Vec
+    Vec_EqPair.new(init pairs, allocator)?
+    let n = Vec_SpecOutput.len(outs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let out = Vec_SpecOutput.at(outs, i)
+        let pn = Vec_EqPair.len(out.eq_pairs)
+        var pi: usize = 0
+        loop decreases (pn - pi) {
+            if pi >= pn { break }
+            Vec_EqPair.push(mutable pairs, Vec_EqPair.at(out.eq_pairs, pi), allocator)?
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+
+public function drain_debug_pairs(
+    outs: Vec_SpecOutput.Vec,
+    allocator: Allocator,
+) -> Vec_EqPair.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit pairs: Vec_EqPair.Vec
+    Vec_EqPair.new(init pairs, allocator)?
+    let n = Vec_SpecOutput.len(outs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let out = Vec_SpecOutput.at(outs, i)
+        let pn = Vec_EqPair.len(out.debug_pairs)
+        var pi: usize = 0
+        loop decreases (pn - pi) {
+            if pi >= pn { break }
+            Vec_EqPair.push(mutable pairs, Vec_EqPair.at(out.debug_pairs, pi), allocator)?
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+
+public function drain_coll_eq_pairs(
+    outs: Vec_SpecOutput.Vec,
+    allocator: Allocator,
+) -> Vec_CollEqPair.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit pairs: Vec_CollEqPair.Vec
+    Vec_CollEqPair.new(init pairs, allocator)?
+    let n = Vec_SpecOutput.len(outs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let out = Vec_SpecOutput.at(outs, i)
+        let pn = Vec_CollEqPair.len(out.coll_eq_pairs)
+        var pi: usize = 0
+        loop decreases (pn - pi) {
+            if pi >= pn { break }
+            Vec_CollEqPair.push(mutable pairs, Vec_CollEqPair.at(out.coll_eq_pairs, pi), allocator)?
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+
+public function add_collection_eq_targets(
+    m: mutable eqmap_mod.EqTargets,
+    pairs: Vec_CollEqPair.Vec,
+    inst_hir: Vec_HirFile.Vec,
+    inst_types: Vec_TypeOutput.Vec,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let eq_sym = interner_mod.intern(mutable interner, "eq", allocator)?
+    let bool_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.primitive(ty_kind_mod.PrimKind.bool_), allocator)?
+    let index = build_module_index(inst_hir, allocator)?
+    let n = Vec_CollEqPair.len(pairs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let pair = Vec_CollEqPair.at(pairs, i)
+        let target_ty = find_coll_type_id(inst_hir, inst_types, index, pair.coll_module)
+        let cmp_def = find_comparator_def(inst_hir, index, pair.cmp_module, eq_sym)
+        if !ty_mod.is_error(target_ty) {
+            if !def_mod.is_error(cmp_def) {
+                uninit params: Vec_TyId.Vec
+                Vec_TyId.new(init params, allocator)?
+                Vec_TyId.push(mutable params, target_ty, allocator)?
+                Vec_TyId.push(mutable params, target_ty, allocator)?
+                let fn_ty = ty_interner_mod.intern(
+                    mutable ty_interner,
+                    ty_kind_mod.CTy.fn_(params: params, ret: bool_ty, effects: effect_pass_mod.empty()),
+                    allocator,
+                )?
+                eqmap_mod.insert_target(mutable m, target_ty, cmp_def, fn_ty, allocator)?
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function find_coll_type_id(
+    inst_hir: Vec_HirFile.Vec,
+    inst_types: Vec_TypeOutput.Vec,
+    index: IntMap_Vec_u32.IntMap,
+    coll_module: sym_mod.Symbol,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    let candidates = match IntMap_Vec_u32.get(index, coll_module.raw as i64) {
+        case .some(let lst) => lst
+        case .none => return ty_mod.error()
+    }
+    let n = Vec_u32.len(candidates)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let fi = Vec_u32.at(candidates, i) as usize
+        if fi < Vec_TypeOutput.len(inst_types) {
+            let file = Vec_HirFile.at(inst_hir, fi)
+            let types_out = Vec_TypeOutput.at(inst_types, fi)
+            let t = file_first_type_id(file, types_out)
+            if !ty_mod.is_error(t) {
+                return t
+            }
+        }
+        i = i + 1
+    }
+    return ty_mod.error()
+}
+
+
+function file_first_type_id(
+    file: hir_file_mod.HirFile,
+    types_out: types_check_mod.TypeOutput,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .type_decl(_) => {
+                match types_check_mod.type_id_of_def(types_out, item.def_id) {
+                    case .some(let t) => return t
+                    case .none => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return ty_mod.error()
+}
+
+
+public function build_debug_targets(
+    pairs: Vec_EqPair.Vec,
+    inst_hir: Vec_HirFile.Vec,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> eqmap_mod.EqTargets
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var m = eqmap_mod.none_targets(allocator)?
+    let format_sym = interner_mod.intern(mutable interner, "format", allocator)?
+    let string_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.string_, allocator)?
+    let index = build_module_index(inst_hir, allocator)?
+    let n = Vec_EqPair.len(pairs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let pair = Vec_EqPair.at(pairs, i)
+        let fmt_def = find_format_def(inst_hir, index, pair.module_name, format_sym)
+        if !def_mod.is_error(fmt_def) {
+            uninit params: Vec_TyId.Vec
+            Vec_TyId.new(init params, allocator)?
+            Vec_TyId.push(mutable params, pair.target_ty, allocator)?
+            let fn_ty = ty_interner_mod.intern(
+                mutable ty_interner,
+                ty_kind_mod.CTy.fn_(params: params, ret: string_ty, effects: effect_pass_mod.empty()),
+                allocator,
+            )?
+            eqmap_mod.insert_target(mutable m, pair.target_ty, fmt_def, fn_ty, allocator)?
+        }
+        i = i + 1
+    }
+    return m
+}
+
+
+function build_module_index(inst_hir: Vec_HirFile.Vec, allocator: Allocator) -> IntMap_Vec_u32.IntMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var index = IntMap_Vec_u32.new(allocator)?
+    let n = Vec_HirFile.len(inst_hir)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_HirFile.at(inst_hir, i)
+        let name = file_module_name(file)
+        if !sym_mod.is_empty(name) {
+            match IntMap_Vec_u32.get(index, name.raw as i64) {
+                case .some(let lst) => {
+                    Vec_u32.push(mutable lst, i as u32, allocator)?
+                    let _ = IntMap_Vec_u32.insert(mutable index, name.raw as i64, lst, allocator)?
+                }
+                case .none => {
+                    uninit lst: Vec_u32.Vec
+                    Vec_u32.new(init lst, allocator)?
+                    Vec_u32.push(mutable lst, i as u32, allocator)?
+                    let _ = IntMap_Vec_u32.insert(mutable index, name.raw as i64, lst, allocator)?
+                }
+            }
+        }
+        i = i + 1
+    }
+    return index
+}
+
+
+function file_module_name(file: hir_file_mod.HirFile) -> sym_mod.Symbol
+    with {divergence}
+{
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let sn = Vec_Ident.len(decl.path.segments)
+                        if sn != 1 { return sym_mod.empty() }
+                        return Vec_Ident.at(decl.path.segments, 0 as usize).name
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return sym_mod.empty()
+}
+
+
+function find_format_def(
+    inst_hir: Vec_HirFile.Vec,
+    index: IntMap_Vec_u32.IntMap,
+    module_name: sym_mod.Symbol,
+    format_sym: sym_mod.Symbol,
+) -> def_mod.DefId
+    with {divergence}
+{
+    let candidates = match IntMap_Vec_u32.get(index, module_name.raw as i64) {
+        case .some(let lst) => lst
+        case .none => return def_mod.error()
+    }
+    let n = Vec_u32.len(candidates)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_HirFile.at(inst_hir, Vec_u32.at(candidates, i) as usize)
+        let fn_def = file_format_fn_def(file, format_sym)
+        if !def_mod.is_error(fn_def) {
+            return fn_def
+        }
+        i = i + 1
+    }
+    return def_mod.error()
+}
+
+
+function file_format_fn_def(file: hir_file_mod.HirFile, format_sym: sym_mod.Symbol) -> def_mod.DefId
+    with {divergence}
+{
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .function_(let sig_box, _) => {
+                let sig = Box_HFnSignature.get(sig_box)
+                if sig.name.raw == format_sym.raw && Vec_HParam.len(sig.params) == 1 as usize {
+                    return item.def_id
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return def_mod.error()
+}
+
+
+public function build_eq_targets(
+    pairs: Vec_EqPair.Vec,
+    inst_hir: Vec_HirFile.Vec,
+    interner: mutable interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> eqmap_mod.EqTargets
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var m = eqmap_mod.none_targets(allocator)?
+    let eq_sym = interner_mod.intern(mutable interner, "eq", allocator)?
+    let bool_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.primitive(ty_kind_mod.PrimKind.bool_), allocator)?
+    let index = build_module_index(inst_hir, allocator)?
+    let n = Vec_EqPair.len(pairs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let pair = Vec_EqPair.at(pairs, i)
+        let cmp_def = find_comparator_def(inst_hir, index, pair.module_name, eq_sym)
+        if !def_mod.is_error(cmp_def) {
+            uninit params: Vec_TyId.Vec
+            Vec_TyId.new(init params, allocator)?
+            Vec_TyId.push(mutable params, pair.target_ty, allocator)?
+            Vec_TyId.push(mutable params, pair.target_ty, allocator)?
+            let fn_ty = ty_interner_mod.intern(
+                mutable ty_interner,
+                ty_kind_mod.CTy.fn_(params: params, ret: bool_ty, effects: effect_pass_mod.empty()),
+                allocator,
+            )?
+            eqmap_mod.insert_target(mutable m, pair.target_ty, cmp_def, fn_ty, allocator)?
+        }
+        i = i + 1
+    }
+    return m
+}
+
+
+function find_comparator_def(
+    inst_hir: Vec_HirFile.Vec,
+    index: IntMap_Vec_u32.IntMap,
+    module_name: sym_mod.Symbol,
+    eq_sym: sym_mod.Symbol,
+) -> def_mod.DefId
+    with {divergence}
+{
+    let candidates = match IntMap_Vec_u32.get(index, module_name.raw as i64) {
+        case .some(let lst) => lst
+        case .none => return def_mod.error()
+    }
+    let n = Vec_u32.len(candidates)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let file = Vec_HirFile.at(inst_hir, Vec_u32.at(candidates, i) as usize)
+        let fn_def = file_eq_fn_def(file, eq_sym)
+        if !def_mod.is_error(fn_def) {
+            return fn_def
+        }
+        i = i + 1
+    }
+    return def_mod.error()
+}
+
+
+function file_eq_fn_def(file: hir_file_mod.HirFile, eq_sym: sym_mod.Symbol) -> def_mod.DefId
+    with {divergence}
+{
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .function_(let sig_box, _) => {
+                if Box_HFnSignature.get(sig_box).name.raw == eq_sym.raw {
+                    return item.def_id
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return def_mod.error()
+}

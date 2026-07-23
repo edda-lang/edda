@@ -1,0 +1,217 @@
+
+module optimize.refine_elim.facts.facts
+
+import std.collections.vec
+import std.collections.hashmap
+import std.mem.alloc
+
+import mir.body.model as mir_body_mod
+import mir.id.block as mir_block_mod
+import refine.discharge.output as refine_output_mod
+import local.refine_elim.proven.proven as proven_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.Obligation)
+spec std.collections.vec.Vec(SiteFact)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(usize)
+
+
+public type SiteFact {
+    block_index: usize
+    stmt_index: u32
+    kind_tag: u32
+    count: usize
+    first_discharged: bool
+}
+
+
+public type SiteFacts {
+    facts: Vec_SiteFact.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+}
+
+
+public function elision_enabled(refine_output: refine_output_mod.RefineOutput) -> bool {
+    return refine_output_mod.ok(refine_output)
+}
+
+
+public function trust_is_discharged(trust: mir_body_mod.TrustAnnotation) -> bool {
+    return match trust {
+        case .discharged => true
+        case .unverified(_) => false
+        case .site_trusted(_) => false
+    }
+}
+
+
+public function kind_matches(
+    a: mir_body_mod.ObligationKind,
+    b: mir_body_mod.ObligationKind,
+) -> bool {
+    return a == b
+}
+
+
+public function obligation_eligible(
+    ob: mir_body_mod.Obligation,
+    body: mir_body_mod.MirBody,
+) -> bool {
+    if !trust_is_discharged(body.function_trust) {
+        return false
+    }
+    return trust_is_discharged(ob.trust)
+}
+
+
+function mix(acc: u64, value: u64) -> u64 {
+    return (acc ^ value) *% (1099511628211 as u64)
+}
+
+
+function site_hash(block_index: usize, stmt_index: u32, kind_tag: u32) -> u64 {
+    var h = 14695981039346656037 as u64
+    h = mix(h, block_index as u64)
+    h = mix(h, stmt_index as u64)
+    h = mix(h, kind_tag as u64)
+    return h
+}
+
+
+public function build_site_facts(body: mir_body_mod.MirBody, allocator: Allocator) -> SiteFacts
+    with {allocator, err: alloc.AllocError}
+{
+    uninit fs: Vec_SiteFact.Vec
+    Vec_SiteFact.new(init fs, allocator)?
+    uninit nx: Vec_usize.Vec
+    Vec_usize.new(init nx, allocator)?
+    let hd = IntMap_usize.new(allocator)?
+    var set = SiteFacts { facts: fs, head: hd, nexts: nx }
+    let n = Vec_Obligation.len(body.obligations)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ob = Vec_Obligation.at(body.obligations, i)
+        record_site(
+            mutable set,
+            mir_block_mod.index(ob.block),
+            ob.stmt_index,
+            proven_mod.kind_tag_of(ob.kind),
+            trust_is_discharged(ob.trust),
+            allocator,
+        )?
+        i = i + 1
+    }
+    return set
+}
+
+
+function record_site(
+    set: mutable SiteFacts,
+    block_index: usize,
+    stmt_index: u32,
+    kind_tag: u32,
+    discharged: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let h = site_hash(block_index, stmt_index, kind_tag) as i64 wrapping
+    var cur = match IntMap_usize.get(set.head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    var fuel = Vec_SiteFact.len(set.facts)
+    loop decreases fuel {
+        if cur == 0 { break }
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        let slot = cur -% 1
+        if slot >= Vec_SiteFact.len(set.facts) { break }
+        var f = Vec_SiteFact.at(set.facts, slot)
+        if f.block_index == block_index && f.stmt_index == stmt_index && f.kind_tag == kind_tag {
+            f.count = f.count + 1
+            Vec_SiteFact.set_at(mutable set.facts, slot, take f)
+            return
+        }
+        if slot >= Vec_usize.len(set.nexts) { break }
+        cur = Vec_usize.at(set.nexts, slot)
+    }
+    let id = Vec_SiteFact.len(set.facts)
+    let nf = SiteFact {
+        block_index: block_index,
+        stmt_index: stmt_index,
+        kind_tag: kind_tag,
+        count: 1,
+        first_discharged: discharged,
+    }
+    Vec_SiteFact.push(mutable set.facts, take nf, allocator)?
+    let prev = match IntMap_usize.get(set.head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable set.nexts, take prev, allocator)?
+    let new_head = id +% 1
+    let _ = IntMap_usize.insert(mutable set.head, h, take new_head, allocator)?
+}
+
+
+function site_fact_at(set: SiteFacts, block_index: usize, stmt_index: u32, kind_tag: u32) -> SiteFact {
+    let h = site_hash(block_index, stmt_index, kind_tag) as i64 wrapping
+    var cur = match IntMap_usize.get(set.head, h) {
+        case .some(let head) => head
+        case .none => 0 as usize
+    }
+    var fuel = Vec_SiteFact.len(set.facts)
+    loop decreases fuel {
+        if cur == 0 { break }
+        if fuel == 0 { break }
+        fuel = fuel - 1
+        let slot = cur -% 1
+        if slot >= Vec_SiteFact.len(set.facts) { break }
+        let f = Vec_SiteFact.at(set.facts, slot)
+        if f.block_index == block_index && f.stmt_index == stmt_index && f.kind_tag == kind_tag {
+            return f
+        }
+        if slot >= Vec_usize.len(set.nexts) { break }
+        cur = Vec_usize.at(set.nexts, slot)
+    }
+    return SiteFact {
+        block_index: block_index,
+        stmt_index: stmt_index,
+        kind_tag: kind_tag,
+        count: 0,
+        first_discharged: false,
+    }
+}
+
+
+public function site_is_proven(
+    body: mir_body_mod.MirBody,
+    sf: SiteFacts,
+    proven: proven_mod.ProvenSet,
+    block: mir_block_mod.BlockId,
+    stmt_index: usize,
+    kind: mir_body_mod.ObligationKind,
+) -> bool {
+    if !trust_is_discharged(body.function_trust) {
+        return false
+    }
+    let kind_tag = proven_mod.kind_tag_of(kind)
+    let f = site_fact_at(sf, mir_block_mod.index(block), stmt_index as u32, kind_tag)
+    if f.count != 1 {
+        return false
+    }
+    if !f.first_discharged {
+        return false
+    }
+    return proven_mod.contains(
+        proven,
+        body.def_id.raw,
+        block,
+        stmt_index as u32,
+        kind_tag,
+    )
+}

@@ -1,0 +1,190 @@
+module httpserver.frame
+
+import std.mem.alloc
+import std.net.socket
+import hermod.error as herr
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function default_max_request_bytes() -> usize { return 262144 as usize }
+
+public function default_read_timeout_millis() -> u32 { return 30000 as u32 }
+
+function _sock_err(e: socket.SocketError) -> herr.TransportError {
+    return match e {
+        case .connection_refused    => herr.TransportError.connection_refused
+        case .connection_reset      => herr.TransportError.connection_reset
+        case .connection_aborted    => herr.TransportError.connection_reset
+        case .host_unreachable      => herr.TransportError.accept_failed
+        case .network_unreachable   => herr.TransportError.accept_failed
+        case .timeout               => herr.TransportError.timed_out
+        case .address_in_use        => herr.TransportError.bind_failed
+        case .address_not_available => herr.TransportError.bind_failed
+        case .dns_lookup_failed(_)  => herr.TransportError.bind_failed
+        case .broken_pipe           => herr.TransportError.write_failed
+        case .would_block           => herr.TransportError.timed_out
+        case .not_connected         => herr.TransportError.connection_reset
+        case .unexpected_eof        => herr.TransportError.read_failed
+        case .out_of_memory         => herr.TransportError.read_failed
+        case .os_error(_)           => herr.TransportError.read_failed
+    }
+}
+
+public function sock_err(e: socket.SocketError) -> herr.TransportError {
+    return _sock_err(e)
+}
+
+function _ascii_lower(b: u8) -> u8 {
+    if b >= (65 as u8) && b <= (90 as u8) { return b + (32 as u8) }
+    return b
+}
+
+function _match_ci_at(buf: [u8], pos: usize, needle: [u8], hi: usize) -> bool {
+    let n = needle.len()
+    if pos + n > hi { return false }
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if _ascii_lower(buf[pos + i]) != _ascii_lower(needle[i]) { return false }
+        i = i + (1 as usize)
+    }
+    return true
+}
+
+public function find_header_end(buf: [u8], len: usize) -> usize {
+    if len < (4 as usize) { return 0 as usize }
+    var i: usize = 0
+    let last = len - (4 as usize)
+    loop decreases (last + (1 as usize)) - i {
+        if i > last { break }
+        if buf[i] == (13 as u8)
+            && buf[i + (1 as usize)] == (10 as u8)
+            && buf[i + (2 as usize)] == (13 as u8)
+            && buf[i + (3 as usize)] == (10 as u8) {
+            return i + (4 as usize)
+        }
+        i = i + (1 as usize)
+    }
+    return 0 as usize
+}
+
+function _next_line(buf: [u8], from: usize, end: usize) -> usize {
+    var i: usize = from
+    loop decreases end - i {
+        if i >= end { return end }
+        if buf[i] == (10 as u8) { return i + (1 as usize) }
+        i = i + (1 as usize)
+    }
+    return end
+}
+
+function _parse_decimal(buf: [u8], from: usize, end: usize) -> usize {
+    var i: usize = from
+    loop decreases end - i {
+        if i >= end { break }
+        let b = buf[i]
+        if b == (32 as u8) || b == (9 as u8) { i = i + (1 as usize) } else { break }
+    }
+    var value: usize = 0
+    loop decreases end - i {
+        if i >= end { break }
+        let b = buf[i]
+        if b < (48 as u8) || b > (57 as u8) { break }
+        let d = (b - (48 as u8)) as usize
+        value = (value *| (10 as usize)) +| d
+        i = i + (1 as usize)
+    }
+    return value
+}
+
+public function content_length(buf: [u8], header_end: usize) -> usize {
+    let needle = "content-length:".bytes()
+    var i: usize = 0
+    loop decreases header_end - i {
+        if i >= header_end { break }
+        if _match_ci_at(buf, i, needle, header_end) {
+            return _parse_decimal(buf, i + needle.len(), header_end)
+        }
+        i = _next_line(buf, i, header_end)
+    }
+    return 0 as usize
+}
+
+function _value_has_chunked(buf: [u8], from: usize, end: usize, chunked: [u8]) -> bool {
+    var i: usize = from
+    let limit = if end >= chunked.len() { end - chunked.len() } else { 0 as usize }
+    loop decreases (limit + (1 as usize)) - i {
+        if i > limit { break }
+        if buf[i] == (13 as u8) || buf[i] == (10 as u8) { break }
+        if _match_ci_at(buf, i, chunked, end) { return true }
+        i = i + (1 as usize)
+    }
+    return false
+}
+
+public function is_chunked(buf: [u8], header_end: usize) -> bool {
+    let needle = "transfer-encoding:".bytes()
+    let chunked = "chunked".bytes()
+    var i: usize = 0
+    loop decreases header_end - i {
+        if i >= header_end { break }
+        if _match_ci_at(buf, i, needle, header_end) {
+            return _value_has_chunked(buf, i + needle.len(), header_end, chunked)
+        }
+        i = _next_line(buf, i, header_end)
+    }
+    return false
+}
+
+function _chunk_terminated(buf: [u8], header_end: usize, filled: usize) -> bool {
+    if filled < header_end + (5 as usize) { return false }
+    let p = filled - (5 as usize)
+    return buf[p] == (48 as u8)
+        && buf[p + (1 as usize)] == (13 as u8)
+        && buf[p + (2 as usize)] == (10 as u8)
+        && buf[p + (3 as usize)] == (13 as u8)
+        && buf[p + (4 as usize)] == (10 as u8)
+}
+
+public function read_full_request(
+    conn: mutable socket.Connection,
+    allocator: Allocator,
+    cap: usize,
+) -> [u8]
+    with {allocator, err: herr.TransportError, err: alloc.AllocError}
+    requires cap > 0
+{
+    let buf: [u8] = _alloc_u8_slots(allocator, cap)?
+    var filled: usize = 0
+    var header_end: usize = 0
+    var needed: usize = 0
+    var chunked: bool = false
+    loop decreases cap - filled {
+        if filled >= cap { break }
+        if header_end != (0 as usize) && !chunked && filled >= needed { break }
+        if header_end != (0 as usize) && chunked && _chunk_terminated(buf, header_end, filled) { break }
+        let got = handle err: socket.SocketError as e -> (raise _sock_err(e)) {
+            socket.read(mutable conn, mutable buf[filled..<cap])?
+        }
+        if got == 0 as usize { break }
+        let adv = if got > cap - filled { cap - filled } else { got }
+        filled = filled + adv
+        if header_end == 0 as usize {
+            let he = find_header_end(buf, filled)
+            if he != 0 as usize {
+                header_end = he
+                if is_chunked(buf, he) {
+                    chunked = true
+                } else {
+                    needed = he +| content_length(buf, he)
+                }
+            }
+        }
+    }
+    if header_end != (0 as usize) && !chunked && needed <= filled {
+        return buf[0..<needed]
+    }
+    return buf[0..<filled]
+}

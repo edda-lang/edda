@@ -1,0 +1,247 @@
+
+module resolve.lints.cohesion.walk.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as tree_mod
+
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(tree_mod.Stmt)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(tree_mod.CallArg)
+spec std.collections.vec.Vec(tree_mod.MatchArm)
+spec std.collections.vec.Vec(tree_mod.StructLitField)
+spec std.collections.vec.Vec(tree_mod.SpawnArg)
+spec std.collections.vec.Vec(tree_mod.FStringSeg)
+spec std.mem.alloc.Box(tree_mod.Expr)
+spec std.mem.alloc.Box(tree_mod.Closure)
+spec std.mem.alloc.Box(tree_mod.SpawnExpr)
+spec std.core.option.Option(Box_Expr)
+
+
+public function collect_calls_in_block(b: tree_mod.Block, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    collect_calls_in_stmts(b.stmts, mutable out, allocator)?
+    match b.trailing {
+        case .some(let e) => collect_calls_in_expr(Box_Expr.get(e), mutable out, allocator)?
+        case .none => ()
+    }
+}
+
+function collect_calls_in_stmts(v: Vec_Stmt.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Stmt.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_calls_in_stmt(Vec_Stmt.at(v, i), mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_calls_in_stmt(s: tree_mod.Stmt, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match s.kind {
+        case .let_(_, _, _, let init_) => match init_ {
+            case .some(let e) => collect_calls_in_expr(e, mutable out, allocator)?
+            case .none => ()
+        }
+        case .assign(let target, _, let rhs) => {
+            collect_calls_in_expr(target, mutable out, allocator)?
+            collect_calls_in_expr(rhs, mutable out, allocator)?
+        }
+        case .expr(let value) => collect_calls_in_expr(value, mutable out, allocator)?
+    }
+}
+
+function collect_calls_in_exprs(v: Vec_Expr.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Expr.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_calls_in_expr(Vec_Expr.at(v, i), mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_calls_in_call_args(v: Vec_CallArg.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_CallArg.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_calls_in_expr(Vec_CallArg.at(v, i).expr, mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_calls_in_match_arms(v: Vec_MatchArm.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_MatchArm.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arm = Vec_MatchArm.at(v, i)
+        match arm.guard {
+            case .some(let g) => collect_calls_in_expr(g, mutable out, allocator)?
+            case .none => ()
+        }
+        collect_calls_in_expr(arm.body, mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_calls_in_struct_lit_fields(v: Vec_StructLitField.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_StructLitField.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_calls_in_expr(Vec_StructLitField.at(v, i).value, mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_calls_in_spawn_args(v: Vec_SpawnArg.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_SpawnArg.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_calls_in_expr(Vec_SpawnArg.at(v, i).init_, mutable out, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_calls_in_fstring_segs(v: Vec_FStringSeg.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_FStringSeg.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_FStringSeg.at(v, i) {
+            case .interp(let e) => collect_calls_in_expr(Box_Expr.get(e), mutable out, allocator)?
+            case .text(_) => ()
+        }
+        i = i + 1
+    }
+}
+
+function collect_calls_in_opt_expr(o: Option_Box_Expr.Option, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match o {
+        case .some(let e) => collect_calls_in_expr(Box_Expr.get(e), mutable out, allocator)?
+        case .none => ()
+    }
+}
+
+function collect_calls_in_expr(e: tree_mod.Expr, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match e.kind {
+        case .literal(_) => ()
+        case .fstring(let segments) => collect_calls_in_fstring_segs(segments, mutable out, allocator)?
+        case .path(_) => ()
+        case .binary(_, let lhs, let rhs) => {
+            collect_calls_in_expr(Box_Expr.get(lhs), mutable out, allocator)?
+            collect_calls_in_expr(Box_Expr.get(rhs), mutable out, allocator)?
+        }
+        case .unary(_, let inner) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .call(let callee, let args) => {
+            match Box_Expr.get(callee).kind {
+                case .path(let p) => {
+                    if Vec_Ident.len(p.segments) == 1 {
+                        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, 0).name, allocator)?
+                    }
+                }
+                case _ => ()
+            }
+            collect_calls_in_expr(Box_Expr.get(callee), mutable out, allocator)?
+            collect_calls_in_call_args(args, mutable out, allocator)?
+        }
+        case .method_call(let receiver, _, let args) => {
+            collect_calls_in_expr(Box_Expr.get(receiver), mutable out, allocator)?
+            collect_calls_in_call_args(args, mutable out, allocator)?
+        }
+        case .field(let receiver, _) => collect_calls_in_expr(Box_Expr.get(receiver), mutable out, allocator)?
+        case .tuple_index(let receiver, _) => collect_calls_in_expr(Box_Expr.get(receiver), mutable out, allocator)?
+        case .positional(let receiver, let index) => {
+            collect_calls_in_expr(Box_Expr.get(receiver), mutable out, allocator)?
+            collect_calls_in_expr(Box_Expr.get(index), mutable out, allocator)?
+        }
+        case .index(let receiver, let index) => {
+            collect_calls_in_expr(Box_Expr.get(receiver), mutable out, allocator)?
+            collect_calls_in_expr(Box_Expr.get(index), mutable out, allocator)?
+        }
+        case .if_(let cond, let then_block, let else_branch) => {
+            collect_calls_in_expr(Box_Expr.get(cond), mutable out, allocator)?
+            collect_calls_in_block(then_block, mutable out, allocator)?
+            collect_calls_in_opt_expr(else_branch, mutable out, allocator)?
+        }
+        case .match_(let scrutinee, let arms) => {
+            collect_calls_in_expr(Box_Expr.get(scrutinee), mutable out, allocator)?
+            collect_calls_in_match_arms(arms, mutable out, allocator)?
+        }
+        case .block(let body) => collect_calls_in_block(body, mutable out, allocator)?
+        case .cast(let inner, _, _) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .range(let lo, let hi, _) => {
+            collect_calls_in_opt_expr(lo, mutable out, allocator)?
+            collect_calls_in_opt_expr(hi, mutable out, allocator)?
+        }
+        case .tuple(let elements) => collect_calls_in_exprs(elements, mutable out, allocator)?
+        case .struct_lit(_, let fields) => collect_calls_in_struct_lit_fields(fields, mutable out, allocator)?
+        case .loop_(let body, _, let decreases_) => {
+            collect_calls_in_block(body, mutable out, allocator)?
+            collect_calls_in_opt_expr(decreases_, mutable out, allocator)?
+        }
+        case .for_(_, let iter, let body, _) => {
+            collect_calls_in_expr(Box_Expr.get(iter), mutable out, allocator)?
+            collect_calls_in_block(body, mutable out, allocator)?
+        }
+        case .try_(let inner) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .await_(let inner) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .raise_(let inner) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .panic_(let inner) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .return_(let v) => collect_calls_in_opt_expr(v, mutable out, allocator)?
+        case .break_(_, let v) => collect_calls_in_opt_expr(v, mutable out, allocator)?
+        case .continue_(_) => ()
+        case .comptime_(let inner) => collect_calls_in_expr(Box_Expr.get(inner), mutable out, allocator)?
+        case .comptime_block(let body) => collect_calls_in_block(body, mutable out, allocator)?
+        case .scope_(_, _, let body) => collect_calls_in_block(body, mutable out, allocator)?
+        case .effect_row(_) => ()
+        case .handle_(_, _, _, let recovery, let body) => {
+            collect_calls_in_expr(Box_Expr.get(recovery), mutable out, allocator)?
+            collect_calls_in_block(body, mutable out, allocator)?
+        }
+        case .closure(let payload) => collect_calls_in_block(Box_Closure.get(payload).body, mutable out, allocator)?
+        case .spawn(let payload) => {
+            let s = Box_SpawnExpr.get(payload)
+            collect_calls_in_spawn_args(s.args, mutable out, allocator)?
+            collect_calls_in_block(s.body, mutable out, allocator)?
+        }
+        case .forall_(_, let iter, let body) => {
+            collect_calls_in_expr(Box_Expr.get(iter), mutable out, allocator)?
+            collect_calls_in_expr(Box_Expr.get(body), mutable out, allocator)?
+        }
+        case .exists_(_, let iter, let body) => {
+            collect_calls_in_expr(Box_Expr.get(iter), mutable out, allocator)?
+            collect_calls_in_expr(Box_Expr.get(body), mutable out, allocator)?
+        }
+        case .error => ()
+    }
+}

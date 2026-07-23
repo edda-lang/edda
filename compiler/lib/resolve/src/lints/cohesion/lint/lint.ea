@@ -1,0 +1,183 @@
+
+module resolve.lints.cohesion.lint.lint
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import intern.symbol
+import span.file as file_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import manifest.lex.toml.val.values as values_mod
+import local.ctx as ctx_mod
+import local.lints.cohesion.walk.walk as walk_mod
+import local.lints.cohesion.graph.graph as graph_mod
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.mem.alloc.Box(ast_item.FnDecl)
+spec std.core.option.Option(usize)
+
+
+public function loc_floor() -> usize { return 400 }
+
+
+public function check_file_cohesion(ctx: mutable ctx_mod.ResolveCtx, files: Vec_File.Vec, source_map: source_map_mod.SourceMap, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_file(mutable ctx, Vec_File.at(files, i), source_map, interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+function count_lines(text: String) -> usize {
+    let bytes = text.bytes()
+    let n = bytes.len()
+    var count: usize = 1
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if bytes[i] == 0x0A { count = count + 1 }
+        i = i + 1
+    }
+    return count
+}
+
+
+function collect_function_names(items: Vec_Item.Vec, out: mutable Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .function_(let decl_box) => Vec_Symbol.push(mutable out, Box_FnDecl.get(decl_box).name.name, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function index_of_name(names: Vec_Symbol.Vec, target: symbol.Symbol) -> Option_usize.Option {
+    let n = Vec_Symbol.len(names)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_Symbol.at(names, i).raw == target.raw { return Option_usize.some(value: i) }
+        i = i + 1
+    }
+    return Option_usize.none
+}
+
+
+function build_edges(items: Vec_Item.Vec, names: Vec_Symbol.Vec, g: mutable graph_mod.CallGraph, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    var fn_idx: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(items, i).kind {
+            case .function_(let decl_box) => {
+                let decl = Box_FnDecl.get(decl_box)
+                match decl.body {
+                    case .block_(let body) => {
+                        uninit callees: Vec_Symbol.Vec
+                        Vec_Symbol.new(init callees, allocator)?
+                        walk_mod.collect_calls_in_block(body, mutable callees, allocator)?
+                        add_edges_for(mutable g, fn_idx, names, callees, allocator)?
+                    }
+                    case .extern_(_, _, _, _) => ()
+                }
+                fn_idx = fn_idx + 1
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function add_edges_for(g: mutable graph_mod.CallGraph, caller: usize, names: Vec_Symbol.Vec, callees: Vec_Symbol.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Symbol.len(callees)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match index_of_name(names, Vec_Symbol.at(callees, i)) {
+            case .some(let callee_idx) => graph_mod.add_edge(mutable g, caller, callee_idx, allocator)?
+            case .none => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function fn_name_string(names: Vec_Symbol.Vec, idx: usize, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let sym = Vec_Symbol.at(names, idx)
+    let bytes = interner_mod.lookup(interner, sym)
+    return values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+}
+
+
+function check_file(ctx: mutable ctx_mod.ResolveCtx, file: ast_file.File, source_map: source_map_mod.SourceMap, interner: interner_mod.Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if file_mod.is_unknown(file.span.file) {
+        return
+    }
+    uninit names: Vec_Symbol.Vec
+    Vec_Symbol.new(init names, allocator)?
+    collect_function_names(file.items, mutable names, allocator)?
+    let n = Vec_Symbol.len(names)
+    if n < graph_mod.min_component_count() * graph_mod.min_component_size() {
+        return
+    }
+    let line_count = count_lines(source_map_mod.file_content_of(source_map, file.span.file))
+    if line_count < loc_floor() {
+        return
+    }
+
+    var g = graph_mod.new_graph(allocator)?
+    build_edges(file.items, names, mutable g, allocator)?
+
+    let wcc = graph_mod.component_stats(g, n, Option_usize.none, graph_mod.min_component_size(), allocator)?
+    if wcc.0 >= graph_mod.min_component_count() && wcc.1 >= graph_mod.min_total_cluster_coverage() {
+        let msg = f"file has low cohesion: intra-file call graph splits into {wcc.0} disjoint clusters covering {wcc.1} of {n} functions"
+        let d = diag_mod.warn_at(diag_code_mod.file_low_cohesion(), file.span, msg)
+        ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+        return
+    }
+
+    if n < graph_mod.min_function_count() {
+        return
+    }
+    let largest_scc = graph_mod.largest_scc_size(g, n, allocator)?
+    if largest_scc >= graph_mod.scc_absolute_floor() || largest_scc * graph_mod.scc_dominance_den() >= n * graph_mod.scc_dominance_num() {
+        return
+    }
+
+    let dispatcher = graph_mod.find_best_dispatcher(g, n, allocator)?
+    if dispatcher.found {
+        let name_str = fn_name_string(names, dispatcher.node, interner, allocator)?
+        let msg = f"file has low cohesion: `{name_str}` dispatches to {dispatcher.qualifying} independent concerns covering {dispatcher.total} of {n} functions"
+        let d = diag_mod.warn_at(diag_code_mod.file_low_cohesion(), file.span, msg)
+        ctx_mod.emit_diagnostic(mutable ctx, take d, allocator)?
+    }
+}

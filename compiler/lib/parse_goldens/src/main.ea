@@ -1,0 +1,151 @@
+
+module parse_goldens.main
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.fmt as fmt_mod
+import std.io.stream
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as sym_mod
+import diagnostics.emit.collection as diags_mod
+import span.file as file_mod
+import syntax.parse.parser as parser_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+
+
+spec std.collections.vec.Vec(tree_mod.CallArg)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.mem.alloc.Box(tree_mod.Expr)
+
+
+public function main(errout: Stderr, allocator: Allocator) -> i32
+    with {errout, allocator, divergence, panic}
+{
+    let code = handle err: alloc.AllocError as ae -> fail_alloc(errout, ae) {
+        run(errout, allocator)?
+    }
+    return code
+}
+
+
+function run(errout: Stderr, allocator: Allocator) -> i32
+    with {errout, allocator, err: alloc.AllocError, divergence}
+{
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    var total: usize = 0
+    var passed: usize = 0
+
+    total = total + 1
+    let r1 = check_call_sugar(errout, "x.dbl()", "dbl", 2 as usize, 0 as usize, mutable interner, allocator)?
+    if r1 { passed = passed + 1 }
+
+    total = total + 1
+    let r2 = check_call_sugar(errout, "a.len()", "len", 2 as usize, 0 as usize, mutable interner, allocator)?
+    if r2 { passed = passed + 1 }
+
+    total = total + 1
+    let r3 = check_call_sugar(errout, "f(x)", "f", 1 as usize, 1 as usize, mutable interner, allocator)?
+    if r3 { passed = passed + 1 }
+
+    let summary = build_summary(passed, total, allocator)?
+    stream.eprint_line(errout, summary)
+    interner_mod.dispose(take interner)
+    return if passed == total { 0 } else { 1 }
+}
+
+
+function check_call_sugar(
+    errout: Stderr,
+    snippet: String,
+    expected_leaf: String,
+    expected_segs: usize,
+    expected_args: usize,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> bool
+    with {errout, allocator, err: alloc.AllocError, divergence}
+{
+    uninit sd: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init sd, allocator)?
+    let bytes = snippet.bytes()
+    let expr = parser_mod.parse_expr_from_bytes(bytes, file_mod.unknown(), mutable interner, mutable sd, allocator)?
+    if diags_mod.has_errors(sd) {
+        report(errout, false, snippet, "parse error", allocator)?
+        return false
+    }
+    let expected_sym = interner_mod.intern(mutable interner, expected_leaf, allocator)?
+    let ok = match expr.kind {
+        case .call(let callee, let args) => callee_path_matches(callee, args, expected_sym, expected_segs, expected_args)
+        case _ => false
+    }
+    report(errout, ok, snippet, "call-of-path", allocator)?
+    return ok
+}
+
+
+function callee_path_matches(
+    callee: Box_Expr.Box,
+    args: Vec_CallArg.Vec,
+    expected_sym: sym_mod.Symbol,
+    expected_segs: usize,
+    expected_args: usize,
+) -> bool {
+    let callee_expr = Box_Expr.get(callee)
+    return match callee_expr.kind {
+        case .path(let p) => path_leaf_matches(p, expected_sym, expected_segs) && (Vec_CallArg.len(args) == expected_args)
+        case _ => false
+    }
+}
+
+
+function path_leaf_matches(p: ident_mod.Path, expected_sym: sym_mod.Symbol, expected_segs: usize) -> bool {
+    let nseg = Vec_Ident.len(p.segments)
+    if nseg == 0 as usize {
+        return false
+    }
+    let last = Vec_Ident.at(p.segments, nseg - 1 as usize)
+    return (nseg == expected_segs) && (last.name == expected_sym)
+}
+
+
+function report(
+    errout: Stderr,
+    ok: bool,
+    snippet: String,
+    detail: String,
+    allocator: Allocator,
+) -> ()
+    with {errout, allocator, err: alloc.AllocError}
+{
+    let tag = if ok { "pass: " } else { "fail: " }
+    let s1 = string.concat(tag, snippet, allocator)?
+    let s2 = string.concat(s1, " -> ", allocator)?
+    let line = string.concat(s2, detail, allocator)?
+    stream.eprint_line(errout, line)
+}
+
+
+function build_summary(passed: usize, total: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p = fmt_mod.usize_to_string(passed, allocator)?
+    let t = fmt_mod.usize_to_string(total, allocator)?
+    let s1 = string.concat("passtest: ", p, allocator)?
+    let s2 = string.concat(s1, "/", allocator)?
+    let s3 = string.concat(s2, t, allocator)?
+    return string.concat(s3, " parse goldens passed", allocator)?
+}
+
+
+function fail_alloc(errout: Stderr, e: alloc.AllocError) -> i32
+    with {errout}
+{
+    match e {
+        case .out_of_memory => errout.eprint_line("parse-goldens: out of memory")
+    }
+    return 70
+}

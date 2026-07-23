@@ -1,0 +1,149 @@
+
+module types.effect.interner
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import types.pass.effect as effect_mod
+import types.effect.row as effect_row_mod
+
+
+spec std.collections.vec.Vec(effect_row_mod.CRow)
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.IntMap(usize)
+spec std.core.option.Option(usize)
+
+
+public linear type Interner {
+    slots: Vec_CRow.Vec
+    head: IntMap_usize.IntMap
+    nexts: Vec_usize.Vec
+}
+
+
+function mix(acc: u64, value: u64) -> u64 {
+    return (acc ^ value) *% (1099511628211 as u64)
+}
+
+
+function entry_hash(acc: u64, e: effect_row_mod.CEntry) -> u64 {
+    return match e {
+        case .capability(let local) => mix(mix(acc, 1 as u64), local as u64)
+        case .err_(let t) => mix(mix(acc, 2 as u64), t.raw as u64)
+        case .panic_ => mix(acc, 3 as u64)
+        case .yield_(let t) => mix(mix(acc, 4 as u64), t.raw as u64)
+        case .cancellation_ => mix(acc, 5 as u64)
+        case .divergence_ => mix(acc, 6 as u64)
+        case .nondet_ => mix(acc, 7 as u64)
+        case .alloc_(let bytes_max) => mix(mix(acc, 8 as u64), bytes_max as u64 wrapping)
+        case .io_(let calls_max) => mix(mix(acc, 9 as u64), calls_max as u64 wrapping)
+        case .time_(let ops_max) => mix(mix(acc, 10 as u64), ops_max as u64 wrapping)
+    }
+}
+
+
+function crow_hash(row: effect_row_mod.CRow) -> u64 {
+    let n = Vec_CEntry.len(row.entries)
+    var h = mix(13779 as u64, n as u64)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        h = entry_hash(h, Vec_CEntry.at(row.entries, i))
+        i = i + 1
+    }
+    return h
+}
+
+
+public function new_interner(out: init Interner, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit slots: Vec_CRow.Vec
+    Vec_CRow.new(init slots, allocator)?
+    uninit nexts: Vec_usize.Vec
+    Vec_usize.new(init nexts, allocator)?
+    let head = IntMap_usize.new(allocator)?
+    out = Interner { slots: slots, head: head, nexts: nexts }
+    let empty = effect_row_mod.empty_row(allocator)?
+    let _ = register_slot(mutable out, take empty, allocator)?
+}
+
+
+function register_slot(
+    it: mutable Interner,
+    row: take effect_row_mod.CRow,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let bucket = crow_hash(row) as i64 wrapping
+    let new_index = Vec_CRow.len(it.slots)
+    let prev = match IntMap_usize.get(it.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    Vec_usize.push(mutable it.nexts, prev, allocator)?
+    Vec_CRow.push(mutable it.slots, take row, allocator)?
+    let _ = IntMap_usize.insert(mutable it.head, bucket, new_index + 1 as usize, allocator)?
+    return new_index as u32
+}
+
+
+public function slot_count(it: Interner) -> usize {
+    return Vec_CRow.len(it.slots)
+}
+
+public function intern(
+    it: mutable Interner,
+    row: take effect_row_mod.CRow,
+    allocator: Allocator,
+) -> effect_mod.EffectRowId
+    with {allocator, err: alloc.AllocError}
+    requires slot_count(it) < 4294967296
+{
+    let bucket = crow_hash(row) as i64 wrapping
+    let start = match IntMap_usize.get(it.head, bucket) {
+        case .some(let v) => v
+        case .none => 0 as usize
+    }
+    let fuel = Vec_CRow.len(it.slots) + 1 as usize
+    let found = find_in_chain(it, row, start, fuel)
+    match found {
+        case .some(let idx) => return effect_mod.EffectRowId { raw: idx as u32 }
+        case .none => ()
+    }
+    let new_raw = register_slot(mutable it, take row, allocator)?
+    return effect_mod.EffectRowId { raw: new_raw }
+}
+
+function find_in_chain(
+    it: Interner,
+    row: effect_row_mod.CRow,
+    slot_one_based: usize,
+    fuel: usize,
+) -> Option_usize.Option
+    decreases fuel
+{
+    if fuel == 0 { return Option_usize.none }
+    if slot_one_based == 0 { return Option_usize.none }
+    let idx = slot_one_based - 1
+    if idx >= Vec_CRow.len(it.slots) { return Option_usize.none }
+    if Vec_CRow.at(it.slots, idx) == row {
+        return Option_usize.some(value: idx)
+    }
+    if idx >= Vec_usize.len(it.nexts) { return Option_usize.none }
+    let nxt = Vec_usize.at(it.nexts, idx)
+    return find_in_chain(it, row, nxt, fuel - 1)
+}
+
+public function lookup(
+    it: Interner,
+    id: effect_mod.EffectRowId where (id.raw as usize) < slot_count(it),
+) -> effect_row_mod.CRow {
+    return Vec_CRow.at(it.slots, id.raw as usize)
+}
+
+
+public function dispose(it: take Interner) -> () { }

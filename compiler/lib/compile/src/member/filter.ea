@@ -1,0 +1,81 @@
+
+module compile.member.filter
+
+import std.collections.vec
+import std.collections.slice as slice
+import std.mem.alloc
+import std.text.string
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import hir.build.file as hir_file_mod
+import mir.body.model as mir_body_mod
+import mir.id.hir as mir_hir_id_mod
+import mir.file.store as mir_file_mod
+import source.map as source_map_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+
+
+public function demote_foreign_mains(
+    mir_files: mutable Vec_MirFile.Vec,
+    member_src_prefix: String,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nf = Vec_MirFile.len(mir_files)
+    var fi: usize = 0
+    loop decreases nf - fi {
+        if fi >= nf { break }
+        var file = Vec_MirFile.at(mir_files, fi)
+        demote_foreign_mains_in_file(mutable file, member_src_prefix, map, interner, allocator)?
+        Vec_MirFile.set_at(mutable mir_files, fi, take file)
+        fi += 1
+    }
+}
+
+
+function demote_foreign_mains_in_file(
+    file: mutable mir_file_mod.MirFile,
+    member_src_prefix: String,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_MirBody.len(file.bodies)
+    var bi: usize = 0
+    loop decreases nb - bi {
+        if bi >= nb { break }
+        let body = Vec_MirBody.at(file.bodies, bi)
+        if is_main_body(body, interner) && !body_under_prefix(file, body, member_src_prefix, map) {
+            let renamed = mir_body_mod.set_name(take body, symbol_mod.empty())
+            Vec_MirBody.set_at(mutable file.bodies, bi, take renamed)
+        }
+        bi += 1
+    }
+}
+
+
+function is_main_body(body: mir_body_mod.MirBody, interner: interner_mod.Interner) -> bool {
+    return slice.eq_u8(interner_mod.lookup(interner, body.name), "main".bytes())
+}
+
+
+function body_under_prefix(
+    file: mir_file_mod.MirFile,
+    body: mir_body_mod.MirBody,
+    member_src_prefix: String,
+    map: source_map_mod.SourceMap,
+) -> bool {
+    let hf = Vec_HirFile.at(file.hir_files, mir_hir_id_mod.index(body.origin_file))
+    let fid = hf.source.span.file
+    let path = source_map_mod.file_name_of(map, fid)
+    return string.starts_with(path, member_src_prefix)
+}

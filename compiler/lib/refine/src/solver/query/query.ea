@@ -1,0 +1,185 @@
+
+module refine.solver.query.query
+
+import std.collections.vec
+import std.mem.alloc
+import intern.interner as interner_mod
+import local.solver.lit.lit as lit_mod
+import local.solver.cdcl.core.state as state_mod
+import local.solver.cdcl.core.core as core_mod
+import local.solver.cnf.tseitin.tseitin as tseitin_mod
+import local.solver.model.model as model_mod
+import local.solver.cnf.instantiate as instantiate_mod
+import local.solver.cnf.diseq as diseq_mod
+import local.solver.cnf.divmod as divmod_mod
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(lit_mod.Lit)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(tseitin_mod.Clause)
+
+
+derive eq, debug for Verdict
+
+
+public type Verdict {
+    case unsat(core: Vec_usize.Vec)
+    case sat(model: String)
+    case unknown(reason: String)
+    case timeout
+    case unavailable
+    case solver_error(message: String)
+}
+
+
+function negate_term(goal: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take goal, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.not_, args: args)
+}
+
+
+function assert_array_axioms(enc: mutable tseitin_mod.Encoder, term: term_mod.SmtTerm, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let axioms = instantiate_mod.array_axiom_terms(term, allocator)?
+    let n = Vec_SmtTerm.len(axioms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        tseitin_mod.assert_true(mutable enc, Vec_SmtTerm.at(axioms, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function assert_int_diseq_lemmas(enc: mutable tseitin_mod.Encoder, term: term_mod.SmtTerm, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let lemmas = diseq_mod.int_diseq_lemma_terms(term, allocator)?
+    let n = Vec_SmtTerm.len(lemmas)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        tseitin_mod.assert_true(mutable enc, Vec_SmtTerm.at(lemmas, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function assert_divmod_lemmas(enc: mutable tseitin_mod.Encoder, term: term_mod.SmtTerm, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let lemmas = divmod_mod.divmod_lemma_terms(term, allocator)?
+    let n = Vec_SmtTerm.len(lemmas)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        tseitin_mod.assert_true(mutable enc, Vec_SmtTerm.at(lemmas, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+public function decide(
+    context: Vec_SmtTerm.Vec,
+    goal: term_mod.SmtTerm,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Verdict
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit ctx_inst: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init ctx_inst, allocator)?
+    let nc = Vec_SmtTerm.len(context)
+    var i: usize = 0
+    loop
+        decreases (nc - i)
+    {
+        if i >= nc {
+            break
+        }
+        match instantiate_mod.instantiate(Vec_SmtTerm.at(context, i), allocator)? {
+            case .none => return Verdict.unknown(reason: "bounded quantifier with non-constant bounds")
+            case .some(let t) => Vec_SmtTerm.push(mutable ctx_inst, take t, allocator)?
+        }
+        i = i + 1
+    }
+    let goal_inst = match instantiate_mod.instantiate(goal, allocator)? {
+        case .none => return Verdict.unknown(reason: "bounded quantifier with non-constant bounds")
+        case .some(let t) => t
+    }
+    uninit enc: tseitin_mod.Encoder
+    tseitin_mod.new_encoder(init enc, allocator)?
+    let nci = Vec_SmtTerm.len(ctx_inst)
+    var j: usize = 0
+    loop
+        decreases (nci - j)
+    {
+        if j >= nci {
+            break
+        }
+        let ct = Vec_SmtTerm.at(ctx_inst, j)
+        tseitin_mod.set_premise_origin(mutable enc, j, allocator)?
+        tseitin_mod.assert_true(mutable enc, ct, allocator)?
+        assert_array_axioms(mutable enc, ct, allocator)?
+        assert_int_diseq_lemmas(mutable enc, ct, allocator)?
+        assert_divmod_lemmas(mutable enc, ct, allocator)?
+        j = j + 1
+    }
+    tseitin_mod.clear_origin(mutable enc)
+    assert_array_axioms(mutable enc, goal_inst, allocator)?
+    assert_int_diseq_lemmas(mutable enc, goal_inst, allocator)?
+    assert_divmod_lemmas(mutable enc, goal_inst, allocator)?
+    let neg = negate_term(goal_inst, allocator)?
+    tseitin_mod.assert_true(mutable enc, neg, allocator)?
+    uninit solver: state_mod.Solver
+    state_mod.new(init solver, enc.atoms, allocator)?
+    let ncl = Vec_Clause.len(enc.clauses)
+    var k: usize = 0
+    loop
+        decreases (ncl - k)
+    {
+        if k >= ncl {
+            break
+        }
+        let c = Vec_Clause.at(enc.clauses, k)
+        let lits = c.lits
+        let origin = c.origin
+        let _ = core_mod.add_clause_lits(mutable solver, take lits, take origin, allocator)?
+        k = k + 1
+    }
+    let sat_result = core_mod.solve(mutable solver, allocator)?
+    return match sat_result {
+        case .unsat(_, let premise_core) => Verdict.unsat(core: premise_core)
+        case .unknown => Verdict.unknown(reason: "solver conflict budget exhausted")
+        case .sat => {
+            if solver.theory.dropped_nonlinear {
+                Verdict.unknown(reason: "nonlinear arithmetic dropped from the LIA constraint system")
+            } else {
+                if solver.theory.lia_gave_up {
+                    Verdict.unknown(reason: "LIA search exhausted its pivot budget or exceeded its arithmetic width")
+                } else {
+                    Verdict.sat(model: model_mod.extract(solver.atoms, solver.trail, solver.theory, interner, allocator)?)
+                }
+            }
+        }
+    }
+}

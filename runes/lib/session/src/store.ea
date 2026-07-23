@@ -1,0 +1,112 @@
+module session.store
+
+import std.mem.alloc
+import std.core.option
+import std.collections.hashmap
+
+spec std.collections.hashmap.StringMap(String)
+spec std.collections.hashmap.StringMap(Session)
+spec std.core.option.Option(String)
+
+
+public type Session {
+    id: String
+    data: StringMap_String.StringMap
+    flash: StringMap_String.StringMap
+    flash_next: StringMap_String.StringMap
+}
+
+public type Store {
+    sessions: StringMap_Session.StringMap
+}
+
+public function new(allocator: Allocator) -> Store
+    with {allocator, err: alloc.AllocError}
+{
+    return Store { sessions: StringMap_Session.new(allocator)? }
+}
+
+function _fresh_session(id: String, allocator: Allocator) -> Session
+    with {allocator, err: alloc.AllocError}
+{
+    return Session {
+        id: id,
+        data: StringMap_String.new(allocator)?,
+        flash: StringMap_String.new(allocator)?,
+        flash_next: StringMap_String.new(allocator)?,
+    }
+}
+
+function _session_or_fresh(store: Store, id: String, allocator: Allocator) -> Session
+    with {allocator, err: alloc.AllocError}
+{
+    return match StringMap_Session.get(store.sessions, id) {
+        case .some(let session) => session
+        case .none => _fresh_session(id, allocator)?
+    }
+}
+
+public function has_session(store: Store, id: String) -> bool {
+    return StringMap_Session.contains(store.sessions, id)
+}
+
+public function get(store: Store, id: String, key: String) -> Option_String.Option {
+    return match StringMap_Session.get(store.sessions, id) {
+        case .some(let session) => StringMap_String.get(session.data, key)
+        case .none => Option_String.none
+    }
+}
+
+public function set(store: mutable Store, id: String, key: String, value: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var session = _session_or_fresh(store, id, allocator)?
+    let _ = StringMap_String.insert(mutable session.data, key, value, allocator)?
+    let _ = StringMap_Session.insert(mutable store.sessions, id, take session, allocator)?
+}
+
+public function remove(store: mutable Store, id: String, key: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match StringMap_Session.get(store.sessions, id) {
+        case .some(let session) => {
+            var updated = session
+            let _ = StringMap_String.remove(mutable updated.data, key)
+            let _ = StringMap_Session.insert(mutable store.sessions, id, take updated, allocator)?
+        }
+        case .none => {}
+    }
+}
+
+public function destroy(store: mutable Store, id: String) -> () {
+    let _ = StringMap_Session.remove(mutable store.sessions, id)
+}
+
+public function flash_set(store: mutable Store, id: String, key: String, value: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var session = _session_or_fresh(store, id, allocator)?
+    let _ = StringMap_String.insert(mutable session.flash_next, key, value, allocator)?
+    let _ = StringMap_Session.insert(mutable store.sessions, id, take session, allocator)?
+}
+
+public function flash_get(store: Store, id: String, key: String) -> Option_String.Option {
+    return match StringMap_Session.get(store.sessions, id) {
+        case .some(let session) => StringMap_String.get(session.flash, key)
+        case .none => Option_String.none
+    }
+}
+
+public function flash_sweep(store: mutable Store, id: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match StringMap_Session.get(store.sessions, id) {
+        case .some(let session) => {
+            var updated = session
+            updated.flash = updated.flash_next
+            updated.flash_next = StringMap_String.new(allocator)?
+            let _ = StringMap_Session.insert(mutable store.sessions, id, take updated, allocator)?
+        }
+        case .none => {}
+    }
+}

@@ -1,0 +1,201 @@
+module optimize.linear_reuse.dataflow.live.liveness
+
+import std.mem.alloc
+import std.collections.vec
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.id.local as mir_local_mod
+import mir.id.block as mir_block_mod
+
+import local.linear_reuse.dataflow.live.genkill as gen_kill_mod
+import local.linear_reuse.dataflow.cfg.rpo as rpo_mod
+import local.linear_reuse.dataflow.live.pointquery as point_query_mod
+import local.linear_reuse.dataflow.bitset as bitset_mod
+
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+
+public type Liveness {
+    n_locals: usize
+    wpr: usize
+    live_in: Vec_u64.Vec
+    live_out: Vec_u64.Vec
+}
+
+public function compute(out: init Liveness, body: mir_body_mod.MirBody, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_locals = Vec_Local.len(body.locals)
+    let nb = Vec_BasicBlock.len(body.blocks)
+    let wpr = bitset_mod.words_per_row(n_locals)
+    let grid_words = nb * wpr
+
+    uninit use_set: Vec_u64.Vec
+    bitset_mod.new_zeros(init use_set, grid_words, allocator)?
+    uninit def_set: Vec_u64.Vec
+    bitset_mod.new_zeros(init def_set, grid_words, allocator)?
+
+    var b: usize = 0
+    loop decreases nb - b {
+        if b >= nb { break }
+        gen_kill_mod.build_block_use_def(mutable use_set, mutable def_set, Vec_BasicBlock.at(body.blocks, b), b * wpr, n_locals)
+        b += 1
+    }
+
+    uninit live_in: Vec_u64.Vec
+    bitset_mod.new_zeros(init live_in, grid_words, allocator)?
+    uninit live_out: Vec_u64.Vec
+    bitset_mod.new_zeros(init live_out, grid_words, allocator)?
+
+    uninit cfg: rpo_mod.BlockCfg
+    rpo_mod.build(init cfg, body, allocator)?
+
+    let n_post = Vec_u32.len(cfg.postorder)
+    var fuel = nb + 2
+    loop decreases fuel {
+        if fuel == 0 { break }
+        fuel -= 1
+        var changed = false
+        var i: usize = 0
+        loop decreases n_post - i {
+            if i >= n_post { break }
+            let blk = Vec_u32.at(cfg.postorder, i) as usize
+            let did = refresh_block(mutable live_in, mutable live_out, use_set, def_set, cfg, body, blk, wpr, n_locals)
+            if did { changed = true }
+            i += 1
+        }
+        if !changed { break }
+    }
+
+    out = Liveness {
+        n_locals: n_locals,
+        wpr: wpr,
+        live_in: live_in,
+        live_out: live_out
+    }
+}
+
+function refresh_block(
+    live_in: mutable Vec_u64.Vec,
+    live_out: mutable Vec_u64.Vec,
+    use_set: Vec_u64.Vec,
+    def_set: Vec_u64.Vec,
+    cfg: rpo_mod.BlockCfg,
+    body: mir_body_mod.MirBody,
+    b: usize,
+    wpr: usize,
+    n_locals: usize,
+) -> bool {
+    if b >= Vec_BasicBlock.len(body.blocks) { return false }
+    let bb = Vec_BasicBlock.at(body.blocks, b)
+    let base = b * wpr
+    var changed = false
+
+    if returns_to_caller(bb) {
+        let ret = return_value_index()
+        if ret < n_locals {
+            if bitset_mod.bit_at(live_out, base, ret) == false {
+                bitset_mod.bit_set(mutable live_out, base, ret)
+                changed = true
+            }
+        }
+    }
+
+    var e = rpo_mod.succ_start(cfg, b)
+    let e_end = rpo_mod.succ_end(cfg, b)
+    loop decreases e_end - e {
+        if e >= e_end { break }
+        if e < Vec_usize.len(cfg.succ_to) {
+            let t = Vec_usize.at(cfg.succ_to, e)
+            let tbase = t * wpr
+            var w: usize = 0
+            loop decreases wpr - w {
+                if w >= wpr { break }
+                let oi = base + w
+                let ti = tbase + w
+                if oi < Vec_u64.len(live_out) {
+                    if ti < Vec_u64.len(live_in) {
+                        let old = Vec_u64.at(live_out, oi)
+                        let neu = old | Vec_u64.at(live_in, ti)
+                        if neu != old {
+                            Vec_u64.set_at(mutable live_out, oi, neu)
+                            changed = true
+                        }
+                    }
+                }
+                w += 1
+            }
+        }
+        e += 1
+    }
+
+    var j: usize = 0
+    loop decreases wpr - j {
+        if j >= wpr { break }
+        let bi = base + j
+        if bi < Vec_u64.len(live_in) {
+            let use_word = Vec_u64.at(use_set, bi)
+            let def_word = Vec_u64.at(def_set, bi)
+            let add = use_word | (Vec_u64.at(live_out, bi) & ~def_word)
+            let old = Vec_u64.at(live_in, bi)
+            let neu = old | add
+            if neu != old {
+                Vec_u64.set_at(mutable live_in, bi, neu)
+                changed = true
+            }
+        }
+        j += 1
+    }
+    return changed
+}
+
+function returns_to_caller(bb: mir_body_mod.BasicBlock) -> bool {
+    return match bb.terminator.kind {
+        case .return_ => true
+        case _ => false
+    }
+}
+
+function return_value_index() -> usize {
+    let rv: mir_local_mod.LocalId = mir_local_mod.LocalId { raw: 1 }
+    return mir_local_mod.index(rv)
+}
+
+function block_count(liveness: Liveness) -> usize {
+    if liveness.wpr == 0 { return 0 }
+    return Vec_u64.len(liveness.live_out) / liveness.wpr
+}
+
+public function dead_after(liveness: Liveness, body: mir_body_mod.MirBody, id: mir_local_mod.LocalId, b: mir_block_mod.BlockId, index: usize) -> bool {
+    let bidx = mir_block_mod.index(b)
+    if bidx >= Vec_BasicBlock.len(body.blocks) { return false }
+    if bidx >= block_count(liveness) { return false }
+    let bb = Vec_BasicBlock.at(body.blocks, bidx)
+    let target = mir_local_mod.index(id)
+    var live: bool = bitset_mod.bit_at(liveness.live_out, bidx * liveness.wpr, target)
+    live = point_query_mod.single_local_terminator(live, bb.terminator, id)
+    let ns = Vec_Statement.len(bb.statements)
+    var i: usize = ns
+    loop decreases i {
+        if i == 0 { break }
+        i -= 1
+        if i <= index { break }
+        let s = Vec_Statement.at(bb.statements, i)
+        live = point_query_mod.single_local_stmt(live, s, id)
+    }
+    return !live
+}
+
+public function is_last_use(liveness: Liveness, body: mir_body_mod.MirBody, id: mir_local_mod.LocalId, b: mir_block_mod.BlockId, index: usize) -> bool {
+    return dead_after(liveness, body, id, b, index)
+}
+
+public function dead_after_terminator(liveness: Liveness, body: mir_body_mod.MirBody, id: mir_local_mod.LocalId, b: mir_block_mod.BlockId) -> bool {
+    let bidx = mir_block_mod.index(b)
+    if bidx >= block_count(liveness) { return false }
+    return bitset_mod.bit_at(liveness.live_out, bidx * liveness.wpr, mir_local_mod.index(id)) == false
+}

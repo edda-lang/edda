@@ -1,0 +1,131 @@
+
+module compile.member.cache.key.hash
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.text.string
+import cache.addr.hash as hash_mod
+import source.file as source_file_mod
+import source.map as source_map_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.core.option.Option(String)
+
+
+public function source_hash_of(
+    map: source_map_mod.SourceMap,
+    program_name: String,
+    workspace_root: String,
+    stdlib_root: String,
+    allocator: Allocator,
+) -> hash_mod.ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    let exe = env.self_exe_path(allocator)
+    let epoch = match env.read_optional("EDDA_CACHE_EPOCH", allocator) {
+        case .some(let v) => v
+        case .none => ""
+    }
+    let ws_norm = string.replace(workspace_root, "\\", "/", allocator)?
+    let std_norm = string.replace(stdlib_root, "\\", "/", allocator)?
+    var acc = meta_hash(exe, epoch, std_norm, program_name, allocator)?
+    let n = source_map_mod.file_count(map)
+    for i in 0..<n {
+        let f = source_map_mod.file_at(map, i)
+        let name_norm = string.replace(source_file_mod.name(f), "\\", "/", allocator)?
+        let rel = strip_root(name_norm, ws_norm, std_norm, allocator)?
+        let per = file_hash(rel, source_file_mod.content(f), allocator)?
+        acc = xor_hash(acc, per)
+    }
+    return acc
+}
+
+
+function meta_hash(
+    exe: String,
+    epoch: String,
+    std: String,
+    program_name: String,
+    allocator: Allocator,
+) -> hash_mod.ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    Vec_u8.extend_from_slice(mutable v, exe.bytes(), allocator)?
+    Vec_u8.push(mutable v, 0, allocator)?
+    Vec_u8.extend_from_slice(mutable v, epoch.bytes(), allocator)?
+    Vec_u8.push(mutable v, 0, allocator)?
+    Vec_u8.extend_from_slice(mutable v, std.bytes(), allocator)?
+    Vec_u8.push(mutable v, 0, allocator)?
+    Vec_u8.extend_from_slice(mutable v, program_name.bytes(), allocator)?
+    let bytes = Vec_u8.into_array(take v, allocator)?
+    return hash_mod.hash_bytes(bytes, allocator)?
+}
+
+
+function file_hash(
+    rel: String,
+    content: String,
+    allocator: Allocator,
+) -> hash_mod.ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    Vec_u8.extend_from_slice(mutable v, rel.bytes(), allocator)?
+    Vec_u8.push(mutable v, 0, allocator)?
+    Vec_u8.extend_from_slice(mutable v, content.bytes(), allocator)?
+    let bytes = Vec_u8.into_array(take v, allocator)?
+    return hash_mod.hash_bytes(bytes, allocator)?
+}
+
+
+function xor_hash(a: hash_mod.ArtifactHash, b: hash_mod.ArtifactHash) -> hash_mod.ArtifactHash {
+    return hash_mod.ArtifactHash {
+        w0: a.w0 ^ b.w0,
+        w1: a.w1 ^ b.w1,
+        w2: a.w2 ^ b.w2,
+        w3: a.w3 ^ b.w3,
+    }
+}
+
+
+function strip_root(
+    name_norm: String,
+    ws_norm: String,
+    std_norm: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let ws_pre = string.concat(ws_norm, "/", allocator)?
+    if string.starts_with(name_norm, ws_pre) {
+        return slice_suffix_to_string(name_norm.bytes(), ws_pre.len(), allocator)?
+    }
+    if std_norm.len() > 0 {
+        let std_pre = string.concat(std_norm, "/", allocator)?
+        if string.starts_with(name_norm, std_pre) {
+            return slice_suffix_to_string(name_norm.bytes(), std_pre.len(), allocator)?
+        }
+    }
+    return string.clone(name_norm, allocator)?
+}
+
+
+function slice_suffix_to_string(b: [u8], start: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = b.len()
+    if start >= n {
+        return ""
+    }
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    Vec_u8.extend_from_slice(mutable v, b[start..], allocator)?
+    let bytes = Vec_u8.into_array(take v, allocator)?
+    return string.from_owned_utf8(take bytes)
+}

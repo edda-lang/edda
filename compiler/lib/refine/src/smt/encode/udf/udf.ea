@@ -1,0 +1,214 @@
+
+module refine.smt.encode.udf.udf
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as ast_tree
+import types.check.env.builtins as builtins_mod
+import types.ty.interner as ty_interner_mod
+import intern.symbol as symbol_mod
+import local.discharge.context as ctx_mod
+import local.discharge.error as err_mod
+import local.smt.render.sort as sort_mod
+import local.smt.term as term_mod
+import local.smt.encode.encres as result_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(ast_tree.CallArg)
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.core.option.Option(symbol_mod.Symbol)
+
+
+public function encode_call(
+    callee_box: Box_Expr,
+    args: Vec_CallArg.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let callee_expr = Box_Expr.get(callee_box)
+    return match callee_expr.kind {
+        case .path(let path) => encode_path_callee(path, args, vars, ty_interner, builtins, allocator, encode_fn)?
+        case .field(let receiver_box, let name) => {
+            let receiver_expr = Box_Expr.get(receiver_box)
+            match encode_fn(receiver_expr, vars, ty_interner, builtins, allocator)? {
+                case .unsupported(let frag) => result_mod.EncodeResult.unsupported(fragment: frag)
+                case .encoded(let receiver_term) => {
+                    uninit method_args: Vec_SmtTerm.Vec
+                    Vec_SmtTerm.new(init method_args, allocator)?
+                    Vec_SmtTerm.push(mutable method_args, take receiver_term, allocator)?
+                    finish_udf(name.name, mutable method_args, args, vars, ty_interner, builtins, allocator, encode_fn)?
+                }
+            }
+        }
+        case _ => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "function call in refinement requires a path or field callee",
+            ),
+        )
+    }
+}
+
+
+function encode_path_callee(
+    path: ident_mod.Path,
+    args: Vec_CallArg.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let nseg = Vec_Ident.len(path.segments)
+    if nseg == 0 {
+        return result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "empty callee path in refinement",
+            ),
+        )
+    }
+    if nseg == 1 {
+        uninit fn_args: Vec_SmtTerm.Vec
+        Vec_SmtTerm.new(init fn_args, allocator)?
+        return finish_udf(Vec_Ident.at(path.segments, 0).name, mutable fn_args, args, vars, ty_interner, builtins, allocator, encode_fn)?
+    }
+    return match receiver_var_term(Vec_Ident.at(path.segments, 0).name, vars, ty_interner, allocator)? {
+        case .unsupported(let frag) => result_mod.EncodeResult.unsupported(fragment: frag)
+        case .encoded(let recv_term) => {
+            let projected = project_segments(take recv_term, path, 1 as usize, nseg, allocator)?
+            uninit method_args: Vec_SmtTerm.Vec
+            Vec_SmtTerm.new(init method_args, allocator)?
+            Vec_SmtTerm.push(mutable method_args, take projected, allocator)?
+            finish_udf(Vec_Ident.at(path.segments, nseg - 1).name, mutable method_args, args, vars, ty_interner, builtins, allocator, encode_fn)?
+        }
+    }
+}
+
+
+function project_segments(
+    base: take term_mod.SmtTerm,
+    path: ident_mod.Path,
+    i: usize,
+    nseg: usize,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+    requires nseg >= 1
+    requires i <= nseg
+    decreases (nseg - i)
+{
+    if i >= nseg - 1 {
+        return base
+    }
+    uninit proj_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init proj_args, allocator)?
+    Vec_SmtTerm.push(mutable proj_args, take base, allocator)?
+    let next = term_mod.SmtTerm.app(
+        op: term_mod.SmtOp.udf(name: Vec_Ident.at(path.segments, i).name),
+        args: proj_args,
+    )
+    return project_segments(take next, path, i + 1, nseg, allocator)?
+}
+
+
+function receiver_var_term(
+    sym: symbol_mod.Symbol,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match ctx_mod.lookup_variable(vars, sym) {
+        case .none => result_mod.EncodeResult.unsupported(
+            fragment: err_mod.UnsupportedFragment.other(
+                message: "unbound receiver in refinement method call",
+            ),
+        )
+        case .some(let ty) => match sort_mod.sort_of(ty, ty_interner, allocator)? {
+            case .unsupported(let frag) => result_mod.EncodeResult.unsupported(fragment: frag)
+            case .ok(let sort) => result_mod.EncodeResult.encoded(
+                term: term_mod.SmtTerm.var_(name: sym, sort: sort),
+            )
+        }
+    }
+}
+
+
+public function encode_method_call(
+    receiver_box: Box_Expr,
+    name: ident_mod.Ident,
+    args: Vec_CallArg.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let receiver_expr = Box_Expr.get(receiver_box)
+    let receiver_result = encode_fn(receiver_expr, vars, ty_interner, builtins, allocator)?
+    return match receiver_result {
+        case .unsupported(let fragment) => result_mod.EncodeResult.unsupported(fragment: fragment)
+        case .encoded(let receiver_term) => {
+            uninit encoded_args: Vec_SmtTerm.Vec
+            Vec_SmtTerm.new(init encoded_args, allocator)?
+            Vec_SmtTerm.push(mutable encoded_args, take receiver_term, allocator)?
+            finish_udf(name.name, mutable encoded_args, args, vars, ty_interner, builtins, allocator, encode_fn)?
+        }
+    }
+}
+
+
+function finish_udf(
+    fn_sym: symbol_mod.Symbol,
+    acc: mutable Vec_SmtTerm.Vec,
+    args: Vec_CallArg.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+    encode_fn: function(e: ast_tree.Expr, vars: Vec_VariableBinding.Vec, ty_interner: ty_interner_mod.Interner, builtins: builtins_mod.Builtins, allocator: Allocator) -> result_mod.EncodeResult with {allocator, err: alloc.AllocError, divergence},
+) -> result_mod.EncodeResult
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_CallArg.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_CallArg.at(args, i)
+        match arg.name {
+            case .some(_) => return result_mod.EncodeResult.unsupported(
+                fragment: err_mod.UnsupportedFragment.other(
+                    message: "named-argument call in refinement",
+                ),
+            )
+            case .none => {}
+        }
+        match encode_fn(arg.expr, vars, ty_interner, builtins, allocator)? {
+            case .unsupported(let fragment) => return result_mod.EncodeResult.unsupported(fragment: fragment)
+            case .encoded(let arg_term) =>
+                Vec_SmtTerm.push(mutable acc, take arg_term, allocator)?
+        }
+        i = i + 1
+    }
+    return result_mod.EncodeResult.encoded(
+        term: term_mod.SmtTerm.app(op: term_mod.SmtOp.udf(name: fn_sym), args: acc),
+    )
+}

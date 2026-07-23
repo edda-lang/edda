@@ -1,0 +1,143 @@
+
+module types.check.pass.modes.overgrab.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import hir.build.file as hir_file
+import hir.item as hir_item
+import hir.tree as hir_tree
+import syntax.ast.ops as ast_ops
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+import local.check.pass.modes.overgrab.scan as scan_mod
+
+
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+
+
+public function check_mode_overgrab(
+    file: hir_file.HirFile,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    walk_items(file, file.items, mutable diags, allocator)?
+}
+
+
+function walk_items(
+    file: hir_file.HirFile,
+    items: Vec_HItem.Vec,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        walk_item(file, Vec_HItem.at(items, i), mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function walk_item(
+    file: hir_file.HirFile,
+    item: hir_item.HItem,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match item.kind {
+        case .function_(let sig_box, let body) => {
+            check_params(file, Box_HFnSignature.get(sig_box).params, body, mutable diags, allocator)?
+        }
+        case .spec_decl(_, let inner_items) => {
+            walk_items(file, inner_items, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function check_params(
+    file: hir_file.HirFile,
+    params: Vec_HParam.Vec,
+    body: hir_tree.HBlock,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HParam.len(params)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        check_param(file, Vec_HParam.at(params, i), body, mutable diags, allocator)?
+        i = i + 1 as usize
+    }
+}
+
+
+function check_param(
+    file: hir_file.HirFile,
+    p: hir_item.HParam,
+    body: hir_tree.HBlock,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match p.mode {
+        case .mutable_ => {
+            if !scan_mod.block_exercises_mode(body, p.def_id, ast_ops.CallMode.mutable_) {
+                emit_overgrab(file, p, "mutable", mutable diags, allocator)?
+            }
+        }
+        case .take_ => {
+            if !scan_mod.block_exercises_mode(body, p.def_id, ast_ops.CallMode.take_) {
+                emit_overgrab(file, p, "take", mutable diags, allocator)?
+            }
+        }
+        case .default => ()
+        case .init_ => ()
+    }
+}
+
+
+function emit_overgrab(
+    file: hir_file.HirFile,
+    p: hir_item.HParam,
+    keyword: String,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match hir_file.span_of_opt(file, p.node_id) {
+        case .some(let span) => {
+            let msg = overgrab_message(keyword, allocator)?
+            let d = diag_mod.warn_at(code_mod.mode_overgrab(), span, msg)
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+
+function overgrab_message(keyword: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat("parameter requests `", keyword, allocator)?
+    return string.concat(p1, "` but the function body never exercises it at that strength", allocator)?
+}

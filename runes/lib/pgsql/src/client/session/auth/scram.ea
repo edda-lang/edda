@@ -1,0 +1,298 @@
+
+module pgsql.client.session.auth.scram
+
+import std.mem.alloc
+import std.text.string
+import std.crypto.hash.sha256 as sha2
+import std.crypto.mac.hmac.sha256 as hmac
+import std.encoding.base64
+import local.error
+import local.client.session.auth.sasl
+
+
+public type ScramSession {
+    client_nonce: [u8]
+    client_first_bare: [u8]
+    password: [u8]
+    salted_password: [u8]
+    auth_message: [u8]
+}
+
+public type ScramFirstStep {
+    bytes: [u8]
+    session: ScramSession
+}
+
+public type ScramSecondStep {
+    bytes: [u8]
+    session: ScramSession
+}
+
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _copy_bytes(dst: mutable [u8], src: [u8], n: usize) -> () {
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        dst[i] = src[i]
+        i = i + (1 as usize)
+    }
+}
+
+function _xor_in_place(dst: mutable [u8], src: [u8], n: usize) -> () {
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        dst[i] = dst[i] ^ src[i]
+        i = i + (1 as usize)
+    }
+}
+
+function _write_at(dst: mutable [u8], off: usize, src: [u8]) -> usize {
+    let n = src.len()
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        dst[off + i] = src[i]
+        i = i + (1 as usize)
+    }
+    return off + n
+}
+
+function _ct_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var diff: u8 = 0 as u8
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        diff = diff | (a[i] ^ b[i])
+        i = i + (1 as usize)
+    }
+    return diff == (0 as u8)
+}
+
+
+function _hi_sha256(
+    password: [u8],
+    salt: [u8],
+    iterations: i64,
+    out: mutable [u8],
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let slen = salt.len()
+    var salted_msg = _alloc_u8_slots(allocator, slen + (4 as usize))?
+    _copy_bytes(mutable salted_msg, salt, slen)
+    salted_msg[slen] = 0 as u8
+    salted_msg[slen + (1 as usize)] = 0 as u8
+    salted_msg[slen + (2 as usize)] = 0 as u8
+    salted_msg[slen + (3 as usize)] = 1 as u8
+
+    hmac.hmac_sha256(password, salted_msg, mutable out, 0 as usize)
+
+    if iterations <= (1 as i64) { return }
+
+    var u_prev = _alloc_u8_slots(allocator, 32 as usize)?
+    _copy_bytes(mutable u_prev, out, 32 as usize)
+    var u_j = _alloc_u8_slots(allocator, 32 as usize)?
+
+    var j: i64 = 2 as i64
+    loop decreases iterations - j + (1 as i64) {
+        if j > iterations { break }
+        hmac.hmac_sha256(password, u_prev, mutable u_j, 0 as usize)
+        _xor_in_place(mutable out, u_j, 32 as usize)
+        _copy_bytes(mutable u_prev, u_j, 32 as usize)
+        j = j + (1 as i64)
+    }
+}
+
+
+function _client_first_prefix() -> [u8] { return "n,,n=,r=".bytes() }
+
+function _client_first_bare_prefix() -> [u8] { return "n=,r=".bytes() }
+
+function _client_final_header() -> [u8] { return "c=biws,r=".bytes() }
+
+function _client_key_marker() -> [u8] { return "Client Key".bytes() }
+
+function _server_key_marker() -> [u8] { return "Server Key".bytes() }
+
+
+public function scram_begin(
+    password: [u8],
+    client_nonce: [u8],
+    allocator: Allocator,
+) -> ScramFirstStep
+    with {allocator, err: alloc.AllocError}
+{
+    let prefix = _client_first_prefix()
+    let plen = prefix.len()
+    let nlen = client_nonce.len()
+    var bytes = _alloc_u8_slots(allocator, plen + nlen)?
+    let _ = _write_at(mutable bytes, 0 as usize, prefix)
+    let _ = _write_at(mutable bytes, plen, client_nonce)
+
+    let bare_prefix = _client_first_bare_prefix()
+    let blen = bare_prefix.len()
+    var bare = _alloc_u8_slots(allocator, blen + nlen)?
+    let _ = _write_at(mutable bare, 0 as usize, bare_prefix)
+    let _ = _write_at(mutable bare, blen, client_nonce)
+
+    let empty = _alloc_u8_slots(allocator, 0 as usize)?
+    let session = ScramSession {
+        client_nonce: client_nonce,
+        client_first_bare: bare,
+        password: password,
+        salted_password: empty,
+        auth_message: empty,
+    }
+    return ScramFirstStep { bytes: bytes, session: session }
+}
+
+
+function _has_prefix(combined: [u8], prefix: [u8]) -> bool {
+    let plen = prefix.len()
+    if combined.len() < plen { return false }
+    var i: usize = 0 as usize
+    loop decreases plen - i {
+        if i >= plen { break }
+        if combined[i] != prefix[i] { return false }
+        i = i + (1 as usize)
+    }
+    return true
+}
+
+
+public function scram_continue(
+    session: ScramSession,
+    server_first: [u8],
+    allocator: Allocator,
+) -> ScramSecondStep
+    with {allocator, err: alloc.AllocError, err: error.AuthError}
+{
+    let parsed = handle err: error.ProtocolError as e -> match e {
+        case .unsupported_protocol_version => raise error.AuthError.scram_mandatory_extension
+        case _                             => raise error.AuthError.malformed_scram_message
+    } {
+        sasl.parse_server_first(server_first)?
+    }
+    if !_has_prefix(parsed.combined_nonce, session.client_nonce) {
+        raise error.AuthError.scram_nonce_mismatch
+    }
+    if parsed.iterations < (1 as i64) {
+        raise error.AuthError.malformed_scram_message
+    }
+
+    let salt = handle err: base64.Base64Error -> (raise error.AuthError.malformed_scram_message) {
+        let salt_str = string.bytes_slice_to_string(parsed.salt_b64, 0, parsed.salt_b64.len(), allocator)?
+        base64.decode(salt_str, allocator)?
+    }
+    var salted_password = _alloc_u8_slots(allocator, 32 as usize)?
+    let _ = handle err: alloc.AllocError -> (raise error.AuthError.out_of_memory) {
+        _hi_sha256(
+            session.password,
+            salt,
+            parsed.iterations,
+            mutable salted_password,
+            allocator,
+        )?
+    }
+
+    let header = _client_final_header()
+    let hlen = header.len()
+    let clen = parsed.combined_nonce.len()
+    var cfinal_wp = _alloc_u8_slots(allocator, hlen + clen)?
+    let _ = _write_at(mutable cfinal_wp, 0 as usize, header)
+    let _ = _write_at(mutable cfinal_wp, hlen, parsed.combined_nonce)
+
+    let bare = session.client_first_bare
+    let auth_message_len = bare.len() + (1 as usize) + server_first.len()
+        + (1 as usize) + cfinal_wp.len()
+    var auth_message = _alloc_u8_slots(allocator, auth_message_len)?
+    var p: usize = _write_at(mutable auth_message, 0 as usize, bare)
+    auth_message[p] = 44 as u8
+    p = p + (1 as usize)
+    p = _write_at(mutable auth_message, p, server_first)
+    auth_message[p] = 44 as u8
+    p = p + (1 as usize)
+    let _ = _write_at(mutable auth_message, p, cfinal_wp)
+
+    var client_key = _alloc_u8_slots(allocator, 32 as usize)?
+    hmac.hmac_sha256(salted_password, _client_key_marker(), mutable client_key, 0 as usize)
+    var stored_key = _alloc_u8_slots(allocator, 32 as usize)?
+    sha2.sha256(client_key, mutable stored_key, 0 as usize)
+    var client_signature = _alloc_u8_slots(allocator, 32 as usize)?
+    hmac.hmac_sha256(stored_key, auth_message, mutable client_signature, 0 as usize)
+    var client_proof = _alloc_u8_slots(allocator, 32 as usize)?
+    _copy_bytes(mutable client_proof, client_key, 32 as usize)
+    _xor_in_place(mutable client_proof, client_signature, 32 as usize)
+
+    let proof_b64_str = handle err: alloc.AllocError -> (raise error.AuthError.out_of_memory) {
+        base64.encode(client_proof, allocator)?
+    }
+    let proof_b64 = proof_b64_str.bytes()
+    let pblen = proof_b64.len()
+    let client_final_len = cfinal_wp.len() + (3 as usize) + pblen
+    var client_final = _alloc_u8_slots(allocator, client_final_len)?
+    var q: usize = _write_at(mutable client_final, 0 as usize, cfinal_wp)
+    client_final[q] = 44 as u8
+    q = q + (1 as usize)
+    client_final[q] = 112 as u8
+    q = q + (1 as usize)
+    client_final[q] = 61 as u8
+    q = q + (1 as usize)
+    let _ = _write_at(mutable client_final, q, proof_b64)
+
+    let updated = ScramSession {
+        client_nonce: session.client_nonce,
+        client_first_bare: session.client_first_bare,
+        password: session.password,
+        salted_password: salted_password,
+        auth_message: auth_message,
+    }
+    return ScramSecondStep { bytes: client_final, session: updated }
+}
+
+
+public function scram_finish(
+    session: ScramSession,
+    server_final: [u8],
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error.AuthError}
+{
+    let parsed = handle err: error.ProtocolError -> (raise error.AuthError.malformed_scram_message) {
+        sasl.parse_server_final(server_final)?
+    }
+    match parsed {
+        case .err(let reason) => raise error.AuthError.scram_server_error(reason: reason)
+        case .ok(let verifier_b64) => {
+            let verifier = handle err: base64.Base64Error -> (raise error.AuthError.malformed_scram_message) {
+                let verifier_str = string.bytes_slice_to_string(verifier_b64, 0, verifier_b64.len(), allocator)?
+                base64.decode(verifier_str, allocator)?
+            }
+            var server_key = _alloc_u8_slots(allocator, 32 as usize)?
+            hmac.hmac_sha256(
+                session.salted_password,
+                _server_key_marker(),
+                mutable server_key,
+                0 as usize,
+            )
+            var expected = _alloc_u8_slots(allocator, 32 as usize)?
+            hmac.hmac_sha256(
+                server_key,
+                session.auth_message,
+                mutable expected,
+                0 as usize,
+            )
+            if !_ct_eq(verifier, expected) {
+                raise error.AuthError.scram_server_signature_mismatch
+            }
+        }
+    }
+}

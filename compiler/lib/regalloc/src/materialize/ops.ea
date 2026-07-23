@@ -1,0 +1,1361 @@
+
+module regalloc.materialize.ops
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import target.triple as triple_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.hlir.op as hlir_op_mod
+
+import local.frame.frame as frame_mod
+import local.materialize.rewrite.subst as subst_mod
+import local.materialize.ops.aapcs64 as aapcs64_mod
+import local.materialize.ops.shared as shared_mod
+
+
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+
+
+spec std.core.option.Option(i32)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function rewrite_op(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    op: lir_op_mod.LirOp,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match op.kind {
+        case .mov(let src, let dst) => rw_mov(mutable body, mutable new_ops, src, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .copy_(let src, let dst) => rw_copy(mutable body, mutable new_ops, src, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .constant_(let c, let dst) => rw_constant(mutable body, mutable new_ops, c, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .binary(let bop, let lhs, let rhs, let dst) => rw_binary(mutable body, mutable new_ops, bop, lhs, rhs, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .unary(let uop, let operand, let dst) => rw_unary(mutable body, mutable new_ops, uop, operand, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .convert_(let src, let to_width, let to_signed, let kind, let dst) => rw_convert(mutable body, mutable new_ops, src, to_width, to_signed, kind, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .load(let addr, let dst, let width) => rw_load(mutable body, mutable new_ops, addr, dst, width, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .store(let value, let addr, let width) => rw_store(mutable body, mutable new_ops, value, addr, width, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .call_(let callee, let args, let return_) => rw_call(mutable body, mutable new_ops, callee, args, return_, op.origin, op.flags, layout, framebase, agg_base, target, allocator)?
+        case .call_indirect(let callee, let args, let return_) => rw_call_indirect(mutable body, mutable new_ops, callee, args, return_, op.origin, op.flags, layout, framebase, agg_base, target, allocator)?
+        case .make_closure(let code, let env, let dst) => rw_make_closure(mutable body, mutable new_ops, code, env, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .stack_addr(let bytes, let dst) => rw_stack_addr(mutable body, mutable new_ops, bytes, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .err_flag(let dst) => rw_err_flag(mutable body, mutable new_ops, dst, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .bounds_check(let index, let len) => rw_bounds_check(mutable body, mutable new_ops, index, len, op.origin, op.flags, layout, framebase, target, allocator)?
+        case .cmov_carry(_, _, _) => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: cmov_carry is minted during call materialization and must not appear in pre-materialize LIR",
+        )
+    }
+}
+
+
+function rw_bounds_check(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    index: lir_reg_mod.Operand,
+    len: lir_reg_mod.Operand,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_index = subst_mod.subst_operand(mutable body, mutable new_ops, index, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    let s_len = subst_mod.subst_operand(mutable body, mutable new_ops, len, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.bounds_check(index: s_index, len: s_len), allocator)?
+}
+
+
+function rw_err_flag(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.err_flag(dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.err_flag(dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_stack_addr(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    bytes: u32,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let disp = match frame_mod.buffer_disp(layout, dst.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: stack_addr without a reserved frame buffer",
+        )
+    }
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: dst), allocator)?
+        case .some(let sd) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, sd, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_make_closure(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    code: def_mod.DefId,
+    env: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let disp = match frame_mod.buffer_disp(layout, dst.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: make_closure without a reserved frame buffer",
+        )
+    }
+    let s_code = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.constant_(c: lir_op_mod.LConstant.fn_ref(def: code), dst: s_code), allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, s_code, framebase, disp, origin, allocator)?
+    let s_env = subst_mod.subst_use(mutable body, mutable new_ops, env, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, s_env, framebase, disp +% (8 as i32), origin, allocator)?
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: dst), allocator)?
+        case .some(let sd) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, sd, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_mov(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    src: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_src = subst_mod.subst_operand(mutable body, mutable new_ops, src, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.mov(src: s_src, dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.mov(src: s_src, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_copy(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    src: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_src = subst_mod.subst_use(mutable body, mutable new_ops, src, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.copy_(src: s_src, dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.copy_(src: s_src, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_constant(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    c: lir_op_mod.LConstant,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.constant_(c: c, dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.constant_(c: c, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_binary(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    bop: lir_op_mod.LBinOp,
+    lhs: lir_vreg_mod.LirVRegId,
+    rhs: lir_reg_mod.Operand,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_lhs = subst_mod.subst_use(mutable body, mutable new_ops, lhs, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    let s_rhs = subst_mod.subst_operand(mutable body, mutable new_ops, rhs, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.binary(op: bop, lhs: s_lhs, rhs: s_rhs, dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.binary(op: bop, lhs: s_lhs, rhs: s_rhs, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_unary(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    uop: lir_op_mod.LUnOp,
+    operand: lir_vreg_mod.LirVRegId,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_op = subst_mod.subst_use(mutable body, mutable new_ops, operand, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.unary(op: uop, operand: s_op, dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.unary(op: uop, operand: s_op, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_convert(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    src: lir_vreg_mod.LirVRegId,
+    to_width: u32,
+    to_signed: bool,
+    kind: lir_op_mod.LCastKind,
+    dst: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_src = subst_mod.subst_use(mutable body, mutable new_ops, src, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.convert_(src: s_src, to_width: to_width, to_signed: to_signed, kind: kind, dst: dst), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.convert_(src: s_src, to_width: to_width, to_signed: to_signed, kind: kind, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_load(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    addr: lir_reg_mod.MemRef,
+    dst: lir_vreg_mod.LirVRegId,
+    width: u32,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_addr = subst_mod.subst_memref(mutable body, mutable new_ops, addr, layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, dst.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.load(addr: s_addr, dst: dst, width: width), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, dst.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.load(addr: s_addr, dst: s_dst, width: width), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_store(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    value: lir_vreg_mod.LirVRegId,
+    addr: lir_reg_mod.MemRef,
+    width: u32,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let value_spilled = subst_mod.vreg_spilled(layout, value.raw)
+    let base_spilled = subst_mod.memref_base_spilled(addr, layout)
+    let index_spilled = subst_mod.memref_index_spilled(addr, layout)
+    if value_spilled && base_spilled && index_spilled {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: store with value, base and index all spilled simultaneously needs a third scratch register beyond the two GP scratch regs (see #196)",
+        )
+    }
+    let s_addr = subst_mod.subst_memref(mutable body, mutable new_ops, addr, layout, framebase, origin, target, allocator)?
+    let value_scratch = if base_spilled { subst_mod.scratch_b(target) } else { subst_mod.scratch_a(target) }
+    let s_value = subst_mod.subst_use(mutable body, mutable new_ops, value, value_scratch, layout, framebase, origin, target, allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.store(value: s_value, addr: s_addr, width: width), allocator)?
+}
+
+
+function rw_call(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if hlir_op_mod.is_syscall(flags) {
+        if Vec_LirVRegId.len(args) > (7 as usize) {
+            raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "regalloc.materialize: raw syscall takes at most 7 register operands (number + 6 args)",
+            )
+        }
+        let sc_rsp = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, rsp_preg(), allocator)?
+        stage_slots(mutable body, mutable new_ops, args, false, 0 as u32, agg_base, origin, layout, framebase, sc_rsp, 0 as usize, target, allocator)?
+        load_syscall_pregs(mutable body, mutable new_ops, args, origin, sc_rsp, allocator)?
+        subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: callee, args: args, return_: Option_LirVRegId.none), allocator)?
+        match return_ {
+            case .none => ()
+            case .some(let rv) => syscall_ret(mutable body, mutable new_ops, rv, origin, layout, framebase, target, allocator)?
+        }
+        return ()
+    }
+
+    match flags.intrinsic {
+        case .slice_addr => {
+            rw_slice_addr(mutable body, mutable new_ops, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .slice_from_raw => {
+            rw_slice_from_raw(mutable body, mutable new_ops, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .string_from_raw => {
+            rw_string_from_raw(mutable body, mutable new_ops, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .load_(let width) => {
+            rw_load_intrinsic(mutable body, mutable new_ops, args, return_, width, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .store_(let width) => {
+            rw_store_intrinsic(mutable body, mutable new_ops, args, width, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .fsqrt => {
+            rw_fmath_intrinsic(mutable body, mutable new_ops, lir_op_mod.LUnOp.fsqrt, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .ffloor => {
+            rw_fmath_intrinsic(mutable body, mutable new_ops, lir_op_mod.LUnOp.ffloor, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .fceil => {
+            rw_fmath_intrinsic(mutable body, mutable new_ops, lir_op_mod.LUnOp.fceil, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .ftrunc => {
+            rw_fmath_intrinsic(mutable body, mutable new_ops, lir_op_mod.LUnOp.ftrunc, args, return_, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .bitcast(let width) => {
+            rw_bitcast_intrinsic(mutable body, mutable new_ops, args, return_, width, origin, layout, framebase, target, allocator)?
+            return ()
+        }
+        case .div128 => {
+            match triple_mod.os(target) {
+                case .windows => {
+                    rw_call_div128(mutable body, mutable new_ops, callee, args, origin, flags, layout, framebase, agg_base, target, allocator)?
+                    return ()
+                }
+                case _ => ()
+            }
+        }
+        case _ => ()
+    }
+
+    match triple_mod.arch(target) {
+        case .aarch64 => {
+            aapcs64_mod.rw_call_aapcs64(mutable body, mutable new_ops, callee, args, return_, origin, flags, layout, framebase, agg_base, target, allocator)?
+            return ()
+        }
+        case _ => ()
+    }
+
+    match triple_mod.os(target) {
+        case .windows => ()
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+
+    match flags.intrinsic {
+        case .float_to_wide => {
+            rw_call_float_to_wide(mutable body, mutable new_ops, callee, args, return_, origin, flags, layout, framebase, agg_base, target, allocator)?
+            return ()
+        }
+        case _ => ()
+    }
+
+    let sret = match return_ {
+        case .some(let rv) => lir_reg_mod.is_by_memory(subst_mod.size_of_vreg(body, rv.raw)) && flags.extern_ret_size == (0 as u32)
+        case .none => false
+    }
+    let sret_buf = match return_ {
+        case .some(let rv) => if sret { shared_mod.align16_local(subst_mod.size_of_vreg(body, rv.raw)) } else { 0 as u32 }
+        case .none => 0 as u32
+    }
+
+    let rsp_base = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, rsp_preg(), allocator)?
+
+    stage_slots(mutable body, mutable new_ops, args, sret, sret_buf, agg_base, origin, layout, framebase, rsp_base, 0 as usize, target, allocator)?
+
+    let r11 = shared_mod.stash_callee(mutable body, mutable new_ops, callee, origin, layout, framebase, target, allocator)?
+
+    load_arg_pregs(mutable body, mutable new_ops, args, sret, origin, rsp_base, 0 as usize, allocator)?
+
+    let new_callee = lir_reg_mod.Operand.preg(reg: r11)
+    match return_ {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: new_callee, args: args, return_: return_), allocator)?
+        case .some(let rv) => emit_call_ret(mutable body, mutable new_ops, new_callee, args, rv, origin, flags, layout, framebase, target, allocator)?
+    }
+}
+
+
+function rw_call_div128(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) != (3 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: wide div/rem call expects [lhs, rhs, dst] operands",
+        )
+    }
+    let dst = Vec_LirVRegId.at(args, 2 as usize)
+    let disp = match frame_mod.buffer_disp(layout, dst.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: wide div/rem result buffer not reserved",
+        )
+    }
+    let rsp_base = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, rsp_preg(), allocator)?
+    stage_slots(mutable body, mutable new_ops, args, false, 0 as u32, agg_base, origin, layout, framebase, rsp_base, 0 as usize, target, allocator)?
+    let r11 = shared_mod.stash_callee(mutable body, mutable new_ops, callee, origin, layout, framebase, target, allocator)?
+    load_arg_pregs(mutable body, mutable new_ops, args, false, origin, rsp_base, 0 as usize, allocator)?
+    let new_callee = lir_reg_mod.Operand.preg(reg: r11)
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: new_callee, args: args, return_: Option_LirVRegId.none), allocator)?
+    let x0 = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.fp, lir_reg_mod.PReg { raw: 0 as u32 }, allocator)?
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: framebase),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: disp,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.store(value: x0, addr: addr, width: 16 as u32), allocator)?
+}
+
+
+function emit_call_ret(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    rv: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let rsize = subst_mod.size_of_vreg(body, rv.raw)
+    if lir_reg_mod.is_by_memory(rsize) {
+        rw_call_ret_by_memory(mutable body, mutable new_ops, callee, args, rv, rsize, origin, flags, layout, framebase, target, allocator)?
+        return ()
+    }
+    shared_mod.rw_call_ret(mutable body, mutable new_ops, callee, args, rv, origin, flags, layout, framebase, target, allocator)?
+}
+
+
+function rw_call_ret_by_memory(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    rv: lir_vreg_mod.LirVRegId,
+    rsize: u32,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let disp = match frame_mod.buffer_disp(layout, rv.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: by-memory call return without a reserved frame buffer",
+        )
+    }
+    if hlir_op_mod.is_extern_call(flags) {
+        rw_call_ret_by_memory_extern(mutable body, mutable new_ops, callee, args, rv, rsize, disp, origin, flags, layout, framebase, target, allocator)?
+        return ()
+    }
+    rw_call_ret_by_memory_body_backed(mutable body, mutable new_ops, callee, args, rv, rsize, disp, origin, flags, layout, framebase, target, allocator)?
+}
+
+
+function rw_call_ret_by_memory_body_backed(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    rv: lir_vreg_mod.LirVRegId,
+    rsize: u32,
+    disp: i32,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_ptr = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_a(target), allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: callee, args: args, return_: Option_LirVRegId.some(value: s_ptr)), allocator)?
+    if flags.extern_ret_size != (0 as u32) {
+        subst_mod.store_slot(mutable body, mutable new_ops, s_ptr, framebase, disp, origin, allocator)?
+    } else {
+        let qwords = (shared_mod.align8_local(rsize) / (8 as u32)) as usize
+        var k: usize = 0
+        loop decreases qwords - k {
+            if k >= qwords { break }
+            let chunk = (k * (8 as usize)) as i32
+            let val = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+            let src_addr = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: s_ptr),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: chunk,
+            }
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: src_addr, dst: val, width: 8 as u32), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, val, framebase, disp + chunk, origin, allocator)?
+            k += 1
+        }
+    }
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    let t2_addr = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: t2_addr), allocator)?
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.copy_(src: t2_addr, dst: rv), allocator)?
+        case .some(let sd) => subst_mod.store_slot(mutable body, mutable new_ops, t2_addr, framebase, sd, origin, allocator)?
+    }
+}
+
+
+function rw_call_ret_by_memory_extern(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    rv: lir_vreg_mod.LirVRegId,
+    rsize: u32,
+    disp: i32,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let s_ptr = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_a(target), allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: callee, args: args, return_: Option_LirVRegId.some(value: s_ptr)), allocator)?
+
+    if flags.extern_ret_size != (0 as u32) {
+        subst_mod.store_slot(mutable body, mutable new_ops, s_ptr, framebase, disp, origin, allocator)?
+    } else {
+        let tag_val = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+        let tag_addr = lir_reg_mod.MemRef {
+            base: Option_LirVRegId.some(value: s_ptr),
+            index: Option_LirVRegId.none,
+            scale: 1 as u32,
+            displacement: 0,
+        }
+        subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: tag_addr, dst: tag_val, width: 1 as u32), allocator)?
+        subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.unary(op: lir_op_mod.LUnOp.neg, operand: tag_val, dst: tag_val), allocator)?
+
+        let qwords = (shared_mod.align8_local(rsize) / (8 as u32)) as usize
+        var k: usize = 0
+        loop decreases qwords - k {
+            if k >= qwords { break }
+            let chunk = (k * (8 as usize)) as i32
+            let val = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+            let src_addr = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: s_ptr),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: (8 as i32) + chunk,
+            }
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: src_addr, dst: val, width: 8 as u32), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, val, framebase, disp + chunk, origin, allocator)?
+            k += 1
+        }
+    }
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    let t_addr = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: t_addr), allocator)?
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.copy_(src: t_addr, dst: rv), allocator)?
+        case .some(let sd) => subst_mod.store_slot(mutable body, mutable new_ops, t_addr, framebase, sd, origin, allocator)?
+    }
+}
+
+
+function rw_call_float_to_wide(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_reg_mod.Operand,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let rv = require_return(return_, "regalloc.materialize: float-to-wide runtime call requires a return value")?
+    let rsp_base = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, rsp_preg(), allocator)?
+    stage_slots(mutable body, mutable new_ops, args, false, 0 as u32, agg_base, origin, layout, framebase, rsp_base, 0 as usize, target, allocator)?
+    let r11 = shared_mod.stash_callee(mutable body, mutable new_ops, callee, origin, layout, framebase, target, allocator)?
+    let raw_arg = Vec_LirVRegId.at(args, 0 as usize)
+    let xmm0_arg = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.fp, lir_reg_mod.PReg { raw: 0 as u32 }, allocator)?
+    match subst_mod.slot_disp(layout, raw_arg.raw) {
+        case .some(let d) => {
+            let home = lir_reg_mod.MemRef {
+                base: Option_LirVRegId.some(value: framebase),
+                index: Option_LirVRegId.none,
+                scale: 1 as u32,
+                displacement: d,
+            }
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: home, dst: xmm0_arg, width: 8 as u32), allocator)?
+        }
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.copy_(src: raw_arg, dst: xmm0_arg), allocator)?
+    }
+    let new_callee = lir_reg_mod.Operand.preg(reg: r11)
+    uninit call_args: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init call_args, allocator)?
+    Vec_LirVRegId.push(mutable call_args, take xmm0_arg, allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: new_callee, args: call_args, return_: Option_LirVRegId.none), allocator)?
+    let xmm0 = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.fp, lir_reg_mod.PReg { raw: 0 as u32 }, allocator)?
+    let disp = match frame_mod.buffer_disp(layout, rv.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: float-to-wide call without a reserved frame buffer",
+        )
+    }
+    let dst_addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: framebase),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: disp,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.store(value: xmm0, addr: dst_addr, width: 16 as u32), allocator)?
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: rv), allocator)?
+        case .some(let sd) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, sd, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_call_indirect(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    callee: lir_vreg_mod.LirVRegId,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    flags: hlir_op_mod.OpFlags,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    agg_base: u32,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match triple_mod.arch(target) {
+        case .aarch64 => {
+            aapcs64_mod.rw_call_indirect_aapcs64(mutable body, mutable new_ops, callee, args, return_, origin, flags, layout, framebase, agg_base, target, allocator)?
+            return ()
+        }
+        case _ => ()
+    }
+
+    match triple_mod.os(target) {
+        case .windows => ()
+        case _ => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+    }
+
+    let sret = match return_ {
+        case .some(let rv) => lir_reg_mod.is_by_memory(subst_mod.size_of_vreg(body, rv.raw))
+        case .none => false
+    }
+    let sret_buf = match return_ {
+        case .some(let rv) => if sret { shared_mod.align16_local(subst_mod.size_of_vreg(body, rv.raw)) } else { 0 as u32 }
+        case .none => 0 as u32
+    }
+
+    let rsp_base = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, rsp_preg(), allocator)?
+
+    stage_slots(mutable body, mutable new_ops, args, sret, sret_buf, agg_base, origin, layout, framebase, rsp_base, 1 as usize, target, allocator)?
+
+    let env_slot: usize = if sret { 1 as usize } else { 0 as usize }
+    let s_addr_env = subst_mod.subst_use(mutable body, mutable new_ops, callee, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    let env_v = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_a(target), allocator)?
+    let env_ref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_addr_env),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 8 as i32,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: env_ref, dst: env_v, width: 8 as u32), allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, env_v, rsp_base, shared_mod.home_disp(env_slot), origin, allocator)?
+
+    let s_addr_code = subst_mod.subst_use(mutable body, mutable new_ops, callee, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    let code_v = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, subst_mod.scratch_b(target), allocator)?
+    let code_ref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_addr_code),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: code_ref, dst: code_v, width: 8 as u32), allocator)?
+
+    load_arg_pregs(mutable body, mutable new_ops, args, sret, origin, rsp_base, 1 as usize, allocator)?
+
+    let new_callee = lir_reg_mod.Operand.preg(reg: subst_mod.scratch_b(target))
+    match return_ {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, flags, lir_op_mod.LirOpKind.call_(callee: new_callee, args: args, return_: return_), allocator)?
+        case .some(let rv) => emit_call_ret(mutable body, mutable new_ops, new_callee, args, rv, origin, flags, layout, framebase, target, allocator)?
+    }
+}
+
+
+function stage_slots(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    sret: bool,
+    sret_buf: u32,
+    agg_base: u32,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    rsp_base: lir_vreg_mod.LirVRegId,
+    lead: usize,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let shift: usize = (if sret { 1 as usize } else { 0 as usize }) + lead
+    var cursor: u32 = agg_base
+
+    if sret {
+        let addr = shared_mod.compute_rsp_addr(mutable body, mutable new_ops, rsp_base, cursor as i32, subst_mod.scratch_a(target), origin, allocator)?
+        subst_mod.store_slot(mutable body, mutable new_ops, addr, rsp_base, shared_mod.home_disp(0), origin, allocator)?
+        cursor = cursor +% sret_buf
+    }
+
+    let n = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = Vec_LirVRegId.at(args, i)
+        let slot = i + shift
+        let asize = subst_mod.size_of_vreg(body, a.raw)
+        if lir_reg_mod.is_by_memory(asize) && !subst_mod.is_ref_vreg(body, a.raw) {
+            shared_mod.copy_aggregate(mutable body, mutable new_ops, a, rsp_base, cursor, asize, layout, framebase, origin, target, allocator)?
+            let addr = shared_mod.compute_rsp_addr(mutable body, mutable new_ops, rsp_base, cursor as i32, subst_mod.scratch_a(target), origin, allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, addr, rsp_base, shared_mod.home_disp(slot), origin, allocator)?
+            cursor = cursor +% shared_mod.align16_local(asize)
+        } else {
+            let s_arg = subst_mod.subst_use(mutable body, mutable new_ops, a, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_arg, rsp_base, shared_mod.home_disp(slot), origin, allocator)?
+        }
+        i += 1
+    }
+}
+
+
+function load_arg_pregs(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    sret: bool,
+    origin: node_mod.NodeId,
+    rsp_base: lir_vreg_mod.LirVRegId,
+    lead: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let shift: usize = (if sret { 1 as usize } else { 0 as usize }) + lead
+    let nslots = Vec_LirVRegId.len(args) + shift
+    var slot: usize = 0
+    loop decreases nslots - slot {
+        if slot >= nslots { break }
+        if slot >= 4 { break }
+        let cls = slot_class(body, args, sret, slot, lead)
+        let dstv = subst_mod.mint_pinned(mutable body, cls, msvc_arg_preg(cls, slot), allocator)?
+        let addr = shared_mod.rsp_memref(rsp_base, shared_mod.home_disp(slot))
+        subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: addr, dst: dstv, width: 8 as u32), allocator)?
+        slot += 1
+    }
+}
+
+
+function slot_class(
+    body: lir_body_mod.LirBody,
+    args: Vec_LirVRegId.Vec,
+    sret: bool,
+    slot: usize,
+    lead: usize,
+) -> lir_reg_mod.RegClass {
+    let shift: usize = (if sret { 1 as usize } else { 0 as usize }) + lead
+    if slot < shift { return lir_reg_mod.RegClass.gp }
+    let arg_idx = slot - shift
+    let a = Vec_LirVRegId.at(args, arg_idx)
+    if lir_reg_mod.is_by_memory(subst_mod.size_of_vreg(body, a.raw)) { return lir_reg_mod.RegClass.gp }
+    return subst_mod.class_of(body, a.raw)
+}
+
+
+function rsp_preg() -> lir_reg_mod.PReg {
+    return lir_reg_mod.PReg { raw: 4 as u32 }
+}
+
+
+function msvc_arg_preg(class_: lir_reg_mod.RegClass, i: usize) -> lir_reg_mod.PReg {
+    return match class_ {
+        case .fp => lir_reg_mod.PReg { raw: i as u32 }
+        case _ => msvc_gp_arg_raw(i)
+    }
+}
+
+
+function msvc_gp_arg_raw(i: usize) -> lir_reg_mod.PReg {
+    if i == 0 { return lir_reg_mod.PReg { raw: 1 as u32 } }
+    if i == 1 { return lir_reg_mod.PReg { raw: 2 as u32 } }
+    if i == 2 { return lir_reg_mod.PReg { raw: 8 as u32 } }
+    return lir_reg_mod.PReg { raw: 9 as u32 }
+}
+
+
+function load_syscall_pregs(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    origin: node_mod.NodeId,
+    rsp_base: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_LirVRegId.len(args)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if i >= (7 as usize) { break }
+        let dstv = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, syscall_arg_raw(i), allocator)?
+        let addr = shared_mod.rsp_memref(rsp_base, shared_mod.home_disp(i))
+        subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: addr, dst: dstv, width: 8 as u32), allocator)?
+        i += 1
+    }
+}
+
+
+function syscall_ret(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    rv: lir_vreg_mod.LirVRegId,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let rax_v = subst_mod.mint_pinned(mutable body, lir_reg_mod.RegClass.gp, syscall_arg_raw(0 as usize), allocator)?
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.copy_(src: rax_v, dst: rv), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.copy_(src: rax_v, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function syscall_arg_raw(i: usize) -> lir_reg_mod.PReg {
+    if i == 0 { return lir_reg_mod.PReg { raw: 0 as u32 } }
+    if i == 1 { return lir_reg_mod.PReg { raw: 7 as u32 } }
+    if i == 2 { return lir_reg_mod.PReg { raw: 6 as u32 } }
+    if i == 3 { return lir_reg_mod.PReg { raw: 2 as u32 } }
+    if i == 4 { return lir_reg_mod.PReg { raw: 10 as u32 } }
+    if i == 5 { return lir_reg_mod.PReg { raw: 8 as u32 } }
+    return lir_reg_mod.PReg { raw: 9 as u32 }
+}
+
+
+function require_return(
+    return_: Option_LirVRegId.Option,
+    message: String,
+) -> lir_vreg_mod.LirVRegId
+    with {err: lir_error_mod.LirError}
+{
+    return match return_ {
+        case .some(let rv) => rv
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: message,
+        )
+    }
+}
+
+
+function rw_slice_addr(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: slice_addr intrinsic takes one operand",
+        )
+    }
+    let rv = require_return(return_, "regalloc.materialize: slice_addr requires a return slot")?
+    let arg = Vec_LirVRegId.at(args, 0 as usize)
+    let s_base = subst_mod.subst_use(mutable body, mutable new_ops, arg, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    let memref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: memref, dst: rv, width: 8 as u32), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_b(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: memref, dst: s_dst, width: 8 as u32), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_slice_from_raw(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (2 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: slice_from_raw intrinsic takes (addr, len)",
+        )
+    }
+    let rv = require_return(return_, "regalloc.materialize: slice_from_raw requires a return slot")?
+    let disp = match frame_mod.buffer_disp(layout, rv.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: slice_from_raw without a reserved frame buffer",
+        )
+    }
+    let addr_arg = Vec_LirVRegId.at(args, 0 as usize)
+    let s_addr = subst_mod.subst_use(mutable body, mutable new_ops, addr_arg, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, s_addr, framebase, disp, origin, allocator)?
+    let len_arg = Vec_LirVRegId.at(args, 1 as usize)
+    let s_len = subst_mod.subst_use(mutable body, mutable new_ops, len_arg, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, s_len, framebase, disp +% (8 as i32), origin, allocator)?
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: rv), allocator)?
+        case .some(let sd) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, sd, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_string_from_raw(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: string_from_raw intrinsic takes one operand (bytes)",
+        )
+    }
+    let rv = require_return(return_, "regalloc.materialize: string_from_raw requires a return slot")?
+    let disp = match frame_mod.buffer_disp(layout, rv.raw) {
+        case .some(let d) => d
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: string_from_raw without a reserved frame buffer",
+        )
+    }
+    let bytes_arg = Vec_LirVRegId.at(args, 0 as usize)
+    let s_src = subst_mod.subst_use(mutable body, mutable new_ops, bytes_arg, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    let ptr_ref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_src),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    let s_ptr = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_b(target), target, allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: ptr_ref, dst: s_ptr, width: 8 as u32), allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, s_ptr, framebase, disp, origin, allocator)?
+    let len_ref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_src),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 8 as i32,
+    }
+    let s_len = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_b(target), target, allocator)?
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: len_ref, dst: s_len, width: 8 as u32), allocator)?
+    subst_mod.store_slot(mutable body, mutable new_ops, s_len, framebase, disp +% (8 as i32), origin, allocator)?
+    let rhs = lir_reg_mod.Operand.imm(value: disp as i64)
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: rv), allocator)?
+        case .some(let sd) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, hlir_op_mod.address_flags(), lir_op_mod.LirOpKind.binary(op: lir_op_mod.LBinOp.add, lhs: framebase, rhs: rhs, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, sd, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_load_intrinsic(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    width: u32,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: load_uN intrinsic takes one operand (addr)",
+        )
+    }
+    let rv = require_return(return_, "regalloc.materialize: load_uN requires a return slot")?
+    let addr_arg = Vec_LirVRegId.at(args, 0 as usize)
+    let s_base = subst_mod.subst_use(mutable body, mutable new_ops, addr_arg, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    let memref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: memref, dst: rv, width: width), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_b(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.load(addr: memref, dst: s_dst, width: width), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_store_intrinsic(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    width: u32,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (2 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: store_uN intrinsic takes (addr, value)",
+        )
+    }
+    let addr_arg = Vec_LirVRegId.at(args, 0 as usize)
+    let s_base = subst_mod.subst_use(mutable body, mutable new_ops, addr_arg, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    let value_arg = Vec_LirVRegId.at(args, 1 as usize)
+    let s_value = subst_mod.subst_use(mutable body, mutable new_ops, value_arg, subst_mod.scratch_b(target), layout, framebase, origin, target, allocator)?
+    let memref = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: s_base),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: 0 as i32,
+    }
+    subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.store(value: s_value, addr: memref, width: width), allocator)?
+}
+
+
+function rw_bitcast_intrinsic(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    width: u32,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: bitcast intrinsic takes one operand",
+        )
+    }
+    let rv = require_return(return_, "regalloc.materialize: bitcast intrinsic requires a return slot")?
+    let operand = Vec_LirVRegId.at(args, 0 as usize)
+    let s_op = subst_mod.subst_use(mutable body, mutable new_ops, operand, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.convert_(src: s_op, to_width: width, to_signed: false, kind: lir_op_mod.LCastKind.reinterpret, dst: rv), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.convert_(src: s_op, to_width: width, to_signed: false, kind: lir_op_mod.LCastKind.reinterpret, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}
+
+
+function rw_fmath_intrinsic(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    uop: lir_op_mod.LUnOp,
+    args: Vec_LirVRegId.Vec,
+    return_: Option_LirVRegId.Option,
+    origin: node_mod.NodeId,
+    layout: frame_mod.FrameLayout,
+    framebase: lir_vreg_mod.LirVRegId,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if Vec_LirVRegId.len(args) < (1 as usize) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "regalloc.materialize: float math intrinsic takes one operand",
+        )
+    }
+    let rv = require_return(return_, "regalloc.materialize: float math intrinsic requires a return slot")?
+    let operand = Vec_LirVRegId.at(args, 0 as usize)
+    let s_op = subst_mod.subst_use(mutable body, mutable new_ops, operand, subst_mod.scratch_a(target), layout, framebase, origin, target, allocator)?
+    match subst_mod.slot_disp(layout, rv.raw) {
+        case .none => subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.unary(op: uop, operand: s_op, dst: rv), allocator)?
+        case .some(let d) => {
+            let s_dst = subst_mod.mint_scratch(mutable body, rv.raw, subst_mod.scratch_a(target), target, allocator)?
+            subst_mod.push_op_id(mutable body, mutable new_ops, origin, shared_mod.call_flags(), lir_op_mod.LirOpKind.unary(op: uop, operand: s_op, dst: s_dst), allocator)?
+            subst_mod.store_slot(mutable body, mutable new_ops, s_dst, framebase, d, origin, allocator)?
+        }
+    }
+}

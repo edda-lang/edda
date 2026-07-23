@@ -1,0 +1,227 @@
+
+module compile.phase.eqwire.tybuild.tybuild
+
+import std.collections.vec
+import std.mem.alloc
+import hir.build.file as hir_file_mod
+import hir.def as def_mod
+import hir.item as hir_item_mod
+import intern.symbol as sym_mod
+import resolve.build.drive.surface.registry as registry_mod
+import specs.gen.typaths as typaths_mod
+import syntax.ast.ident as ast_ident_mod
+import types.check as types_check_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+
+
+spec std.mem.alloc.Box(hir_item_mod.HTypeSignature)
+spec std.mem.alloc.Box(hir_item_mod.HFnSignature)
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+
+
+public function build_ty_paths(
+    primary: Vec_HirFile.Vec,
+    feeds_primary: Vec_TypeOutput.Vec,
+    deps: Vec_HirFile.Vec,
+    feeds_deps: Vec_TypeOutput.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> typaths_mod.TyPathMap
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var m = typaths_mod.empty_ty_paths(allocator)?
+    extend_ty_paths(mutable m, primary, feeds_primary, mutable ty_interner, allocator)?
+    extend_ty_paths(mutable m, deps, feeds_deps, mutable ty_interner, allocator)?
+    return m
+}
+
+
+public function extend_ty_paths(
+    m: mutable typaths_mod.TyPathMap,
+    files: Vec_HirFile.Vec,
+    feeds: Vec_TypeOutput.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HirFile.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if i >= Vec_TypeOutput.len(feeds) { break }
+        extend_ty_paths_file(mutable m, Vec_HirFile.at(files, i), Vec_TypeOutput.at(feeds, i), mutable ty_interner, allocator)?
+        i = i + 1
+    }
+}
+
+
+public function extend_ty_paths_synthetic(
+    m: mutable typaths_mod.TyPathMap,
+    reg: registry_mod.Registry,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = registry_mod.synthetic_nominal_count(reg)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let entry = registry_mod.synthetic_nominal_at(reg, i)
+        if !def_mod.is_error(entry.def) {
+            uninit segs: Vec_Symbol.Vec
+            Vec_Symbol.new(init segs, allocator)?
+            Vec_Symbol.push(mutable segs, entry.module_name, allocator)?
+            Vec_Symbol.push(mutable segs, entry.item_name, allocator)?
+            add_alias_paths(mutable m, entry.def, take segs, mutable ty_interner, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+
+function add_alias_paths(
+    m: mutable typaths_mod.TyPathMap,
+    def: def_mod.DefId,
+    segs: take Vec_Symbol.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let rec_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.record(def: def), allocator)?
+    let sum_ty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.sum_(def: def), allocator)?
+    if typaths_mod.has_ty_path(m, rec_ty) && typaths_mod.has_ty_path(m, sum_ty) {
+        return
+    }
+    if !typaths_mod.has_ty_path(m, rec_ty) {
+        let rec_segs = clone_segs(segs, allocator)?
+        typaths_mod.add_ty_path(mutable m, rec_ty, take rec_segs, allocator)?
+    }
+    if !typaths_mod.has_ty_path(m, sum_ty) {
+        typaths_mod.add_ty_path(mutable m, sum_ty, take segs, allocator)?
+    }
+}
+
+
+function clone_segs(
+    segs: Vec_Symbol.Vec,
+    allocator: Allocator,
+) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Symbol.len(segs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(segs, i), allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function extend_ty_paths_file(
+    m: mutable typaths_mod.TyPathMap,
+    file: hir_file_mod.HirFile,
+    feed: types_check_mod.TypeOutput,
+    ty_interner: mutable ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let mod_segs = file_module_segments(file, allocator)?
+    if Vec_Symbol.len(mod_segs) == 0 {
+        return
+    }
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                let segs = item_segs(mod_segs, Box_HTypeSignature.get(sig_box).name, allocator)?
+                match types_check_mod.type_id_of_def(feed, item.def_id) {
+                    case .some(let t) => {
+                        if !typaths_mod.has_ty_path(m, t) {
+                            let decl_segs = clone_segs(segs, allocator)?
+                            typaths_mod.add_ty_path(mutable m, t, take decl_segs, allocator)?
+                        }
+                    }
+                    case .none => ()
+                }
+                add_alias_paths(mutable m, item.def_id, take segs, mutable ty_interner, allocator)?
+            }
+            case .function_(let sig_box, _) => {
+                let segs = item_segs(mod_segs, Box_HFnSignature.get(sig_box).name, allocator)?
+                add_alias_paths(mutable m, item.def_id, take segs, mutable ty_interner, allocator)?
+            }
+            case .function_extern(let sig_box, _, _, _) => {
+                let segs = item_segs(mod_segs, Box_HFnSignature.get(sig_box).name, allocator)?
+                add_alias_paths(mutable m, item.def_id, take segs, mutable ty_interner, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function item_segs(
+    mod_segs: Vec_Symbol.Vec,
+    name: sym_mod.Symbol,
+    allocator: Allocator,
+) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var segs = clone_segs(mod_segs, allocator)?
+    Vec_Symbol.push(mutable segs, name, allocator)?
+    return segs
+}
+
+
+function file_module_segments(
+    file: hir_file_mod.HirFile,
+    allocator: Allocator,
+) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit segs: Vec_Symbol.Vec
+    Vec_Symbol.new(init segs, allocator)?
+    let n = Vec_HItem.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(file.items, i)
+        match item.kind {
+            case .module_decl => {
+                match item.ast_item.kind {
+                    case .module_(let decl) => {
+                        let pn = Vec_Ident.len(decl.path.segments)
+                        var pi: usize = 0
+                        loop decreases (pn - pi) {
+                            if pi >= pn { break }
+                            Vec_Symbol.push(mutable segs, Vec_Ident.at(decl.path.segments, pi).name, allocator)?
+                            pi = pi + 1
+                        }
+                        return segs
+                    }
+                    case _ => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return segs
+}

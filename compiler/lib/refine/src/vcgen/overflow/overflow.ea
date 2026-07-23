@@ -1,0 +1,220 @@
+
+module refine.vcgen.overflow.overflow
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.symbol as symbol_mod
+import mir.body.model as mir_body
+import mir.id.block as block_mod
+import mir.id.local as local_mod
+import mir.rvalue as rvalue_mod
+import mir.stmt as stmt_mod
+import mir.place as place_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import local.smt.term as term_mod
+import local.vcgen.term.term as vterm_mod
+import local.vcgen.bodyidx.bodyidx as bodyidx_mod
+
+
+spec std.collections.vec.Vec(mir_body.BasicBlock)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_body.Local)
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtOp)
+spec std.core.option.Option(ty_kind_mod.PrimKind)
+
+
+public function vc_int_overflow(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    obligation: mir_body.Obligation,
+    ty_interner: ty_interner_mod.Interner,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let bi = block_mod.index(obligation.block)
+    if bi >= Vec_BasicBlock.len(body.blocks) {
+        return Option_SmtTerm.none
+    }
+    let bb = Vec_BasicBlock.at(body.blocks, bi)
+    let si = obligation.stmt_index as usize
+    if si >= Vec_Statement.len(bb.statements) {
+        return Option_SmtTerm.none
+    }
+    let stmt = Vec_Statement.at(bb.statements, si)
+    return match stmt.kind {
+        case .assign(let dest, let value) => vc_from_binary(body, idx, dest, value, ty_interner, ptr_width, anchor, allocator)?
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function vc_from_binary(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    dest: place_mod.Place,
+    value: rvalue_mod.Rvalue,
+    ty_interner: ty_interner_mod.Interner,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match value {
+        case .binary(let op, let lhs, let rhs) => {
+            match smt_op_of(op) {
+                case .some(let sop) => range_term(body, idx, dest, sop, lhs, rhs, ty_interner, ptr_width, anchor, allocator)?
+                case .none => Option_SmtTerm.none
+            }
+        }
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function smt_op_of(op: rvalue_mod.MBinOp) -> Option_SmtOp.Option {
+    return match op {
+        case .add(let mode) => trapping_op(mode, term_mod.SmtOp.add)
+        case .sub(let mode) => trapping_op(mode, term_mod.SmtOp.sub)
+        case .mul(let mode) => trapping_op(mode, term_mod.SmtOp.mul)
+        case _ => Option_SmtOp.none
+    }
+}
+
+
+function trapping_op(mode: rvalue_mod.OverflowMode, sop: term_mod.SmtOp) -> Option_SmtOp.Option {
+    return match mode {
+        case .trapping => Option_SmtOp.some(value: sop)
+        case _ => Option_SmtOp.none
+    }
+}
+
+
+function range_term(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    dest: place_mod.Place,
+    sop: term_mod.SmtOp,
+    lhs: rvalue_mod.Operand,
+    rhs: rvalue_mod.Operand,
+    ty_interner: ty_interner_mod.Interner,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match resolve_dest_prim(body, dest, ty_interner) {
+        case .some(let pk) => build_range(body, idx, sop, lhs, rhs, pk, ptr_width, anchor, allocator)?
+        case .none => Option_SmtTerm.none
+    }
+}
+
+
+function build_range(
+    body: mir_body.MirBody,
+    idx: bodyidx_mod.BodyIndex,
+    sop: term_mod.SmtOp,
+    lhs: rvalue_mod.Operand,
+    rhs: rvalue_mod.Operand,
+    pk: ty_kind_mod.PrimKind,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let lo_lhs = match vterm_mod.operand_to_int_term(body, idx, lhs) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let lo_rhs = match vterm_mod.operand_to_int_term(body, idx, rhs) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let hi_lhs = match vterm_mod.operand_to_int_term(body, idx, lhs) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let hi_rhs = match vterm_mod.operand_to_int_term(body, idx, rhs) {
+        case .some(let t) => t
+        case .none => return Option_SmtTerm.none
+    }
+    let res_lo = vterm_mod.mk_bin(sop, take lo_lhs, take lo_rhs, allocator)?
+    let res_hi = vterm_mod.mk_bin(sop, take hi_lhs, take hi_rhs, allocator)?
+    let lower = vterm_mod.mk_bin(
+        term_mod.SmtOp.ge,
+        take res_lo,
+        vterm_mod.bound_lo_term(pk, ptr_width, anchor, allocator)?,
+        allocator,
+    )?
+    let upper = vterm_mod.mk_bin(
+        term_mod.SmtOp.le,
+        take res_hi,
+        vterm_mod.bound_hi_term(pk, ptr_width, anchor, allocator)?,
+        allocator,
+    )?
+    return Option_SmtTerm.some(value: vterm_mod.mk_bin(term_mod.SmtOp.and_, take lower, take upper, allocator)?)
+}
+
+
+function resolve_dest_prim(
+    body: mir_body.MirBody,
+    dest: place_mod.Place,
+    ty_interner: ty_interner_mod.Interner,
+) -> Option_PrimKind.Option
+    with {divergence}
+{
+    if place_mod.proj_len(dest) != 0 {
+        return Option_PrimKind.none
+    }
+    let idx = local_mod.index(dest.local)
+    if idx >= Vec_Local.len(body.locals) {
+        return Option_PrimKind.none
+    }
+    let local = Vec_Local.at(body.locals, idx)
+    return resolve_prim(local.ty, ty_interner)
+}
+
+
+function resolve_prim(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> Option_PrimKind.Option
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return Option_PrimKind.none
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let pk) => representable(pk)
+        case .refined(let base, _) => resolve_prim(base, ty_interner)
+        case _ => Option_PrimKind.none
+    }
+}
+
+
+function representable(pk: ty_kind_mod.PrimKind) -> Option_PrimKind.Option {
+    return match pk {
+        case .i8_ => Option_PrimKind.some(value: pk)
+        case .i16_ => Option_PrimKind.some(value: pk)
+        case .i32_ => Option_PrimKind.some(value: pk)
+        case .i64_ => Option_PrimKind.some(value: pk)
+        case .u8_ => Option_PrimKind.some(value: pk)
+        case .u16_ => Option_PrimKind.some(value: pk)
+        case .u32_ => Option_PrimKind.some(value: pk)
+        case .u64_ => Option_PrimKind.some(value: pk)
+        case .i128_ => Option_PrimKind.some(value: pk)
+        case .u128_ => Option_PrimKind.some(value: pk)
+        case .isize_ => Option_PrimKind.some(value: pk)
+        case .usize_ => Option_PrimKind.some(value: pk)
+        case _ => Option_PrimKind.none
+    }
+}

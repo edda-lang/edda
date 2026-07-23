@@ -1,0 +1,437 @@
+
+module compile.setup.env.stdreach.stdreach
+
+import std.mem.alloc
+import std.os.fs
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import local.setup.env.discover as discover_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(String)
+spec std.core.option.Option(String)
+
+
+public function stdlib_reachable(
+    rfs: ReadOnlyFilesystem,
+    stdlib_lib_root: String,
+    seed_paths: [String],
+    pkg_files_memo: mutable StringMap_String.StringMap,
+    file_edges_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit results: Vec_String.Vec
+    Vec_String.new(init results, allocator)?
+    var visited = StringMap_bool.new(allocator)?
+    var pkg_memo = StringMap_String.new(allocator)?
+    uninit worklist: Vec_String.Vec
+    Vec_String.new(init worklist, allocator)?
+
+    let sn = seed_paths.len()
+    var si: usize = 0
+    loop decreases (sn - si + 1 as usize) {
+        if si >= sn {
+            break
+        }
+        Vec_String.push(mutable worklist, string.clone(seed_paths[si], allocator)?, allocator)?
+        si = si + 1 as usize
+    }
+
+    let core_dir = string.concat(stdlib_lib_root, "/core", allocator)?
+    add_stdlib_packages(rfs, core_dir, mutable results, mutable visited, mutable worklist, mutable pkg_files_memo, memo_alloc, allocator)?
+
+    var idx: usize = 0
+    loop {
+        let wn = Vec_String.len(worklist)
+        if idx >= wn {
+            break
+        }
+        let file = string.clone(Vec_String.at(worklist, idx), allocator)?
+        scan_stdlib_file(rfs, file, stdlib_lib_root, mutable results, mutable visited, mutable pkg_memo, mutable worklist, mutable pkg_files_memo, mutable file_edges_memo, memo_alloc, allocator)?
+        idx = idx + 1 as usize
+    }
+    return results
+}
+
+
+function scan_stdlib_file(
+    rfs: ReadOnlyFilesystem,
+    path: String,
+    root: String,
+    results: mutable Vec_String.Vec,
+    visited: mutable StringMap_bool.StringMap,
+    pkg_memo: mutable StringMap_String.StringMap,
+    worklist: mutable Vec_String.Vec,
+    pkg_files_memo: mutable StringMap_String.StringMap,
+    file_edges_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    match StringMap_String.get(file_edges_memo, path) {
+        case .some(let joined) => {
+            apply_edge_dirs(rfs, joined, mutable results, mutable visited, mutable worklist, mutable pkg_files_memo, memo_alloc, allocator)?
+            return
+        }
+        case .none => ()
+    }
+    let content = fs.read_to_string(rfs, path, allocator)?
+    uninit edge_dirs: Vec_String.Vec
+    Vec_String.new(init edge_dirs, allocator)?
+    let parts = string.split(content, "std.", allocator)?
+    let n = parts.len()
+    var i: usize = 1
+    loop decreases (n - i + 1 as usize) {
+        if i >= n {
+            break
+        }
+        let tb = parts[i].bytes()
+        let end = token_end(tb)
+        let pathstr = string.bytes_slice_to_string(tb, 0 as usize, end, allocator)?
+        match resolve_pkg_dir_cached(rfs, root, pathstr, mutable pkg_memo, allocator)? {
+            case .some(let d) => Vec_String.push(mutable edge_dirs, d, allocator)?
+            case .none => ()
+        }
+        i = i + 1 as usize
+    }
+    if uses_concurrency(content) {
+        Vec_String.push(mutable edge_dirs, string.concat(root, "/task", allocator)?, allocator)?
+    }
+    if uses_derive_serde(content) {
+        Vec_String.push(mutable edge_dirs, string.concat(root, "/serde", allocator)?, allocator)?
+    }
+    if uses_derive_properties(content) {
+        Vec_String.push(mutable edge_dirs, string.concat(root, "/testing", allocator)?, allocator)?
+    }
+    let joined = join_string_list(edge_dirs, allocator)?
+    let _ = StringMap_String.insert(mutable file_edges_memo, path, string.clone(joined, memo_alloc)?, memo_alloc)?
+    apply_edge_dirs(rfs, joined, mutable results, mutable visited, mutable worklist, mutable pkg_files_memo, memo_alloc, allocator)?
+}
+
+
+function apply_edge_dirs(
+    rfs: ReadOnlyFilesystem,
+    joined: String,
+    results: mutable Vec_String.Vec,
+    visited: mutable StringMap_bool.StringMap,
+    worklist: mutable Vec_String.Vec,
+    pkg_files_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let parts = string.split(joined, ",", allocator)?
+    let n = parts.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        if !string.is_empty(parts[i]) {
+            add_stdlib_packages(rfs, parts[i], mutable results, mutable visited, mutable worklist, mutable pkg_files_memo, memo_alloc, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function join_string_list(items: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var joined: String = ""
+    let n = Vec_String.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        if i > 0 as usize {
+            joined = string.concat(joined, ",", allocator)?
+        }
+        joined = string.concat(joined, Vec_String.at(items, i), allocator)?
+        i = i + 1 as usize
+    }
+    return joined
+}
+
+
+function push_cached_files(
+    joined: String,
+    results: mutable Vec_String.Vec,
+    worklist: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let parts = string.split(joined, ",", allocator)?
+    let n = parts.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        if !string.is_empty(parts[i]) {
+            Vec_String.push(mutable results, string.clone(parts[i], allocator)?, allocator)?
+            Vec_String.push(mutable worklist, string.clone(parts[i], allocator)?, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function uses_derive_serde(content: String) -> bool {
+    if !contains(content, "derive ") {
+        return false
+    }
+    return contains(content, "serialize")
+}
+
+
+function uses_derive_properties(content: String) -> bool {
+    if !contains(content, "derive ") {
+        return false
+    }
+    return contains(content, "properties")
+}
+
+
+function uses_concurrency(content: String) -> bool {
+    if contains(content, "scope(exec)") {
+        return true
+    }
+    if contains(content, ".spawn") {
+        return true
+    }
+    return contains(content, ".await")
+}
+
+
+function contains(s: String, needle: String) -> bool {
+    let sb = s.bytes()
+    let nb = needle.bytes()
+    let sn = sb.len()
+    let nn = nb.len()
+    if nn == 0 as usize {
+        return true
+    }
+    if sn < nn {
+        return false
+    }
+    var i: usize = 0
+    loop decreases (sn - i) {
+        if i + nn > sn {
+            break
+        }
+        var j: usize = 0
+        var hit = true
+        loop decreases (nn - j) {
+            if j >= nn {
+                break
+            }
+            if sb[i + j] != nb[j] {
+                hit = false
+                break
+            }
+            j = j + 1
+        }
+        if hit {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function token_end(b: [u8]) -> usize
+    ensures result <= b.len()
+{
+    let n = b.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        if !is_path_byte(b[i]) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+
+function is_path_byte(c: u8) -> bool {
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    return c == 95 || c == 46
+}
+
+
+function add_stdlib_packages(
+    rfs: ReadOnlyFilesystem,
+    dir: String,
+    results: mutable Vec_String.Vec,
+    visited: mutable StringMap_bool.StringMap,
+    worklist: mutable Vec_String.Vec,
+    pkg_files_memo: mutable StringMap_String.StringMap,
+    memo_alloc: Allocator,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, memo_alloc, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    if StringMap_bool.contains(visited, dir) {
+        return
+    }
+    match StringMap_String.get(pkg_files_memo, dir) {
+        case .some(let joined) => {
+            let _ = StringMap_bool.insert(mutable visited, string.clone(dir, allocator)?, true, allocator)?
+            push_cached_files(joined, mutable results, mutable worklist, allocator)?
+            return
+        }
+        case .none => ()
+    }
+    let entries = fs.read_dir(rfs, dir, allocator)?
+    let n = entries.len()
+    var has_manifest = false
+    var has_src = false
+    var i: usize = 0
+    loop decreases (n - i + 1 as usize) {
+        if i >= n {
+            break
+        }
+        let entry = entries[i]
+        if string.equals(entry, "package.toml") {
+            has_manifest = true
+        }
+        if string.equals(entry, "src") {
+            has_src = true
+        }
+        i = i + 1 as usize
+    }
+    if has_manifest && has_src {
+        let _ = StringMap_bool.insert(mutable visited, string.clone(dir, allocator)?, true, allocator)?
+        let src_dir = string.concat(dir, "/src", allocator)?
+        uninit files: Vec_String.Vec
+        Vec_String.new(init files, allocator)?
+        discover_mod.walk_dir(rfs, src_dir, mutable files, allocator)?
+        let joined = join_string_list(files, allocator)?
+        let _ = StringMap_String.insert(mutable pkg_files_memo, dir, string.clone(joined, memo_alloc)?, memo_alloc)?
+        push_cached_files(joined, mutable results, mutable worklist, allocator)?
+        return
+    }
+    var k: usize = 0
+    loop decreases (n - k + 1 as usize) {
+        if k >= n {
+            break
+        }
+        let entry = entries[k]
+        if !string.starts_with(entry, ".") && !string.ends_with(entry, ".ea") {
+            let part = string.concat(dir, "/", allocator)?
+            let full = string.concat(part, entry, allocator)?
+            handle err: fs.FsError as e -> match e {
+                case .not_a_directory(_) => ()
+                case _ => raise e
+            } {
+                add_stdlib_packages(rfs, full, mutable results, mutable visited, mutable worklist, mutable pkg_files_memo, memo_alloc, allocator)?
+            }
+        }
+        k = k + 1 as usize
+    }
+}
+
+
+function resolve_pkg_dir_cached(
+    rfs: ReadOnlyFilesystem,
+    root: String,
+    pathstr: String,
+    pkg_memo: mutable StringMap_String.StringMap,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    match StringMap_String.get(pkg_memo, pathstr) {
+        case .some(let dir) => {
+            if string.is_empty(dir) {
+                return Option_String.none
+            }
+            return Option_String.some(value: string.clone(dir, allocator)?)
+        }
+        case .none => ()
+    }
+    match resolve_pkg_dir(rfs, root, pathstr, allocator)? {
+        case .some(let d) => {
+            let _ = StringMap_String.insert(mutable pkg_memo, pathstr, string.clone(d, allocator)?, allocator)?
+            return Option_String.some(value: d)
+        }
+        case .none => {
+            let _ = StringMap_String.insert(mutable pkg_memo, pathstr, "", allocator)?
+            return Option_String.none
+        }
+    }
+}
+
+
+function resolve_pkg_dir(
+    rfs: ReadOnlyFilesystem,
+    root: String,
+    pathstr: String,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let segs = string.split(pathstr, ".", allocator)?
+    let n = segs.len()
+    var k: usize = n
+    loop decreases k {
+        if k == 0 as usize {
+            break
+        }
+        let cand = join_segs(root, segs, k, allocator)?
+        let src = string.concat(cand, "/src", allocator)?
+        if fs.path_exists(rfs, src) {
+            return Option_String.some(value: cand)
+        }
+        k = k - 1 as usize
+    }
+    return Option_String.none
+}
+
+
+function join_segs(
+    root: String,
+    segs: [String],
+    k: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+    requires k <= segs.len()
+{
+    var acc = string.clone(root, allocator)?
+    var j: usize = 0
+    loop decreases (k - j + 1 as usize) {
+        if j >= k {
+            break
+        }
+        let with_sep = string.concat(acc, "/", allocator)?
+        acc = string.concat(with_sep, segs[j], allocator)?
+        j = j + 1 as usize
+    }
+    return acc
+}

@@ -1,0 +1,320 @@
+
+module json.value.core
+
+import std.mem.alloc
+import std.core.option
+
+spec std.mem.alloc.Box(JsonValue)
+spec std.core.option.Option(JsonValue)
+spec std.core.option.Option(bool)
+spec std.core.option.Option(f64)
+spec std.core.option.Option(String)
+
+public type JsonObjectEntry {
+    key: String
+    value: Box_JsonValue
+}
+
+public type JsonValue {
+    case null_value
+    case bool_value(bool)
+    case num_value(f64)
+    case str_value(String)
+    case arr_value([Box_JsonValue])
+    case obj_value([JsonObjectEntry])
+}
+
+
+public function null_v() -> JsonValue {
+    return JsonValue.null_value
+}
+
+public function bool_v(b: bool) -> JsonValue {
+    return JsonValue.bool_value(b)
+}
+
+public function num_v(n: f64) -> JsonValue {
+    return JsonValue.num_value(n)
+}
+
+public function str_v(s: take String) -> JsonValue {
+    return JsonValue.str_value(s)
+}
+
+
+public function is_null(v: JsonValue) -> bool {
+    return match v {
+        case .null_value => true
+        case _           => false
+    }
+}
+
+public function is_bool(v: JsonValue) -> bool {
+    return match v {
+        case .bool_value(_) => true
+        case _              => false
+    }
+}
+
+public function is_num(v: JsonValue) -> bool {
+    return match v {
+        case .num_value(_) => true
+        case _             => false
+    }
+}
+
+public function is_str(v: JsonValue) -> bool {
+    return match v {
+        case .str_value(_) => true
+        case _             => false
+    }
+}
+
+public function is_arr(v: JsonValue) -> bool {
+    return match v {
+        case .arr_value(_) => true
+        case _             => false
+    }
+}
+
+public function is_obj(v: JsonValue) -> bool {
+    return match v {
+        case .obj_value(_) => true
+        case _             => false
+    }
+}
+
+
+public function as_bool(v: JsonValue) -> Option_bool {
+    return match v {
+        case .bool_value(let b) => Option_bool.some(value: b)
+        case _                  => Option_bool.none
+    }
+}
+
+public function as_num(v: JsonValue) -> Option_f64 {
+    return match v {
+        case .num_value(let n) => Option_f64.some(value: n)
+        case _                 => Option_f64.none
+    }
+}
+
+public function as_str(v: take JsonValue) -> Option_String {
+    return match v {
+        case .str_value(let s) => Option_String.some(value: s)
+        case _                 => Option_String.none
+    }
+}
+
+public function box_round_trip(
+    v: take JsonValue,
+    allocator: mutable Allocator,
+) -> JsonValue
+    with {allocator, err: alloc.AllocError}
+{
+    let b = Box_JsonValue.new(take v, allocator)?
+    return Box_JsonValue.unbox(take b, mutable allocator)
+}
+
+
+public function arr_len(v: JsonValue) -> usize {
+    return match v {
+        case .arr_value(let xs) => xs.len()
+        case _                  => 0 as usize
+    }
+}
+
+public function arr_at(v: JsonValue, i: usize) -> Option_JsonValue {
+    return match v {
+        case .arr_value(let xs) => {
+            if i < xs.len() {
+                Option_JsonValue.some(value: xs[i].get())
+            } else {
+                Option_JsonValue.none
+            }
+        }
+        case _ => Option_JsonValue.none
+    }
+}
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function _obj_scan_for_key(entries: [JsonObjectEntry], target: [u8]) -> bool {
+    let n = entries.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if _bytes_eq(entries[i].key.bytes(), target) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+public function obj_len(v: JsonValue) -> usize {
+    return match v {
+        case .obj_value(let entries) => entries.len()
+        case _                       => 0 as usize
+    }
+}
+
+public function obj_has_key(v: JsonValue, key: String) -> bool {
+    return match v {
+        case .obj_value(let entries) => _obj_scan_for_key(entries, key.bytes())
+        case _                       => false
+    }
+}
+
+public function obj_get(v: JsonValue, key: String) -> Option_JsonValue {
+    return match v {
+        case .obj_value(let entries) => _obj_lookup(entries, key.bytes())
+        case _                       => Option_JsonValue.none
+    }
+}
+
+public function obj_get_bytes(v: JsonValue, key: [u8]) -> Option_JsonValue {
+    return match v {
+        case .obj_value(let entries) => _obj_lookup(entries, key)
+        case _                       => Option_JsonValue.none
+    }
+}
+
+function _obj_lookup(
+    entries: [JsonObjectEntry],
+    target: [u8],
+) -> Option_JsonValue {
+    let n = entries.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if _bytes_eq(entries[i].key.bytes(), target) {
+            return Option_JsonValue.some(value: entries[i].value.get())
+        }
+        i += 1
+    }
+    return Option_JsonValue.none
+}
+
+public function equals(a: JsonValue, b: JsonValue) -> bool
+    with {divergence}
+{
+    return match a {
+        case .null_value => match b {
+            case .null_value => true
+            case _           => false
+        }
+        case .bool_value(let ba) => match b {
+            case .bool_value(let bb) => ba == bb
+            case _                   => false
+        }
+        case .num_value(let na) => match b {
+            case .num_value(let nb) => na == nb
+            case _                  => false
+        }
+        case .str_value(let sa) => match b {
+            case .str_value(let sb) => _bytes_eq(sa.bytes(), sb.bytes())
+            case _                  => false
+        }
+        case .arr_value(let xa) => match b {
+            case .arr_value(let xb) => _arr_equals(xa, xb)
+            case _                  => false
+        }
+        case .obj_value(let ea) => match b {
+            case .obj_value(let eb) => _obj_equals(ea, eb)
+            case _                  => false
+        }
+    }
+}
+
+function _arr_equals(a: [Box_JsonValue], b: [Box_JsonValue]) -> bool
+    with {divergence}
+{
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if !equals(a[i].get(), b[i].get()) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _obj_equals(a: [JsonObjectEntry], b: [JsonObjectEntry]) -> bool
+    with {divergence}
+{
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if !_bytes_eq(a[i].key.bytes(), b[i].key.bytes()) { return false }
+        if !equals(a[i].value.get(), b[i].value.get()) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _try_parse_usize(bytes: [u8], s: usize, e: usize) -> (usize, bool) {
+    if s >= e { return (0 as usize, false) }
+    var n: usize = 0
+    var i: usize = s
+    loop decreases e - i + 1 as usize {
+        if i >= e { break }
+        let c = bytes[i]
+        if c < 48 as u8 || c > 57 as u8 { return (0 as usize, false) }
+        n = n * (10 as usize) + ((c - 48 as u8) as usize)
+        i = i + 1 as usize
+    }
+    return (n, true)
+}
+
+public function get_path(v: JsonValue, path: String) -> Option_JsonValue
+    with {divergence}
+{
+    let bytes = path.bytes()
+    let n = bytes.len()
+    if n == 0 as usize { return Option_JsonValue.some(value: v) }
+
+    var current: JsonValue = v
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        var j: usize = i
+        loop decreases n - j + 1 as usize {
+            if j >= n { break }
+            if bytes[j] == 46 as u8 { break }
+            j = j + 1 as usize
+        }
+        if j == i { return Option_JsonValue.none }
+
+        let next = if is_arr(current) {
+            let (idx, ok) = _try_parse_usize(bytes, i, j)
+            if !ok { return Option_JsonValue.none }
+            arr_at(current, idx)
+        } else if is_obj(current) {
+            obj_get_bytes(current, bytes[i..<j])
+        } else {
+            Option_JsonValue.none
+        }
+
+        let advanced = match next {
+            case .some(let inner) => inner
+            case .none            => return Option_JsonValue.none
+        }
+        current = advanced
+        i = j + 1 as usize
+    }
+    return Option_JsonValue.some(value: current)
+}

@@ -1,0 +1,343 @@
+
+module compile.phase.emit.link.link
+
+import std.core.fmt
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.os.fs
+import std.os.process as process
+import std.text.string
+
+import target.triple as triple_mod
+import object.coff as coff_mod
+
+import link.invoke as link_invoke_mod
+import link.error as link_error_mod
+import link.emit.image.fix.reloc.defs.defs as link_reloc_mod
+import link.emit.image.fix.res.resolve as link_resolve_mod
+import link.coff.archive as link_archive_mod
+import link.coff.cursor as link_cursor_mod
+import link.feed.feed as link_feed_mod
+import link.feed.entry.entry as link_entry_mod
+import link.feed.select.select as link_select_mod
+import local.phase.emit.link.selfid as selfid_mod
+
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.hashmap.StringMap(bool)
+spec std.collections.hashmap.StringMap(String)
+
+
+public function output_dir(
+    workspace_root: String,
+    triple_str: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let base = string.concat(workspace_root, "/target/edda/", allocator)?
+    return string.concat(base, triple_str, allocator)?
+}
+
+
+public function bin_dir(
+    workspace_root: String,
+    triple_str: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let base = string.concat(workspace_root, "/.edda/build/", allocator)?
+    let with_triple = string.concat(base, triple_str, allocator)?
+    return string.concat(with_triple, "/dev/bin", allocator)?
+}
+
+
+public function output_exe_path(
+    outdir: String,
+    target: triple_mod.TargetTriple,
+    program_name: String,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let stem = string.concat("/", program_name, allocator)?
+    let base = string.concat(outdir, stem, allocator)?
+    return match triple_mod.os(target) {
+        case .windows => string.concat(base, ".exe", allocator)?
+        case _ => base
+    }
+}
+
+
+public function runtime_lib_path(allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let args = process.args(allocator)?
+    if args.len() == 0 {
+        return "edda_rt.lib"
+    }
+    let exe = args[0]
+    let eb = exe.bytes()
+    let n = eb.len()
+    var sep: usize = 0
+    var found = false
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if eb[i] == (0x2F as u8) || eb[i] == (0x5C as u8) {
+            sep = i
+            found = true
+        }
+        i = i + (1 as usize)
+    }
+    if !found {
+        return "edda_rt.lib"
+    }
+    let dlen = sep + (1 as usize)
+    let buf: [u8] = allocator.alloc_array(u8, dlen)?
+    var j: usize = 0
+    loop decreases (dlen - j) {
+        if j >= dlen { break }
+        buf[j] = eb[j]
+        j = j + (1 as usize)
+    }
+    let dir = string.from_owned_utf8(take buf)
+    return string.concat(dir, "edda_rt.lib", allocator)?
+}
+
+
+function read_runtime_lib(
+    rfs: ReadOnlyFilesystem,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let rt_path = runtime_lib_path(allocator)?
+    let bytes: [u8] = fs.read_bytes(rfs, rt_path, allocator)?
+    let n = bytes.len()
+    uninit out: Vec_u8.Vec
+    Vec_u8.with_capacity(init out, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = bytes[i]
+        Vec_u8.push(mutable out, take b, allocator)?
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+
+public function runtime_defined_symbols(
+    rfs: ReadOnlyFilesystem,
+    allocator: Allocator,
+) -> StringMap_bool.StringMap
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    return handle err: fs.FsError as fe -> StringMap_bool.new(allocator)? {
+        handle err: link_cursor_mod.ReadError as re -> StringMap_bool.new(allocator)? {
+            let rt_bytes = read_runtime_lib(rfs, allocator)?
+            let contents = link_archive_mod.parse_archive(rt_bytes, allocator)?
+            link_select_mod.defined_symbols(contents.objects, allocator)?
+        }
+    }
+}
+
+
+public function link_image_to_file(
+    objects: Vec_CoffFile.Vec,
+    outpath: String,
+    declared_externs: StringMap_bool.StringMap,
+    declared_extern_dlls: StringMap_String.StringMap,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if selfid_mod.is_self_image_path(outpath, allocator)? {
+        emit_self_image_skip_diag(mutable diags, outpath, allocator)?
+        return
+    }
+    let rt_bytes = read_runtime_lib(rfs, allocator)?
+    let image_base: u64 = 0x140000000 as u64
+    handle err: link_error_mod.LinkError as e -> emit_link_diag(mutable diags, e, allocator)? {
+    handle err: link_reloc_mod.RelocError as re -> emit_codegen_diag(mutable diags, span_mod.dummy(), reloc_msg(re, allocator)?, allocator)? {
+    handle err: link_cursor_mod.ReadError -> emit_codegen_diag(mutable diags, span_mod.dummy(), "rt-archive", allocator)? {
+        uninit stub: coff_mod.CoffFile
+        link_entry_mod.build_entry_stub(init stub, allocator)?
+        uninit roots: Vec_CoffFile.Vec
+        Vec_CoffFile.new(init roots, allocator)?
+        Vec_CoffFile.push(mutable roots, take stub, allocator)?
+        let nobj = Vec_CoffFile.len(objects)
+        var i: usize = 0
+        loop decreases (nobj - i) {
+            if i >= nobj { break }
+            let f = Vec_CoffFile.at(objects, i)
+            Vec_CoffFile.push(mutable roots, take f, allocator)?
+            i = i + (1 as usize)
+        }
+        let feed = link_feed_mod.prepare_runtime(roots, rt_bytes, declared_externs, declared_extern_dlls, allocator)?
+        let blocked = gate_runtime_externs(feed, mutable diags, allocator)?
+        if blocked {
+            return
+        }
+        let image = link_invoke_mod.link_image(feed.objects, feed.provided, feed.dlls, link_entry_mod.entry_symbol(), image_base, allocator)?
+        let buf = Vec_u8.into_array(take image, allocator)?
+        fs.write_bytes(wfs, outpath, buf)?
+    }}}
+}
+
+
+function reloc_msg(e: link_reloc_mod.RelocError, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .unresolved_target(let name) => string.concat("link-reloc: unresolved target ", name, allocator)?
+        case .unsupported_kind(let kind)  => string.concat("link-reloc: unsupported kind ", fmt.u64_to_string(kind as u64, allocator)?, allocator)?
+        case .site_out_of_range           => "link-reloc: site out of range"
+        case .displacement_out_of_range(let disp) => string.concat("link-reloc: rel32 displacement out of range ", fmt.i64_to_string(disp, allocator)?, allocator)?
+    }
+}
+
+
+public function emit_codegen_diag(
+    diags: mutable diags_mod.Diagnostics,
+    at: span_mod.Span,
+    stage: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let msg = string.concat("native codegen failed at stage: ", stage, allocator)?
+    let d = diag_mod.error_at(diag_code_mod.codegen_error(), at, msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_link_diag(
+    diags: mutable diags_mod.Diagnostics,
+    e: link_error_mod.LinkError,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = link_error_mod.to_diagnostic(e, span_mod.dummy(), allocator)?
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_self_image_skip_diag(
+    diags: mutable diags_mod.Diagnostics,
+    outpath: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("skipped relink of '", outpath, allocator)?
+    let msg = string.concat(head, "': the planned output executable is this compiler's own running image — overwriting a live compiler mid-run silently replaces it with a binary that is not the one currently executing; run this build from a compiler binary outside the target output tree, or remove the target executable first", allocator)?
+    let d = diag_mod.warn_at(diag_code_mod.link_self_image_skip(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function is_runtime_extern(name: String) -> bool {
+    return string.starts_with(name, "__edda_")
+}
+
+
+function emit_unprovided_diag(
+    diags: mutable diags_mod.Diagnostics,
+    name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("unprovided runtime extern '", name, allocator)?
+    let msg = string.concat(head, "': referenced by an emitted object but neither inlined away nor defined in a link input (edda_rt.lib) — provide the runtime impl or lower the call so the reference disappears", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.unprovided_runtime_extern(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_unresolved_emitted_diag(
+    diags: mutable diags_mod.Diagnostics,
+    name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("unresolved emitted symbol '", name, allocator)?
+    let msg = string.concat(head, "': an emitted object references this function but no compiled object defines it — its body was not emitted into any link input (a codegen reachability/instantiation gap, not a missing runtime impl)", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.unresolved_emitted_symbol(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_duplicate_diag(
+    diags: mutable diags_mod.Diagnostics,
+    name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("duplicate runtime extern '", name, allocator)?
+    let msg = string.concat(head, "': defined in more than one link input — the linker resolves it to one definition arbitrarily; keep a single definition in edda_rt.lib", allocator)?
+    let d = diag_mod.warn_at(diag_code_mod.duplicate_runtime_extern(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function gate_runtime_externs(
+    feed: link_feed_mod.RuntimeFeed,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let res = link_resolve_mod.resolve(feed.objects, feed.provided, allocator)?
+    var has_error = false
+
+    var seen_unprovided = StringMap_bool.new(allocator)?
+    let nu = Vec_String.len(res.unresolved)
+    var i: usize = 0
+    loop decreases (nu - i) {
+        if i >= nu { break }
+        let name = Vec_String.at(res.unresolved, i)
+        if !StringMap_bool.contains(seen_unprovided, name) {
+            let _ = StringMap_bool.insert(mutable seen_unprovided, name, true, allocator)?
+            if is_runtime_extern(name) {
+                emit_unprovided_diag(mutable diags, name, allocator)?
+            } else {
+                emit_unresolved_emitted_diag(mutable diags, name, allocator)?
+            }
+            has_error = true
+        }
+        i = i + (1 as usize)
+    }
+
+    var seen_dup = StringMap_bool.new(allocator)?
+    let nd = Vec_String.len(res.duplicates)
+    var j: usize = 0
+    loop decreases (nd - j) {
+        if j >= nd { break }
+        let name = Vec_String.at(res.duplicates, j)
+        if is_runtime_extern(name) && !StringMap_bool.contains(seen_dup, name) {
+            let _ = StringMap_bool.insert(mutable seen_dup, name, true, allocator)?
+            emit_duplicate_diag(mutable diags, name, allocator)?
+        }
+        j = j + (1 as usize)
+    }
+
+    return has_error
+}

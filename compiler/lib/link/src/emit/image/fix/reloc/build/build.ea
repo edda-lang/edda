@@ -1,0 +1,125 @@
+module link.emit.image.fix.reloc.build.build
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import object.coff as coff_mod
+import local.emit.layout as layout_mod
+import local.emit.image.fix.res.resolve as resolve_mod
+import local.emit.image.fix.reloc.defs.defs as reloc_mod
+import local.emit.image.fix.reloc.patch.patch as patch_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(reloc_mod.MergedSection)
+spec std.core.option.Option(layout_mod.Placement)
+spec std.collections.hashmap.StringMap(resolve_mod.Definition)
+spec std.collections.hashmap.StringMap(u32)
+
+
+public function build_class(
+    objects: Vec_CoffFile.Vec,
+    class_: layout_mod.SectionClass,
+    plan: layout_mod.LayoutPlan,
+    table: StringMap_Definition.StringMap,
+    imports: StringMap_u32.StringMap,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let size = layout_mod.class_size(plan, class_) as usize
+    uninit data: Vec_u8.Vec
+    Vec_u8.new(init data, allocator)?
+    var z: usize = 0
+    loop decreases (size - z) {
+        if z >= size { break }
+        Vec_u8.push(mutable data, take (0 as u8), allocator)?
+        z = z + 1
+    }
+    copy_inputs(objects, class_, plan, mutable data, allocator)?
+    patch_mod.patch_relocs(objects, class_, plan, table, imports, mutable data, allocator)?
+    return data
+}
+
+
+public function copy_inputs(
+    objects: Vec_CoffFile.Vec,
+    class_: layout_mod.SectionClass,
+    plan: layout_mod.LayoutPlan,
+    data: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let buf_len = Vec_u8.len(data)
+    let n_obj = Vec_CoffFile.len(objects)
+    var oi: usize = 0
+    loop decreases (n_obj - oi) {
+        if oi >= n_obj { break }
+        let file = Vec_CoffFile.at(objects, oi)
+        let nsec = Vec_CoffSection.len(file.sections)
+        var si: usize = 0
+        loop decreases (nsec - si) {
+            if si >= nsec { break }
+            let sec = Vec_CoffSection.at(file.sections, si)
+            if layout_mod.section_class_of(sec, file.string_table) == class_ {
+                match layout_mod.placement_of(plan, oi, si) {
+                    case .none => raise reloc_mod.RelocError.site_out_of_range
+                    case .some(let p) => copy_section_data(sec, p.offset as usize, mutable data, buf_len, allocator)?
+                }
+            }
+            si = si + 1
+        }
+        oi = oi + 1
+    }
+}
+
+
+public function copy_section_data(
+    sec: coff_mod.CoffSection,
+    base: usize,
+    data: mutable Vec_u8.Vec,
+    buf_len: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let n = Vec_u8.len(sec.data)
+    var k: usize = 0
+    loop decreases (n - k) {
+        if k >= n { break }
+        let dst = base + k
+        if dst >= buf_len { raise reloc_mod.RelocError.site_out_of_range }
+        Vec_u8.set_at(mutable data, dst, Vec_u8.at(sec.data, k))
+        k = k + 1
+    }
+}
+
+
+public function append_class(
+    objects: Vec_CoffFile.Vec,
+    class_: layout_mod.SectionClass,
+    characteristics: u32,
+    plan: layout_mod.LayoutPlan,
+    table: StringMap_Definition.StringMap,
+    imports: StringMap_u32.StringMap,
+    out: mutable Vec_MergedSection.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let size = layout_mod.class_size(plan, class_)
+    if size == (0 as u32) { return () }
+    let data = build_class(objects, class_, plan, table, imports, allocator)?
+    let ms = reloc_mod.MergedSection {
+        class_: class_,
+        rva: layout_mod.class_base_rva(plan, class_),
+        size: size,
+        characteristics: characteristics,
+        data: data,
+    }
+    Vec_MergedSection.push(mutable out, take ms, allocator)?
+}

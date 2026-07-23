@@ -1,0 +1,253 @@
+
+module regalloc.scan.step.walk
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.lir.op as lir_op_mod
+import ir.lir.term as lir_term_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_term_mod.LirSwitchCase)
+
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function op_def(op: lir_op_mod.LirOp) -> Option_u32.Option {
+    return match op.kind {
+        case .mov(_, let dst)              => Option_u32.some(value: dst.raw)
+        case .copy_(_, let dst)            => Option_u32.some(value: dst.raw)
+        case .constant_(_, let dst)        => Option_u32.some(value: dst.raw)
+        case .binary(_, _, _, let dst)     => Option_u32.some(value: dst.raw)
+        case .unary(_, _, let dst)         => Option_u32.some(value: dst.raw)
+        case .convert_(_, _, _, _, let dst) => Option_u32.some(value: dst.raw)
+        case .load(_, let dst, _)          => Option_u32.some(value: dst.raw)
+        case .store(_, _, _)               => Option_u32.none
+        case .call_(_, _, let ret)         => match ret {
+            case .some(let r) => Option_u32.some(value: r.raw)
+            case .none        => Option_u32.none
+        }
+        case .call_indirect(_, _, let ret) => match ret {
+            case .some(let r) => Option_u32.some(value: r.raw)
+            case .none        => Option_u32.none
+        }
+        case .make_closure(_, _, let dst)  => Option_u32.some(value: dst.raw)
+        case .stack_addr(_, let dst)       => Option_u32.some(value: dst.raw)
+        case .err_flag(let dst)            => Option_u32.some(value: dst.raw)
+        case .bounds_check(_, _)           => Option_u32.none
+        case .cmov_carry(_, let dst, _)    => Option_u32.some(value: dst.raw)
+    }
+}
+
+
+public function collect_op_uses(
+    op: lir_op_mod.LirOp,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match op.kind {
+        case .mov(let src, _)              => push_operand_use(mutable out, src, allocator)?
+        case .copy_(let src, _)            => Vec_u32.push(mutable out, src.raw, allocator)?
+        case .constant_(_, _)              => ()
+        case .binary(_, let lhs, let rhs, _) => {
+            Vec_u32.push(mutable out, lhs.raw, allocator)?
+            push_operand_use(mutable out, rhs, allocator)?
+        }
+        case .unary(_, let operand, _)     => Vec_u32.push(mutable out, operand.raw, allocator)?
+        case .convert_(let src, _, _, _, _) => Vec_u32.push(mutable out, src.raw, allocator)?
+        case .load(let addr, _, _)         => push_memref_uses(mutable out, addr, allocator)?
+        case .store(let value, let addr, _) => {
+            Vec_u32.push(mutable out, value.raw, allocator)?
+            push_memref_uses(mutable out, addr, allocator)?
+        }
+        case .call_(let callee, let args, _) => {
+            push_operand_use(mutable out, callee, allocator)?
+            push_vreg_list(mutable out, args, allocator)?
+        }
+        case .call_indirect(let callee, let args, _) => {
+            Vec_u32.push(mutable out, callee.raw, allocator)?
+            push_vreg_list(mutable out, args, allocator)?
+        }
+        case .make_closure(_, let env, _)  => Vec_u32.push(mutable out, env.raw, allocator)?
+        case .stack_addr(_, _)             => ()
+        case .err_flag(_)                  => ()
+        case .bounds_check(let index, let len) => {
+            push_operand_use(mutable out, index, allocator)?
+            push_operand_use(mutable out, len, allocator)?
+        }
+        case .cmov_carry(let src, let dst, _) => {
+            Vec_u32.push(mutable out, src.raw, allocator)?
+            Vec_u32.push(mutable out, dst.raw, allocator)?
+        }
+    }
+}
+
+
+public function collect_term_uses(
+    term: lir_term_mod.LirTerminator,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match term.kind {
+        case .jump(_, let args)            => push_vreg_list(mutable out, args, allocator)?
+        case .branch_if(let cond, _, let ta, _, let fa) => {
+            Vec_u32.push(mutable out, cond.raw, allocator)?
+            push_vreg_list(mutable out, ta, allocator)?
+            push_vreg_list(mutable out, fa, allocator)?
+        }
+        case .switch_(let discr, let targets) => {
+            Vec_u32.push(mutable out, discr.raw, allocator)?
+            push_switch_arg_uses(mutable out, targets, allocator)?
+        }
+        case .return_(let values)          => push_vreg_list(mutable out, values, allocator)?
+        case .unreachable_                 => ()
+        case .raise_(let value, _)         => Vec_u32.push(mutable out, value.raw, allocator)?
+        case .panic_(let message)          => Vec_u32.push(mutable out, message.raw, allocator)?
+        case .coherence_enter(_, _)        => ()
+        case .coherence_exit(_)            => ()
+    }
+}
+
+
+public function collect_successors(
+    term: lir_term_mod.LirTerminator,
+    out: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match term.kind {
+        case .jump(let target, _)          => Vec_u32.push(mutable out, target.raw, allocator)?
+        case .branch_if(_, let t, _, let f, _) => {
+            Vec_u32.push(mutable out, t.raw, allocator)?
+            Vec_u32.push(mutable out, f.raw, allocator)?
+        }
+        case .switch_(_, let targets)      => push_switch_succs(mutable out, targets, allocator)?
+        case .return_(_)                   => ()
+        case .unreachable_                 => ()
+        case .raise_(_, let unwind)        => push_unwind_succ(mutable out, unwind, allocator)?
+        case .panic_(_)                    => ()
+        case .coherence_enter(let body_entry, let exit) => {
+            Vec_u32.push(mutable out, body_entry.raw, allocator)?
+            Vec_u32.push(mutable out, exit.raw, allocator)?
+        }
+        case .coherence_exit(let target)   => Vec_u32.push(mutable out, target.raw, allocator)?
+    }
+}
+
+
+function push_operand_use(
+    out: mutable Vec_u32.Vec,
+    operand: lir_reg_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match operand {
+        case .vreg(let id) => Vec_u32.push(mutable out, id.raw, allocator)?
+        case .preg(_)      => ()
+        case .imm(_)       => ()
+    }
+}
+
+
+function push_memref_uses(
+    out: mutable Vec_u32.Vec,
+    addr: lir_reg_mod.MemRef,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match addr.base {
+        case .some(let id) => Vec_u32.push(mutable out, id.raw, allocator)?
+        case .none         => ()
+    }
+    match addr.index {
+        case .some(let id) => Vec_u32.push(mutable out, id.raw, allocator)?
+        case .none         => ()
+    }
+}
+
+
+function push_vreg_list(
+    out: mutable Vec_u32.Vec,
+    ids: Vec_LirVRegId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LirVRegId.len(ids)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let id = Vec_LirVRegId.at(ids, i)
+        Vec_u32.push(mutable out, id.raw, allocator)?
+        i += 1
+    }
+}
+
+
+function push_switch_arg_uses(
+    out: mutable Vec_u32.Vec,
+    targets: lir_term_mod.LirSwitchTargets,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let cases = targets.cases
+    let n = Vec_LirSwitchCase.len(cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_LirSwitchCase.at(cases, i)
+        push_vreg_list(mutable out, c.args, allocator)?
+        i += 1
+    }
+    push_vreg_list(mutable out, targets.default_args, allocator)?
+}
+
+
+function push_switch_succs(
+    out: mutable Vec_u32.Vec,
+    targets: lir_term_mod.LirSwitchTargets,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let cases = targets.cases
+    let n = Vec_LirSwitchCase.len(cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_LirSwitchCase.at(cases, i)
+        Vec_u32.push(mutable out, c.target.raw, allocator)?
+        i += 1
+    }
+    Vec_u32.push(mutable out, targets.default.raw, allocator)?
+}
+
+
+function push_unwind_succ(
+    out: mutable Vec_u32.Vec,
+    action: lir_term_mod.LirUnwindAction,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match action {
+        case .continue_         => ()
+        case .unreachable_      => ()
+        case .cleanup(let target) => Vec_u32.push(mutable out, target.raw, allocator)?
+    }
+}

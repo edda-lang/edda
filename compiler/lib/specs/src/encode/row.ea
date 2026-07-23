@@ -1,0 +1,104 @@
+
+module specs.encode.row
+
+import std.mem.alloc
+import std.collections.vec
+import types.pass.effect as effect_mod
+import types.effect.row as effect_row_mod
+import types.effect.interner as row_interner_mod
+import intern.interner as sym_interner_mod
+import span.loc.pos.span as span_mod
+import local.error as err_mod
+import local.encode.bytes as bytes_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(effect_row_mod.CEntry)
+
+
+public function kind_effect_row() -> u8 { return 0x02 as u8 }
+
+
+public function encode_effect_row(
+    buf: mutable Vec_u8.Vec,
+    row: effect_mod.EffectRowId,
+    at: span_mod.Span,
+    row_interner: row_interner_mod.Interner,
+    sym_interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    let _ = sym_interner
+    bytes_mod.put_u8(mutable buf, kind_effect_row(), allocator)?
+    let canonical = row_interner_mod.lookup(row_interner, row)
+    let entries = canonical.entries
+    let n = Vec_CEntry.len(entries)
+    bytes_mod.put_u32_le(mutable buf, n as u32, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let entry = Vec_CEntry.at(entries, i)
+        encode_entry(mutable buf, entry, at, allocator)?
+        i += 1
+    }
+}
+
+function encode_entry(
+    buf: mutable Vec_u8.Vec,
+    entry: effect_row_mod.CEntry,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    match entry {
+        case .panic_ =>
+            put_name(mutable buf, "panic", allocator)?
+        case .cancellation_ =>
+            put_name(mutable buf, "cancellation", allocator)?
+        case .divergence_ =>
+            put_name(mutable buf, "divergence", allocator)?
+        case .nondet_ =>
+            put_name(mutable buf, "nondet", allocator)?
+        case .alloc_(let bytes_max) => {
+            put_name(mutable buf, "alloc", allocator)?
+            bytes_mod.put_u128_le(mutable buf, bytes_max, allocator)?
+        }
+        case .io_(let calls_max) => {
+            put_name(mutable buf, "io", allocator)?
+            bytes_mod.put_u128_le(mutable buf, calls_max, allocator)?
+        }
+        case .time_(let ops_max) => {
+            put_name(mutable buf, "time", allocator)?
+            bytes_mod.put_u128_le(mutable buf, ops_max, allocator)?
+        }
+        case .capability(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "effect_capability",
+                message: "capability mentions reference spec-internal param indices; encoding is deferred to the walker phase, which has the parameter context",
+            )
+        case .err_(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "effect_err",
+                message: "typed err: T entries depend on the composite-Type encoding, which is deferred to the walker phase",
+            )
+        case .yield_(_) =>
+            raise err_mod.SpecError.encoding_failed(
+                at: at,
+                kind: "effect_yield",
+                message: "typed yield: T entries depend on the composite-Type encoding, which is deferred to the walker phase",
+            )
+    }
+}
+
+function put_name(buf: mutable Vec_u8.Vec, name: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = name.bytes()
+    let len_u32 = bytes.len() as u32
+    bytes_mod.put_u32_le(mutable buf, len_u32, allocator)?
+    bytes_mod.put_bytes(mutable buf, bytes, allocator)?
+}

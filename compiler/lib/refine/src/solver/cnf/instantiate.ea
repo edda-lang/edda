@@ -1,0 +1,330 @@
+
+module refine.solver.cnf.instantiate
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.symbol as symbol_mod
+import local.smt.term as term_mod
+import local.solver.theory.quant.quant as quant_mod
+import local.solver.theory.arrays as arrays_mod
+
+
+spec std.mem.alloc.Box(term_mod.SmtTerm)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.core.option.Option(term_mod.SmtTerm)
+spec std.collections.vec.Vec(arrays_mod.ArrayLit)
+spec std.collections.vec.Vec(arrays_mod.ArrayClause)
+
+
+public type Bounds {
+    lo: i64
+    hi: i64
+    closed: bool
+}
+
+
+spec std.core.option.Option(Bounds)
+
+
+public function instantiate(term: term_mod.SmtTerm, allocator: Allocator) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match term {
+        case .true_ => Option_SmtTerm.some(value: term)
+        case .false_ => Option_SmtTerm.some(value: term)
+        case .numeral(_) => Option_SmtTerm.some(value: term)
+        case .var_(_, _) => Option_SmtTerm.some(value: term)
+        case .app(let op, let args) => inst_app(op, args, allocator)?
+        case .forall_(let binder, _, let body) => inst_quant(true, binder, body, allocator)?
+        case .exists_(let binder, _, let body) => inst_quant(false, binder, body, allocator)?
+    }
+}
+
+
+function inst_app(op: term_mod.SmtOp, args: Vec_SmtTerm.Vec, allocator: Allocator) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit new_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init new_args, allocator)?
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        match instantiate(arg, allocator)? {
+            case .none => return Option_SmtTerm.none
+            case .some(let t) => Vec_SmtTerm.push(mutable new_args, take t, allocator)?
+        }
+        i = i + 1
+    }
+    return Option_SmtTerm.some(value: term_mod.SmtTerm.app(op: op, args: new_args))
+}
+
+
+function inst_quant(
+    is_forall: bool,
+    binder: symbol_mod.Symbol,
+    body: Box_SmtTerm,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_SmtTerm.get(body)
+    return match inner {
+        case .app(let wrap_op, let wargs) => inst_guarded(is_forall, binder, wrap_op, wargs, allocator)?
+        case _ => Option_SmtTerm.none
+    }
+}
+
+
+function inst_guarded(
+    is_forall: bool,
+    binder: symbol_mod.Symbol,
+    wrap_op: term_mod.SmtOp,
+    wargs: Vec_SmtTerm.Vec,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_SmtTerm.len(wargs) != 2 {
+        return Option_SmtTerm.none
+    }
+    let wrap_ok = match wrap_op {
+        case .implies_ => is_forall
+        case .and_ => !is_forall
+        case _ => false
+    }
+    if !wrap_ok {
+        return Option_SmtTerm.none
+    }
+    let guard = Vec_SmtTerm.at(wargs, 0)
+    let consequent = Vec_SmtTerm.at(wargs, 1)
+    return match extract_bounds(guard, binder) {
+        case .none => Option_SmtTerm.none
+        case .some(let bnds) => expand_bounds(is_forall, binder, consequent, bnds, allocator)?
+    }
+}
+
+
+function expand_bounds(
+    is_forall: bool,
+    binder: symbol_mod.Symbol,
+    consequent: term_mod.SmtTerm,
+    bnds: Bounds,
+    allocator: Allocator,
+) -> Option_SmtTerm.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let hi_excl = if bnds.closed {
+        if bnds.hi == 9223372036854775807 {
+            return Option_SmtTerm.none
+        }
+        bnds.hi + 1
+    } else {
+        bnds.hi
+    }
+    let inner_inst = match instantiate(consequent, allocator)? {
+        case .none => return Option_SmtTerm.none
+        case .some(let t) => t
+    }
+    let expanded = if is_forall {
+        quant_mod.expand_forall(binder, inner_inst, bnds.lo, hi_excl, allocator)?
+    } else {
+        quant_mod.expand_exists(binder, inner_inst, bnds.lo, hi_excl, allocator)?
+    }
+    return Option_SmtTerm.some(value: expanded)
+}
+
+
+function extract_bounds(guard: term_mod.SmtTerm, binder: symbol_mod.Symbol) -> Option_Bounds.Option {
+    return match guard {
+        case .app(let op, let args) => match op {
+            case .and_ => extract_and(args, binder)
+            case _ => Option_Bounds.none
+        }
+        case _ => Option_Bounds.none
+    }
+}
+
+
+function extract_and(args: Vec_SmtTerm.Vec, binder: symbol_mod.Symbol) -> Option_Bounds.Option {
+    if Vec_SmtTerm.len(args) != 2 {
+        return Option_Bounds.none
+    }
+    let lo_bound = Vec_SmtTerm.at(args, 0)
+    let hi_bound = Vec_SmtTerm.at(args, 1)
+    return match extract_lo(lo_bound, binder) {
+        case .none => Option_Bounds.none
+        case .some(let lo) => match extract_hi(hi_bound, binder) {
+            case .none => Option_Bounds.none
+            case .some(let hb) => Option_Bounds.some(
+                value: Bounds { lo: lo, hi: hb.hi, closed: hb.closed },
+            )
+        }
+    }
+}
+
+
+spec std.core.option.Option(i64)
+
+
+function extract_lo(t: term_mod.SmtTerm, binder: symbol_mod.Symbol) -> Option_i64.Option {
+    return match t {
+        case .app(let op, let args) => match op {
+            case .le => extract_lo_args(args, binder)
+            case _ => Option_i64.none
+        }
+        case _ => Option_i64.none
+    }
+}
+
+
+function extract_lo_args(args: Vec_SmtTerm.Vec, binder: symbol_mod.Symbol) -> Option_i64.Option {
+    if Vec_SmtTerm.len(args) != 2 {
+        return Option_i64.none
+    }
+    let lo_term = Vec_SmtTerm.at(args, 0)
+    let var_term = Vec_SmtTerm.at(args, 1)
+    if !is_binder_var(var_term, binder) {
+        return Option_i64.none
+    }
+    return as_numeral(lo_term)
+}
+
+
+public type HiBound {
+    hi: i64
+    closed: bool
+}
+
+
+spec std.core.option.Option(HiBound)
+
+
+function extract_hi(t: term_mod.SmtTerm, binder: symbol_mod.Symbol) -> Option_HiBound.Option {
+    return match t {
+        case .app(let op, let args) => match op {
+            case .lt => extract_hi_args(args, binder, false)
+            case .le => extract_hi_args(args, binder, true)
+            case _ => Option_HiBound.none
+        }
+        case _ => Option_HiBound.none
+    }
+}
+
+
+function extract_hi_args(args: Vec_SmtTerm.Vec, binder: symbol_mod.Symbol, closed: bool) -> Option_HiBound.Option {
+    if Vec_SmtTerm.len(args) != 2 {
+        return Option_HiBound.none
+    }
+    let var_term = Vec_SmtTerm.at(args, 0)
+    let hi_term = Vec_SmtTerm.at(args, 1)
+    if !is_binder_var(var_term, binder) {
+        return Option_HiBound.none
+    }
+    return match as_numeral(hi_term) {
+        case .none => Option_HiBound.none
+        case .some(let hv) => Option_HiBound.some(value: HiBound { hi: hv, closed: closed })
+    }
+}
+
+
+function is_binder_var(t: term_mod.SmtTerm, binder: symbol_mod.Symbol) -> bool {
+    return match t {
+        case .var_(let name, _) => name == binder
+        case _ => false
+    }
+}
+
+
+function as_numeral(t: term_mod.SmtTerm) -> Option_i64.Option {
+    return match t {
+        case .numeral(let v) => if v > (9223372036854775807 as i128) {
+            Option_i64.none
+        } else {
+            if v < ((0 - 9223372036854775807 - 1) as i128) {
+                Option_i64.none
+            } else {
+                Option_i64.some(value: v as i64)
+            }
+        }
+        case _ => Option_i64.none
+    }
+}
+
+
+public function array_axiom_terms(term: term_mod.SmtTerm, allocator: Allocator) -> Vec_SmtTerm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit clauses: Vec_ArrayClause.Vec
+    Vec_ArrayClause.new(init clauses, allocator)?
+    arrays_mod.collect_axioms(term, mutable clauses, allocator)?
+    uninit out: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init out, allocator)?
+    let n = Vec_ArrayClause.len(clauses)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let clause = Vec_ArrayClause.at(clauses, i)
+        let ct = clause_to_term(clause, allocator)?
+        Vec_SmtTerm.push(mutable out, take ct, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function clause_to_term(clause: arrays_mod.ArrayClause, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let lits = clause.lits
+    let n = Vec_ArrayLit.len(lits)
+    var acc = term_mod.SmtTerm.false_
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let lit = Vec_ArrayLit.at(lits, i)
+        let lit_term = if lit.positive {
+            lit.atom
+        } else {
+            not_term(lit.atom, allocator)?
+        }
+        acc = or_term(acc, lit_term, allocator)?
+        i = i + 1
+    }
+    return acc
+}
+
+
+function not_term(a: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take a, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.not_, args: args)
+}
+
+
+function or_term(a: term_mod.SmtTerm, b: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take a, allocator)?
+    Vec_SmtTerm.push(mutable args, take b, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.or_, args: args)
+}

@@ -1,0 +1,428 @@
+
+module types.check.consume.state
+
+import std.mem.alloc
+import std.collections.vec
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(Slot)
+spec std.collections.vec.Vec(ConsumeFact)
+
+
+derive eq, clone, debug for FlowState
+derive clone, debug for Slot
+derive clone, debug for ConsumeFact
+
+
+public type FlowState {
+    case unknown
+    case uninit_
+    case ready
+    case consumed
+    case field_drained
+}
+
+
+public type Slot {
+    state: FlowState
+    owned: bool
+    terminal: bool
+    decl: node_mod.NodeId
+}
+
+
+public type ConsumeFact {
+    local: def_mod.DefId
+    node: node_mod.NodeId
+    state: FlowState
+}
+
+
+public type FlowTable {
+    base: usize
+    slots: Vec_Slot.Vec
+}
+
+
+function default_slot() -> Slot {
+    return Slot { state: FlowState.unknown, owned: false, terminal: false, decl: node_mod.error() }
+}
+
+
+public function new_table(out: init FlowTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit slots: Vec_Slot.Vec
+    Vec_Slot.new(init slots, allocator)?
+    out = FlowTable { base: 0, slots: slots }
+}
+
+
+public function slot_count(t: FlowTable) -> usize {
+    return Vec_Slot.len(t.slots)
+}
+
+
+public function slot_at_pos(t: FlowTable, i: usize) -> Slot {
+    if i >= Vec_Slot.len(t.slots) {
+        return default_slot()
+    }
+    return Vec_Slot.at(t.slots, i)
+}
+
+
+function align_down(t: mutable FlowTable, new_base: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if new_base >= t.base {
+        return
+    }
+    let delta = t.base - new_base
+    let n = Vec_Slot.len(t.slots)
+    uninit fresh: Vec_Slot.Vec
+    Vec_Slot.with_capacity(init fresh, n + delta, allocator)?
+    var i: usize = 0 as usize
+    loop decreases (delta - i) {
+        if i >= delta { break }
+        Vec_Slot.push(mutable fresh, default_slot(), allocator)?
+        i = i + 1 as usize
+    }
+    var j: usize = 0 as usize
+    loop decreases (n - j) {
+        if j >= n { break }
+        Vec_Slot.push(mutable fresh, Vec_Slot.at(t.slots, j), allocator)?
+        j = j + 1 as usize
+    }
+    t.slots = fresh
+    t.base = new_base
+}
+
+
+function ensure_covers(t: mutable FlowTable, target: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_Slot.len(t.slots) == 0 as usize {
+        t.base = target
+        Vec_Slot.push(mutable t.slots, default_slot(), allocator)?
+        return
+    }
+    if target < t.base {
+        align_down(mutable t, target, allocator)?
+        return
+    }
+    grow_to(mutable t.slots, target - t.base, allocator)?
+}
+
+
+function grow_to(
+    states: mutable Vec_Slot.Vec,
+    target: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        let len = Vec_Slot.len(states)
+        if len > target { break }
+        Vec_Slot.push(mutable states, default_slot(), allocator)?
+    }
+}
+
+
+public function set_state(
+    states: mutable FlowTable,
+    def: def_mod.DefId,
+    st: FlowState,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let target = def_mod.index(def)
+    ensure_covers(mutable states, target, allocator)?
+    let pos = target - states.base
+    let cur = Vec_Slot.at(states.slots, pos)
+    Vec_Slot.set_at(mutable states.slots, pos, Slot { state: st, owned: cur.owned, terminal: cur.terminal, decl: cur.decl })
+}
+
+
+public function set_owned(
+    states: mutable FlowTable,
+    def: def_mod.DefId,
+    decl: node_mod.NodeId,
+    terminal: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let target = def_mod.index(def)
+    ensure_covers(mutable states, target, allocator)?
+    let pos = target - states.base
+    let cur = Vec_Slot.at(states.slots, pos)
+    Vec_Slot.set_at(mutable states.slots, pos, Slot { state: cur.state, owned: true, terminal: terminal, decl: decl })
+}
+
+
+public function record_fact(
+    facts: mutable Vec_ConsumeFact.Vec,
+    local: def_mod.DefId,
+    node: node_mod.NodeId,
+    st: FlowState,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if def_mod.is_error(local) {
+        return
+    }
+    Vec_ConsumeFact.push(mutable facts, ConsumeFact { local: local, node: node, state: st }, allocator)?
+}
+
+
+public function get_state(states: FlowTable, def: def_mod.DefId) -> FlowState {
+    if def_mod.is_error(def) {
+        return FlowState.unknown
+    }
+    let i = def_mod.index(def)
+    if i < states.base {
+        return FlowState.unknown
+    }
+    let pos = i - states.base
+    if pos >= Vec_Slot.len(states.slots) {
+        return FlowState.unknown
+    }
+    return Vec_Slot.at(states.slots, pos).state
+}
+
+
+public function type_of_local(local_types: Vec_TyId.Vec, def: def_mod.DefId) -> ty_mod.TyId {
+    if def_mod.is_error(def) {
+        return ty_mod.error()
+    }
+    let i = def_mod.index(def)
+    if i >= Vec_TyId.len(local_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(local_types, i)
+}
+
+
+public function clone_slots(src: FlowTable, allocator: Allocator) -> FlowTable
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Slot.len(src.slots)
+    uninit out: Vec_Slot.Vec
+    Vec_Slot.with_capacity(init out, n, allocator)?
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Slot.push(mutable out, Vec_Slot.at(src.slots, i), allocator)?
+        i = i + 1 as usize
+    }
+    return FlowTable { base: src.base, slots: out }
+}
+
+
+function src_slot_abs(src: FlowTable, abs: usize) -> Slot {
+    if abs < src.base {
+        return default_slot()
+    }
+    return slot_at_pos(src, abs - src.base)
+}
+
+
+public function overwrite_slots(
+    dst: mutable FlowTable,
+    src: FlowTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let sn = Vec_Slot.len(src.slots)
+    if sn == 0 as usize {
+        let dn0 = Vec_Slot.len(dst.slots)
+        var k: usize = 0 as usize
+        loop decreases (dn0 - k) {
+            if k >= dn0 { break }
+            let cur = Vec_Slot.at(dst.slots, k)
+            Vec_Slot.set_at(mutable dst.slots, k, Slot { state: FlowState.unknown, owned: cur.owned, terminal: cur.terminal, decl: cur.decl })
+            k = k + 1 as usize
+        }
+        return
+    }
+    let src_end = src.base + sn
+    if Vec_Slot.len(dst.slots) == 0 as usize {
+        dst.base = src.base
+    }
+    if src.base < dst.base {
+        align_down(mutable dst, src.base, allocator)?
+    }
+    ensure_covers(mutable dst, src_end - 1 as usize, allocator)?
+    let copy_n = src_end - dst.base
+    var i: usize = 0 as usize
+    loop decreases (copy_n - i) {
+        if i >= copy_n { break }
+        Vec_Slot.set_at(mutable dst.slots, i, src_slot_abs(src, dst.base + i))
+        i = i + 1 as usize
+    }
+    let dn = Vec_Slot.len(dst.slots)
+    var j: usize = copy_n
+    loop decreases (dn - j) {
+        if j >= dn { break }
+        let cur = Vec_Slot.at(dst.slots, j)
+        Vec_Slot.set_at(mutable dst.slots, j, Slot { state: FlowState.unknown, owned: cur.owned, terminal: cur.terminal, decl: cur.decl })
+        j = j + 1 as usize
+    }
+}
+
+
+public function merge_into(
+    dst: mutable FlowTable,
+    a: FlowTable,
+    a_ft: bool,
+    b: FlowTable,
+    b_ft: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if a_ft && !b_ft {
+        overwrite_slots(mutable dst, a, allocator)?
+        return
+    }
+    if b_ft && !a_ft {
+        overwrite_slots(mutable dst, b, allocator)?
+        return
+    }
+    if !a_ft && !b_ft {
+        overwrite_slots(mutable dst, a, allocator)?
+        return
+    }
+    merge_overwrite(mutable dst, a, b, allocator)?
+}
+
+
+function merge_overwrite(
+    dst: mutable FlowTable,
+    a: FlowTable,
+    b: FlowTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let na = Vec_Slot.len(a.slots)
+    let nb = Vec_Slot.len(b.slots)
+    if na == 0 as usize && nb == 0 as usize {
+        overwrite_slots(mutable dst, a, allocator)?
+        return
+    }
+    let a_lo = if na == 0 as usize { b.base } else { a.base }
+    let b_lo = if nb == 0 as usize { a.base } else { b.base }
+    let lo = if a_lo < b_lo { a_lo } else { b_lo }
+    let a_end = if na == 0 as usize { lo } else { a.base + na }
+    let b_end = if nb == 0 as usize { lo } else { b.base + nb }
+    let hi = if a_end > b_end { a_end } else { b_end }
+    if Vec_Slot.len(dst.slots) == 0 as usize {
+        dst.base = lo
+    }
+    if lo < dst.base {
+        align_down(mutable dst, lo, allocator)?
+    }
+    ensure_covers(mutable dst, hi - 1 as usize, allocator)?
+    let copy_n = hi - dst.base
+    var i: usize = 0 as usize
+    loop decreases (copy_n - i) {
+        if i >= copy_n { break }
+        let abs = dst.base + i
+        Vec_Slot.set_at(mutable dst.slots, i, merge_slot(src_slot_abs(a, abs), src_slot_abs(b, abs)))
+        i = i + 1 as usize
+    }
+    let dn = Vec_Slot.len(dst.slots)
+    var j: usize = copy_n
+    loop decreases (dn - j) {
+        if j >= dn { break }
+        let cur = Vec_Slot.at(dst.slots, j)
+        Vec_Slot.set_at(mutable dst.slots, j, Slot { state: FlowState.unknown, owned: cur.owned, terminal: cur.terminal, decl: cur.decl })
+        j = j + 1 as usize
+    }
+}
+
+
+public function merge_accumulate(
+    dst: mutable FlowTable,
+    b: FlowTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let na = Vec_Slot.len(dst.slots)
+    let nb = Vec_Slot.len(b.slots)
+    if na == 0 as usize && nb == 0 as usize {
+        return
+    }
+    let a_lo = if na == 0 as usize { b.base } else { dst.base }
+    let b_lo = if nb == 0 as usize { dst.base } else { b.base }
+    let lo = if a_lo < b_lo { a_lo } else { b_lo }
+    let a_end = if na == 0 as usize { lo } else { dst.base + na }
+    let b_end = if nb == 0 as usize { lo } else { b.base + nb }
+    let hi = if a_end > b_end { a_end } else { b_end }
+    if Vec_Slot.len(dst.slots) == 0 as usize {
+        dst.base = lo
+    }
+    if lo < dst.base {
+        align_down(mutable dst, lo, allocator)?
+    }
+    ensure_covers(mutable dst, hi - 1 as usize, allocator)?
+    let copy_n = hi - dst.base
+    var i: usize = 0 as usize
+    loop decreases (copy_n - i) {
+        if i >= copy_n { break }
+        let cur = Vec_Slot.at(dst.slots, i)
+        Vec_Slot.set_at(mutable dst.slots, i, merge_slot(cur, src_slot_abs(b, dst.base + i)))
+        i = i + 1 as usize
+    }
+}
+
+
+function merge_slot(a: Slot, b: Slot) -> Slot {
+    let owned = a.owned || b.owned
+    let terminal = a.terminal || b.terminal
+    let decl = if a.owned { a.decl } else { b.decl }
+    return Slot { state: merge_flow(a.state, b.state), owned: owned, terminal: terminal, decl: decl }
+}
+
+
+function merge_flow(a: FlowState, b: FlowState) -> FlowState {
+    return match a {
+        case .unknown => b
+        case .uninit_ => FlowState.uninit_
+        case .ready => match b {
+            case .unknown => FlowState.ready
+            case .uninit_ => FlowState.uninit_
+            case _ => FlowState.ready
+        }
+        case .consumed => match b {
+            case .unknown => FlowState.consumed
+            case .consumed => FlowState.consumed
+            case .field_drained => FlowState.consumed
+            case .uninit_ => FlowState.uninit_
+            case _ => FlowState.ready
+        }
+        case .field_drained => match b {
+            case .unknown => FlowState.field_drained
+            case .field_drained => FlowState.field_drained
+            case .consumed => FlowState.consumed
+            case .uninit_ => FlowState.uninit_
+            case _ => FlowState.ready
+        }
+    }
+}

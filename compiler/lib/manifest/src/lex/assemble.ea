@@ -1,0 +1,216 @@
+
+module manifest.lex.assemble
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import diagnostics.emit.collection as collection_mod
+import diagnostics.emit.lint.config as lint_config_mod
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import local.model.build.build as build_mod
+import local.model.codegen.gc_schedule as gc_schedule_mod
+import local.model.dependency.dependency as dep_mod
+import local.manifest as manifest_mod
+import local.model.package.package as pkg_mod
+import local.model.reserved.reserved as reserved_mod
+import local.model.structmap.structmap as structmap_mod
+import local.lex.toml.val.values as values_mod
+import local.model.workspace.workspace as ws_mod
+import link.emit.image.output as output_mod
+
+spec std.collections.vec.Vec(dep_mod.Dependency)
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(bool)
+spec std.core.option.Option(String)
+spec std.core.option.Option(gc_schedule_mod.GcScheduleMode)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(output_mod.OutputKind)
+spec std.core.option.Option(pkg_mod.SemVer)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(ws_mod.Workspace)
+spec std.core.option.Option(ws_mod.WorkspaceDiscover)
+
+
+public function assemble_parts(
+    pkg_name_opt: take Option_String.Option,
+    pkg_version_opt: Option_SemVer.Option,
+    pkg_ns_opt: take Option_String.Option,
+    pkg_ns_span: span_mod.Span,
+    pkg_kind_opt: Option_OutputKind.Option,
+    pkg_license_opt: take Option_String.Option,
+    pkg_edition_opt: take Option_String.Option,
+    pkg_authors_vec: Vec_String.Vec,
+    pkg_description_opt: take Option_String.Option,
+    pkg_max_trust_opt: Option_u32.Option,
+    ws_members_vec: Vec_String.Vec,
+    ws_discover_opt: Option_WorkspaceDiscover.Option,
+    build_target_opt: Option_String.Option,
+    build_profile_opt: take Option_String.Option,
+    build_emit_opt: Option_bool.Option,
+    structmap_descendant_tree_opt: Option_bool.Option,
+    gc_schedule_mode_opt: Option_GcScheduleMode.Option,
+    deps_vec: Vec_Dependency.Vec,
+    has_pkg: bool,
+    has_ws: bool,
+    lints_config: lint_config_mod.LintConfig,
+    file: file_mod.FileId,
+    diags: mutable collection_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_LoadedManifest
+    with {allocator, err: alloc.AllocError}
+{
+    let build_val = build_from_parts(build_target_opt, take build_profile_opt, build_emit_opt)
+    let structmap_val = structmap_from_parts(structmap_descendant_tree_opt, ws_discover_opt)
+    let codegen_val = codegen_from_parts(gc_schedule_mode_opt)
+
+    if has_ws {
+        if !validate_members(ws_members_vec, mutable diags, allocator)? {
+            return Option_LoadedManifest.none
+        }
+    }
+
+    if has_pkg {
+        if !is_some_string(pkg_name_opt) || !is_some_semver(pkg_version_opt) || !is_some_string(pkg_ns_opt) {
+            values_mod.emit_error_at(mutable diags, span_mod.dummy(), "`[package]` is missing one or more required fields: `name`, `version`, `root_namespace`", allocator)?
+            return Option_LoadedManifest.none
+        }
+        let name_v = unwrap_string(take pkg_name_opt)
+        let ver_v = unwrap_semver(pkg_version_opt)
+        let ns_v = unwrap_string(take pkg_ns_opt)
+        let kind_v = unwrap_output_kind(pkg_kind_opt)
+        let license_v = unwrap_string(take pkg_license_opt)
+        let edition_v = unwrap_string(take pkg_edition_opt)
+        let description_v = unwrap_string(take pkg_description_opt)
+        if reserved_mod.is_reserved(ns_v) {
+            values_mod.emit_error_at(mutable diags, pkg_ns_span, "`root_namespace` collides with a compiler-reserved prefix (`std`, `codegen`, `tests`, `bench`, `examples`)", allocator)?
+            return Option_LoadedManifest.none
+        }
+        let pkg_val = pkg_mod.package_of(name_v, ver_v, ns_v, kind_v, license_v, edition_v, pkg_authors_vec, description_v, pkg_max_trust_opt)
+        let ws_opt = if has_ws {
+            Option_Workspace.some(value: ws_mod.workspace_of(ws_members_vec, ws_discover_opt))
+        } else {
+            Option_Workspace.none
+        }
+        return Option_LoadedManifest.some(value: manifest_mod.LoadedManifest.package(
+            pkg: pkg_val,
+            deps: deps_vec,
+            build: build_val,
+            workspace: ws_opt,
+            lints: lints_config,
+            structmap: structmap_val,
+            codegen: codegen_val,
+        ))
+    }
+
+    if has_ws {
+        let members_empty = Vec_String.len(ws_members_vec) == 0
+        let discover_set = match ws_discover_opt {
+            case .some(_) => true
+            case .none    => false
+        }
+        if members_empty && !discover_set {
+            values_mod.emit_error_at(mutable diags, span_mod.dummy(), "`[workspace]` requires either a non-empty `members = [...]` or `discover = true | \"<path>\"`", allocator)?
+            return Option_LoadedManifest.none
+        }
+        let ws_val = ws_mod.workspace_of(ws_members_vec, ws_discover_opt)
+        return Option_LoadedManifest.some(value: manifest_mod.LoadedManifest.workspace_only(
+            workspace: ws_val,
+            build: build_val,
+            lints: lints_config,
+            structmap: structmap_val,
+            codegen: codegen_val,
+        ))
+    }
+
+    values_mod.emit_error_at(mutable diags, span_mod.dummy(), "manifest declares neither `[package]` nor `[workspace]`", allocator)?
+    return Option_LoadedManifest.none
+}
+
+function validate_members(members: Vec_String.Vec, diags: mutable collection_mod.Diagnostics, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(members)
+    var i: usize = 0
+    var ok = true
+    loop decreases (n - i) {
+        if i >= n { break }
+        let m = Vec_String.at(members, i)
+        if !reserved_mod.is_safe_path_segment(m) {
+            values_mod.emit_error_at(mutable diags, span_mod.dummy(), "`[workspace] members` entry contains an unsafe path character (only letters, digits, underscore, and hyphen are allowed)", allocator)?
+            ok = false
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+function build_from_parts(target_opt: Option_String.Option, profile_opt: take Option_String.Option, emit_opt: Option_bool.Option) -> build_mod.Build {
+    let dflt = build_mod.locked_default()
+    let profile = match profile_opt {
+        case .some(let s) => s
+        case .none        => build_mod.default_profile(dflt)
+    }
+    let emit = match emit_opt {
+        case .some(let b) => b
+        case .none        => build_mod.emit_structmap(dflt)
+    }
+    return build_mod.build_of(target_opt, profile, emit)
+}
+
+
+function structmap_from_parts(descendant_tree_opt: Option_bool.Option, discover_opt: Option_WorkspaceDiscover.Option) -> structmap_mod.StructmapConfig {
+    let descendant_tree = match discover_opt {
+        case .some(_) => true
+        case .none => match descendant_tree_opt {
+            case .some(let v) => v
+            case .none         => false
+        }
+    }
+    return structmap_mod.structmap_config_of(descendant_tree)
+}
+
+
+function codegen_from_parts(mode_opt: Option_GcScheduleMode.Option) -> gc_schedule_mod.GcScheduleConfig {
+    let mode = match mode_opt {
+        case .some(let v) => v
+        case .none        => gc_schedule_mod.GcScheduleMode.never
+    }
+    return gc_schedule_mod.gc_schedule_config_of(mode)
+}
+
+
+function is_some_string(o: Option_String.Option) -> bool {
+    return match o {
+        case .some(_) => true
+        case .none    => false
+    }
+}
+
+function is_some_semver(o: Option_SemVer.Option) -> bool {
+    return match o {
+        case .some(_) => true
+        case .none    => false
+    }
+}
+
+function unwrap_string(o: take Option_String.Option) -> String {
+    return match o {
+        case .some(let v) => v
+        case .none        => ""
+    }
+}
+
+function unwrap_semver(o: Option_SemVer.Option) -> pkg_mod.SemVer {
+    return match o {
+        case .some(let v) => v
+        case .none        => pkg_mod.semver_of(0, 0, 0)
+    }
+}
+
+function unwrap_output_kind(o: Option_OutputKind.Option) -> output_mod.OutputKind {
+    return match o {
+        case .some(let v) => v
+        case .none        => output_mod.OutputKind.executable
+    }
+}

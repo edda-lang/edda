@@ -1,0 +1,123 @@
+
+module refine.solver.cnf.diseq
+
+import std.collections.vec
+import std.mem.alloc
+import local.smt.term as term_mod
+
+
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function int_diseq_lemma_terms(term: term_mod.SmtTerm, allocator: Allocator) -> Vec_SmtTerm.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init out, allocator)?
+    collect_lemmas(term, mutable out, allocator)?
+    return out
+}
+
+
+function collect_lemmas(t: term_mod.SmtTerm, out: mutable Vec_SmtTerm.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match t {
+        case .app(let op, let args) => {
+            if is_eq_family(op) && Vec_SmtTerm.len(args) == 2 {
+                let lhs = Vec_SmtTerm.at(args, 0)
+                let rhs = Vec_SmtTerm.at(args, 1)
+                if is_int_term(lhs) || is_int_term(rhs) {
+                    let lemma = build_lemma(op, t, lhs, rhs, allocator)?
+                    Vec_SmtTerm.push(mutable out, take lemma, allocator)?
+                }
+            }
+            let n = Vec_SmtTerm.len(args)
+            var i: usize = 0
+            loop
+                decreases (n - i)
+            {
+                if i >= n {
+                    break
+                }
+                collect_lemmas(Vec_SmtTerm.at(args, i), mutable out, allocator)?
+                i = i + 1
+            }
+        }
+        case _ => {}
+    }
+}
+
+
+function is_eq_family(op: term_mod.SmtOp) -> bool {
+    return match op {
+        case .eq_ => true
+        case .distinct_ => true
+        case _ => false
+    }
+}
+
+
+function is_int_term(t: term_mod.SmtTerm) -> bool {
+    return match t {
+        case .numeral(_) => true
+        case .var_(_, let sort) => match sort {
+            case .int_ => true
+            case _ => false
+        }
+        case .app(let op, _) => is_arith_op(op)
+        case _ => false
+    }
+}
+
+
+function is_arith_op(op: term_mod.SmtOp) -> bool {
+    return match op {
+        case .add => true
+        case .sub => true
+        case .mul => true
+        case .neg => true
+        case .div_ => true
+        case .mod_ => true
+        case _ => false
+    }
+}
+
+
+function build_lemma(op: term_mod.SmtOp, whole: term_mod.SmtTerm, lhs: term_mod.SmtTerm, rhs: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let head = match op {
+        case .eq_ => whole
+        case _ => not_term(whole, allocator)?
+    }
+    let below = cmp_term(term_mod.SmtOp.lt, lhs, rhs, allocator)?
+    let above = cmp_term(term_mod.SmtOp.gt, lhs, rhs, allocator)?
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take head, allocator)?
+    Vec_SmtTerm.push(mutable args, take below, allocator)?
+    Vec_SmtTerm.push(mutable args, take above, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.or_, args: args)
+}
+
+
+function cmp_term(op: term_mod.SmtOp, lhs: term_mod.SmtTerm, rhs: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take lhs, allocator)?
+    Vec_SmtTerm.push(mutable args, take rhs, allocator)?
+    return term_mod.SmtTerm.app(op: op, args: args)
+}
+
+
+function not_term(a: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take a, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.not_, args: args)
+}

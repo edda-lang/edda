@@ -1,0 +1,135 @@
+
+module optimize.effect_gvn.stack.promote.size
+
+import std.collections.vec
+import ir.hlir.id.value as value_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.tree.body as hlir_body_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+import mir.layout.table as layout_mod
+
+
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+
+
+public type ConstBytes {
+    known: bool
+    value: u128
+}
+
+
+public function unknown_bytes() -> ConstBytes {
+    return ConstBytes { known: false, value: 0 as u128 }
+}
+
+
+public function alloc_const_bytes(
+    op: hlir_op_mod.HlirOp,
+    args: Vec_ValueId.Vec,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+) -> ConstBytes
+    with {panic}
+{
+    if Vec_ValueId.len(args) < 2 { return unknown_bytes() }
+    let count = const_u128_of(Vec_ValueId.at(args, 1), body)
+    if !count.known { return unknown_bytes() }
+    let elem = elem_size_of(result_value_ty(op, body), ty_interner, body.agg_layouts)
+    if !elem.known { return unknown_bytes() }
+    return ConstBytes { known: true, value: elem.value *| count.value }
+}
+
+
+function result_value_ty(
+    op: hlir_op_mod.HlirOp,
+    body: hlir_body_mod.HlirBody,
+) -> ty_mod.TyId
+    with {panic}
+{
+    let raw = op.result_.raw
+    if raw == 0 { return ty_mod.error() }
+    if (raw as usize) >= Vec_HlirValue.len(body.values) { return ty_mod.error() }
+    return Vec_HlirValue.at(body.values, raw as usize).ty
+}
+
+
+function const_u128_of(
+    v: value_mod.ValueId,
+    body: hlir_body_mod.HlirBody,
+) -> ConstBytes
+    with {panic}
+{
+    if v.raw == 0 { return unknown_bytes() }
+    if (v.raw as usize) >= Vec_HlirValue.len(body.values) { return unknown_bytes() }
+    let value = Vec_HlirValue.at(body.values, v.raw as usize)
+    let def_op = match value.def {
+        case .op_result(let op_id) => op_id
+        case .block_param(let blk, let pos) => return unknown_bytes()
+    }
+    if (def_op.raw as usize) >= Vec_HlirOp.len(body.ops) { return unknown_bytes() }
+    let defining = Vec_HlirOp.at(body.ops, def_op.raw as usize)
+    return match defining.kind {
+        case .literal(let c) => match c {
+            case .int_(let iv, let ty) =>
+                if iv < (0 as i128) { unknown_bytes() } else { ConstBytes { known: true, value: iv as u128 } }
+            case _ => unknown_bytes()
+        }
+        case _ => unknown_bytes()
+    }
+}
+
+
+function elem_size_of(
+    ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    agg_layouts: layout_mod.LayoutTable,
+) -> ConstBytes {
+    if ty_mod.is_error(ty) { return unknown_bytes() }
+    if (ty.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return unknown_bytes() }
+    let elem = match ty_interner_mod.lookup(ty_interner, ty) {
+        case .slice(let e) => e
+        case _ => return unknown_bytes()
+    }
+    if ty_mod.is_error(elem) { return unknown_bytes() }
+    if (elem.raw as usize) >= ty_interner_mod.slot_count(ty_interner) { return unknown_bytes() }
+    return match ty_interner_mod.lookup(ty_interner, elem) {
+        case .primitive(let pk) => prim_size(pk)
+        case _ => agg_size_of(elem, agg_layouts)
+    }
+}
+
+
+function agg_size_of(
+    elem: ty_mod.TyId,
+    agg_layouts: layout_mod.LayoutTable,
+) -> ConstBytes {
+    return match layout_mod.lookup(agg_layouts, elem) {
+        case .some(let l) => ConstBytes { known: true, value: l.total_size as u128 }
+        case .none => unknown_bytes()
+    }
+}
+
+
+function prim_size(pk: ty_kind_mod.PrimKind) -> ConstBytes {
+    return match pk {
+        case .i8_ => ConstBytes { known: true, value: 1 as u128 }
+        case .u8_ => ConstBytes { known: true, value: 1 as u128 }
+        case .bool_ => ConstBytes { known: true, value: 1 as u128 }
+        case .i16_ => ConstBytes { known: true, value: 2 as u128 }
+        case .u16_ => ConstBytes { known: true, value: 2 as u128 }
+        case .i32_ => ConstBytes { known: true, value: 4 as u128 }
+        case .u32_ => ConstBytes { known: true, value: 4 as u128 }
+        case .f32_ => ConstBytes { known: true, value: 4 as u128 }
+        case .codepoint_ => ConstBytes { known: true, value: 4 as u128 }
+        case .i64_ => ConstBytes { known: true, value: 8 as u128 }
+        case .u64_ => ConstBytes { known: true, value: 8 as u128 }
+        case .f64_ => ConstBytes { known: true, value: 8 as u128 }
+        case .i128_ => ConstBytes { known: true, value: 16 as u128 }
+        case .u128_ => ConstBytes { known: true, value: 16 as u128 }
+        case _ => unknown_bytes()
+    }
+}

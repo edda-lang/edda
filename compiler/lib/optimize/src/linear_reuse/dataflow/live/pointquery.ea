@@ -1,0 +1,131 @@
+module optimize.linear_reuse.dataflow.live.pointquery
+
+import std.collections.vec
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.id.local as mir_local_mod
+
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+
+public function single_local_stmt(live_after: bool, s: mir_stmt_mod.Statement, id: mir_local_mod.LocalId) -> bool {
+    let target = mir_local_mod.index(id)
+    if stmt_gens(s, target) { return true }
+    if stmt_kills(s, target) { return false }
+    return live_after
+}
+
+public function single_local_terminator(live_after: bool, term: mir_term_mod.Terminator, id: mir_local_mod.LocalId) -> bool {
+    let target = mir_local_mod.index(id)
+    if term_gens(term, target) { return true }
+    if term_kills(term, target) { return false }
+    return live_after
+}
+
+function stmt_kills(s: mir_stmt_mod.Statement, target: usize) -> bool {
+    return match s.kind {
+        case .assign(let dest, _) => mir_place_mod.proj_len(dest) == 0 && mir_local_mod.index(dest.local) == target
+        case .storage_live(let l) => mir_local_mod.index(l) == target
+        case .storage_dead(_) => false
+        case .nop_ => false
+    }
+}
+
+function stmt_gens(s: mir_stmt_mod.Statement, target: usize) -> bool {
+    return match s.kind {
+        case .assign(let dest, let value) => projected_dest_reads(dest, target) || rvalue_reads(value, target)
+        case .storage_live(_) => false
+        case .storage_dead(_) => false
+        case .nop_ => false
+    }
+}
+
+function term_kills(term: mir_term_mod.Terminator, target: usize) -> bool {
+    return match term.kind {
+        case .call_(_, _, let dest, _, _) => mir_place_mod.proj_len(dest) == 0 && mir_local_mod.index(dest.local) == target
+        case .spawn_(_, _, _, let handle_dest, _, _) => mir_place_mod.proj_len(handle_dest) == 0 && mir_local_mod.index(handle_dest.local) == target
+        case .await_(_, let dest, _, _) => mir_place_mod.proj_len(dest) == 0 && mir_local_mod.index(dest.local) == target
+        case _ => false
+    }
+}
+
+function term_gens(term: mir_term_mod.Terminator, target: usize) -> bool {
+    return match term.kind {
+        case .branch(let cond, _, _) => operand_reads(cond, target)
+        case .switch_(let discr, _) => operand_reads(discr, target)
+        case .raise_(let value, _) => operand_reads(value, target)
+        case .panic_(let message) => operand_reads(message, target)
+        case .call_(let callee, let args, let dest, _, _) => operand_reads(callee, target) || operands_read(args, target) || projected_dest_reads(dest, target)
+        case .drop_(let place, _, _) => place_reads(place, target)
+        case .spawn_(_, let args, let group_local, let handle_dest, _, _) => mir_local_mod.index(group_local) == target || operands_read(args, target) || projected_dest_reads(handle_dest, target)
+        case .await_(let handle, let dest, _, _) => operand_reads(handle, target) || projected_dest_reads(dest, target)
+        case _ => false
+    }
+}
+
+function projected_dest_reads(dest: mir_place_mod.Place, target: usize) -> bool {
+    if mir_place_mod.proj_len(dest) == 0 { return false }
+    if mir_local_mod.index(dest.local) == target { return true }
+    return projection_reads(dest, target)
+}
+
+function rvalue_reads(value: mir_rvalue_mod.Rvalue, target: usize) -> bool {
+    return match value {
+        case .use_(let operand) => operand_reads(operand, target)
+        case .binary(_, let lhs, let rhs) => operand_reads(lhs, target) || operand_reads(rhs, target)
+        case .unary(_, let operand) => operand_reads(operand, target)
+        case .cast(let operand, _, _, _) => operand_reads(operand, target)
+        case .aggregate(_, let elems, _) => operands_read(elems, target)
+        case .ref_(_, let place) => place_reads(place, target)
+        case .len(let place) => place_reads(place, target)
+        case .discriminant(let place) => place_reads(place, target)
+        case .make_closure(_, let env) => operand_reads(env, target)
+    }
+}
+
+function operands_read(ops: Vec_Operand.Vec, target: usize) -> bool {
+    let n = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if operand_reads(Vec_Operand.at(ops, i), target) { return true }
+        i += 1
+    }
+    return false
+}
+
+function operand_reads(op: mir_rvalue_mod.Operand, target: usize) -> bool {
+    return match op {
+        case .copy_(let place, _) => place_reads(place, target)
+        case .move_(let place, _) => place_reads(place, target)
+        case .constant(_) => false
+    }
+}
+
+function place_reads(place: mir_place_mod.Place, target: usize) -> bool {
+    if mir_local_mod.index(place.local) == target { return true }
+    return projection_reads(place, target)
+}
+
+function projection_reads(place: mir_place_mod.Place, target: usize) -> bool {
+    let n = mir_place_mod.proj_len(place)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let p = mir_place_mod.proj_at(place, i)
+        match p.kind {
+            case .index(let idx_local, _) => { if mir_local_mod.index(idx_local) == target { return true } }
+            case .slice_subrange(let lo_local, let hi_local, _) => {
+                if mir_local_mod.index(lo_local) == target { return true }
+                if mir_local_mod.index(hi_local) == target { return true }
+            }
+            case .field(_) => ()
+            case .deref_ => ()
+            case .variant_payload(_) => ()
+        }
+        i += 1
+    }
+    return false
+}

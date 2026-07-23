@@ -1,0 +1,249 @@
+
+module x64.abi.sret
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import hir.node as node_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.term as lir_term_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.op as lir_op_id_mod
+import mir.layout.table as mir_layout_mod
+import local.gen.sel.regs as regs_mod
+import local.abi.shared as shared_mod
+
+
+spec std.core.option.Option(mir_layout_mod.AggLayout)
+
+
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+
+
+spec std.core.option.Option(lir_vreg_mod.LirVRegId)
+
+
+public function apply_sret_at(
+    body: mutable lir_body_mod.LirBody,
+    block_idx: usize,
+    sret_ptr: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    match Vec_LirBlock.at(body.blocks, block_idx).terminator.kind {
+        case .return_(let values) => write_sret_return(mutable body, block_idx, values, sret_ptr, allocator)?
+        case .raise_(let value, let unwind) => write_sret_raise(mutable body, block_idx, value, unwind, sret_ptr, allocator)?
+        case _ => ()
+    }
+}
+
+function write_sret_raise(
+    body: mutable lir_body_mod.LirBody,
+    block_idx: usize,
+    value: lir_vreg_mod.LirVRegId,
+    unwind: lir_term_mod.LirUnwindAction,
+    sret_ptr: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    let block = Vec_LirBlock.at(body.blocks, block_idx)
+
+    uninit new_ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init new_ops, allocator)?
+    let no = Vec_LirOpId.len(block.ops)
+    var q: usize = 0
+    loop decreases no - q {
+        if q >= no { break }
+        Vec_LirOpId.push(mutable new_ops, Vec_LirOpId.at(block.ops, q), allocator)?
+        q += 1
+    }
+
+    let vsize = shared_mod.vreg_size_at(body, value.raw as usize)
+    if lir_reg_mod.is_by_memory(vsize) {
+        write_agg_field(mutable body, mutable new_ops, sret_ptr, 0 as u32, value, mem_copy_size(body, value, vsize), allocator)?
+    } else {
+        store_scalar_field(mutable body, mutable new_ops, sret_ptr, 0 as u32, value, allocator)?
+    }
+
+    let new_block = lir_body_mod.LirBlock {
+        node_id_origin: block.node_id_origin,
+        params: block.params,
+        ops: new_ops,
+        terminator: lir_term_mod.LirTerminator {
+            origin: block.terminator.origin,
+            kind: lir_term_mod.LirTermKind.raise_(value: sret_ptr, unwind: unwind),
+        },
+        coherence_region: block.coherence_region,
+    }
+    Vec_LirBlock.set_at(mutable body.blocks, block_idx, take new_block)
+}
+
+function write_sret_return(
+    body: mutable lir_body_mod.LirBody,
+    block_idx: usize,
+    values: Vec_LirVRegId.Vec,
+    sret_ptr: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    let block = Vec_LirBlock.at(body.blocks, block_idx)
+
+    uninit new_ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init new_ops, allocator)?
+    let no = Vec_LirOpId.len(block.ops)
+    var q: usize = 0
+    loop decreases no - q {
+        if q >= no { break }
+        Vec_LirOpId.push(mutable new_ops, Vec_LirOpId.at(block.ops, q), allocator)?
+        q += 1
+    }
+
+    let nv = Vec_LirVRegId.len(values)
+    var i: usize = 0
+    var running: u32 = 0
+    loop decreases nv - i {
+        if i >= nv { break }
+        let v = Vec_LirVRegId.at(values, i)
+        let vsize = shared_mod.vreg_size_at(body, v.raw as usize)
+        if lir_reg_mod.is_by_memory(vsize) {
+            write_agg_field(mutable body, mutable new_ops, sret_ptr, running, v, mem_copy_size(body, v, vsize), allocator)?
+            running = running +% shared_mod.align8_u32(vsize)
+        } else {
+            store_scalar_field(mutable body, mutable new_ops, sret_ptr, running, v, allocator)?
+            running = running +% (8 as u32)
+        }
+        i += 1
+    }
+
+    let rax_vreg = lir_body_mod.push_vreg(
+        mutable body,
+        take shared_mod.pinned_vreg(lir_reg_mod.RegClass.gp, regs_mod.preg_of(regs_mod.Gp64Reg.rax)),
+        allocator,
+    )?
+    let rax_copy = lir_op_mod.LirOp {
+        origin: node_mod.error(),
+        kind: lir_op_mod.LirOpKind.copy_(src: sret_ptr, dst: rax_vreg),
+        flags: shared_mod.stack_flags(),
+    }
+    let rax_copy_id = lir_body_mod.push_op(mutable body, take rax_copy, allocator)?
+    Vec_LirOpId.push(mutable new_ops, rax_copy_id, allocator)?
+
+    uninit empty_vals: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init empty_vals, allocator)?
+
+    let new_block = lir_body_mod.LirBlock {
+        node_id_origin: block.node_id_origin,
+        params: block.params,
+        ops: new_ops,
+        terminator: lir_term_mod.LirTerminator {
+            origin: block.terminator.origin,
+            kind: lir_term_mod.LirTermKind.return_(values: empty_vals),
+        },
+        coherence_region: block.coherence_region,
+    }
+    Vec_LirBlock.set_at(mutable body.blocks, block_idx, take new_block)
+}
+
+function store_scalar_field(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    sret_ptr: lir_vreg_mod.LirVRegId,
+    off: u32,
+    value: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let addr = lir_reg_mod.MemRef {
+        base: Option_LirVRegId.some(value: sret_ptr),
+        index: Option_LirVRegId.none,
+        scale: 1 as u32,
+        displacement: off as i32,
+    }
+    let op = lir_op_mod.LirOp {
+        origin: node_mod.error(),
+        kind: lir_op_mod.LirOpKind.store(value: value, addr: addr, width: 8 as u32),
+        flags: shared_mod.stack_flags(),
+    }
+    let id = lir_body_mod.push_op(mutable body, take op, allocator)?
+    Vec_LirOpId.push(mutable new_ops, id, allocator)?
+}
+
+function write_agg_field(
+    body: mutable lir_body_mod.LirBody,
+    new_ops: mutable Vec_LirOpId.Vec,
+    sret_ptr: lir_vreg_mod.LirVRegId,
+    off: u32,
+    src_ptr: lir_vreg_mod.LirVRegId,
+    size: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    var cursor: u32 = 0
+    loop decreases size - cursor {
+        if cursor >= size { break }
+        let rem = size - cursor
+        let chunk = if rem >= (8 as u32) { 8 as u32 } else { if rem >= (4 as u32) { 4 as u32 } else { if rem >= (2 as u32) { 2 as u32 } else { 1 as u32 } } }
+        let src_addr = lir_reg_mod.MemRef {
+            base: Option_LirVRegId.some(value: src_ptr),
+            index: Option_LirVRegId.none,
+            scale: 1 as u32,
+            displacement: cursor as i32 wrapping,
+        }
+        let tmp = lir_body_mod.push_vreg(mutable body, take shared_mod.unpinned_vreg(lir_reg_mod.RegClass.gp), allocator)?
+        let load_op = lir_op_mod.LirOp {
+            origin: node_mod.error(),
+            kind: lir_op_mod.LirOpKind.load(addr: src_addr, dst: tmp, width: chunk),
+            flags: shared_mod.stack_flags(),
+        }
+        let load_id = lir_body_mod.push_op(mutable body, take load_op, allocator)?
+        Vec_LirOpId.push(mutable new_ops, load_id, allocator)?
+
+        let dst_addr = lir_reg_mod.MemRef {
+            base: Option_LirVRegId.some(value: sret_ptr),
+            index: Option_LirVRegId.none,
+            scale: 1 as u32,
+            displacement: ((off +% cursor) as i32 wrapping),
+        }
+        let store_op = lir_op_mod.LirOp {
+            origin: node_mod.error(),
+            kind: lir_op_mod.LirOpKind.store(value: tmp, addr: dst_addr, width: chunk),
+            flags: shared_mod.stack_flags(),
+        }
+        let store_id = lir_body_mod.push_op(mutable body, take store_op, allocator)?
+        Vec_LirOpId.push(mutable new_ops, store_id, allocator)?
+        cursor += chunk
+    }
+}
+
+
+function mem_copy_size(
+    body: lir_body_mod.LirBody,
+    value: lir_vreg_mod.LirVRegId,
+    vsize: u32,
+) -> u32 {
+    let idx = value.raw as usize
+    if idx >= Vec_LirVReg.len(body.vregs) { return vsize }
+    let ty = Vec_LirVReg.at(body.vregs, idx).ty
+    return match mir_layout_mod.lookup(body.agg_layouts, ty) {
+        case .some(let l) => {
+            if l.total_size != (0 as u32) && l.total_size < vsize { l.total_size } else { vsize }
+        }
+        case .none => vsize
+    }
+}

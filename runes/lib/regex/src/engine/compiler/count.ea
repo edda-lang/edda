@@ -1,0 +1,100 @@
+
+module regex.engine.compiler.count
+
+import regex.syntax.grammar.ast
+import regex.syntax.errors
+
+spec std.mem.alloc.Box(ast.RegexAst)
+
+function _repeat_expand_limit() -> u32 {
+    return 1000 as u32
+}
+
+public function count(b: Box_RegexAst) -> (u32, u32)
+    with {err: errors.CompileError}
+    decreases box_depth(b)
+{
+    let node = b.get()
+    return match node {
+        case .empty                  => (0 as u32, 0 as u32)
+        case .literal(_)             => (1 as u32, 0 as u32)
+        case .any_char               => (1 as u32, 0 as u32)
+        case .anchor_node(_)         => (1 as u32, 0 as u32)
+        case .class_node(_)          => (1 as u32, 1 as u32)
+        case .backref(_)             => (1 as u32, 0 as u32)
+        case .concat(let items) => {
+            var n: u32 = 0 as u32
+            var c: u32 = 0 as u32
+            let len = items.len()
+            var i: usize = 0 as usize
+            loop decreases len - i + 1 as usize {
+                if i >= len { break }
+                let (ni, ci) = count(items[i])?
+                n = n +% ni
+                c = c +% ci
+                i = i + 1 as usize
+            }
+            (n, c)
+        }
+        case .alternate(let bs) => {
+            var n: u32 = 0 as u32
+            var c: u32 = 0 as u32
+            let len = bs.len()
+            var i: usize = 0 as usize
+            loop decreases len - i + 1 as usize {
+                if i >= len { break }
+                let (ni, ci) = count(bs[i])?
+                n = n +% ni
+                c = c +% ci
+                i = i + 1 as usize
+            }
+            if len >= 2 as usize {
+                let k = len as u32
+                let extras = (2 as u32) *% (k -% (1 as u32))
+                n = n +% extras
+            }
+            (n, c)
+        }
+        case .repeat_node(let inner, let bnd) => {
+            let (n_in, c_in) = count(inner)?
+            _count_repeat(n_in, c_in, bnd)?
+        }
+        case .group_node(let inner, let kind) => {
+            let (n_in, c_in) = count(inner)?
+            _count_group(n_in, c_in, kind)
+        }
+    }
+}
+
+function _count_repeat(n_in: u32, c_in: u32, bnd: ast.RepeatBound) -> (u32, u32)
+    with {err: errors.CompileError}
+{
+    let min_v = bnd.min
+    return match bnd.max {
+        case .none => {
+            let required = n_in *% min_v
+            let tail = ((2 as u32) +% n_in)
+            (required +% tail, c_in *% (min_v +% (1 as u32)))
+        }
+        case .some(let max_v) => {
+            if max_v < min_v {
+                raise errors.CompileError.bad_repeat_count(at: 0 as usize)
+            }
+            let span = max_v -% min_v
+            if span > _repeat_expand_limit() {
+                raise errors.CompileError.pattern_too_long
+            }
+            let required = n_in *% min_v
+            let optional = (n_in +% (1 as u32)) *% span
+            (required +% optional, c_in *% max_v)
+        }
+    }
+}
+
+function _count_group(n_in: u32, c_in: u32, kind: ast.GroupKind) -> (u32, u32) {
+    return match kind {
+        case .capture(_)     => (n_in +% (2 as u32), c_in)
+        case .non_capturing  => (n_in, c_in)
+        case .lookaround(_)  => (n_in, c_in)
+    }
+}

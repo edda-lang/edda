@@ -1,0 +1,121 @@
+
+module refine.vcgen.basis.basis
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree_mod
+import types.check.env.builtins as builtins_mod
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import local.discharge.context as ctx_mod
+import local.smt.encode.encode as encode_mod
+import local.smt.term as term_mod
+import local.vcgen.term.term as vterm_mod
+
+
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+spec std.collections.vec.Vec(ctx_mod.VariableBinding)
+spec std.core.option.Option(ty_kind_mod.PrimKind)
+
+
+public function append_requires_context(
+    ctx_terms: mutable Vec_SmtTerm.Vec,
+    requires_assumptions: Vec_Expr.Vec,
+    vars: Vec_VariableBinding.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Expr.len(requires_assumptions)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let pred = Vec_Expr.at(requires_assumptions, i)
+        match encode_mod.encode_predicate(pred, vars, ty_interner, builtins, allocator)? {
+            case .encoded(let term) => Vec_SmtTerm.push(mutable ctx_terms, take term, allocator)?
+            case .unsupported(_) => {}
+        }
+        i = i + 1
+    }
+}
+
+
+public function append_var_range(
+    ctx_terms: mutable Vec_SmtTerm.Vec,
+    binding: ctx_mod.VariableBinding,
+    ty_interner: ty_interner_mod.Interner,
+    ptr_width: usize,
+    anchor: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match int_prim_of(binding.ty, ty_interner) {
+        case .some(let pk) => {
+            let v_lo = term_mod.SmtTerm.var_(name: binding.name, sort: term_mod.SmtSort.int_)
+            let lo = vterm_mod.mk_bin(
+                term_mod.SmtOp.ge,
+                take v_lo,
+                take vterm_mod.bound_lo_term(pk, ptr_width, anchor, allocator)?,
+                allocator,
+            )?
+            Vec_SmtTerm.push(mutable ctx_terms, take lo, allocator)?
+            let v_hi = term_mod.SmtTerm.var_(name: binding.name, sort: term_mod.SmtSort.int_)
+            let hi = vterm_mod.mk_bin(
+                term_mod.SmtOp.le,
+                take v_hi,
+                take vterm_mod.bound_hi_term(pk, ptr_width, anchor, allocator)?,
+                allocator,
+            )?
+            Vec_SmtTerm.push(mutable ctx_terms, take hi, allocator)?
+        }
+        case .none => {}
+    }
+}
+
+
+function int_prim_of(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> Option_PrimKind.Option
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return Option_PrimKind.none
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let pk) => if is_int_prim(pk) {
+            Option_PrimKind.some(value: pk)
+        } else {
+            Option_PrimKind.none
+        }
+        case .refined(let base, _) => int_prim_of(base, ty_interner)
+        case _ => Option_PrimKind.none
+    }
+}
+
+
+function is_int_prim(pk: ty_kind_mod.PrimKind) -> bool {
+    return match pk {
+        case .i8_ => true
+        case .i16_ => true
+        case .i32_ => true
+        case .i64_ => true
+        case .i128_ => true
+        case .isize_ => true
+        case .u8_ => true
+        case .u16_ => true
+        case .u32_ => true
+        case .u64_ => true
+        case .u128_ => true
+        case .usize_ => true
+        case _ => false
+    }
+}

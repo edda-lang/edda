@@ -1,0 +1,63 @@
+
+module compile.gc.schedule.schedule
+
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.os.fs
+import diagnostics.emit.collection as diags_mod
+import manifest.manifest as manifest_mod
+import manifest.model.codegen.gc_schedule as gc_schedule_mod
+import source.map as source_map_mod
+import local.gc.local.local as gc_local_mod
+import local.setup.env.load.load as load_mod
+
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+
+
+public function maybe_run(
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    workspace_root: String,
+    wall_clock: Clock,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, wfs, wall_clock, allocator, err: fs.FsError, err: alloc.AllocError, panic, time(ops <= 1)}
+{
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    let manifest_opt = load_mod.manifest_load(rfs, mutable scratch_map, workspace_root, mutable diags, allocator)?
+    match manifest_opt {
+        case .none => ()
+        case .some(let manifest) => {
+            let schedule = manifest_mod.codegen_of(manifest)
+            if is_due(gc_schedule_mod.mode_of(schedule), allocator) {
+                gc_local_mod.run_gc(rfs, wfs, workspace_root, wall_clock, mutable diags, allocator)?
+            }
+        }
+    }
+}
+
+
+function is_due(mode: gc_schedule_mod.GcScheduleMode, allocator: Allocator) -> bool
+    with {allocator}
+{
+    return match mode {
+        case .never             => false
+        case .on_ci             => is_ci_env(allocator)
+        case .daily             => true
+        case .weekly            => true
+        case .on_promote_revoke => false
+    }
+}
+
+
+function is_ci_env(allocator: Allocator) -> bool
+    with {allocator}
+{
+    return match env.read_optional("CI", allocator) {
+        case .some(_) => true
+        case .none    => false
+    }
+}

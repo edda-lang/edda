@@ -1,0 +1,269 @@
+
+module resolve.build.drive.surface.registry
+
+import std.collections.hashmap
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import intern.symbol
+import hir.def as def_mod
+import local.bind.bindings as bindings_mod
+import local.build.builtins as builtins_mod
+import local.cteval.builtins as cbi_mod
+import local.paths.modules as mt_mod
+import local.primitives.defs as primitives_mod
+import local.capabilities.defs as capabilities_mod
+
+spec std.collections.hashmap.IntMap(bindings_mod.SymbolTable)
+spec std.collections.hashmap.IntMap(def_mod.DefId)
+spec std.collections.hashmap.IntMap(symbol.Symbol)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(SyntheticNominal)
+spec std.core.option.Option(bindings_mod.SymbolTable)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public type SyntheticNominal {
+    module_name: symbol.Symbol
+    item_name: symbol.Symbol
+    def: def_mod.DefId
+}
+
+public type Registry {
+    bindings_by_module: IntMap_SymbolTable.IntMap
+    variants_by_module: IntMap_SymbolTable.IntMap
+    invoked_specs: IntMap_DefId.IntMap
+    instance_full: IntMap_Symbol.IntMap
+    inst_bare: IntMap_Symbol.IntMap
+    inst_primary: IntMap_Symbol.IntMap
+    colliding: IntMap_DefId.IntMap
+    synthetic_nominals: Vec_SyntheticNominal.Vec
+    builtins: builtins_mod.BuiltinDefs
+    primitives: primitives_mod.PrimitiveDefs
+    comptime_builtins: cbi_mod.ComptimeBuiltinDefs
+    capabilities: capabilities_mod.CapabilityDefs
+}
+
+
+public function new_registry(
+    out: init Registry,
+    builtins: builtins_mod.BuiltinDefs,
+    primitives: primitives_mod.PrimitiveDefs,
+    comptime_builtins: cbi_mod.ComptimeBuiltinDefs,
+    capabilities: capabilities_mod.CapabilityDefs,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bindings_map = IntMap_SymbolTable.new(allocator)?
+    let variants_map = IntMap_SymbolTable.new(allocator)?
+    let invoked_map = IntMap_DefId.new(allocator)?
+    let inst_full_map = IntMap_Symbol.new(allocator)?
+    let inst_bare_map = IntMap_Symbol.new(allocator)?
+    let inst_primary_map = IntMap_Symbol.new(allocator)?
+    let colliding_map = IntMap_DefId.new(allocator)?
+    uninit synthetics: Vec_SyntheticNominal.Vec
+    Vec_SyntheticNominal.new(init synthetics, allocator)?
+    out = Registry {
+        bindings_by_module: bindings_map,
+        variants_by_module: variants_map,
+        invoked_specs: invoked_map,
+        instance_full: inst_full_map,
+        inst_bare: inst_bare_map,
+        inst_primary: inst_primary_map,
+        colliding: colliding_map,
+        synthetic_nominals: take synthetics,
+        builtins: builtins,
+        primitives: primitives,
+        comptime_builtins: comptime_builtins,
+        capabilities: capabilities,
+    }
+}
+
+
+public function record_synthetic_nominal(reg: mutable Registry, module_name: symbol.Symbol, item_name: symbol.Symbol, def: def_mod.DefId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_SyntheticNominal.push(
+        mutable reg.synthetic_nominals,
+        SyntheticNominal { module_name: module_name, item_name: item_name, def: def },
+        allocator,
+    )?
+}
+
+
+public function synthetic_nominal_count(reg: Registry) -> usize {
+    return Vec_SyntheticNominal.len(reg.synthetic_nominals)
+}
+
+
+public function synthetic_nominal_at(reg: Registry, i: usize) -> SyntheticNominal {
+    if i >= Vec_SyntheticNominal.len(reg.synthetic_nominals) {
+        return SyntheticNominal { module_name: symbol.empty(), item_name: symbol.empty(), def: def_mod.error() }
+    }
+    return Vec_SyntheticNominal.at(reg.synthetic_nominals, i)
+}
+
+
+public function register_module(reg: mutable Registry, mod_id: mt_mod.ModuleId, table: take bindings_mod.SymbolTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let key = mod_id.raw as i64
+    let _ = IntMap_SymbolTable.insert(mutable reg.bindings_by_module, key, table, allocator)?
+}
+
+
+public stable function lookup_in_module(reg: Registry, mod_id: mt_mod.ModuleId, name: symbol.Symbol) -> def_mod.DefId {
+    let key = mod_id.raw as i64
+    let opt_table = IntMap_SymbolTable.get(reg.bindings_by_module, key)
+    return match opt_table {
+        case .some(let table) => unwrap_def(bindings_mod.lookup(table, name))
+        case .none => def_mod.error()
+    }
+}
+
+
+public function register_module_variants(reg: mutable Registry, mod_id: mt_mod.ModuleId, table: take bindings_mod.SymbolTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let key = mod_id.raw as i64
+    let _ = IntMap_SymbolTable.insert(mutable reg.variants_by_module, key, table, allocator)?
+}
+
+public stable function lookup_variant_in_module(reg: Registry, mod_id: mt_mod.ModuleId, name: symbol.Symbol) -> def_mod.DefId {
+    let key = mod_id.raw as i64
+    let opt_table = IntMap_SymbolTable.get(reg.variants_by_module, key)
+    return match opt_table {
+        case .some(let table) => unwrap_def(bindings_mod.lookup(table, name))
+        case .none => def_mod.error()
+    }
+}
+
+function spec_visibility_key(file_mod_id: mt_mod.ModuleId, mangled: symbol.Symbol) -> i64 {
+    let k: u64 = ((file_mod_id.raw as u64) << 32) | (mangled.raw as u64)
+    return k as i64 wrapping
+}
+
+public function register_invoked_spec(reg: mutable Registry, file_mod_id: mt_mod.ModuleId, mangled: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let key = spec_visibility_key(file_mod_id, mangled)
+    let _ = IntMap_DefId.insert(mutable reg.invoked_specs, key, def_mod.error(), allocator)?
+}
+
+public function file_invoked_spec(reg: Registry, file_mod_id: mt_mod.ModuleId, mangled: symbol.Symbol) -> bool {
+    return IntMap_DefId.contains(reg.invoked_specs, spec_visibility_key(file_mod_id, mangled))
+}
+
+public function register_instance_full(reg: mutable Registry, file_mod_id: mt_mod.ModuleId, short: symbol.Symbol, full: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let key = spec_visibility_key(file_mod_id, short)
+    let _ = IntMap_Symbol.insert(mutable reg.instance_full, key, full, allocator)?
+}
+
+public function instance_full(reg: Registry, file_mod_id: mt_mod.ModuleId, short: symbol.Symbol) -> symbol.Symbol {
+    let key = spec_visibility_key(file_mod_id, short)
+    return match IntMap_Symbol.get(reg.instance_full, key) {
+        case .some(let full) => full
+        case .none => symbol.empty()
+    }
+}
+
+public function register_inst_bare(reg: mutable Registry, full: symbol.Symbol, bare: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = IntMap_Symbol.insert(mutable reg.inst_bare, full.raw as i64, bare, allocator)?
+}
+
+public function inst_bare_of(reg: Registry, full: symbol.Symbol) -> symbol.Symbol {
+    return match IntMap_Symbol.get(reg.inst_bare, full.raw as i64) {
+        case .some(let bare) => bare
+        case .none => symbol.empty()
+    }
+}
+
+public function register_inst_primary(reg: mutable Registry, full: symbol.Symbol, primary: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = IntMap_Symbol.insert(mutable reg.inst_primary, full.raw as i64, primary, allocator)?
+}
+
+public function inst_primary_of(reg: Registry, full: symbol.Symbol) -> symbol.Symbol {
+    return match IntMap_Symbol.get(reg.inst_primary, full.raw as i64) {
+        case .some(let primary) => primary
+        case .none => symbol.empty()
+    }
+}
+
+public function mark_colliding(reg: mutable Registry, short: symbol.Symbol, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = IntMap_DefId.insert(mutable reg.colliding, short.raw as i64, def_mod.error(), allocator)?
+}
+
+public function is_colliding(reg: Registry, short: symbol.Symbol) -> bool {
+    return IntMap_DefId.contains(reg.colliding, short.raw as i64)
+}
+
+
+public stable function builtins(reg: Registry) -> builtins_mod.BuiltinDefs {
+    return reg.builtins
+}
+
+public stable function primitives(reg: Registry) -> primitives_mod.PrimitiveDefs {
+    return reg.primitives
+}
+
+public stable function comptime_builtins(reg: Registry) -> cbi_mod.ComptimeBuiltinDefs {
+    return reg.comptime_builtins
+}
+
+public stable function capabilities(reg: Registry) -> capabilities_mod.CapabilityDefs {
+    return reg.capabilities
+}
+
+public function lookup_single_segment(reg: Registry, name: symbol.Symbol, interner: interner_mod.Interner) -> def_mod.DefId {
+    let p_def = primitives_mod.lookup(reg.primitives, name, interner)
+    if !def_mod.is_error(p_def) {
+        return p_def
+    }
+    let c_def = cbi_mod.lookup(reg.comptime_builtins, name, interner)
+    if !def_mod.is_error(c_def) {
+        return c_def
+    }
+    let intr_def = builtins_mod.lookup(reg.builtins, name, interner)
+    if !def_mod.is_error(intr_def) {
+        return intr_def
+    }
+    let cap_def = capabilities_mod.lookup(reg.capabilities, name, interner)
+    if !def_mod.is_error(cap_def) {
+        return cap_def
+    }
+    return def_mod.error()
+}
+
+
+public stable function lookup_path(reg: Registry, segments: Vec_Symbol.Vec, mt: mt_mod.ModuleTree) -> def_mod.DefId {
+    let m_opt = mt_mod.find_longest_prefix(mt, segments)
+    let m = match m_opt {
+        case .none => return def_mod.error()
+        case .some(let pm) => pm
+    }
+    let path_len = Vec_Symbol.len(segments)
+    if path_len != m.segments_consumed + 1 {
+        return def_mod.error()
+    }
+    let leaf = Vec_Symbol.at(segments, m.segments_consumed)
+    return lookup_in_module(reg, m.mod_id, leaf)
+}
+
+
+stable function unwrap_def(opt: Option_DefId.Option) -> def_mod.DefId {
+    return match opt {
+        case .some(let d) => d
+        case .none => def_mod.error()
+    }
+}

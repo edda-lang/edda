@@ -1,0 +1,587 @@
+
+module std.crypto.hash.blake3
+
+import std.mem.bits
+import std.mem.byteorder
+import local.consts
+
+
+public type ChainingValue {
+    cv0: u32
+    cv1: u32
+    cv2: u32
+    cv3: u32
+    cv4: u32
+    cv5: u32
+    cv6: u32
+    cv7: u32
+}
+
+type _BlakeBlock {
+    m0: u32
+    m1: u32
+    m2: u32
+    m3: u32
+    m4: u32
+    m5: u32
+    m6: u32
+    m7: u32
+    m8: u32
+    m9: u32
+    m10: u32
+    m11: u32
+    m12: u32
+    m13: u32
+    m14: u32
+    m15: u32
+}
+
+type _BlakeState {
+    s0: u32
+    s1: u32
+    s2: u32
+    s3: u32
+    s4: u32
+    s5: u32
+    s6: u32
+    s7: u32
+    s8: u32
+    s9: u32
+    s10: u32
+    s11: u32
+    s12: u32
+    s13: u32
+    s14: u32
+    s15: u32
+}
+
+
+function _iv_chaining_value() -> ChainingValue {
+    return ChainingValue {
+        cv0: consts.iv0(),
+        cv1: consts.iv1(),
+        cv2: consts.iv2(),
+        cv3: consts.iv3(),
+        cv4: consts.iv4(),
+        cv5: consts.iv5(),
+        cv6: consts.iv6(),
+        cv7: consts.iv7(),
+    }
+}
+
+function _bytes_to_cv_le(bytes: [u8], offset: usize) -> ChainingValue
+    requires offset + 32 <= bytes.len()
+{
+    return ChainingValue {
+        cv0: byteorder.read_u32_le(bytes, offset),
+        cv1: byteorder.read_u32_le(bytes, offset + 4),
+        cv2: byteorder.read_u32_le(bytes, offset + 8),
+        cv3: byteorder.read_u32_le(bytes, offset + 12),
+        cv4: byteorder.read_u32_le(bytes, offset + 16),
+        cv5: byteorder.read_u32_le(bytes, offset + 20),
+        cv6: byteorder.read_u32_le(bytes, offset + 24),
+        cv7: byteorder.read_u32_le(bytes, offset + 28),
+    }
+}
+
+function _state_to_cv(s: _BlakeState) -> ChainingValue {
+    return ChainingValue {
+        cv0: s.s0,
+        cv1: s.s1,
+        cv2: s.s2,
+        cv3: s.s3,
+        cv4: s.s4,
+        cv5: s.s5,
+        cv6: s.s6,
+        cv7: s.s7,
+    }
+}
+
+
+function _read_word_padded(
+    data: [u8],
+    chunk_offset: usize,
+    word_offset: usize,
+    block_len: usize,
+) -> u32
+    requires word_offset + 4 <= 64
+    requires block_len <= 64
+    requires chunk_offset + block_len <= data.len()
+{
+    let b0: u32 = if word_offset < block_len {
+        data[chunk_offset + word_offset] as u32
+    } else { 0 }
+    let b1: u32 = if word_offset + 1 < block_len {
+        data[chunk_offset + word_offset + 1] as u32
+    } else { 0 }
+    let b2: u32 = if word_offset + 2 < block_len {
+        data[chunk_offset + word_offset + 2] as u32
+    } else { 0 }
+    let b3: u32 = if word_offset + 3 < block_len {
+        data[chunk_offset + word_offset + 3] as u32
+    } else { 0 }
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+function _read_block_le(
+    data: [u8],
+    chunk_offset: usize,
+    block_len: usize,
+) -> _BlakeBlock
+    requires block_len <= 64
+    requires chunk_offset + block_len <= data.len()
+{
+    return _BlakeBlock {
+        m0:  _read_word_padded(data, chunk_offset, 0,  block_len),
+        m1:  _read_word_padded(data, chunk_offset, 4,  block_len),
+        m2:  _read_word_padded(data, chunk_offset, 8,  block_len),
+        m3:  _read_word_padded(data, chunk_offset, 12, block_len),
+        m4:  _read_word_padded(data, chunk_offset, 16, block_len),
+        m5:  _read_word_padded(data, chunk_offset, 20, block_len),
+        m6:  _read_word_padded(data, chunk_offset, 24, block_len),
+        m7:  _read_word_padded(data, chunk_offset, 28, block_len),
+        m8:  _read_word_padded(data, chunk_offset, 32, block_len),
+        m9:  _read_word_padded(data, chunk_offset, 36, block_len),
+        m10: _read_word_padded(data, chunk_offset, 40, block_len),
+        m11: _read_word_padded(data, chunk_offset, 44, block_len),
+        m12: _read_word_padded(data, chunk_offset, 48, block_len),
+        m13: _read_word_padded(data, chunk_offset, 52, block_len),
+        m14: _read_word_padded(data, chunk_offset, 56, block_len),
+        m15: _read_word_padded(data, chunk_offset, 60, block_len),
+    }
+}
+
+
+function _blake3_round(
+    s: mutable _BlakeState,
+    m0: u32, m1: u32, m2: u32, m3: u32,
+    m4: u32, m5: u32, m6: u32, m7: u32,
+    m8: u32, m9: u32, m10: u32, m11: u32,
+    m12: u32, m13: u32, m14: u32, m15: u32,
+) -> () {
+    s.s0 = s.s0 +% s.s4 +% m0
+    s.s12 = bits.rotate_right_u32(s.s12 ^ s.s0, 16)
+    s.s8 = s.s8 +% s.s12
+    s.s4 = bits.rotate_right_u32(s.s4 ^ s.s8, 12)
+    s.s0 = s.s0 +% s.s4 +% m1
+    s.s12 = bits.rotate_right_u32(s.s12 ^ s.s0, 8)
+    s.s8 = s.s8 +% s.s12
+    s.s4 = bits.rotate_right_u32(s.s4 ^ s.s8, 7)
+
+    s.s1 = s.s1 +% s.s5 +% m2
+    s.s13 = bits.rotate_right_u32(s.s13 ^ s.s1, 16)
+    s.s9 = s.s9 +% s.s13
+    s.s5 = bits.rotate_right_u32(s.s5 ^ s.s9, 12)
+    s.s1 = s.s1 +% s.s5 +% m3
+    s.s13 = bits.rotate_right_u32(s.s13 ^ s.s1, 8)
+    s.s9 = s.s9 +% s.s13
+    s.s5 = bits.rotate_right_u32(s.s5 ^ s.s9, 7)
+
+    s.s2 = s.s2 +% s.s6 +% m4
+    s.s14 = bits.rotate_right_u32(s.s14 ^ s.s2, 16)
+    s.s10 = s.s10 +% s.s14
+    s.s6 = bits.rotate_right_u32(s.s6 ^ s.s10, 12)
+    s.s2 = s.s2 +% s.s6 +% m5
+    s.s14 = bits.rotate_right_u32(s.s14 ^ s.s2, 8)
+    s.s10 = s.s10 +% s.s14
+    s.s6 = bits.rotate_right_u32(s.s6 ^ s.s10, 7)
+
+    s.s3 = s.s3 +% s.s7 +% m6
+    s.s15 = bits.rotate_right_u32(s.s15 ^ s.s3, 16)
+    s.s11 = s.s11 +% s.s15
+    s.s7 = bits.rotate_right_u32(s.s7 ^ s.s11, 12)
+    s.s3 = s.s3 +% s.s7 +% m7
+    s.s15 = bits.rotate_right_u32(s.s15 ^ s.s3, 8)
+    s.s11 = s.s11 +% s.s15
+    s.s7 = bits.rotate_right_u32(s.s7 ^ s.s11, 7)
+
+    s.s0 = s.s0 +% s.s5 +% m8
+    s.s15 = bits.rotate_right_u32(s.s15 ^ s.s0, 16)
+    s.s10 = s.s10 +% s.s15
+    s.s5 = bits.rotate_right_u32(s.s5 ^ s.s10, 12)
+    s.s0 = s.s0 +% s.s5 +% m9
+    s.s15 = bits.rotate_right_u32(s.s15 ^ s.s0, 8)
+    s.s10 = s.s10 +% s.s15
+    s.s5 = bits.rotate_right_u32(s.s5 ^ s.s10, 7)
+
+    s.s1 = s.s1 +% s.s6 +% m10
+    s.s12 = bits.rotate_right_u32(s.s12 ^ s.s1, 16)
+    s.s11 = s.s11 +% s.s12
+    s.s6 = bits.rotate_right_u32(s.s6 ^ s.s11, 12)
+    s.s1 = s.s1 +% s.s6 +% m11
+    s.s12 = bits.rotate_right_u32(s.s12 ^ s.s1, 8)
+    s.s11 = s.s11 +% s.s12
+    s.s6 = bits.rotate_right_u32(s.s6 ^ s.s11, 7)
+
+    s.s2 = s.s2 +% s.s7 +% m12
+    s.s13 = bits.rotate_right_u32(s.s13 ^ s.s2, 16)
+    s.s8 = s.s8 +% s.s13
+    s.s7 = bits.rotate_right_u32(s.s7 ^ s.s8, 12)
+    s.s2 = s.s2 +% s.s7 +% m13
+    s.s13 = bits.rotate_right_u32(s.s13 ^ s.s2, 8)
+    s.s8 = s.s8 +% s.s13
+    s.s7 = bits.rotate_right_u32(s.s7 ^ s.s8, 7)
+
+    s.s3 = s.s3 +% s.s4 +% m14
+    s.s14 = bits.rotate_right_u32(s.s14 ^ s.s3, 16)
+    s.s9 = s.s9 +% s.s14
+    s.s4 = bits.rotate_right_u32(s.s4 ^ s.s9, 12)
+    s.s3 = s.s3 +% s.s4 +% m15
+    s.s14 = bits.rotate_right_u32(s.s14 ^ s.s3, 8)
+    s.s9 = s.s9 +% s.s14
+    s.s4 = bits.rotate_right_u32(s.s4 ^ s.s9, 7)
+}
+
+
+function _compress(
+    cv: ChainingValue,
+    m: _BlakeBlock,
+    counter_low: u32,
+    counter_high: u32,
+    block_len: u32,
+    flags: u32,
+) -> _BlakeState {
+    var s: _BlakeState = _BlakeState {
+        s0:  cv.cv0,
+        s1:  cv.cv1,
+        s2:  cv.cv2,
+        s3:  cv.cv3,
+        s4:  cv.cv4,
+        s5:  cv.cv5,
+        s6:  cv.cv6,
+        s7:  cv.cv7,
+        s8:  consts.iv0(),
+        s9:  consts.iv1(),
+        s10: consts.iv2(),
+        s11: consts.iv3(),
+        s12: counter_low,
+        s13: counter_high,
+        s14: block_len,
+        s15: flags,
+    }
+
+    _blake3_round(
+        mutable s,
+        m.m0,  m.m1,  m.m2,  m.m3,
+        m.m4,  m.m5,  m.m6,  m.m7,
+        m.m8,  m.m9,  m.m10, m.m11,
+        m.m12, m.m13, m.m14, m.m15,
+    )
+
+    _blake3_round(
+        mutable s,
+        m.m2,  m.m6,  m.m3,  m.m10,
+        m.m7,  m.m0,  m.m4,  m.m13,
+        m.m1,  m.m11, m.m12, m.m5,
+        m.m9,  m.m14, m.m15, m.m8,
+    )
+
+    _blake3_round(
+        mutable s,
+        m.m3,  m.m4,  m.m10, m.m12,
+        m.m13, m.m2,  m.m7,  m.m14,
+        m.m6,  m.m5,  m.m9,  m.m0,
+        m.m11, m.m15, m.m8,  m.m1,
+    )
+
+    _blake3_round(
+        mutable s,
+        m.m10, m.m7,  m.m12, m.m9,
+        m.m14, m.m3,  m.m13, m.m15,
+        m.m4,  m.m0,  m.m11, m.m2,
+        m.m5,  m.m8,  m.m1,  m.m6,
+    )
+
+    _blake3_round(
+        mutable s,
+        m.m12, m.m13, m.m9,  m.m11,
+        m.m15, m.m10, m.m14, m.m8,
+        m.m7,  m.m2,  m.m5,  m.m3,
+        m.m0,  m.m1,  m.m6,  m.m4,
+    )
+
+    _blake3_round(
+        mutable s,
+        m.m9,  m.m14, m.m11, m.m5,
+        m.m8,  m.m12, m.m15, m.m1,
+        m.m13, m.m3,  m.m0,  m.m10,
+        m.m2,  m.m6,  m.m4,  m.m7,
+    )
+
+    _blake3_round(
+        mutable s,
+        m.m11, m.m15, m.m5,  m.m0,
+        m.m1,  m.m9,  m.m8,  m.m6,
+        m.m14, m.m10, m.m2,  m.m12,
+        m.m3,  m.m4,  m.m7,  m.m13,
+    )
+
+    s.s0  = s.s0  ^ s.s8
+    s.s1  = s.s1  ^ s.s9
+    s.s2  = s.s2  ^ s.s10
+    s.s3  = s.s3  ^ s.s11
+    s.s4  = s.s4  ^ s.s12
+    s.s5  = s.s5  ^ s.s13
+    s.s6  = s.s6  ^ s.s14
+    s.s7  = s.s7  ^ s.s15
+    s.s8  = s.s8  ^ cv.cv0
+    s.s9  = s.s9  ^ cv.cv1
+    s.s10 = s.s10 ^ cv.cv2
+    s.s11 = s.s11 ^ cv.cv3
+    s.s12 = s.s12 ^ cv.cv4
+    s.s13 = s.s13 ^ cv.cv5
+    s.s14 = s.s14 ^ cv.cv6
+    s.s15 = s.s15 ^ cv.cv7
+
+    return s
+}
+
+
+function _process_chunk(
+    data: [u8],
+    chunk_offset_in: usize,
+    chunk_byte_len: usize,
+    chunk_counter: u64,
+    key: ChainingValue,
+    base_flags: u32,
+    is_root: bool,
+) -> ChainingValue
+    requires chunk_byte_len <= 1024
+    requires chunk_offset_in + chunk_byte_len <= data.len()
+{
+    let counter_low: u32 = chunk_counter as u32
+    let counter_high: u32 = (chunk_counter >> 32) as u32
+
+    let n_blocks: usize = if chunk_byte_len == 0 {
+        1
+    } else if chunk_byte_len % 64 == 0 {
+        chunk_byte_len / 64
+    } else {
+        chunk_byte_len / 64 + 1
+    }
+
+    var cv: ChainingValue = key
+    var i: usize = 0
+    loop
+        decreases n_blocks - i
+    {
+        if i >= n_blocks { break }
+
+        let block_start_in_chunk: usize = i * 64
+        let is_last_block: bool = (i == n_blocks - 1)
+
+        let block_len: usize = if is_last_block {
+            chunk_byte_len - block_start_in_chunk
+        } else {
+            64
+        }
+
+        var block_flags: u32 = base_flags
+        if i == 0 {
+            block_flags = block_flags | consts.flag_chunk_start()
+        }
+        if is_last_block {
+            block_flags = block_flags | consts.flag_chunk_end()
+            if is_root {
+                block_flags = block_flags | consts.flag_root()
+            }
+        }
+
+        let m: _BlakeBlock = _read_block_le(
+            data,
+            chunk_offset_in + block_start_in_chunk,
+            block_len,
+        )
+        let state: _BlakeState = _compress(
+            cv,
+            m,
+            counter_low,
+            counter_high,
+            block_len as u32,
+            block_flags,
+        )
+        cv = _state_to_cv(state)
+
+        i = i + 1
+    }
+    return cv
+}
+
+
+function _parent_compress(
+    left: ChainingValue,
+    right: ChainingValue,
+    key: ChainingValue,
+    base_flags: u32,
+    is_root: bool,
+) -> ChainingValue {
+    let m: _BlakeBlock = _BlakeBlock {
+        m0:  left.cv0,
+        m1:  left.cv1,
+        m2:  left.cv2,
+        m3:  left.cv3,
+        m4:  left.cv4,
+        m5:  left.cv5,
+        m6:  left.cv6,
+        m7:  left.cv7,
+        m8:  right.cv0,
+        m9:  right.cv1,
+        m10: right.cv2,
+        m11: right.cv3,
+        m12: right.cv4,
+        m13: right.cv5,
+        m14: right.cv6,
+        m15: right.cv7,
+    }
+    var flags: u32 = base_flags | consts.flag_parent()
+    if is_root {
+        flags = flags | consts.flag_root()
+    }
+    let state: _BlakeState = _compress(key, m, 0, 0, 64, flags)
+    return _state_to_cv(state)
+}
+
+
+function _largest_pow2_up_to_half(n_chunks: usize) -> usize
+    requires n_chunks >= 2
+    ensures  result >= 1
+    ensures  result < n_chunks
+{
+    let half: usize = n_chunks / 2
+    var p: usize = 1
+    loop
+        decreases (half - p)
+    {
+        if p * 2 > half { break }
+        p = p * 2
+    }
+    return p
+}
+
+
+function _blake3_recurse(
+    data: [u8],
+    data_offset: usize,
+    data_len: usize,
+    chunk_counter: u64,
+    key: ChainingValue,
+    base_flags: u32,
+    is_root: bool,
+    fuel: usize,
+) -> ChainingValue
+    requires data_offset + data_len <= data.len()
+    decreases fuel
+{
+    if fuel == 0 {
+        return _process_chunk(
+            data,
+            data_offset,
+            data_len,
+            chunk_counter,
+            key,
+            base_flags,
+            is_root,
+        )
+    }
+    if data_len <= 1024 {
+        return _process_chunk(
+            data,
+            data_offset,
+            data_len,
+            chunk_counter,
+            key,
+            base_flags,
+            is_root,
+        )
+    }
+
+    let total_chunks: usize = (data_len + 1023) / 1024
+    let left_chunks: usize = _largest_pow2_up_to_half(total_chunks)
+    let split: usize = left_chunks * 1024
+    let right_len: usize = data_len - split
+
+    let left_cv: ChainingValue = _blake3_recurse(
+        data,
+        data_offset,
+        split,
+        chunk_counter,
+        key,
+        base_flags,
+        false,
+        fuel - 1,
+    )
+    let right_cv: ChainingValue = _blake3_recurse(
+        data,
+        data_offset + split,
+        right_len,
+        chunk_counter + (left_chunks as u64),
+        key,
+        base_flags,
+        false,
+        fuel - 1,
+    )
+
+    return _parent_compress(left_cv, right_cv, key, base_flags, is_root)
+}
+
+
+function _write_cv_le(
+    cv: ChainingValue,
+    out: mutable [u8],
+    offset: usize,
+) -> ()
+    requires offset + 32 <= out.len()
+{
+    byteorder.write_u32_le(mutable out, offset,      cv.cv0)
+    byteorder.write_u32_le(mutable out, offset + 4,  cv.cv1)
+    byteorder.write_u32_le(mutable out, offset + 8,  cv.cv2)
+    byteorder.write_u32_le(mutable out, offset + 12, cv.cv3)
+    byteorder.write_u32_le(mutable out, offset + 16, cv.cv4)
+    byteorder.write_u32_le(mutable out, offset + 20, cv.cv5)
+    byteorder.write_u32_le(mutable out, offset + 24, cv.cv6)
+    byteorder.write_u32_le(mutable out, offset + 28, cv.cv7)
+}
+
+
+public function blake3(
+    data: [u8],
+    out: mutable [u8],
+    offset: usize,
+) -> ()
+    requires offset + 32 <= out.len()
+{
+    let cv: ChainingValue = _blake3_recurse(
+        data,
+        0,
+        data.len(),
+        0,
+        _iv_chaining_value(),
+        0,
+        true,
+        data.len(),
+    )
+    _write_cv_le(cv, mutable out, offset)
+}
+
+public function blake3_keyed(
+    key: [u8],
+    data: [u8],
+    out: mutable [u8],
+    offset: usize,
+) -> ()
+    requires key.len() == 32
+    requires offset + 32 <= out.len()
+{
+    let key_cv: ChainingValue = _bytes_to_cv_le(key, 0)
+    let cv: ChainingValue = _blake3_recurse(
+        data,
+        0,
+        data.len(),
+        0,
+        key_cv,
+        consts.flag_keyed_hash(),
+        true,
+        data.len(),
+    )
+    _write_cv_le(cv, mutable out, offset)
+}

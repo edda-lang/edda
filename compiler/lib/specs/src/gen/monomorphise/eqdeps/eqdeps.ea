@@ -1,0 +1,108 @@
+
+module specs.gen.monomorphise.eqdeps.eqdeps
+
+import std.collections.vec
+import std.mem.alloc
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as types_check_mod
+
+
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+
+public function direct_nominal_deps(
+    target: ty_mod.TyId,
+    types_out: types_check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_TyId.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_TyId.Vec
+    Vec_TyId.new(init out, allocator)?
+    if ty_mod.is_error(target) {
+        return out
+    }
+    if ty_mod.index(target) >= ty_interner_mod.slot_count(ty_interner) {
+        return out
+    }
+    match ty_interner_mod.lookup(ty_interner, target) {
+        case .record(let def) => {
+            let n = types_check_mod.field_ty_count(types_out, def)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                collect_nominal_deps(types_check_mod.field_ty_at(types_out, def, i), target, ty_interner, mutable out, 8, allocator)?
+                i = i + 1
+            }
+        }
+        case .sum_(let def) => {
+            let n = types_check_mod.variant_count_of(types_out, def)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                collect_nominal_deps(types_check_mod.variant_payload_ty(types_out, def, i as u32), target, ty_interner, mutable out, 8, allocator)?
+                i = i + 1
+            }
+        }
+        case _ => ()
+    }
+    return out
+}
+
+
+function collect_nominal_deps(
+    t: ty_mod.TyId,
+    root: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    out: mutable Vec_TyId.Vec,
+    fuel: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    decreases fuel
+{
+    if fuel == 0 {
+        return
+    }
+    if ty_mod.is_error(t) {
+        return
+    }
+    if ty_mod.index(t) >= ty_interner_mod.slot_count(ty_interner) {
+        return
+    }
+    if t.raw == root.raw {
+        return
+    }
+    match ty_interner_mod.lookup(ty_interner, t) {
+        case .record(_) => push_unique(mutable out, t, allocator)?
+        case .sum_(_) => push_unique(mutable out, t, allocator)?
+        case .tuple_(let elems) => {
+            let n = Vec_TyId.len(elems)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                collect_nominal_deps(Vec_TyId.at(elems, i), root, ty_interner, mutable out, fuel - 1, allocator)?
+                i = i + 1
+            }
+        }
+        case _ => ()
+    }
+}
+
+
+function push_unique(out: mutable Vec_TyId.Vec, t: ty_mod.TyId, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_TyId.len(out)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if Vec_TyId.at(out, i).raw == t.raw {
+            return
+        }
+        i = i + 1
+    }
+    Vec_TyId.push(mutable out, t, allocator)?
+}

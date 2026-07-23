@@ -1,0 +1,366 @@
+
+module cache.blob.mir.stmt.term
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import mir.id.block as block_mod
+import mir.id.local as local_mod
+import mir.stmt as stmt_mod
+import mir.term as term_mod
+import mir.rvalue as rvalue_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.place.codec as place_codec_mod
+import local.blob.mir.operand.codec as operand_codec_mod
+import local.blob.mir.rvalue.codec as rvalue_codec_mod
+import local.blob.mir.ops.codec as ops_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u128)
+spec std.collections.vec.Vec(block_mod.BlockId)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+
+
+public function write_statement(
+    s: stmt_mod.Statement,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    prim_mod.push_u32_le(mutable out, s.origin.raw, allocator)?
+    write_stmt_kind(s.kind, it, mutable out, allocator)?
+}
+
+public function read_statement(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> stmt_mod.Statement
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let origin = node_mod.NodeId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let kind = read_stmt_kind(bytes, mutable cur, mutable it, allocator)?
+    return stmt_mod.Statement { origin: origin, kind: kind }
+}
+
+public function write_stmt_kind(
+    k: stmt_mod.MStmtKind,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match k {
+        case .assign(let dest, let value) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            place_codec_mod.write_place(dest, mutable out, allocator)?
+            rvalue_codec_mod.write_rvalue(value, it, mutable out, allocator)?
+        }
+        case .storage_live(let local) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            prim_mod.push_u32_le(mutable out, local.raw, allocator)?
+        }
+        case .storage_dead(let local) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            prim_mod.push_u32_le(mutable out, local.raw, allocator)?
+        }
+        case .nop_ => prim_mod.push_u8(mutable out, 3, allocator)?
+    }
+}
+
+public function read_stmt_kind(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> stmt_mod.MStmtKind
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => {
+            let dest = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let value = rvalue_codec_mod.read_rvalue(bytes, mutable cur, mutable it, allocator)?
+            stmt_mod.MStmtKind.assign(dest: dest, value: value)
+        }
+        case 1 => stmt_mod.MStmtKind.storage_live(local: local_mod.LocalId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+        case 2 => stmt_mod.MStmtKind.storage_dead(local: local_mod.LocalId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+        case 3 => stmt_mod.MStmtKind.nop_
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown MStmtKind tag")
+    }
+}
+
+public function write_terminator(
+    t: term_mod.Terminator,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    prim_mod.push_u32_le(mutable out, t.origin.raw, allocator)?
+    write_term_kind(t.kind, it, mutable out, allocator)?
+}
+
+public function read_terminator(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> term_mod.Terminator
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let origin = node_mod.NodeId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    let kind = read_term_kind(bytes, mutable cur, mutable it, allocator)?
+    return term_mod.Terminator { origin: origin, kind: kind }
+}
+
+public function write_operand_vec(
+    ops: Vec_Operand.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Operand.len(ops)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        operand_codec_mod.write_operand(Vec_Operand.at(ops, i), it, mutable out, allocator)?
+        i += 1
+    }
+}
+
+public function read_operand_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit ops: Vec_Operand.Vec
+    Vec_Operand.new(init ops, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+        Vec_Operand.push(mutable ops, take op, allocator)?
+        i += 1
+    }
+    return ops
+}
+
+public function write_term_kind(
+    k: term_mod.TermKind,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match k {
+        case .goto_(let target) => {
+            prim_mod.push_u8(mutable out, 0, allocator)?
+            prim_mod.push_u32_le(mutable out, target.raw, allocator)?
+        }
+        case .branch(let cond, let true_, let false_) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            operand_codec_mod.write_operand(cond, it, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, true_.raw, allocator)?
+            prim_mod.push_u32_le(mutable out, false_.raw, allocator)?
+        }
+        case .switch_(let discr, let targets) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            operand_codec_mod.write_operand(discr, it, mutable out, allocator)?
+            write_switch_targets(targets, mutable out, allocator)?
+        }
+        case .return_      => prim_mod.push_u8(mutable out, 3, allocator)?
+        case .unreachable_ => prim_mod.push_u8(mutable out, 4, allocator)?
+        case .raise_(let value, let unwind) => {
+            prim_mod.push_u8(mutable out, 5, allocator)?
+            operand_codec_mod.write_operand(value, it, mutable out, allocator)?
+            ops_mod.write_unwind_action(unwind, mutable out, allocator)?
+        }
+        case .panic_(let message) => {
+            prim_mod.push_u8(mutable out, 6, allocator)?
+            operand_codec_mod.write_operand(message, it, mutable out, allocator)?
+        }
+        case .call_(let callee, let args, let dest, let return_, let unwind) => {
+            prim_mod.push_u8(mutable out, 7, allocator)?
+            operand_codec_mod.write_operand(callee, it, mutable out, allocator)?
+            write_operand_vec(args, it, mutable out, allocator)?
+            place_codec_mod.write_place(dest, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, return_.raw, allocator)?
+            ops_mod.write_unwind_action(unwind, mutable out, allocator)?
+        }
+        case .drop_(let place, let target, let unwind) => {
+            prim_mod.push_u8(mutable out, 8, allocator)?
+            place_codec_mod.write_place(place, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, target.raw, allocator)?
+            ops_mod.write_unwind_action(unwind, mutable out, allocator)?
+        }
+        case .coherence_enter(let body_entry, let exit) => {
+            prim_mod.push_u8(mutable out, 9, allocator)?
+            prim_mod.push_u32_le(mutable out, body_entry.raw, allocator)?
+            prim_mod.push_u32_le(mutable out, exit.raw, allocator)?
+        }
+        case .coherence_exit(let target) => {
+            prim_mod.push_u8(mutable out, 10, allocator)?
+            prim_mod.push_u32_le(mutable out, target.raw, allocator)?
+        }
+        case .spawn_(let child, let args, let group_local, let handle_dest, let return_, let unwind) => {
+            prim_mod.push_u8(mutable out, 11, allocator)?
+            prim_mod.push_u32_le(mutable out, child.raw, allocator)?
+            write_operand_vec(args, it, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, group_local.raw, allocator)?
+            place_codec_mod.write_place(handle_dest, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, return_.raw, allocator)?
+            ops_mod.write_unwind_action(unwind, mutable out, allocator)?
+        }
+        case .await_(let handle, let dest, let return_, let unwind) => {
+            prim_mod.push_u8(mutable out, 12, allocator)?
+            operand_codec_mod.write_operand(handle, it, mutable out, allocator)?
+            place_codec_mod.write_place(dest, mutable out, allocator)?
+            prim_mod.push_u32_le(mutable out, return_.raw, allocator)?
+            ops_mod.write_unwind_action(unwind, mutable out, allocator)?
+        }
+    }
+}
+
+public function read_term_kind(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> term_mod.TermKind
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => term_mod.TermKind.goto_(target: block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+        case 1 => {
+            let cond = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let true_ = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let false_ = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            term_mod.TermKind.branch(cond: cond, true_: true_, false_: false_)
+        }
+        case 2 => {
+            let discr = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let targets = read_switch_targets(bytes, mutable cur, allocator)?
+            term_mod.TermKind.switch_(discr: discr, targets: targets)
+        }
+        case 3 => term_mod.TermKind.return_
+        case 4 => term_mod.TermKind.unreachable_
+        case 5 => {
+            let value = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let unwind = ops_mod.read_unwind_action(bytes, mutable cur)?
+            term_mod.TermKind.raise_(value: value, unwind: unwind)
+        }
+        case 6 => term_mod.TermKind.panic_(message: operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?)
+        case 7 => {
+            let callee = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let args = read_operand_vec(bytes, mutable cur, mutable it, allocator)?
+            let dest = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let return_ = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let unwind = ops_mod.read_unwind_action(bytes, mutable cur)?
+            term_mod.TermKind.call_(callee: callee, args: args, dest: dest, return_: return_, unwind: unwind)
+        }
+        case 8 => {
+            let place = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let target = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let unwind = ops_mod.read_unwind_action(bytes, mutable cur)?
+            term_mod.TermKind.drop_(place: place, target: target, unwind: unwind)
+        }
+        case 9 => {
+            let body_entry = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let exit = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            term_mod.TermKind.coherence_enter(body_entry: body_entry, exit: exit)
+        }
+        case 10 => term_mod.TermKind.coherence_exit(target: block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? })
+        case 11 => {
+            let child = def_mod.DefId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let args = read_operand_vec(bytes, mutable cur, mutable it, allocator)?
+            let group_local = local_mod.LocalId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let handle_dest = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let return_ = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let unwind = ops_mod.read_unwind_action(bytes, mutable cur)?
+            term_mod.TermKind.spawn_(
+                child: child,
+                args: args,
+                group_local: group_local,
+                handle_dest: handle_dest,
+                return_: return_,
+                unwind: unwind,
+            )
+        }
+        case 12 => {
+            let handle = operand_codec_mod.read_operand(bytes, mutable cur, mutable it, allocator)?
+            let dest = place_codec_mod.read_place(bytes, mutable cur, allocator)?
+            let return_ = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+            let unwind = ops_mod.read_unwind_action(bytes, mutable cur)?
+            term_mod.TermKind.await_(handle: handle, dest: dest, return_: return_, unwind: unwind)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown TermKind tag")
+    }
+}
+
+public function write_switch_targets(t: term_mod.SwitchTargets, out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_u128.len(t.values)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        prim_mod.push_u128_le(mutable out, Vec_u128.at(t.values, i), allocator)?
+        i += 1
+    }
+    let m = Vec_BlockId.len(t.targets)
+    prim_mod.push_u32_le(mutable out, m as u32 wrapping, allocator)?
+    var j: usize = 0
+    loop decreases m - j {
+        if j >= m { break }
+        prim_mod.push_u32_le(mutable out, Vec_BlockId.at(t.targets, j).raw, allocator)?
+        j += 1
+    }
+    prim_mod.push_u32_le(mutable out, t.otherwise_.raw, allocator)?
+}
+
+public function read_switch_targets(bytes: [u8], cur: mutable prim_mod.Reader, allocator: Allocator) -> term_mod.SwitchTargets
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit values: Vec_u128.Vec
+    Vec_u128.new(init values, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let v = prim_mod.read_u128_le(bytes, mutable cur)?
+        Vec_u128.push(mutable values, take v, allocator)?
+        i += 1
+    }
+    let m = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit targets: Vec_BlockId.Vec
+    Vec_BlockId.new(init targets, allocator)?
+    var j: usize = 0
+    loop decreases m - j {
+        if j >= m { break }
+        let t = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+        Vec_BlockId.push(mutable targets, take t, allocator)?
+        j += 1
+    }
+    let otherwise_ = block_mod.BlockId { raw: prim_mod.read_u32_le(bytes, mutable cur)? }
+    return term_mod.SwitchTargets { values: values, targets: targets, otherwise_: otherwise_ }
+}

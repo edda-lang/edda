@@ -1,0 +1,72 @@
+
+module pgsql.client.session.auth
+
+import std.mem.alloc
+import local.error
+import local.message.fe.auth as fe_auth
+import local.client.session.auth.cleartext
+import local.client.session.auth.scram
+
+
+public function mechanism_scram_sha256() -> [u8] { return "SCRAM-SHA-256".bytes() }
+
+public function mechanism_scram_sha256_plus() -> [u8] { return "SCRAM-SHA-256-PLUS".bytes() }
+
+
+public function handle_cleartext(
+    password: [u8],
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    return cleartext.build_response(password, allocator)?
+}
+
+
+public type ScramBegun {
+    bytes: [u8]
+    session: scram.ScramSession
+}
+
+public function begin_scram(
+    password: [u8],
+    nonce: [u8],
+    allocator: Allocator,
+) -> ScramBegun
+    with {allocator, err: alloc.AllocError, err: error.ProtocolError}
+{
+    let first = scram.scram_begin(password, nonce, allocator)?
+    let bytes = fe_auth.encode_sasl_initial(
+        mechanism_scram_sha256(),
+        first.bytes,
+        allocator,
+    )?
+    return ScramBegun { bytes: bytes, session: first.session }
+}
+
+public type ScramContinued {
+    bytes: [u8]
+    session: scram.ScramSession
+}
+
+public function continue_scram(
+    session: scram.ScramSession,
+    server_first: [u8],
+    allocator: Allocator,
+) -> ScramContinued
+    with {allocator, err: alloc.AllocError, err: error.AuthError, err: error.ProtocolError}
+{
+    let second = scram.scram_continue(session, server_first, allocator)?
+    let bytes = fe_auth.encode_sasl_response(second.bytes, allocator)?
+    return ScramContinued { bytes: bytes, session: second.session }
+}
+
+public function finish_scram(
+    session: scram.ScramSession,
+    server_final: [u8],
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error.AuthError}
+{
+    return scram.scram_finish(session, server_final, allocator)?
+}

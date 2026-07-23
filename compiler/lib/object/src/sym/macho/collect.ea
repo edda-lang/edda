@@ -1,0 +1,337 @@
+
+module object.sym.macho.collect
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+
+import local.fmt.macho as macho_mod
+import local.macho.wrap as macho_wrap_mod
+import local.sym.coff.multisym as multisym_mod
+import ir.emitted as emit_types_mod
+import ir.runtime as runtime_mod
+
+
+spec std.collections.vec.Vec(emit_types_mod.EmittedReloc)
+spec std.collections.vec.Vec(macho_mod.MachoRelocationInfo)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(bool)
+
+spec std.collections.hashmap.IntMap(u32)
+spec std.collections.hashmap.IntMap(String)
+
+spec std.core.option.Option(u32)
+spec std.core.option.Option(String)
+
+
+public function collect_data_locals(
+    relocs: Vec_EmittedReloc.Vec,
+    data_index_map: mutable IntMap_u32.IntMap,
+    f32_index_map: mutable IntMap_u32.IntMap,
+    f64_index_map: mutable IntMap_u32.IntMap,
+    data_offsets: mutable Vec_u32.Vec,
+    data_is_string: mutable Vec_bool.Vec,
+    rdata: mutable Vec_u8.Vec,
+    start_index: u32,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    var next_index = start_index
+    let n = Vec_EmittedReloc.len(relocs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let reloc = Vec_EmittedReloc.at(relocs, i)
+        match reloc.target {
+            case .function_(_) => ()
+            case .runtime_symbol(_) => ()
+            case .data_symbol(let sym) => {
+                if !IntMap_u32.contains(data_index_map, sym.raw as i64) {
+                    let assigned = next_index
+                    let _ = IntMap_u32.insert(mutable data_index_map, sym.raw as i64, take assigned, allocator)?
+                    let offset = Vec_u8.len(rdata) as u32
+                    append_string_fatptr(mutable rdata, sym, interner, allocator)?
+                    let off = offset
+                    Vec_u32.push(mutable data_offsets, take off, allocator)?
+                    Vec_bool.push(mutable data_is_string, true, allocator)?
+                    next_index = next_index + 1
+                }
+            }
+            case .float_const(let bits, let size) => {
+                let key = bits as i64 wrapping
+                let is_f32 = size == (4 as u8)
+                let present = if is_f32 {
+                    IntMap_u32.contains(f32_index_map, key)
+                } else {
+                    IntMap_u32.contains(f64_index_map, key)
+                }
+                if !present {
+                    let assigned = next_index
+                    if is_f32 {
+                        let _ = IntMap_u32.insert(mutable f32_index_map, key, take assigned, allocator)?
+                    } else {
+                        let _ = IntMap_u32.insert(mutable f64_index_map, key, take assigned, allocator)?
+                    }
+                    let offset = Vec_u8.len(rdata) as u32
+                    append_float_bytes(mutable rdata, bits, size, allocator)?
+                    let off = offset
+                    Vec_u32.push(mutable data_offsets, take off, allocator)?
+                    Vec_bool.push(mutable data_is_string, false, allocator)?
+                    next_index = next_index + 1
+                }
+            }
+        }
+        i += 1
+    }
+    return next_index
+}
+
+
+public function collect_externals_macho(
+    relocs: Vec_EmittedReloc.Vec,
+    func_index_map: mutable IntMap_u32.IntMap,
+    ext_defs: mutable Vec_u32.Vec,
+    start_index: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    var next_index = start_index
+    let n = Vec_EmittedReloc.len(relocs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let reloc = Vec_EmittedReloc.at(relocs, i)
+        match reloc.target {
+            case .function_(let def) => {
+                if !IntMap_u32.contains(func_index_map, def.raw as i64) {
+                    let assigned = next_index
+                    let _ = IntMap_u32.insert(mutable func_index_map, def.raw as i64, take assigned, allocator)?
+                    let dr = def.raw
+                    Vec_u32.push(mutable ext_defs, take dr, allocator)?
+                    next_index = next_index + 1
+                }
+            }
+            case .data_symbol(_) => ()
+            case .float_const(_, _) => ()
+            case .runtime_symbol(_) => ()
+        }
+        i += 1
+    }
+    return next_index
+}
+
+
+public function collect_runtime_macho(
+    relocs: Vec_EmittedReloc.Vec,
+    rt_index_map: mutable IntMap_u32.IntMap,
+    rt_defs: mutable Vec_u32.Vec,
+    start_index: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    var next_index = start_index
+    let n = Vec_EmittedReloc.len(relocs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let reloc = Vec_EmittedReloc.at(relocs, i)
+        match reloc.target {
+            case .function_(_) => ()
+            case .data_symbol(_) => ()
+            case .float_const(_, _) => ()
+            case .runtime_symbol(let fn_) => {
+                let ord = runtime_mod.runtime_fn_ordinal(fn_)
+                if !IntMap_u32.contains(rt_index_map, ord as i64) {
+                    let assigned = next_index
+                    let _ = IntMap_u32.insert(mutable rt_index_map, ord as i64, take assigned, allocator)?
+                    let o = ord
+                    Vec_u32.push(mutable rt_defs, take o, allocator)?
+                    next_index = next_index + 1
+                }
+            }
+        }
+        i += 1
+    }
+    return next_index
+}
+
+
+public function translate_relocs_macho(
+    relocs: Vec_EmittedReloc.Vec,
+    func_index_map: IntMap_u32.IntMap,
+    rt_index_map: IntMap_u32.IntMap,
+    data_index_map: IntMap_u32.IntMap,
+    f32_index_map: IntMap_u32.IntMap,
+    f64_index_map: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> Vec_MachoRelocationInfo.Vec
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    uninit out: Vec_MachoRelocationInfo.Vec
+    Vec_MachoRelocationInfo.new(init out, allocator)?
+    let n = Vec_EmittedReloc.len(relocs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let reloc = Vec_EmittedReloc.at(relocs, i)
+        let idx = match reloc.target {
+            case .function_(let def) => resolve_index(func_index_map, def.raw)?
+            case .runtime_symbol(let fn_) => resolve_index_key(rt_index_map, runtime_mod.runtime_fn_ordinal(fn_) as i64)?
+            case .data_symbol(let sym) => resolve_index(data_index_map, sym.raw)?
+            case .float_const(let bits, let size) => {
+                let key = bits as i64 wrapping
+                if size == (4 as u8) {
+                    resolve_index_key(f32_index_map, key)?
+                } else {
+                    resolve_index_key(f64_index_map, key)?
+                }
+            }
+        }
+        let r = macho_wrap_mod.make_relocation(
+            reloc.offset as i32,
+            idx,
+            reloc_pcrel_for_macho(reloc.kind),
+            reloc_length_for_macho(reloc.kind),
+            true,
+            reloc_type_for_macho(reloc.kind),
+        )
+        Vec_MachoRelocationInfo.push(mutable out, take r, allocator)?
+        i += 1
+    }
+    return out
+}
+
+
+function append_float_bytes(
+    rdata: mutable Vec_u8.Vec,
+    bits: u64,
+    size: u8,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = size as usize
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let shift: u64 = (i as u64) * (8 as u64)
+        let octet: u64 = (bits >> shift) & (255 as u64)
+        Vec_u8.push(mutable rdata, octet as u8 wrapping, allocator)?
+        i += 1
+    }
+}
+
+
+function push_u64_le(
+    rdata: mutable Vec_u8.Vec,
+    value: u64,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var i: usize = 0
+    loop decreases (8 as usize) - i {
+        if i >= (8 as usize) { break }
+        let shift: u64 = (i as u64) * (8 as u64)
+        let octet: u64 = (value >> shift) & (255 as u64)
+        Vec_u8.push(mutable rdata, octet as u8 wrapping, allocator)?
+        i += 1
+    }
+}
+
+
+function append_string_fatptr(
+    rdata: mutable Vec_u8.Vec,
+    sym: symbol_mod.Symbol,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: multisym_mod.MultiSymError}
+{
+    let slots = interner_mod.slot_count(interner)
+    if (sym.raw as usize) >= slots {
+        raise multisym_mod.MultiSymError.unresolved_symbol(def_raw: sym.raw)
+    }
+    let bytes = interner_mod.lookup(interner, sym)
+    let n = bytes.len()
+    push_u64_le(mutable rdata, 16 as u64, allocator)?
+    push_u64_le(mutable rdata, n as u64, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u8.push(mutable rdata, bytes[i], allocator)?
+        i += 1
+    }
+}
+
+
+function reloc_type_for_macho(kind: emit_types_mod.RelocKind) -> u8 {
+    return match kind {
+        case .rel32  => 1 as u8
+        case .addr64 => 0 as u8
+        case .page_hi21 => 3 as u8
+        case .page_lo12_add => 4 as u8
+    }
+}
+
+
+function reloc_length_for_macho(kind: emit_types_mod.RelocKind) -> u8 {
+    return match kind {
+        case .rel32  => 2 as u8
+        case .addr64 => 3 as u8
+        case .page_hi21 => 2 as u8
+        case .page_lo12_add => 2 as u8
+    }
+}
+
+
+function reloc_pcrel_for_macho(kind: emit_types_mod.RelocKind) -> bool {
+    return match kind {
+        case .rel32  => true
+        case .addr64 => false
+        case .page_hi21 => true
+        case .page_lo12_add => false
+    }
+}
+
+
+function resolve_index_key(map: IntMap_u32.IntMap, key: i64) -> u32
+    with {err: multisym_mod.MultiSymError}
+{
+    return match IntMap_u32.get(map, key) {
+        case .some(let v) => v
+        case .none => raise multisym_mod.MultiSymError.unresolved_symbol(def_raw: 0 as u32)
+    }
+}
+
+
+public function resolve_index(map: IntMap_u32.IntMap, raw: u32) -> u32
+    with {err: multisym_mod.MultiSymError}
+{
+    return match IntMap_u32.get(map, raw as i64) {
+        case .some(let v) => v
+        case .none => raise multisym_mod.MultiSymError.unresolved_symbol(def_raw: raw)
+    }
+}
+
+
+public function lookup_symbol(
+    global_syms: IntMap_String.IntMap,
+    def_raw: u32,
+) -> String
+    with {err: multisym_mod.MultiSymError}
+{
+    return match IntMap_String.get(global_syms, def_raw as i64) {
+        case .some(let s) => s
+        case .none => raise multisym_mod.MultiSymError.unresolved_symbol(def_raw: def_raw)
+    }
+}

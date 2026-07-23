@@ -1,0 +1,294 @@
+module link.emit.image.fix.reloc.patch.patch
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import object.coff as coff_mod
+import object.coff.wrap.wrap as wrap_mod
+import local.emit.layout as layout_mod
+import local.emit.image.fix.res.resolve as resolve_mod
+import local.emit.image.fix.reloc.defs.defs as reloc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(coff_mod.CoffSymbol)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+spec std.core.option.Option(resolve_mod.Definition)
+spec std.core.option.Option(layout_mod.Placement)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(layout_mod.SectionClass)
+spec std.collections.hashmap.StringMap(resolve_mod.Definition)
+spec std.collections.hashmap.StringMap(u32)
+
+
+public function rel32_delta(kind: u16) -> u32 {
+    if kind == wrap_mod.rel_amd64_rel32_1() { return 5 as u32 }
+    if kind == wrap_mod.rel_amd64_rel32_2() { return 6 as u32 }
+    if kind == wrap_mod.rel_amd64_rel32_3() { return 7 as u32 }
+    if kind == wrap_mod.rel_amd64_rel32_4() { return 8 as u32 }
+    if kind == wrap_mod.rel_amd64_rel32_5() { return 9 as u32 }
+    return 4 as u32
+}
+
+
+public function is_rel32_family(kind: u16) -> bool {
+    return kind == wrap_mod.rel_amd64_rel32()
+        || kind == wrap_mod.rel_amd64_rel32_1()
+        || kind == wrap_mod.rel_amd64_rel32_2()
+        || kind == wrap_mod.rel_amd64_rel32_3()
+        || kind == wrap_mod.rel_amd64_rel32_4()
+        || kind == wrap_mod.rel_amd64_rel32_5()
+}
+
+
+function is_image_base(name: String) -> bool {
+    return string.equals(name, "__ImageBase")
+}
+
+
+function is_tls_start(name: String) -> bool {
+    return string.equals(name, "__edda_tls_start")
+}
+
+
+function is_tls_end(name: String) -> bool {
+    return string.equals(name, "__edda_tls_end")
+}
+
+
+public function target_rva(
+    file: coff_mod.CoffFile,
+    object_index: usize,
+    sym: coff_mod.CoffSymbol,
+    plan: layout_mod.LayoutPlan,
+    table: StringMap_Definition.StringMap,
+    imports: StringMap_u32.StringMap,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let name = resolve_mod.symbol_name(sym.name, file.string_table, allocator)?
+    if sym.section_number > (0 as i16) {
+        return match layout_mod.section_rva(plan, object_index, sym.section_number, sym.value) {
+            case .some(let r) => r
+            case .none        => raise reloc_mod.RelocError.unresolved_target(name: name)
+        }
+    }
+    if is_image_base(name) {
+        return 0 as u32
+    }
+    if is_tls_start(name) {
+        return plan.tls_rva
+    }
+    if is_tls_end(name) {
+        return plan.tls_rva + plan.tls_size
+    }
+    if string.equals(name, "__edda_tls_callbacks") && plan.crt_size > (0 as u32) {
+        return plan.crt_rva
+    }
+    return match StringMap_Definition.get(table, name) {
+        case .some(let def) => match layout_mod.section_rva(plan, def.object_index, def.section_number, def.value) {
+            case .some(let r) => r
+            case .none        => raise reloc_mod.RelocError.unresolved_target(name: name)
+        }
+        case .none => match StringMap_u32.get(imports, name) {
+            case .some(let r) => r
+            case .none        => raise reloc_mod.RelocError.unresolved_target(name: name)
+        }
+    }
+}
+
+
+public function apply_one(
+    data: mutable Vec_u8.Vec,
+    site_offset: usize,
+    site_rva: u32,
+    kind: u16,
+    plan: layout_mod.LayoutPlan,
+    tgt_rva: u32,
+) -> ()
+    with {err: reloc_mod.RelocError}
+{
+    let image_base = plan.image_base
+    if kind == wrap_mod.rel_amd64_addr64() {
+        let addend = read_u64_at(data, site_offset)?
+        write_u64_at(mutable data, site_offset, image_base + (tgt_rva as u64) + addend)?
+        return ()
+    }
+    if kind == wrap_mod.rel_amd64_addr32nb() {
+        let addend = read_u32_at(data, site_offset)?
+        write_u32_at(mutable data, site_offset, tgt_rva + addend)?
+        return ()
+    }
+    if kind == wrap_mod.rel_amd64_addr32() {
+        let addend = read_u32_at(data, site_offset)?
+        let va = image_base + (tgt_rva as u64)
+        let low = (va & (0xFFFFFFFF as u64)) as u32
+        write_u32_at(mutable data, site_offset, low +% addend)?
+        return ()
+    }
+    if kind == wrap_mod.rel_amd64_secrel() {
+        let class_ = match layout_mod.class_of_rva(plan, tgt_rva) {
+            case .some(let c) => c
+            case .none        => raise reloc_mod.RelocError.unsupported_kind(kind: kind)
+        }
+        let addend = read_u32_at(data, site_offset)?
+        let secrel = tgt_rva - layout_mod.class_base_rva(plan, class_)
+        write_u32_at(mutable data, site_offset, secrel + addend)?
+        return ()
+    }
+    if kind == wrap_mod.rel_amd64_section() {
+        let class_ = match layout_mod.class_of_rva(plan, tgt_rva) {
+            case .some(let c) => c
+            case .none        => raise reloc_mod.RelocError.unsupported_kind(kind: kind)
+        }
+        let ordinal = layout_mod.section_ordinal(plan, class_)
+        if ordinal == (0 as u16) { raise reloc_mod.RelocError.unsupported_kind(kind: kind) }
+        write_u16_at(mutable data, site_offset, ordinal)?
+        return ()
+    }
+    if is_rel32_family(kind) {
+        let addend = read_u32_at(data, site_offset)? as i32 wrapping
+        let delta = rel32_delta(kind)
+        let disp = (tgt_rva as i64) - ((site_rva as i64) + (delta as i64)) + (addend as i64)
+        let i32_min: i64 = -2147483648 as i64
+        let i32_max: i64 = 2147483647 as i64
+        if disp < i32_min || disp > i32_max {
+            raise reloc_mod.RelocError.displacement_out_of_range(disp: disp)
+        }
+        write_u32_at(mutable data, site_offset, disp as u32 wrapping)?
+        return ()
+    }
+    raise reloc_mod.RelocError.unsupported_kind(kind: kind)
+}
+
+
+public function patch_relocs(
+    objects: Vec_CoffFile.Vec,
+    class_: layout_mod.SectionClass,
+    plan: layout_mod.LayoutPlan,
+    table: StringMap_Definition.StringMap,
+    imports: StringMap_u32.StringMap,
+    data: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let n_obj = Vec_CoffFile.len(objects)
+    var oi: usize = 0
+    loop decreases (n_obj - oi) {
+        if oi >= n_obj { break }
+        let file = Vec_CoffFile.at(objects, oi)
+        let nsec = Vec_CoffSection.len(file.sections)
+        var si: usize = 0
+        loop decreases (nsec - si) {
+            if si >= nsec { break }
+            let sec = Vec_CoffSection.at(file.sections, si)
+            if layout_mod.section_class_of(sec, file.string_table) == class_ {
+                patch_section(file, oi, si, sec, plan, table, imports, mutable data, allocator)?
+            }
+            si = si + 1
+        }
+        oi = oi + 1
+    }
+}
+
+
+public function patch_section(
+    file: coff_mod.CoffFile,
+    object_index: usize,
+    section_index: usize,
+    sec: coff_mod.CoffSection,
+    plan: layout_mod.LayoutPlan,
+    table: StringMap_Definition.StringMap,
+    imports: StringMap_u32.StringMap,
+    data: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: reloc_mod.RelocError}
+{
+    let p = match layout_mod.placement_of(plan, object_index, section_index) {
+        case .some(let pl) => pl
+        case .none         => raise reloc_mod.RelocError.site_out_of_range
+    }
+    let n_sym = Vec_CoffSymbol.len(file.symbols)
+    let n_rel = Vec_CoffRelocation.len(sec.relocations)
+    var ri: usize = 0
+    loop decreases (n_rel - ri) {
+        if ri >= n_rel { break }
+        let r = Vec_CoffRelocation.at(sec.relocations, ri)
+        let sym_index = r.symbol_table_index as usize
+        if sym_index >= n_sym { raise reloc_mod.RelocError.unresolved_target(name: "<symbol index out of range>") }
+        let sym = Vec_CoffSymbol.at(file.symbols, sym_index)
+        let tgt = target_rva(file, object_index, sym, plan, table, imports, allocator)?
+        let site_offset = (p.offset as usize) + (r.virtual_address as usize)
+        let site_rva = p.rva + r.virtual_address
+        apply_one(mutable data, site_offset, site_rva, r.type_, plan, tgt)?
+        ri = ri + 1
+    }
+}
+
+
+function read_u32_at(data: Vec_u8.Vec, at: usize) -> u32
+    with {err: reloc_mod.RelocError}
+{
+    let len = Vec_u8.len(data)
+    if at >= len { raise reloc_mod.RelocError.site_out_of_range }
+    if len - at < (4 as usize) { raise reloc_mod.RelocError.site_out_of_range }
+    let b0 = Vec_u8.at(data, at) as u32
+    let b1 = Vec_u8.at(data, at + (1 as usize)) as u32
+    let b2 = Vec_u8.at(data, at + (2 as usize)) as u32
+    let b3 = Vec_u8.at(data, at + (3 as usize)) as u32
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+
+function read_u64_at(data: Vec_u8.Vec, at: usize) -> u64
+    with {err: reloc_mod.RelocError}
+{
+    let len = Vec_u8.len(data)
+    if at >= len { raise reloc_mod.RelocError.site_out_of_range }
+    if len - at < (8 as usize) { raise reloc_mod.RelocError.site_out_of_range }
+    let lo = read_u32_at(data, at)? as u64
+    let hi = read_u32_at(data, at + (4 as usize))? as u64
+    return lo | (hi << (32 as u64))
+}
+
+
+function write_u16_at(data: mutable Vec_u8.Vec, at: usize, value: u16) -> ()
+    with {err: reloc_mod.RelocError}
+{
+    let len = Vec_u8.len(data)
+    if at >= len { raise reloc_mod.RelocError.site_out_of_range }
+    if len - at < (2 as usize) { raise reloc_mod.RelocError.site_out_of_range }
+    Vec_u8.set_at(mutable data, at, (value & (0xFF as u16)) as u8)
+    Vec_u8.set_at(mutable data, at + (1 as usize), ((value >> 8) & (0xFF as u16)) as u8)
+}
+
+
+function write_u32_at(data: mutable Vec_u8.Vec, at: usize, value: u32) -> ()
+    with {err: reloc_mod.RelocError}
+{
+    let len = Vec_u8.len(data)
+    if at >= len { raise reloc_mod.RelocError.site_out_of_range }
+    if len - at < (4 as usize) { raise reloc_mod.RelocError.site_out_of_range }
+    Vec_u8.set_at(mutable data, at, (value & (0xFF as u32)) as u8)
+    Vec_u8.set_at(mutable data, at + (1 as usize), ((value >> 8) & (0xFF as u32)) as u8)
+    Vec_u8.set_at(mutable data, at + (2 as usize), ((value >> 16) & (0xFF as u32)) as u8)
+    Vec_u8.set_at(mutable data, at + (3 as usize), ((value >> 24) & (0xFF as u32)) as u8)
+}
+
+
+function write_u64_at(data: mutable Vec_u8.Vec, at: usize, value: u64) -> ()
+    with {err: reloc_mod.RelocError}
+{
+    let len = Vec_u8.len(data)
+    if at >= len { raise reloc_mod.RelocError.site_out_of_range }
+    if len - at < (8 as usize) { raise reloc_mod.RelocError.site_out_of_range }
+    write_u32_at(mutable data, at, (value & (0xFFFFFFFF as u64)) as u32)?
+    write_u32_at(mutable data, at + (4 as usize), ((value >> (32 as u64)) & (0xFFFFFFFF as u64)) as u32)?
+}

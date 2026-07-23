@@ -1,0 +1,144 @@
+
+module compile.trace.trace
+
+import std.mem.alloc
+import std.text.string
+import std.core.fmt as fmt_mod
+import std.os.time as time_mod
+import std.io.stream as stream_mod
+
+
+public type TraceConfig {
+    enabled: bool
+    filter: String
+}
+
+public type Span {
+    label: String
+    start: time_mod.MonotonicInstant
+    active: bool
+}
+
+
+public function off() -> TraceConfig {
+    return TraceConfig { enabled: false, filter: "" }
+}
+
+public function on(filter: String) -> TraceConfig {
+    return TraceConfig { enabled: true, filter: filter }
+}
+
+
+function selected(cfg: TraceConfig, label: String) -> bool {
+    if !cfg.enabled { return false }
+    if string.is_empty(cfg.filter) { return true }
+    return string.equals(cfg.filter, label)
+}
+
+
+public function phase_begin(
+    cfg: TraceConfig,
+    clock: MonotonicClock,
+    errout: Stderr,
+    label: String,
+    allocator: Allocator,
+) -> Span
+    with {clock, errout, allocator, err: alloc.AllocError}
+{
+    if !selected(cfg, label) {
+        return Span {
+            label: label,
+            start: time_mod.MonotonicInstant { nanos_since_clock_start: 0 },
+            active: false,
+        }
+    }
+    let line = string.concat("trace: ", label, allocator)?
+    let opened = string.concat(line, " ...", allocator)?
+    stream_mod.eprint_line(errout, opened)
+    return Span {
+        label: label,
+        start: time_mod.monotonic_now_untimed(clock),
+        active: true,
+    }
+}
+
+
+public function phase_end(
+    span: Span,
+    clock: MonotonicClock,
+    errout: Stderr,
+    allocator: Allocator,
+) -> ()
+    with {clock, errout, allocator, err: alloc.AllocError}
+{
+    if !span.active { return }
+    let line = closing_line(span, clock, "", allocator)?
+    stream_mod.eprint_line(errout, line)
+}
+
+
+public function phase_end_n(
+    span: Span,
+    clock: MonotonicClock,
+    errout: Stderr,
+    n: usize,
+    noun: String,
+    allocator: Allocator,
+) -> ()
+    with {clock, errout, allocator, err: alloc.AllocError}
+{
+    if !span.active { return }
+    let count = fmt_mod.usize_to_string(n, allocator)?
+    let with_noun = string.concat(count, " ", allocator)?
+    let detail = string.concat(with_noun, noun, allocator)?
+    let line = closing_line(span, clock, detail, allocator)?
+    stream_mod.eprint_line(errout, line)
+}
+
+
+public function phase_end_detail(
+    span: Span,
+    clock: MonotonicClock,
+    errout: Stderr,
+    detail: String,
+    allocator: Allocator,
+) -> ()
+    with {clock, errout, allocator, err: alloc.AllocError}
+{
+    if !span.active { return }
+    let line = closing_line(span, clock, detail, allocator)?
+    stream_mod.eprint_line(errout, line)
+}
+
+
+function closing_line(
+    span: Span,
+    clock: MonotonicClock,
+    detail: String,
+    allocator: Allocator,
+) -> String
+    with {clock, allocator, err: alloc.AllocError}
+{
+    let dur = elapsed_safe(time_mod.monotonic_now_untimed(clock), span.start)
+    let us = fmt_mod.i64_to_string(time_mod.as_micros(dur), allocator)?
+    let head = string.concat("trace: ", span.label, allocator)?
+    var line = string.concat(head, " ok", allocator)?
+    if !string.is_empty(detail) {
+        let spaced = string.concat(line, "  ", allocator)?
+        line = string.concat(spaced, detail, allocator)?
+    }
+    let pre = string.concat(line, "  (", allocator)?
+    let with_us = string.concat(pre, us, allocator)?
+    return string.concat(with_us, " us)", allocator)?
+}
+
+
+function elapsed_safe(
+    later: time_mod.MonotonicInstant,
+    earlier: time_mod.MonotonicInstant,
+) -> time_mod.Duration {
+    if later.nanos_since_clock_start >= earlier.nanos_since_clock_start {
+        return time_mod.duration_since(later, earlier)
+    }
+    return time_mod.zero()
+}

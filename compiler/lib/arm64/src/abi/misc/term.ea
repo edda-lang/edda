@@ -1,0 +1,164 @@
+
+module arm64.abi.misc.term
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.term as lir_term_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.lir.id.block as lir_block_mod
+
+import local.gen.regs as regs_mod
+import local.encoding.branch as branch_mod
+import local.encoding.instr.mem.system as system_mod
+import local.abi.misc.fixup as fixup_mod
+import local.abi.misc.regutil as regutil_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(fixup_mod.Arm64Fixup)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_term_mod.LirSwitchCase)
+
+
+public function emit_terminator(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_Arm64Fixup.Vec,
+    body: lir_body_mod.LirBody,
+    block_idx: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError, panic}
+    requires block_idx < Vec_LirBlock.len(body.blocks)
+{
+    let block = Vec_LirBlock.at(body.blocks, block_idx)
+    match block.terminator.kind {
+        case .return_(let values) => emit_return(mutable code, body, values, allocator)?
+        case .jump(let target, _) => emit_jump_to(mutable code, mutable fixups, target, allocator)?
+        case .branch_if(let cond, let true_, _, let false_, _) => emit_branch_if(mutable code, mutable fixups, body, cond, true_, false_, allocator)?
+        case .unreachable_ => system_mod.encode_brk(mutable code, 0 as u16, allocator)?
+        case .raise_(_, _) => system_mod.encode_brk(mutable code, 0 as u16, allocator)?
+        case .panic_(_) => system_mod.encode_brk(mutable code, 0 as u16, allocator)?
+        case .coherence_enter(let body_entry, _) => emit_jump_to(mutable code, mutable fixups, body_entry, allocator)?
+        case .coherence_exit(let target) => emit_jump_to(mutable code, mutable fixups, target, allocator)?
+        case .switch_(_, _) => raise regutil_mod.unsupported()
+    }
+}
+
+function emit_return(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    values: Vec_LirVRegId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_LirVRegId.len(values)
+    if n > 1 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: multi-value return needs the aggregate ABI — pending ABI contract",
+        )
+    }
+    if n == 1 {
+        verify_return_in_x0(body, Vec_LirVRegId.at(values, 0))?
+    }
+    branch_mod.encode_ret(mutable code, regs_mod.GpReg.x30, allocator)?
+}
+
+function emit_jump_to(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_Arm64Fixup.Vec,
+    target: lir_block_mod.LirBlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let site = tail_site_next(code)
+    branch_mod.encode_b(mutable code, 0 as i32, allocator)?
+    record_fixup(mutable fixups, site, target.raw, false, allocator)?
+}
+
+function emit_branch_if(
+    code: mutable Vec_u8.Vec,
+    fixups: mutable Vec_Arm64Fixup.Vec,
+    body: lir_body_mod.LirBody,
+    cond: lir_vreg_mod.LirVRegId,
+    true_: lir_block_mod.LirBlockId,
+    false_: lir_block_mod.LirBlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let creg = regutil_mod.gp_of_pinned_vreg(body, cond)?
+    let site_t = tail_site_next(code)
+    branch_mod.encode_cbnz(mutable code, true, creg, 0 as i32, allocator)?
+    record_fixup(mutable fixups, site_t, true_.raw, true, allocator)?
+    let site_f = tail_site_next(code)
+    branch_mod.encode_b(mutable code, 0 as i32, allocator)?
+    record_fixup(mutable fixups, site_f, false_.raw, false, allocator)?
+}
+
+function tail_site_next(code: Vec_u8.Vec) -> u32 {
+    return Vec_u8.len(code) as u32 wrapping
+}
+
+function record_fixup(
+    fixups: mutable Vec_Arm64Fixup.Vec,
+    site: u32,
+    target_block: u32,
+    cond: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_Arm64Fixup.push(mutable fixups, take fixup_mod.Arm64Fixup {
+        site: site,
+        target_block: target_block,
+        cond: cond,
+    }, allocator)?
+}
+
+function verify_return_in_x0(
+    body: lir_body_mod.LirBody,
+    value_id: lir_vreg_mod.LirVRegId,
+) -> ()
+    with {err: lir_error_mod.LirError}
+{
+    let idx = value_id.raw as usize
+    if idx == 0 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: return value references sentinel vreg id 0",
+        )
+    }
+    if idx >= Vec_LirVReg.len(body.vregs) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: return value vreg id out of range",
+        )
+    }
+    let vreg = Vec_LirVReg.at(body.vregs, idx)
+    let expected = regs_mod.preg_of(regs_mod.GpReg.x0)
+    return match vreg.pin {
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: return value vreg unpinned — ABI lowering pass did not run",
+        )
+        case .some(let p) => {
+            if p.raw != expected.raw {
+                raise lir_error_mod.LirError.internal_lowering_invariant(
+                    at: span_mod.dummy(),
+                    message: "arm64.gen.emit: return value vreg pinned to non-X0 register",
+                )
+            }
+        }
+    }
+}

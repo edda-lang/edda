@@ -1,0 +1,69 @@
+module session.signed
+
+import std.mem.alloc
+import std.crypto.mac.hmac.sha256 as hmac
+import std.crypto.subtle
+import std.encoding.hex
+import std.text.string
+
+
+public type Unsigned {
+    case valid(value: String)
+    case tampered
+    case malformed
+}
+
+function _to_string(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _hmac_tag(key: [u8], data: [u8], allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    var out: [u8] = allocator.alloc_array(u8, 32 as usize)?
+    hmac.hmac_sha256(key, data, mutable out, 0 as usize)
+    return out
+}
+
+public function sign(value: String, key: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let tag = _hmac_tag(key, value.bytes(), allocator)?
+    let tag_hex = hex.encode(tag, allocator)?
+    let dotted = string.concat(value, ".", allocator)?
+    return string.concat(dotted, tag_hex, allocator)?
+}
+
+public function unsign(signed: String, key: [u8], allocator: Allocator) -> Unsigned
+    with {allocator, err: alloc.AllocError}
+{
+    let sb = signed.bytes()
+    let n = sb.len()
+    if n < 65 as usize {
+        return Unsigned.malformed
+    }
+    let dot_pos = n - 65 as usize
+    if sb[dot_pos] != 46 as u8 {
+        return Unsigned.malformed
+    }
+    let value_bytes = sb[0 as usize..<dot_pos]
+    let tag_start = dot_pos + 1 as usize
+    let provided_hex = sb[tag_start..<n]
+    let tag = _hmac_tag(key, value_bytes, allocator)?
+    let computed_hex = hex.encode(tag, allocator)?
+    if subtle.eq_bytes(computed_hex.bytes(), provided_hex) {
+        let value = _to_string(value_bytes, allocator)?
+        return Unsigned.valid(value: value)
+    }
+    return Unsigned.tampered
+}

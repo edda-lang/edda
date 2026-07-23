@@ -1,0 +1,361 @@
+
+module std.collections.hashset
+
+import std.core.hash
+import std.mem.alloc
+
+
+public spec StringSet() {
+
+    public type Entry { key: String, hash: u64, occupied: bool }
+
+    public type StringSet {
+        entries: [Entry]
+        len: usize where len <= entries.len()
+    }
+
+    public function new(allocator: Allocator) -> StringSet
+        with {allocator, err: alloc.AllocError}
+    {
+        let raw: [Entry] = allocator.alloc_array(Entry, 8)?
+        return StringSet { entries: raw, len: 0 }
+    }
+
+    public function len(set: StringSet) -> usize {
+        return set.len
+    }
+
+    public function is_empty(set: StringSet) -> bool {
+        return set.len == 0
+    }
+
+    public function contains(set: StringSet, key: String) -> bool {
+        let h = _hash_key(key)
+        let idx = _probe_index(set, key, h)
+        return set.entries[idx].occupied
+    }
+
+    public function insert(set: mutable StringSet, key: String, allocator: Allocator) -> bool
+        with {allocator, err: alloc.AllocError}
+    {
+        _grow_table(mutable set, set.len + 1, allocator)?
+        let h = _hash_key(key)
+        let idx = _probe_index(set, key, h)
+        if set.entries[idx].occupied {
+            return false
+        }
+        set.entries[idx] = Entry { key: key, hash: h, occupied: true }
+        set.len += 1
+        return true
+    }
+
+    public function remove(set: mutable StringSet, key: String) -> bool {
+        let h = _hash_key(key)
+        let idx = _probe_index(set, key, h)
+        if !set.entries[idx].occupied {
+            return false
+        }
+        set.entries[idx].occupied = false
+        set.len -= 1
+        _backshift(mutable set, idx)
+        return true
+    }
+
+
+    function _hash_key(key: String) -> u64 {
+        return hash.hash_string(key)
+    }
+
+    function _string_equals(a: String, b: String) -> bool {
+        let ab = a.bytes()
+        let bb = b.bytes()
+        let n: usize = ab.len()
+        if n != bb.len() { return false }
+        var i: usize = 0
+        loop
+            decreases n - i
+        {
+            if i >= n { break }
+            if ab[i] != bb[i] { return false }
+            i += 1
+        }
+        return true
+    }
+
+    function _probe_index(set: StringSet, key: String, hash: u64) -> usize {
+        let cap = set.entries.len()
+        let mask = cap - 1
+        var i: usize = (hash as usize) & mask
+        var probes: usize = 0
+        loop
+            decreases cap - probes
+        {
+            if probes >= cap { return i }
+            let slot = set.entries[i]
+            if !slot.occupied { return i }
+            if slot.hash == hash && _string_equals(slot.key, key) { return i }
+            i = (i + 1) & mask
+            probes += 1
+        }
+    }
+
+    function _backshift(set: mutable StringSet, idx: usize) -> () {
+        let cap = set.entries.len()
+        let mask = cap - 1
+        var current_idx: usize = idx
+        var outer_probes: usize = 0
+        loop
+            decreases cap - outer_probes
+        {
+            if outer_probes >= cap { return }
+            var i: usize = (current_idx + 1) & mask
+            var inner_probes: usize = 0
+            var moved: bool = false
+            loop
+                decreases cap - inner_probes
+            {
+                if inner_probes >= cap { return }
+                let slot = set.entries[i]
+                if !slot.occupied { return }
+                let preferred = (slot.hash as usize) & mask
+                if _in_probe_range(preferred, i, current_idx, mask) {
+                    set.entries[current_idx] = slot
+                    set.entries[i].occupied = false
+                    current_idx = i
+                    moved = true
+                    break
+                }
+                i = (i + 1) & mask
+                inner_probes += 1
+            }
+            if !moved { return }
+            outer_probes += 1
+        }
+    }
+
+    function _in_probe_range(preferred: usize, current: usize, vacant: usize, mask: usize) -> bool {
+        if preferred <= vacant {
+            return current > vacant || current < preferred
+        }
+        return current > vacant && current < preferred
+    }
+
+    function _grow_table(set: mutable StringSet, incoming: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        let cap = set.entries.len()
+        if incoming * 4 <= cap * 3 { return }
+        var new_cap: usize = if cap == 0 { 8 } else { cap * 2 }
+        let max_doublings: usize = 64
+        var doublings: usize = 0
+        loop
+            decreases max_doublings - doublings
+        {
+            if doublings >= max_doublings { break }
+            if incoming * 4 <= new_cap * 3 { break }
+            new_cap = new_cap * 2
+            doublings += 1
+        }
+        _rehash(mutable set, new_cap, allocator)?
+    }
+
+    function _rehash(set: mutable StringSet, new_cap: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        var fresh: [Entry] = allocator.alloc_array(Entry, new_cap)?
+        let mask = new_cap - 1
+        let old_cap: usize = set.entries.len()
+        var j: usize = 0
+        loop
+            decreases old_cap - j
+        {
+            if j >= old_cap { break }
+            let slot = set.entries[j]
+            if slot.occupied {
+                var probe: usize = (slot.hash as usize) & mask
+                var probes: usize = 0
+                loop
+                    decreases new_cap - probes
+                {
+                    if probes >= new_cap { break }
+                    if !fresh[probe].occupied { break }
+                    probe = (probe + 1) & mask
+                    probes += 1
+                }
+                fresh[probe] = slot
+            }
+            j += 1
+        }
+        set.entries = fresh
+    }
+}
+
+
+public spec IntSet() {
+
+    public type Entry { key: i64, hash: u64, occupied: bool }
+
+    public type IntSet {
+        entries: [Entry]
+        len: usize where len <= entries.len()
+    }
+
+    public function new(allocator: Allocator) -> IntSet
+        with {allocator, err: alloc.AllocError}
+    {
+        let raw: [Entry] = allocator.alloc_array(Entry, 8)?
+        return IntSet { entries: raw, len: 0 }
+    }
+
+    public function len(set: IntSet) -> usize {
+        return set.len
+    }
+
+    public function is_empty(set: IntSet) -> bool {
+        return set.len == 0
+    }
+
+    public function contains(set: IntSet, key: i64) -> bool {
+        let h = _hash_key(key)
+        let idx = _probe_index(set, key, h)
+        return set.entries[idx].occupied
+    }
+
+    public function insert(set: mutable IntSet, key: i64, allocator: Allocator) -> bool
+        with {allocator, err: alloc.AllocError}
+    {
+        _grow_table(mutable set, set.len + 1, allocator)?
+        let h = _hash_key(key)
+        let idx = _probe_index(set, key, h)
+        if set.entries[idx].occupied {
+            return false
+        }
+        set.entries[idx] = Entry { key: key, hash: h, occupied: true }
+        set.len += 1
+        return true
+    }
+
+    public function remove(set: mutable IntSet, key: i64) -> bool {
+        let h = _hash_key(key)
+        let idx = _probe_index(set, key, h)
+        if !set.entries[idx].occupied {
+            return false
+        }
+        set.entries[idx].occupied = false
+        set.len -= 1
+        _backshift(mutable set, idx)
+        return true
+    }
+
+
+    function _hash_key(key: i64) -> u64 {
+        return hash.hash_i64(key)
+    }
+
+    function _probe_index(set: IntSet, key: i64, hash: u64) -> usize {
+        let cap = set.entries.len()
+        let mask = cap - 1
+        var i: usize = (hash as usize) & mask
+        var probes: usize = 0
+        loop
+            decreases cap - probes
+        {
+            if probes >= cap { return i }
+            let slot = set.entries[i]
+            if !slot.occupied { return i }
+            if slot.hash == hash && slot.key == key { return i }
+            i = (i + 1) & mask
+            probes += 1
+        }
+    }
+
+    function _backshift(set: mutable IntSet, idx: usize) -> () {
+        let cap = set.entries.len()
+        let mask = cap - 1
+        var current_idx: usize = idx
+        var outer_probes: usize = 0
+        loop
+            decreases cap - outer_probes
+        {
+            if outer_probes >= cap { return }
+            var i: usize = (current_idx + 1) & mask
+            var inner_probes: usize = 0
+            var moved: bool = false
+            loop
+                decreases cap - inner_probes
+            {
+                if inner_probes >= cap { return }
+                let slot = set.entries[i]
+                if !slot.occupied { return }
+                let preferred = (slot.hash as usize) & mask
+                if _in_probe_range(preferred, i, current_idx, mask) {
+                    set.entries[current_idx] = slot
+                    set.entries[i].occupied = false
+                    current_idx = i
+                    moved = true
+                    break
+                }
+                i = (i + 1) & mask
+                inner_probes += 1
+            }
+            if !moved { return }
+            outer_probes += 1
+        }
+    }
+
+    function _in_probe_range(preferred: usize, current: usize, vacant: usize, mask: usize) -> bool {
+        if preferred <= vacant {
+            return current > vacant || current < preferred
+        }
+        return current > vacant && current < preferred
+    }
+
+    function _grow_table(set: mutable IntSet, incoming: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        let cap = set.entries.len()
+        if incoming * 4 <= cap * 3 { return }
+        var new_cap: usize = if cap == 0 { 8 } else { cap * 2 }
+        let max_doublings: usize = 64
+        var doublings: usize = 0
+        loop
+            decreases max_doublings - doublings
+        {
+            if doublings >= max_doublings { break }
+            if incoming * 4 <= new_cap * 3 { break }
+            new_cap = new_cap * 2
+            doublings += 1
+        }
+        _rehash(mutable set, new_cap, allocator)?
+    }
+
+    function _rehash(set: mutable IntSet, new_cap: usize, allocator: Allocator) -> ()
+        with {allocator, err: alloc.AllocError}
+    {
+        var fresh: [Entry] = allocator.alloc_array(Entry, new_cap)?
+        let mask = new_cap - 1
+        let old_cap: usize = set.entries.len()
+        var j: usize = 0
+        loop
+            decreases old_cap - j
+        {
+            if j >= old_cap { break }
+            let slot = set.entries[j]
+            if slot.occupied {
+                var probe: usize = (slot.hash as usize) & mask
+                var probes: usize = 0
+                loop
+                    decreases new_cap - probes
+                {
+                    if probes >= new_cap { break }
+                    if !fresh[probe].occupied { break }
+                    probe = (probe + 1) & mask
+                    probes += 1
+                }
+                fresh[probe] = slot
+            }
+            j += 1
+        }
+        set.entries = fresh
+    }
+}

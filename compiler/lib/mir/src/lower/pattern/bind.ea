@@ -1,0 +1,531 @@
+module mir.lower.pattern.bind
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as ast_pat_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import local.term as term_mod
+import local.body.model as body_mod
+import local.place as place_mod
+import local.stmt as stmt_mod
+import local.rvalue as rvalue_mod
+import local.id.local as local_mod
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.pattern.decide.build as build_mod
+import local.lower.pattern.query.query as query_mod
+import local.lower.pattern.test.test as test_mod
+
+
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(ast_pat_mod.StructPatField)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(local_mod.LocalId)
+spec std.mem.alloc.Box(ast_pat_mod.Pat)
+spec std.core.option.Option(ast_pat_mod.SliceRest)
+spec std.core.option.Option(body_mod.RegionId)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(local_mod.LocalId)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(symbol_mod.Symbol)
+
+
+public function bind_arm_pattern(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    pat: ast_pat_mod.Pat,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    match pat.kind {
+        case .wildcard => ()
+        case .literal(_) => ()
+        case .range(_, _, _) => ()
+        case .binding(let ident) => query_mod.bind_name(mutable builder, bindings, ident.name, scrut_local, allocator)?
+        case .at_binding(let ident, let inner_box) => {
+            query_mod.bind_name(mutable builder, bindings, ident.name, scrut_local, allocator)?
+            bind_arm_pattern(mutable builder, scrut_local, scrut_ty, Box_Pat.get(inner_box), bindings, types_out, ty_interner, match_node, allocator)?
+        }
+        case .tuple(let elems) => bind_tuple_pattern(mutable builder, scrut_local, scrut_ty, elems, bindings, types_out, ty_interner, match_node, allocator)?
+        case .slice(let prefix, let rest, let suffix) => bind_slice_pattern(mutable builder, scrut_local, scrut_ty, prefix, rest, suffix, bindings, types_out, ty_interner, match_node, allocator)?
+        case .variant(let path, let payload) => bind_variant_pattern(mutable builder, scrut_local, scrut_ty, path, payload, bindings, types_out, ty_interner, match_node, allocator)?
+        case .or_(let alts) => {
+            if query_mod.vec_pat_any_binds(alts) {
+                bind_or_pattern(mutable builder, scrut_local, scrut_ty, alts, bindings, types_out, ty_interner, match_node, allocator)?
+            }
+        }
+        case .struct_(_, let fields, _) => bind_struct_pattern(mutable builder, scrut_local, scrut_ty, fields, bindings, types_out, ty_interner, match_node, allocator)?
+        case .guard(_, _) => panic("walker.bind_arm_pattern: nested pattern-level guard deferred (match-tail residue)")
+        case .error => panic("walker.bind_arm_pattern: error pattern reached MIR — upstream typecheck should have rejected")
+    }
+}
+
+function bind_or_pattern(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    alts: Vec_Pat.Vec,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let bool_ty = types_out.builtins.bool_
+    uninit or_defs: Vec_DefId.Vec
+    Vec_DefId.new(init or_defs, allocator)?
+    if Vec_Pat.len(alts) > 0 {
+        collect_or_bound_defs(Vec_Pat.at(alts, 0), bindings, mutable or_defs, allocator)?
+    }
+    uninit canon_locals: Vec_LocalId.Vec
+    Vec_LocalId.new(init canon_locals, allocator)?
+    alloc_canonical_or_locals(mutable builder, or_defs, mutable canon_locals, types_out, match_node, allocator)?
+    let join_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+    let n = Vec_Pat.len(alts)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let alt = Vec_Pat.at(alts, i)
+        let is_last = (i + 1) >= n
+        if is_last {
+            bind_arm_pattern(mutable builder, scrut_local, scrut_ty, alt, bindings, types_out, ty_interner, match_node, allocator)?
+            funnel_or_bindings(mutable builder, or_defs, canon_locals, match_node, allocator)?
+            let goto_term = term_mod.Terminator {
+                origin: match_node,
+                kind: term_mod.TermKind.goto_(target: join_blk),
+            }
+            builder_mod.seal_block_with(mutable builder, take goto_term, allocator)?
+        } else {
+            let alt_bind_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+            let next_alt_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+            let cond = test_mod.emit_arm_test(mutable builder, scrut_local, scrut_ty, bool_ty, alt, types_out, ty_interner, match_node, allocator)?
+            let branch_term = term_mod.Terminator {
+                origin: match_node,
+                kind: term_mod.TermKind.branch(cond: cond, true_: alt_bind_blk, false_: next_alt_blk),
+            }
+            builder_mod.seal_block_with(mutable builder, take branch_term, allocator)?
+            builder_mod.switch_to(mutable builder, alt_bind_blk)
+            bind_arm_pattern(mutable builder, scrut_local, scrut_ty, alt, bindings, types_out, ty_interner, match_node, allocator)?
+            funnel_or_bindings(mutable builder, or_defs, canon_locals, match_node, allocator)?
+            let goto_term = term_mod.Terminator {
+                origin: match_node,
+                kind: term_mod.TermKind.goto_(target: join_blk),
+            }
+            builder_mod.seal_block_with(mutable builder, take goto_term, allocator)?
+            builder_mod.switch_to(mutable builder, next_alt_blk)
+        }
+        i = i + 1
+    }
+    builder_mod.switch_to(mutable builder, join_blk)
+    rebind_or_canonicals(mutable builder, or_defs, canon_locals, allocator)?
+}
+
+public function collect_or_bound_defs(
+    pat: ast_pat_mod.Pat,
+    bindings: Vec_HBinding.Vec,
+    defs: mutable Vec_DefId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match pat.kind {
+        case .binding(let id) => push_or_bound_def(bindings, id.name, mutable defs, allocator)?
+        case .tuple(let elems) => collect_or_bound_defs_pats(elems, bindings, mutable defs, allocator)?
+        case .struct_(_, let fields, _) => collect_or_bound_defs_fields(fields, bindings, mutable defs, allocator)?
+        case .variant(_, let payload) => match payload {
+            case .none => ()
+            case .tuple(let elems) => collect_or_bound_defs_pats(elems, bindings, mutable defs, allocator)?
+            case .struct_(let fields) => collect_or_bound_defs_fields(fields, bindings, mutable defs, allocator)?
+        }
+        case .or_(let alts) => {
+            if Vec_Pat.len(alts) > 0 {
+                collect_or_bound_defs(Vec_Pat.at(alts, 0), bindings, mutable defs, allocator)?
+            }
+        }
+        case _ => ()
+    }
+}
+
+function collect_or_bound_defs_pats(
+    pats: Vec_Pat.Vec,
+    bindings: Vec_HBinding.Vec,
+    defs: mutable Vec_DefId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        collect_or_bound_defs(Vec_Pat.at(pats, i), bindings, mutable defs, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_or_bound_defs_fields(
+    fields: Vec_StructPatField.Vec,
+    bindings: Vec_HBinding.Vec,
+    defs: mutable Vec_DefId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        let f = Vec_StructPatField.at(fields, i)
+        collect_or_bound_defs(f.pat, bindings, mutable defs, allocator)?
+        i = i + 1
+    }
+}
+
+function push_or_bound_def(
+    bindings: Vec_HBinding.Vec,
+    name: symbol_mod.Symbol,
+    defs: mutable Vec_DefId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match query_mod.find_binding_def(bindings, name) {
+        case .some(let def) => {
+            if !or_defs_contain(defs, def) {
+                Vec_DefId.push(mutable defs, def, allocator)?
+            }
+        }
+        case .none => ()
+    }
+}
+
+function or_defs_contain(defs: Vec_DefId.Vec, def: def_mod.DefId) -> bool {
+    let n = Vec_DefId.len(defs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        let d = Vec_DefId.at(defs, i)
+        if d.raw == def.raw {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+public function alloc_canonical_or_locals(
+    builder: mutable builder_mod.LowerCtx,
+    defs: Vec_DefId.Vec,
+    canon_locals: mutable Vec_LocalId.Vec,
+    types_out: check_mod.TypeOutput,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_DefId.len(defs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        let def = Vec_DefId.at(defs, i)
+        let ty = check_mod.type_of_local(types_out, def)
+        let l = builder_mod.alloc_local(
+            mutable builder,
+            ty,
+            body_mod.Mutability.mutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.none,
+            Option_NodeId.some(value: origin),
+            allocator,
+        )?
+        Vec_LocalId.push(mutable canon_locals, l, allocator)?
+        i = i + 1
+    }
+}
+
+public function funnel_or_bindings(
+    builder: mutable builder_mod.LowerCtx,
+    defs: Vec_DefId.Vec,
+    canon_locals: Vec_LocalId.Vec,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_DefId.len(defs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        let def = Vec_DefId.at(defs, i)
+        if i < Vec_LocalId.len(canon_locals) {
+            let canon = Vec_LocalId.at(canon_locals, i)
+            match builder_mod.lookup_local(builder, def) {
+                case .some(let cur) => {
+                    if local_mod.index(cur) != local_mod.index(canon) {
+                        let ty = builder_mod.local_ty(builder, canon)
+                        let copy_stmt = stmt_mod.Statement {
+                            origin: origin,
+                            kind: stmt_mod.MStmtKind.assign(
+                                dest: builder_mod.local_place(canon),
+                                value: rvalue_mod.Rvalue.use_(
+                                    operand: rvalue_mod.Operand.copy_(place: builder_mod.local_place(cur), ty: ty),
+                                ),
+                            ),
+                        }
+                        builder_mod.push_stmt(mutable builder, take copy_stmt, allocator)?
+                    }
+                }
+                case .none => ()
+            }
+        }
+        i = i + 1
+    }
+}
+
+public function rebind_or_canonicals(
+    builder: mutable builder_mod.LowerCtx,
+    defs: Vec_DefId.Vec,
+    canon_locals: Vec_LocalId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_DefId.len(defs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        if i < Vec_LocalId.len(canon_locals) {
+            builder_mod.bind_local(mutable builder, Vec_DefId.at(defs, i), Vec_LocalId.at(canon_locals, i), allocator)?
+        }
+        i = i + 1
+    }
+}
+
+function bind_tuple_pattern(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    elems: Vec_Pat.Vec,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let m = Vec_Pat.len(elems)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let ep = Vec_Pat.at(elems, i)
+        if query_mod.pat_binds_any(ep) {
+            let ety = query_mod.tuple_elem_ty(ty_interner, scrut_ty, i)
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.field(idx: i as u32), ety, match_node, allocator)?
+            bind_arm_pattern(mutable builder, el, ety, ep, bindings, types_out, ty_interner, match_node, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+function bind_struct_pattern(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    fields: Vec_StructPatField.Vec,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let rec_def = match query_mod.record_def_of_ty(ty_interner, scrut_ty) {
+        case .some(let d) => d
+        case .none => panic("walker.bind_struct_pattern: struct pattern on non-record scrutinee — typecheck should have rejected")
+    }
+    let m = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let f = Vec_StructPatField.at(fields, i)
+        if query_mod.pat_binds_any(f.pat) {
+            let fidx = query_mod.resolve_field_index(types_out, rec_def, 0 as u32, f.name.name)
+            let fty = check_mod.field_ty_at(types_out, rec_def, fidx as usize)
+            let fl = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.field(idx: fidx), fty, match_node, allocator)?
+            bind_arm_pattern(mutable builder, fl, fty, f.pat, bindings, types_out, ty_interner, match_node, allocator)?
+        }
+        i = i + 1
+    }
+}
+
+function bind_variant_pattern(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    path: ident_mod.Path,
+    payload: ast_pat_mod.VariantPatPayload,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let sum_def = match check_mod.sum_def_of_ty(types_out, scrut_ty) {
+        case .some(let d) => d
+        case .none => panic("walker.bind_variant_pattern: variant pattern on non-sum scrutinee — typecheck should have rejected")
+    }
+    let vidx = query_mod.resolve_variant_idx(types_out, sum_def, path)
+    match payload {
+        case .none => ()
+        case .struct_(let fields) => {
+            let payload_ty = check_mod.variant_payload_ty(types_out, sum_def, vidx)
+            let pl = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.variant_payload(variant_idx: vidx), payload_ty, match_node, allocator)?
+            let m = Vec_StructPatField.len(fields)
+            var i: usize = 0
+            loop
+                decreases (m - i)
+            {
+                if i >= m {
+                    break
+                }
+                let f = Vec_StructPatField.at(fields, i)
+                if query_mod.pat_binds_any(f.pat) {
+                    let fidx = query_mod.resolve_field_index(types_out, sum_def, vidx, f.name.name)
+                    let fty = query_mod.tuple_elem_ty(ty_interner, payload_ty, fidx as usize)
+                    let fl = build_mod.project_into_local(mutable builder, pl, place_mod.ProjectionKind.field(idx: fidx), fty, match_node, allocator)?
+                    bind_arm_pattern(mutable builder, fl, fty, f.pat, bindings, types_out, ty_interner, match_node, allocator)?
+                }
+                i = i + 1
+            }
+        }
+        case .tuple(let elems) => {
+            let payload_ty = check_mod.variant_payload_ty(types_out, sum_def, vidx)
+            let pl = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.variant_payload(variant_idx: vidx), payload_ty, match_node, allocator)?
+            let m = Vec_Pat.len(elems)
+            var i: usize = 0
+            loop
+                decreases (m - i)
+            {
+                if i >= m {
+                    break
+                }
+                let ep = Vec_Pat.at(elems, i)
+                if query_mod.pat_binds_any(ep) {
+                    let ety = query_mod.tuple_elem_ty(ty_interner, payload_ty, i)
+                    let fl = build_mod.project_into_local(mutable builder, pl, place_mod.ProjectionKind.field(idx: i as u32), ety, match_node, allocator)?
+                    bind_arm_pattern(mutable builder, fl, ety, ep, bindings, types_out, ty_interner, match_node, allocator)?
+                }
+                i = i + 1
+            }
+        }
+    }
+}
+
+function bind_slice_pattern(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    prefix: Vec_Pat.Vec,
+    rest: Option_SliceRest.Option,
+    suffix: Vec_Pat.Vec,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    match_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let usize_ty = types_out.builtins.usize_
+    let pl = Vec_Pat.len(prefix)
+    let sl = Vec_Pat.len(suffix)
+    let elem_ty = query_mod.slice_elem_ty(ty_interner, scrut_ty)
+    var i: usize = 0
+    loop
+        decreases (pl - i)
+    {
+        if i >= pl {
+            break
+        }
+        let ep = Vec_Pat.at(prefix, i)
+        if query_mod.pat_binds_any(ep) {
+            let idx_local = build_mod.materialize_usize_const(mutable builder, i as u128, usize_ty, match_node, allocator)?
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.index(idx_local: idx_local, proven: false), elem_ty, match_node, allocator)?
+            bind_arm_pattern(mutable builder, el, elem_ty, ep, bindings, types_out, ty_interner, match_node, allocator)?
+        }
+        i = i + 1
+    }
+    match rest {
+        case .none => ()
+        case .some(let r) => match r.binding {
+            case .none => ()
+            case .some(let ident) => {
+                let len_local = build_mod.materialize_len(mutable builder, scrut_local, usize_ty, match_node, allocator)?
+                let lo_local = build_mod.materialize_usize_const(mutable builder, pl as u128, usize_ty, match_node, allocator)?
+                let hi_local = build_mod.materialize_index_from_end(mutable builder, len_local, sl as u128, usize_ty, match_node, allocator)?
+                let rest_local = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.slice_subrange(lo_local: lo_local, hi_local: hi_local, proven: false), scrut_ty, match_node, allocator)?
+                query_mod.bind_name(mutable builder, bindings, ident.name, rest_local, allocator)?
+            }
+        }
+    }
+    var k: usize = 0
+    loop
+        decreases (sl - k)
+    {
+        if k >= sl {
+            break
+        }
+        let sp = Vec_Pat.at(suffix, k)
+        if query_mod.pat_binds_any(sp) {
+            let len_local = build_mod.materialize_len(mutable builder, scrut_local, usize_ty, match_node, allocator)?
+            let idx_local = build_mod.materialize_index_from_end(mutable builder, len_local, (sl - k) as u128, usize_ty, match_node, allocator)?
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.index(idx_local: idx_local, proven: false), elem_ty, match_node, allocator)?
+            bind_arm_pattern(mutable builder, el, elem_ty, sp, bindings, types_out, ty_interner, match_node, allocator)?
+        }
+        k = k + 1
+    }
+}

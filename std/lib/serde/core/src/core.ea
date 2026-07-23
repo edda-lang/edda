@@ -1,0 +1,331 @@
+
+module std.serde.core
+
+import std.mem.alloc
+import std.mem.byteorder
+import std.math.scalar
+import std.text.string
+import std.text.utf8
+
+
+public function write_byte(out: mutable [u8], offset: usize, value: u8) -> usize {
+    if offset + 1 <= out.len() {
+        out[offset] = value
+    }
+    return offset + 1
+}
+
+public function write_u16(out: mutable [u8], offset: usize, value: u16) -> usize {
+    if offset + 2 <= out.len() {
+        byteorder.write_u16_le(mutable out, offset, value)
+    }
+    return offset + 2
+}
+
+public function write_u32(out: mutable [u8], offset: usize, value: u32) -> usize {
+    if offset + 4 <= out.len() {
+        byteorder.write_u32_le(mutable out, offset, value)
+    }
+    return offset + 4
+}
+
+public function write_u64(out: mutable [u8], offset: usize, value: u64) -> usize {
+    if offset + 8 <= out.len() {
+        byteorder.write_u64_le(mutable out, offset, value)
+    }
+    return offset + 8
+}
+
+public function write_bytes(out: mutable [u8], offset: usize, bytes: [u8]) -> usize {
+    var i: usize = 0
+    loop
+        decreases bytes.len() - i
+    {
+        if i >= bytes.len() { break }
+        if offset + i + 1 <= out.len() {
+            out[offset + i] = bytes[i]
+        }
+        i = i + 1
+    }
+    return offset + bytes.len()
+}
+
+
+public function value_length<comptime U: Type>(x: U) -> usize {
+    comptime if U == bool {
+        return 1
+    } else { comptime if U == i8 || U == u8 {
+        return 1
+    } else { comptime if U == i16 || U == u16 {
+        return 2
+    } else { comptime if U == i32 || U == u32 || U == f32 {
+        return 4
+    } else { comptime if U == i64 || U == u64 || U == isize || U == usize || U == f64 {
+        return 8
+    } else { comptime if U == i128 || U == u128 {
+        return 16
+    } else { comptime if U == String {
+        return 8 + x.bytes().len()
+    } else { comptime if is_sum(U) {
+        var total: usize = 4
+        comptime for i in 0..<field_count(U) {
+            if discriminant_of(x) == i {
+                total = total + value_length(x.(i))
+            }
+        }
+        return total
+    } else { comptime if is_primitive(U) {
+        return 0
+    } else {
+        var total: usize = 0
+        comptime for i in 0..<field_count(U) {
+            total = total + value_length(x.(i))
+        }
+        return total
+    } } } } } } } } }
+}
+
+public function value_write<comptime U: Type>(x: U, out: mutable [u8], offset: usize) -> usize {
+    comptime if U == bool {
+        return write_byte(mutable out, offset, if x { 1 } else { 0 })
+    } else { comptime if U == u8 {
+        return write_byte(mutable out, offset, x)
+    } else { comptime if U == i8 {
+        return write_byte(mutable out, offset, x as u8 wrapping)
+    } else { comptime if U == u16 {
+        return write_u16(mutable out, offset, x)
+    } else { comptime if U == i16 {
+        return write_u16(mutable out, offset, x as u16 wrapping)
+    } else { comptime if U == u32 {
+        return write_u32(mutable out, offset, x)
+    } else { comptime if U == i32 {
+        return write_u32(mutable out, offset, x as u32 wrapping)
+    } else { comptime if U == u64 {
+        return write_u64(mutable out, offset, x)
+    } else { comptime if U == i64 {
+        return write_u64(mutable out, offset, x as u64 wrapping)
+    } else { comptime if U == usize {
+        return write_u64(mutable out, offset, x as u64)
+    } else { comptime if U == isize {
+        return write_u64(mutable out, offset, (x as i64) as u64 wrapping)
+    } else { comptime if U == u128 {
+        let lo: usize = write_u64(mutable out, offset, x as u64 wrapping)
+        return write_u64(mutable out, lo, (x >> 64) as u64 wrapping)
+    } else { comptime if U == i128 {
+        let wide: u128 = x as u128 wrapping
+        let lo: usize = write_u64(mutable out, offset, wide as u64 wrapping)
+        return write_u64(mutable out, lo, (wide >> 64) as u64 wrapping)
+    } else { comptime if U == f32 {
+        return write_u32(mutable out, offset, scalar.f32_to_bits(x))
+    } else { comptime if U == f64 {
+        return write_u64(mutable out, offset, scalar.f64_to_bits(x))
+    } else { comptime if U == String {
+        let after_len: usize = write_u64(mutable out, offset, x.bytes().len() as u64)
+        return write_bytes(mutable out, after_len, x.bytes())
+    } else { comptime if is_sum(U) {
+        var cursor: usize = write_u32(mutable out, offset, discriminant_of(x) as u32 wrapping)
+        comptime for i in 0..<field_count(U) {
+            if discriminant_of(x) == i {
+                cursor = value_write(x.(i), mutable out, cursor)
+            }
+        }
+        return cursor
+    } else { comptime if is_primitive(U) {
+        return offset
+    } else {
+        var cursor: usize = offset
+        comptime for i in 0..<field_count(U) {
+            cursor = value_write(x.(i), mutable out, cursor)
+        }
+        return cursor
+    } } } } } } } } } } } } } } } } } }
+}
+
+
+public spec serialize(comptime T: Type) {
+
+    public function byte_length(v: T) -> usize {
+        return value_length(v)
+    }
+
+    public function serialize_into(v: T, out: mutable [u8], offset: usize) -> usize {
+        return value_write(v, mutable out, offset)
+    }
+
+    public function serialize(v: T, allocator: Allocator) -> [u8]
+        with {allocator, err: alloc.AllocError}
+    {
+        let total: usize = value_length(v)
+        var out: [u8] = allocator.alloc_array(u8, total)?
+        let _ = value_write(v, mutable out, 0)
+        return out
+    }
+}
+
+public type DeserializeError {
+    case short_input
+    case invalid_encoding
+}
+
+public function read_byte(bytes: [u8], offset: usize) -> u8
+    with {err: core.DeserializeError}
+{
+    if offset + 1 > bytes.len() { raise DeserializeError.short_input }
+    return bytes[offset]
+}
+
+public function read_u16(bytes: [u8], offset: usize) -> u16
+    with {err: core.DeserializeError}
+{
+    if offset + 2 > bytes.len() { raise DeserializeError.short_input }
+    return byteorder.read_u16_le(bytes, offset)
+}
+
+public function read_u32(bytes: [u8], offset: usize) -> u32
+    with {err: core.DeserializeError}
+{
+    if offset + 4 > bytes.len() { raise DeserializeError.short_input }
+    return byteorder.read_u32_le(bytes, offset)
+}
+
+public function read_u64(bytes: [u8], offset: usize) -> u64
+    with {err: core.DeserializeError}
+{
+    if offset + 8 > bytes.len() { raise DeserializeError.short_input }
+    return byteorder.read_u64_le(bytes, offset)
+}
+
+public function type_length(comptime U: Type) -> usize {
+    comptime if U == bool || U == i8 || U == u8 {
+        return 1
+    } else { comptime if U == i16 || U == u16 {
+        return 2
+    } else { comptime if U == i32 || U == u32 || U == f32 {
+        return 4
+    } else { comptime if U == i64 || U == u64 || U == isize || U == usize || U == f64 {
+        return 8
+    } else { comptime if U == i128 || U == u128 {
+        return 16
+    } else { comptime if is_sum(U) {
+        var max_len: usize = 0
+        comptime for i in 0..<field_count(U) {
+            if type_length(field_type_at(U, i)) > max_len {
+                max_len = type_length(field_type_at(U, i))
+            }
+        }
+        return 4 + max_len
+    } else { comptime if U == String {
+        return 8
+    } else { comptime if is_primitive(U) {
+        return 0
+    } else {
+        var total: usize = 0
+        comptime for i in 0..<field_count(U) {
+            total = total + type_length(field_type_at(U, i))
+        }
+        return total
+    } } } } } } } }
+}
+
+public function value_read(comptime U: Type, bytes: [u8], offset: usize, allocator: Allocator) -> (U, usize)
+    with {allocator, err: alloc.AllocError, err: core.DeserializeError}
+{
+    comptime if U == bool {
+        let flag: u8 = read_byte(bytes, offset)?
+        if flag == 0 { return (false, 1) }
+        if flag == 1 { return (true, 1) }
+        raise DeserializeError.invalid_encoding
+    } else { comptime if U == u8 {
+        return (read_byte(bytes, offset)?, 1)
+    } else { comptime if U == i8 {
+        return (read_byte(bytes, offset)? as i8 wrapping, 1)
+    } else { comptime if U == u16 {
+        return (read_u16(bytes, offset)?, 2)
+    } else { comptime if U == i16 {
+        return (read_u16(bytes, offset)? as i16 wrapping, 2)
+    } else { comptime if U == u32 {
+        return (read_u32(bytes, offset)?, 4)
+    } else { comptime if U == i32 {
+        return (read_u32(bytes, offset)? as i32 wrapping, 4)
+    } else { comptime if U == u64 {
+        return (read_u64(bytes, offset)?, 8)
+    } else { comptime if U == i64 {
+        return (read_u64(bytes, offset)? as i64 wrapping, 8)
+    } else { comptime if U == usize {
+        return (read_u64(bytes, offset)? as usize, 8)
+    } else { comptime if U == isize {
+        return ((read_u64(bytes, offset)? as i64 wrapping) as isize, 8)
+    } else { comptime if U == u128 {
+        let lo: u64 = read_u64(bytes, offset)?
+        let hi: u64 = read_u64(bytes, offset + 8)?
+        return (((hi as u128) << 64) | (lo as u128), 16)
+    } else { comptime if U == i128 {
+        let lo: u64 = read_u64(bytes, offset)?
+        let hi: u64 = read_u64(bytes, offset + 8)?
+        return ((((hi as u128) << 64) | (lo as u128)) as i128 wrapping, 16)
+    } else { comptime if U == f32 {
+        return (scalar.f32_from_bits(read_u32(bytes, offset)?), 4)
+    } else { comptime if U == f64 {
+        return (scalar.f64_from_bits(read_u64(bytes, offset)?), 8)
+    } else { comptime if is_sum(U) {
+        let tag: usize = read_u32(bytes, offset)? as usize
+        comptime for i in 0..<field_count(U) {
+            comptime if is_primitive(field_type_at(U, i)) {
+                if tag == i {
+                    return (U.(i)(), 4)
+                }
+            } else {
+                if tag == i {
+                    let (payload, consumed) = value_read(field_type_at(U, i), bytes, offset + 4, allocator)?
+                    return (U.(i)(payload), 4 + consumed)
+                }
+            }
+        }
+        raise DeserializeError.invalid_encoding
+    } else { comptime if U == String {
+        let n: usize = read_u64(bytes, offset)? as usize
+        var buf: [u8] = allocator.alloc_array(u8, n)?
+        var i: usize = 0
+        loop
+            decreases n - i
+        {
+            if i >= n { break }
+            buf[i] = read_byte(bytes, offset + 8 + i)?
+            i = i + 1
+        }
+        if !utf8.validate(buf) { raise DeserializeError.invalid_encoding }
+        return (string.from_owned_utf8(take buf), 8 + n)
+    } else { comptime if is_primitive(U) {
+        return ((), 0)
+    } else {
+        uninit out: U
+        var consumed: usize = 0
+        comptime for i in 0..<field_count(U) {
+            let (field_value, field_consumed) = value_read(field_type_at(U, i), bytes, offset + consumed, allocator)?
+            out.(i) = field_value
+            consumed = consumed + field_consumed
+        }
+        return (out, consumed)
+    } } } } } } } } } } } } } } } } } }
+}
+
+public spec deserialize(comptime T: Type) {
+
+    public function byte_length_required() -> usize {
+        return type_length(T)
+    }
+
+    public function deserialize_from(bytes: [u8], offset: usize, allocator: Allocator) -> T
+        with {allocator, err: alloc.AllocError, err: core.DeserializeError}
+    {
+        let (value, _) = value_read(T, bytes, offset, allocator)?
+        return value
+    }
+
+    public function deserialize(bytes: [u8], allocator: Allocator) -> T
+        with {allocator, err: alloc.AllocError, err: core.DeserializeError}
+    {
+        let (value, _) = value_read(T, bytes, 0, allocator)?
+        return value
+    }
+}

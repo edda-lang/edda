@@ -1,0 +1,145 @@
+module ulid.ulid
+
+import std.mem.alloc
+import std.crypto.random
+import std.core.option
+import std.text.string
+
+spec std.core.option.Option(Ulid)
+
+
+public type Ulid {
+    hi: u64
+    lo: u64
+}
+
+function _alphabet() -> [u8] {
+    return "0123456789ABCDEFGHJKMNPQRSTVWXYZ".bytes()
+}
+
+function _ms_mask() -> u64 {
+    return 0xFFFFFFFFFFFF as u64
+}
+
+function _be_u64(bytes: [u8], off: usize) -> u64
+    requires off + 8 as usize <= bytes.len()
+{
+    var acc: u64 = 0
+    var k: usize = 0
+    loop decreases 8 as usize - k {
+        if k >= 8 as usize { break }
+        acc = (acc << 8) | (bytes[off + k] as u64)
+        k += 1
+    }
+    return acc
+}
+
+function _be_u16(bytes: [u8], off: usize) -> u64
+    requires off + 2 as usize <= bytes.len()
+{
+    let high = bytes[off] as u64
+    let low = bytes[off + 1 as usize] as u64
+    return (high << 8) | low
+}
+
+public function new(ms: u64, rand: Random, allocator: Allocator) -> Ulid
+    with {rand, allocator, err: alloc.AllocError}
+{
+    var buf: [u8] = allocator.alloc_array(u8, 10 as usize)?
+    random.fill(rand, mutable buf)
+    let ms_48 = ms & _ms_mask()
+    let rand_hi = _be_u16(buf, 0 as usize)
+    let rand_lo = _be_u64(buf, 2 as usize)
+    let hi = (ms_48 << 16) | rand_hi
+    return Ulid { hi: hi, lo: rand_lo }
+}
+
+public function timestamp_ms(u: Ulid) -> u64 {
+    return u.hi >> 16
+}
+
+function _value(u: Ulid) -> u128 {
+    return ((u.hi as u128) << 64) | (u.lo as u128)
+}
+
+public function encode(u: Ulid, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let alpha = _alphabet()
+    let value = _value(u)
+    let mask: u128 = 31
+    let n: usize = 26
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let shift = 125 as u128 - 5 as u128 * (i as u128)
+        let idx = ((value >> shift) & mask) as usize
+        buf[i] = alpha[idx]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _decode_char(c: u8) -> i32 {
+    if c >= 0x30 as u8 && c <= 0x39 as u8 {
+        return c as i32 - 0x30 as i32
+    }
+    let up = if c >= 0x61 as u8 && c <= 0x7A as u8 { c - 0x20 as u8 } else { c }
+    return _decode_letter(up)
+}
+
+function _decode_letter(c: u8) -> i32 {
+    if c == 0x41 as u8 { return 10 }
+    if c == 0x42 as u8 { return 11 }
+    if c == 0x43 as u8 { return 12 }
+    if c == 0x44 as u8 { return 13 }
+    if c == 0x45 as u8 { return 14 }
+    if c == 0x46 as u8 { return 15 }
+    if c == 0x47 as u8 { return 16 }
+    if c == 0x48 as u8 { return 17 }
+    if c == 0x4A as u8 { return 18 }
+    if c == 0x4B as u8 { return 19 }
+    if c == 0x4D as u8 { return 20 }
+    if c == 0x4E as u8 { return 21 }
+    if c == 0x50 as u8 { return 22 }
+    if c == 0x51 as u8 { return 23 }
+    if c == 0x52 as u8 { return 24 }
+    if c == 0x53 as u8 { return 25 }
+    if c == 0x54 as u8 { return 26 }
+    if c == 0x56 as u8 { return 27 }
+    if c == 0x57 as u8 { return 28 }
+    if c == 0x58 as u8 { return 29 }
+    if c == 0x59 as u8 { return 30 }
+    if c == 0x5A as u8 { return 31 }
+    return 0 as i32 - 1 as i32
+}
+
+public function parse(s: String) -> Option_Ulid {
+    let sb = s.bytes()
+    let n: usize = sb.len()
+    if n != 26 as usize {
+        return Option_Ulid.none
+    }
+    var value: u128 = 0
+    var i: usize = 0
+    loop decreases 26 as usize - i {
+        if i >= 26 as usize { break }
+        let d = _decode_char(sb[i])
+        if d < 0 as i32 {
+            return Option_Ulid.none
+        }
+        if i == 0 as usize && d > 7 as i32 {
+            return Option_Ulid.none
+        }
+        value = (value << 5) | (d as u128)
+        i += 1
+    }
+    let hi = (value >> 64) as u64
+    let lo = (value & _lo_mask()) as u64
+    return Option_Ulid.some(value: Ulid { hi: hi, lo: lo })
+}
+
+function _lo_mask() -> u128 {
+    return 0xFFFFFFFFFFFFFFFF as u128
+}

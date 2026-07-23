@@ -1,0 +1,113 @@
+
+module std.net.dns.win
+
+import std.os.raw
+import std.os.pages
+import std.net.ip
+
+public type WinDnsError {
+    case name_too_long
+    case query_failed
+    case not_found(host: String)
+}
+
+function write_cstr(dst: u64, s: String) -> () {
+    let b: [u8] = s.bytes()
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        raw.store_u8(dst +% (i as u64), b[i])
+        i = i + 1
+    }
+    raw.store_u8(dst +% (b.len() as u64), 0)
+}
+
+function release_page(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, 4096)?
+    }
+}
+
+function ws_getaddrinfo(node_name: u64, service_name: u64, hints: u64, out_result: u64) -> i32
+    extern "getaddrinfo" from "ws2_32.dll"
+
+function ws_freeaddrinfo(res: u64) -> ()
+    extern "freeaddrinfo" from "ws2_32.dll"
+
+function wsa_startup(version: u32, data: u64) -> i32
+    extern "WSAStartup" from "ws2_32.dll"
+
+function ensure_started() -> () {
+    comptime if target_has("windows") {
+        let pg: u64 = handle err: pages.PageError as _e -> (return ()) { pages.map(4096)? }
+        let _ = wsa_startup(0x0202 as u32, pg)
+        release_page(pg)
+    } else {
+        return ()
+    }
+}
+
+function first_ipv4_addr(node: u64, host: String) -> ip.Ipv4Addr
+    with {err: WinDnsError}
+{
+    var cur: u64 = node
+    var fuel: u64 = 16
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { raise WinDnsError.not_found(host: host) }
+        fuel = fuel -% 1
+        if cur == 0 { raise WinDnsError.not_found(host: host) }
+        let family: u32 = raw.load_u32(cur +% 4)
+        if family == 2 {
+            let sockaddr: u64 = raw.load_u64(cur +% 32)
+            return ip.new_v4(
+                raw.load_u8(sockaddr +% 4),
+                raw.load_u8(sockaddr +% 5),
+                raw.load_u8(sockaddr +% 6),
+                raw.load_u8(sockaddr +% 7),
+            )
+        }
+        cur = raw.load_u64(cur +% 40)
+    }
+}
+
+public function resolve_v4_win(net: Network, host: String) -> ip.Ipv4Addr
+    with {net, err: WinDnsError}
+{
+    let hb: [u8] = host.bytes()
+    if hb.len() == 0 || hb.len() > 253 { raise WinDnsError.name_too_long }
+    ensure_started()
+    let pg: u64 = handle err: pages.PageError as _e -> (raise WinDnsError.query_failed) {
+        pages.map(4096)?
+    }
+    var i: u64 = 0
+    loop
+        decreases 48 - i
+    {
+        if i >= 48 { break }
+        raw.store_u8(pg +% i, 0)
+        i = i + 1
+    }
+    raw.store_u32(pg +% 4, 2 as u32)
+    raw.store_u32(pg +% 8, 1 as u32)
+    raw.store_u64(pg +% 64, 0 as u64)
+    write_cstr(pg +% 128, host)
+    let rc: i32 = ws_getaddrinfo(pg +% 128, 0 as u64, pg, pg +% 64)
+    if rc != 0 {
+        release_page(pg)
+        raise WinDnsError.query_failed
+    }
+    let node: u64 = raw.load_u64(pg +% 64)
+    let addr: ip.Ipv4Addr = handle err: WinDnsError as e -> {
+        ws_freeaddrinfo(node)
+        release_page(pg)
+        raise e
+    } { first_ipv4_addr(node, host)? }
+    ws_freeaddrinfo(node)
+    release_page(pg)
+    return addr
+}

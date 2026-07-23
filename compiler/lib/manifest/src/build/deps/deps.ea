@@ -1,0 +1,140 @@
+
+module manifest.build.deps.deps
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import diagnostics.emit.collection as collection_mod
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import local.model.dependency.dependency as dep_mod
+import local.lex.toml.toml as toml_mod
+import local.lex.toml.val.values as values_mod
+
+spec std.collections.vec.Vec(dep_mod.Dependency)
+spec std.collections.vec.Vec(toml_mod.TomlToken)
+
+
+public function parse_array_header(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, deps: mutable Vec_Dependency.Vec, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    if pos + 4 >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, pos)), "unterminated `[[...]]` header", allocator)?
+        return n
+    }
+    let key_tok = Vec_TomlToken.at(tokens, pos + 2)
+    if !toml_mod.is_bare_key(key_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(key_tok), "expected a bare-key block name after `[[`", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    if !toml_mod.is_rbracket(Vec_TomlToken.at(tokens, pos + 3)) || !toml_mod.is_rbracket(Vec_TomlToken.at(tokens, pos + 4)) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(key_tok), "expected `]]` to close the array-table header", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let key_sp = toml_mod.token_span(key_tok)
+    let block_name = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    let body_start = pos + 5
+    if string.equals(block_name, "dependencies") {
+        return parse_dependency_block(tokens, source, file, mutable deps, mutable diags, body_start, key_sp, allocator)?
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown array-table block — entries skipped", allocator)?
+    return values_mod.skip_block_body(tokens, body_start)
+}
+
+function parse_dependency_block(tokens: Vec_TomlToken.Vec, source: [u8], file: file_mod.FileId, deps: mutable Vec_Dependency.Vec, diags: mutable collection_mod.Diagnostics, pos: usize, header_sp: span_mod.Span, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos <= Vec_TomlToken.len(tokens)
+    ensures result > pos || result == Vec_TomlToken.len(tokens)
+{
+    let n = Vec_TomlToken.len(tokens)
+    var dep_name: String = ""
+    var dep_version: String = ""
+    var dep_source: String = ""
+    var p = pos
+    loop decreases (n - p) {
+        if p >= n { break }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_eof(tok) { break }
+        if toml_mod.is_newline(tok) { p = p + 1; continue }
+        if toml_mod.is_lbracket(tok) { break }
+        if toml_mod.is_lex_error(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "manifest tokenizer rejected this input", allocator)?
+            p = p + 1
+            break
+        }
+        if !toml_mod.is_bare_key(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a key=value pair inside `[[dependencies]]`", allocator)?
+            p = values_mod.skip_to_newline(tokens, p)
+            continue
+        }
+        let key_sp = toml_mod.token_span(tok)
+        let key = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+        if p + 2 >= n {
+            values_mod.emit_error_at(mutable diags, key_sp, "expected `= \"value\"` after key", allocator)?
+            return n
+        }
+        if !toml_mod.is_equals(Vec_TomlToken.at(tokens, p + 1)) {
+            values_mod.emit_error_at(mutable diags, key_sp, "expected `=` after key", allocator)?
+            p = values_mod.skip_to_newline(tokens, p)
+            continue
+        }
+        let r = values_mod.parse_string_value(tokens, source, p + 2, mutable diags, allocator)?
+        if string.equals(key, "name") {
+            dep_name = r.text
+        } else if string.equals(key, "version") {
+            dep_version = r.text
+        } else if string.equals(key, "source") {
+            dep_source = r.text
+        } else {
+            values_mod.emit_warn_at(mutable diags, key_sp, "unknown `[[dependencies]]` key — skipped", allocator)?
+        }
+        p = values_mod.after_value_newline(tokens, r.after)
+    }
+    if string.is_empty(dep_name) {
+        values_mod.emit_error_at(mutable diags, header_sp, "`[[dependencies]]` block is missing a `name` key", allocator)?
+        return if p > pos { p } else { n }
+    }
+    if dep_name_exists(deps, dep_name) {
+        values_mod.emit_error_at(mutable diags, header_sp, "duplicate dependency name in `[[dependencies]]`", allocator)?
+        return if p > pos { p } else { n }
+    }
+    let src = decode_source_string(dep_source, allocator)?
+    let dep = dep_mod.dependency_of(take dep_name, take dep_version, src)
+    Vec_Dependency.push(mutable deps, take dep, allocator)?
+    return if p > pos { p } else { n }
+}
+
+function decode_source_string(value: String, allocator: Allocator) -> dep_mod.DependencySource
+    with {allocator, err: alloc.AllocError}
+{
+    if string.starts_with(value, "path+") && value.len() >= 5 {
+        let b = value.bytes()
+        if b.len() >= 5 {
+            let rel = string.bytes_slice_to_string(b, 5, b.len(), allocator)?
+            return dep_mod.DependencySource.path(rel: rel)
+        }
+    }
+    if string.starts_with(value, "git+") && value.len() >= 4 {
+        let b = value.bytes()
+        if b.len() >= 4 {
+            let url = string.bytes_slice_to_string(b, 4, b.len(), allocator)?
+            return dep_mod.DependencySource.git(url: url)
+        }
+    }
+    return dep_mod.DependencySource.registry
+}
+
+public function dep_name_exists(deps: Vec_Dependency.Vec, name: String) -> bool {
+    let n = Vec_Dependency.len(deps)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        let d = Vec_Dependency.at(deps, i)
+        if string.equals(dep_mod.name(d), name) { return true }
+        i = i + 1
+    }
+    return false
+}

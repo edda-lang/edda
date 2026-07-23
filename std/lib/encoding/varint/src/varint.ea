@@ -1,0 +1,310 @@
+
+module std.encoding.varint
+
+
+public type DecodedU32 {
+    value: u32
+    end: usize
+}
+
+public type DecodedU64 {
+    value: u64
+    end: usize
+}
+
+public type DecodedI32 {
+    value: i32
+    end: usize
+}
+
+public type DecodedI64 {
+    value: i64
+    end: usize
+}
+
+public type VarintError {
+    case buffer_too_small
+    case overflow
+    case malformed
+}
+
+
+public stable function size_of_u32(value: u32) -> usize
+    ensures result >= 1
+    ensures result <= 5
+{
+    var v: u32 = value
+    var n: usize = 1
+    loop
+        decreases v
+    {
+        v = v >> 7
+        if v == 0 { return n }
+        n += 1
+    }
+}
+
+public stable function size_of_u64(value: u64) -> usize
+    ensures result >= 1
+    ensures result <= 10
+{
+    var v: u64 = value
+    var n: usize = 1
+    loop
+        decreases v
+    {
+        v = v >> 7
+        if v == 0 { return n }
+        n += 1
+    }
+}
+
+
+public stable function encode_u32(
+    value: u32,
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: VarintError}
+{
+    let n: usize = out.len()
+    var v: u32 = value
+    var i: usize = offset
+    loop
+        decreases v + 1
+    {
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let chunk: u8 = (v & 127) as u8
+        let next: u32 = v >> 7
+        if next == 0 {
+            out[i] = chunk
+            return i + 1
+        }
+        out[i] = chunk | 128
+        v = next
+        i += 1
+    }
+}
+
+public stable function encode_u64(
+    value: u64,
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: VarintError}
+{
+    let n: usize = out.len()
+    var v: u64 = value
+    var i: usize = offset
+    loop
+        decreases v + 1
+    {
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let chunk: u8 = (v & 127) as u8
+        let next: u64 = v >> 7
+        if next == 0 {
+            out[i] = chunk
+            return i + 1
+        }
+        out[i] = chunk | 128
+        v = next
+        i += 1
+    }
+}
+
+public stable function decode_u32(bytes: [u8], offset: usize) -> DecodedU32
+    with {err: VarintError}
+{
+    let n: usize = bytes.len()
+    var value: u32 = 0
+    var shift: u32 = 0
+    var i: usize = offset
+    loop
+        decreases n - i
+    {
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let byte: u8 = bytes[i]
+        let chunk: u32 = (byte & 127) as u32
+        if shift >= 32 {
+            raise VarintError.overflow
+        }
+        if shift == 28 && chunk > 15 {
+            raise VarintError.overflow
+        }
+        value = value | (chunk << shift)
+        i += 1
+        if (byte & 128) == 0 {
+            return DecodedU32 { value: value, end: i }
+        }
+        shift += 7
+    }
+}
+
+public stable function decode_u64(bytes: [u8], offset: usize) -> DecodedU64
+    with {err: VarintError}
+{
+    let n: usize = bytes.len()
+    var value: u64 = 0
+    var shift: u64 = 0
+    var i: usize = offset
+    loop
+        decreases n - i
+    {
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let byte: u8 = bytes[i]
+        let chunk: u64 = (byte & 127) as u64
+        if shift >= 64 {
+            raise VarintError.overflow
+        }
+        if shift == 63 && chunk > 1 {
+            raise VarintError.overflow
+        }
+        value = value | (chunk << shift)
+        i += 1
+        if (byte & 128) == 0 {
+            return DecodedU64 { value: value, end: i }
+        }
+        shift += 7
+    }
+}
+
+
+public stable function encode_i32(
+    value: i32,
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: VarintError}
+{
+    let n: usize = out.len()
+    var v: i32 = value
+    var i: usize = offset
+    var budget: usize = 6
+    loop
+        decreases budget
+    {
+        if budget == 0 { raise VarintError.malformed }
+        budget -= 1
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let chunk_i: i32 = v & 127
+        let chunk: u8 = chunk_i as u8
+        let next: i32 = v >> 7
+        let sign_set: bool = (chunk & 64) != 0
+        let done: bool = (next == 0 && !sign_set) || (next == -1 && sign_set)
+        if done {
+            out[i] = chunk
+            return i + 1
+        }
+        out[i] = chunk | 128
+        v = next
+        i += 1
+    }
+}
+
+public stable function encode_i64(
+    value: i64,
+    out: mutable [u8],
+    offset: usize,
+) -> usize
+    with {err: VarintError}
+{
+    let n: usize = out.len()
+    var v: i64 = value
+    var i: usize = offset
+    var budget: usize = 11
+    loop
+        decreases budget
+    {
+        if budget == 0 { raise VarintError.malformed }
+        budget -= 1
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let chunk_i: i64 = v & 127
+        let chunk: u8 = chunk_i as u8
+        let next: i64 = v >> 7
+        let sign_set: bool = (chunk & 64) != 0
+        let done: bool = (next == 0 && !sign_set) || (next == -1 && sign_set)
+        if done {
+            out[i] = chunk
+            return i + 1
+        }
+        out[i] = chunk | 128
+        v = next
+        i += 1
+    }
+}
+
+public stable function decode_i32(bytes: [u8], offset: usize) -> DecodedI32
+    with {err: VarintError}
+{
+    let n: usize = bytes.len()
+    var value: i32 = 0
+    var shift: i32 = 0
+    var i: usize = offset
+    loop
+        decreases n - i
+    {
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let byte: u8 = bytes[i]
+        let chunk: i32 = (byte & 127) as i32
+        if shift >= 32 {
+            raise VarintError.overflow
+        }
+        value = value | (chunk << shift)
+        i += 1
+        let more: bool = (byte & 128) != 0
+        shift += 7
+        if !more {
+            if shift < 32 && (chunk & 64) != 0 {
+                let fill: i32 = -1
+                value = value | (fill << shift)
+            }
+            return DecodedI32 { value: value, end: i }
+        }
+    }
+}
+
+public stable function decode_i64(bytes: [u8], offset: usize) -> DecodedI64
+    with {err: VarintError}
+{
+    let n: usize = bytes.len()
+    var value: i64 = 0
+    var shift: i64 = 0
+    var i: usize = offset
+    loop
+        decreases n - i
+    {
+        if i >= n {
+            raise VarintError.buffer_too_small
+        }
+        let byte: u8 = bytes[i]
+        let chunk: i64 = (byte & 127) as i64
+        if shift >= 64 {
+            raise VarintError.overflow
+        }
+        value = value | (chunk << shift)
+        i += 1
+        let more: bool = (byte & 128) != 0
+        shift += 7
+        if !more {
+            if shift < 64 && (chunk & 64) != 0 {
+                let fill: i64 = -1
+                value = value | (fill << shift)
+            }
+            return DecodedI64 { value: value, end: i }
+        }
+    }
+}

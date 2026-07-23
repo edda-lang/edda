@@ -1,0 +1,219 @@
+
+module cache.blob.mir.ty.read.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ident as ident_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.ops as ast_ops_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_tree_mod.Ty)
+spec std.collections.vec.Vec(ast_tree_mod.FnTyParam)
+spec std.collections.vec.Vec(ast_tree_mod.EffectMember)
+spec std.core.option.Option(ast_tree_mod.EffectRow)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.mem.alloc.Box(ast_tree_mod.Ty)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+
+
+public function read_ty(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.Ty
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    let kind = match tag {
+        case 0 => ast_tree_mod.TyKind.path(path: ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => ast_tree_mod.TyKind.tuple(elements: read_ty_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?)
+        case 2 => {
+            let elem = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.TyKind.slice(elem: Box_Ty.new(take elem, allocator)?)
+        }
+        case 3 => ast_tree_mod.TyKind.unit
+        case 4 => {
+            let params = read_fn_ty_param_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            let ret = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            let effects = read_option_effect_row(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.TyKind.function_(params: params, ret: Box_Ty.new(take ret, allocator)?, effects: effects)
+        }
+        case 5 => ast_tree_mod.TyKind.meta
+        case 6 => ast_tree_mod.TyKind.error
+        case 7 => {
+            let inner = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.TyKind.comptime_(inner: Box_Ty.new(take inner, allocator)?)
+        }
+        case 8 => {
+            let base = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            let pred = read_expr_fn(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.TyKind.refined(base: Box_Ty.new(take base, allocator)?, pred: pred)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown TyKind tag")
+    }
+    return ast_tree_mod.Ty { span: span, kind: kind }
+}
+
+public function read_ty_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> Vec_Ty.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit elements: Vec_Ty.Vec
+    Vec_Ty.new(init elements, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let t = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+        Vec_Ty.push(mutable elements, take t, allocator)?
+        i += 1
+    }
+    return elements
+}
+
+public function read_fn_ty_param(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.FnTyParam
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let name = read_option_ident(bytes, mutable cur, mutable it, allocator)?
+    let mode = ast_ops_mod.read_param_mode(bytes, mutable cur)?
+    let ty = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+    return ast_tree_mod.FnTyParam { span: span, name: name, mode: mode, ty: ty }
+}
+
+public function read_fn_ty_param_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> Vec_FnTyParam.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit params: Vec_FnTyParam.Vec
+    Vec_FnTyParam.new(init params, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let p = read_fn_ty_param(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+        Vec_FnTyParam.push(mutable params, take p, allocator)?
+        i += 1
+    }
+    return params
+}
+
+public function read_effect_row(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.EffectRow
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let members = read_effect_member_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+    return ast_tree_mod.EffectRow { span: span, members: members }
+}
+
+public function read_effect_member(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.EffectMember
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_tree_mod.EffectMember.capability(name: ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => {
+            let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let ty = read_ty(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.EffectMember.named(name: name, ty: ty)
+        }
+        case 2 => ast_tree_mod.EffectMember.spread(path: ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?)
+        case 3 => {
+            let kind = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let bound = read_expr_fn(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.EffectMember.graded(kind: kind, bound: Box_Expr.new(take bound, allocator)?)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown EffectMember tag")
+    }
+}
+
+public function read_effect_member_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> Vec_EffectMember.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit members: Vec_EffectMember.Vec
+    Vec_EffectMember.new(init members, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let m = read_effect_member(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+        Vec_EffectMember.push(mutable members, take m, allocator)?
+        i += 1
+    }
+    return members
+}
+
+public function read_option_effect_row(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> Option_EffectRow
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_EffectRow.some(value: read_effect_row(bytes, mutable cur, mutable it, allocator, read_expr_fn)?)
+    }
+    return Option_EffectRow.none
+}
+
+public function read_option_ident(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Ident
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_Ident.some(value: ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?)
+    }
+    return Option_Ident.none
+}

@@ -1,0 +1,277 @@
+
+module compile.phase.emit.library.library
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import std.os.process.spawn as spawn_mod
+import std.os.process.spawn.error as spawn_error_mod
+import std.os.process.wait as wait_mod
+import std.os.process.child as child_spec_mod
+
+import target.triple as triple_mod
+import object.lib as object_mod
+import link.driver.plan as driver_plan_mod
+import link.driver.tool as link_tool_mod
+import link.emit.image.output as output_mod
+import link.error as link_error_mod
+import local.phase.emit.library.libpath as libpath_mod
+
+import std.core.fmt as fmt_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(output_mod.LibSpec)
+
+
+public type LinkRequest {
+    kind: output_mod.OutputKind
+    output_path: String
+    inputs: Vec_String.Vec
+    export_names: Vec_String.Vec
+    target: triple_mod.TargetTriple
+}
+
+
+public function new_request(
+    kind: output_mod.OutputKind,
+    output_path: take String,
+    inputs: take Vec_String.Vec,
+    export_names: take Vec_String.Vec,
+    target: triple_mod.TargetTriple,
+) -> LinkRequest {
+    return LinkRequest {
+        kind: kind,
+        output_path: output_path,
+        inputs: inputs,
+        export_names: export_names,
+        target: target,
+    }
+}
+
+
+public function output_lib_path(
+    outdir: String,
+    target: triple_mod.TargetTriple,
+    program_name: String,
+    kind: output_mod.OutputKind,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let stem = string.concat("/", program_name, allocator)?
+    let base = string.concat(outdir, stem, allocator)?
+    return match triple_mod.os(target) {
+        case .windows => match kind {
+            case .dynamic_library => string.concat(base, ".dll", allocator)?
+            case .static_library  => string.concat(base, ".lib", allocator)?
+            case .executable      => string.concat(base, ".exe", allocator)?
+        }
+        case .macos => {
+            let libstem = string.concat("/lib", program_name, allocator)?
+            let libbase = string.concat(outdir, libstem, allocator)?
+            match kind {
+                case .dynamic_library => string.concat(libbase, ".dylib", allocator)?
+                case .static_library  => string.concat(libbase, ".a", allocator)?
+                case .executable      => base
+            }
+        }
+        case _ => {
+            let libstem = string.concat("/lib", program_name, allocator)?
+            let libbase = string.concat(outdir, libstem, allocator)?
+            match kind {
+                case .dynamic_library => string.concat(libbase, ".so", allocator)?
+                case .static_library  => string.concat(libbase, ".a", allocator)?
+                case .executable      => base
+            }
+        }
+    }
+}
+
+
+public function link_library(
+    p: Subprocess,
+    req: LinkRequest,
+    rfs: ReadOnlyFilesystem,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {p, rfs, allocator, err: alloc.AllocError}
+{
+    let inputs_arr = clone_inputs(req.inputs, allocator)?
+    if inputs_arr.len() == 0 as usize {
+        emit_note(mutable diags, "no link inputs for library output", allocator)?
+        return
+    }
+    let host = triple_mod.os(req.target)
+    let extra = build_extra_args(req.kind, req.target, req.export_names, allocator)?
+    let out_owned = string.concat(req.output_path, "", allocator)?
+    let libs = libpath_mod.default_link_libs(req.kind, req.target, allocator)?
+    let lib_paths = libpath_mod.default_lib_search_paths(req.kind, req.target, rfs, allocator)?
+    let plan = driver_plan_mod.LinkPlan {
+        target: req.target,
+        host: host,
+        inputs: inputs_arr,
+        output: out_owned,
+        kind: req.kind,
+        libs: libs,
+        lib_search_paths: lib_paths,
+        extra_args: extra,
+    }
+    handle err: link_error_mod.LinkError as e -> emit_link_error(mutable diags, e, allocator)? {
+    handle err: spawn_error_mod.SpawnError -> emit_note(mutable diags, "external linker failed to spawn — is the linker (e.g. lld-link) on PATH?", allocator)? {
+    handle err: wait_mod.WaitError -> emit_note(mutable diags, "external linker process wait failed", allocator)? {
+        let argv_vec = driver_plan_mod.argv(plan, allocator)?
+        let tool = driver_plan_mod.tool(plan)?
+        let tool_name = link_tool_mod.tool_name(tool)
+        let outcome = spawn_tool(p, tool_name, take argv_vec, allocator)?
+        check_outcome(mutable diags, outcome, tool_name, allocator)?
+    }}}
+}
+
+
+function clone_inputs(inputs: Vec_String.Vec, allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let n = Vec_String.len(inputs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = Vec_String.at(inputs, i)
+        Vec_String.push(mutable out, string.concat(s, "", allocator)?, allocator)?
+        i += 1
+    }
+    return Vec_String.into_array(take out, allocator)?
+}
+
+
+function build_extra_args(
+    kind: output_mod.OutputKind,
+    target: triple_mod.TargetTriple,
+    export_names: Vec_String.Vec,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit extra: Vec_String.Vec
+    Vec_String.new(init extra, allocator)?
+    let is_dynamic = match kind {
+        case .dynamic_library => true
+        case _                => false
+    }
+    if !is_dynamic { return extra }
+    match object_mod.format_for_triple(target) {
+        case .coff => {
+            let n = Vec_String.len(export_names)
+            var i: usize = 0
+            loop decreases n - i {
+                if i >= n { break }
+                let nm = Vec_String.at(export_names, i)
+                Vec_String.push(mutable extra, string.concat("/EXPORT:", nm, allocator)?, allocator)?
+                i += 1
+            }
+        }
+        case _ => ()
+    }
+    return extra
+}
+
+
+function spawn_tool(
+    p: Subprocess,
+    tool_name: String,
+    argv_vec: take Vec_String.Vec,
+    allocator: Allocator,
+) -> wait_mod.ExitOutcome
+    with {p, allocator, err: spawn_error_mod.SpawnError, err: wait_mod.WaitError, err: alloc.AllocError}
+{
+    let argv = Vec_String.into_array(take argv_vec, allocator)?
+    let exe = string.concat(tool_name, "", allocator)?
+    let p = restrict_to_tool(p, tool_name, allocator)?
+    let spec_init = child_spec_mod.of(take exe, take argv)
+    let spec_built = child_spec_mod.build(take spec_init)
+    let child = spawn_mod.spawn(p, take spec_built, allocator)?
+    return wait_mod.wait(take child)?
+}
+
+
+function restrict_to_tool(
+    p: Subprocess,
+    tool_name: String,
+    allocator: Allocator,
+) -> Subprocess
+    with {p, allocator, err: alloc.AllocError}
+{
+    uninit allow: Vec_String.Vec
+    Vec_String.new(init allow, allocator)?
+    let nm = string.concat(tool_name, "", allocator)?
+    Vec_String.push(mutable allow, take nm, allocator)?
+    let allowlist = Vec_String.into_array(take allow, allocator)?
+    return spawn_mod.allowing(p, allowlist)
+}
+
+
+function check_outcome(
+    diags: mutable diags_mod.Diagnostics,
+    o: wait_mod.ExitOutcome,
+    tool_name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match o {
+        case .exited(let code) => {
+            if code != 0 as i32 {
+                emit_link_fail(mutable diags, tool_name, code, allocator)?
+            }
+        }
+        case .signaled(let sig) => emit_link_fail(mutable diags, tool_name, sig, allocator)?
+        case .wait_failed(_) => emit_note(mutable diags, "external linker process wait failed", allocator)?
+    }
+}
+
+
+function emit_link_fail(
+    diags: mutable diags_mod.Diagnostics,
+    tool_name: String,
+    code: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("external linker '", tool_name, allocator)?
+    let mid = string.concat(head, "' exited with code ", allocator)?
+    let msg = string.concat(mid, fmt_mod.i64_to_string(code as i64, allocator)?, allocator)?
+    let d = diag_mod.error_at(diag_code_mod.codegen_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_link_error(
+    diags: mutable diags_mod.Diagnostics,
+    e: link_error_mod.LinkError,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = link_error_mod.to_diagnostic(e, span_mod.dummy(), allocator)?
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_note(
+    diags: mutable diags_mod.Diagnostics,
+    msg: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.codegen_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

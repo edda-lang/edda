@@ -1,0 +1,85 @@
+
+module cache.blob.mir.symbol.codec
+
+import std.mem.alloc
+import std.collections.vec
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public function write_symbol(
+    it: interner_mod.Interner,
+    sym: symbol_mod.Symbol,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let name = interner_mod.lookup(it, sym)
+    prim_mod.push_bytes(mutable out, name, allocator)?
+}
+
+public function read_symbol(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> symbol_mod.Symbol
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let name = prim_mod.read_bytes(bytes, mutable cur)?
+    return interner_mod.intern_bytes(mutable it, name, allocator)?
+}
+
+@property()
+function round_trip_preserves_symbol_name(shift: u8 where shift < 20, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    uninit write_it: interner_mod.Interner
+    interner_mod.new_interner(init write_it, allocator)?
+    let sym = interner_mod.intern(mutable write_it, "hello_symbol", allocator)?
+
+    uninit out: Vec_u8.Vec
+    Vec_u8.new(init out, allocator)?
+    write_symbol(write_it, sym, mutable out, allocator)?
+    let bytes = Vec_u8.into_array(take out, allocator)?
+    let original_name = interner_mod.lookup(write_it, sym)
+
+    uninit read_it: interner_mod.Interner
+    interner_mod.new_interner(init read_it, allocator)?
+    var k: u8 = 0
+    loop decreases (shift - k) {
+        if k >= shift { break }
+        let placeholder = f"placeholder_{k}"
+        let _ = interner_mod.intern(mutable read_it, placeholder, allocator)?
+        k += 1
+    }
+
+    var cur = prim_mod.reader_at_start()
+    let decoded_sym = read_symbol(bytes, mutable cur, mutable read_it, allocator)?
+    let decoded_name = interner_mod.lookup(read_it, decoded_sym)
+
+    let matches = bytes_equal(original_name, decoded_name)
+    interner_mod.dispose(take write_it)
+    interner_mod.dispose(take read_it)
+    return matches
+}
+
+function bytes_equal(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var i: usize = 0
+    let n = a.len()
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}

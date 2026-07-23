@@ -1,0 +1,211 @@
+
+module tls.conn
+
+import std.net.socket
+import std.mem.alloc
+import local.error
+import local.crypto.aead
+import local.alert
+import local.record.kind as record_kind
+import local.record.ciphertext as rec_cipher
+
+unstable public linear type Connection {
+    tcp: socket.Connection
+    cipher: aead.AeadCipher
+    read_key: [u8]
+    read_iv: [u8] where read_iv.len() == 12
+    write_key: [u8]
+    write_iv: [u8] where write_iv.len() == 12
+    read_seq: [u64]
+    write_seq: [u64]
+}
+
+function _alloc_u64_slots(allocator: Allocator, n: usize) -> [u64]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_seq(allocator: Allocator) -> [u64]
+    with {allocator, err: error.TlsError}
+{
+    let box = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u64_slots(allocator, 1 as usize)?
+    }
+    box[0 as usize] = 0 as u64
+    return box
+}
+
+public function connection_new(
+    tcp: take socket.Connection,
+    cipher: aead.AeadCipher,
+    read_key: [u8],
+    read_iv: [u8] where read_iv.len() == 12,
+    write_key: [u8],
+    write_iv: [u8] where write_iv.len() == 12,
+    allocator: Allocator,
+) -> Connection
+    with {allocator, err: error.TlsError}
+{
+    let read_seq = _alloc_seq(allocator)?
+    let write_seq = _alloc_seq(allocator)?
+    return Connection {
+        tcp: tcp,
+        cipher: cipher,
+        read_key: read_key,
+        read_iv: read_iv,
+        write_key: write_key,
+        write_iv: write_iv,
+        read_seq: read_seq,
+        write_seq: write_seq,
+    }
+}
+
+function _max_skip_records() -> usize { return 16 as usize }
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _close_notify_bytes(allocator: Allocator) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let buf = handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, 2 as usize)?
+    }
+    buf[0 as usize] = alert.alert_level_wire(alert.AlertLevel.warning)
+    buf[1 as usize] = alert.alert_description_wire(alert.AlertDescription.close_notify)
+    return buf
+}
+
+public function send(
+    conn: mutable Connection,
+    data: [u8],
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    rec_cipher.write_ciphertext(
+        mutable conn.tcp,
+        conn.cipher,
+        conn.write_key,
+        conn.write_iv,
+        conn.write_seq[0 as usize],
+        record_kind.RecordKind.application_data,
+        data,
+        mutable allocator,
+    )?
+    conn.write_seq[0 as usize] = conn.write_seq[0 as usize] + (1 as u64)
+}
+
+type RecvStep {
+    case data(rec_cipher.DecryptedRecord)
+    case closed
+}
+
+function _closed_or_reraise(e: error.TlsError) -> RecvStep
+    with {err: error.TlsError}
+{
+    return match e {
+        case .peer_closed_unexpectedly => RecvStep.closed
+        case _                         => raise e
+    }
+}
+
+function _read_step(
+    conn: mutable socket.Connection,
+    cipher: aead.AeadCipher,
+    key: [u8],
+    iv: [u8] where iv.len() == 12,
+    seq: u64,
+    allocator: mutable Allocator,
+) -> RecvStep
+    with {allocator, err: error.TlsError}
+{
+    return handle err: error.TlsError as e -> _closed_or_reraise(e)? {
+        RecvStep.data(rec_cipher.read_ciphertext(mutable conn, cipher, key, iv, seq, mutable allocator)?)
+    }
+}
+
+public function recv(
+    conn: mutable Connection,
+    buf: mutable [u8],
+    allocator: mutable Allocator,
+) -> usize
+    with {allocator, err: error.TlsError}
+{
+    var attempts: usize = _max_skip_records()
+    loop decreases attempts {
+        if attempts == (0 as usize) { raise error.TlsError.unexpected_message }
+        attempts = attempts - (1 as usize)
+        let step = _read_step(
+            mutable conn.tcp,
+            conn.cipher,
+            conn.read_key,
+            conn.read_iv,
+            conn.read_seq[0 as usize],
+            mutable allocator,
+        )?
+        let rec = match step {
+            case .closed        => { return 0 as usize }
+            case .data(let r)   => r
+        }
+        conn.read_seq[0 as usize] = conn.read_seq[0 as usize] + (1 as u64)
+        match rec.kind {
+            case .application_data => {
+                return _copy_out(rec.plaintext, mutable buf)?
+            }
+            case .handshake => {
+            }
+            case .alert => {
+                if rec.plaintext.len() < (2 as usize) { raise error.TlsError.bad_record }
+                let desc = alert.alert_description_from_wire(rec.plaintext[1 as usize])
+                match desc {
+                    case .close_notify => { return 0 as usize }
+                    case _ => {
+                        raise error.TlsError.alert_received(
+                            level: rec.plaintext[0 as usize],
+                            code: rec.plaintext[1 as usize],
+                        )
+                    }
+                }
+            }
+            case _ => {
+                raise error.TlsError.unexpected_message
+            }
+        }
+    }
+    raise error.TlsError.unexpected_message
+}
+
+function _copy_out(src: [u8], buf: mutable [u8]) -> usize
+    with {err: error.TlsError}
+{
+    let n = src.len()
+    if n > buf.len() { raise error.TlsError.bad_record }
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = src[i]
+        i = i + (1 as usize)
+    }
+    return n
+}
+
+public function close(conn: take Connection, allocator: mutable Allocator) -> ()
+    with {allocator}
+{
+    handle err: error.TlsError -> () {
+        let notify = _close_notify_bytes(allocator)?
+        rec_cipher.write_ciphertext(
+            mutable conn.tcp,
+            conn.cipher,
+            conn.write_key,
+            conn.write_iv,
+            conn.write_seq[0 as usize],
+            record_kind.RecordKind.alert,
+            notify,
+            mutable allocator,
+        )?
+    }
+    let sock = conn.tcp
+    socket.close(take sock)
+}

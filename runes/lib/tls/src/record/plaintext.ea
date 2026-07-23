@@ -1,0 +1,97 @@
+
+module tls.record.plaintext
+
+import std.net.socket
+import std.mem.alloc
+import local.error
+import local.wire
+import local.record.kind as record_kind
+
+unstable public type Record {
+    kind: record_kind.RecordKind
+    fragment: [u8]
+}
+
+function _max_plaintext_len() -> usize { return 16384 as usize }
+
+function _header_len() -> usize { return 5 as usize }
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _read_exact(conn: mutable socket.Connection, buf: mutable [u8]) -> ()
+    with {err: error.TlsError}
+{
+    let need = buf.len()
+    var have: usize = 0 as usize
+    loop decreases need - have {
+        if have >= need { break }
+        let chunk = handle err: socket.SocketError -> (raise error.TlsError.socket_failed) {
+            socket.read(mutable conn, mutable buf[have..])?
+        }
+        if chunk == (0 as usize) { raise error.TlsError.peer_closed_unexpectedly }
+        have = have + chunk
+    }
+}
+
+function _write_all(conn: mutable socket.Connection, data: [u8]) -> ()
+    with {err: error.TlsError}
+{
+    let need = data.len()
+    var sent: usize = 0 as usize
+    loop decreases need - sent {
+        if sent >= need { break }
+        let chunk = handle err: socket.SocketError -> (raise error.TlsError.socket_failed) {
+            socket.write(mutable conn, data[sent..])?
+        }
+        if chunk == (0 as usize) { raise error.TlsError.socket_failed }
+        sent = sent + chunk
+    }
+}
+
+public function write_record(
+    conn: mutable socket.Connection,
+    kind: record_kind.RecordKind,
+    fragment: [u8],
+    allocator: mutable Allocator,
+) -> ()
+    with {allocator, err: error.TlsError}
+{
+    let n = fragment.len()
+    if n > _max_plaintext_len() { raise error.TlsError.bad_record }
+    let total = _header_len() + n
+    var buf = _alloc_bytes(allocator, total)?
+    var pos: usize = 0 as usize
+    pos = wire.write_u8(mutable buf, pos, record_kind.record_kind_wire(kind))?
+    pos = wire.write_u16_be(mutable buf, pos, 0x0303 as u16)?
+    pos = wire.write_u16_be(mutable buf, pos, n as u16)?
+    pos = wire.write_bytes(mutable buf, pos, fragment)?
+    let _ = pos
+    _write_all(mutable conn, buf)?
+}
+
+public function read_record(
+    conn: mutable socket.Connection,
+    allocator: mutable Allocator,
+) -> Record
+    with {allocator, err: error.TlsError}
+{
+    var header = _alloc_bytes(allocator, _header_len())?
+    _read_exact(mutable conn, mutable header)?
+    let kind = record_kind.record_kind_from_wire(wire.read_u8(header, 0 as usize)?)?
+    let _legacy_version = wire.read_u16_be(header, 1 as usize)?
+    let length = wire.read_u16_be(header, 3 as usize)? as usize
+    if length > _max_plaintext_len() { raise error.TlsError.bad_record }
+    var fragment = _alloc_bytes(allocator, length)?
+    _read_exact(mutable conn, mutable fragment)?
+    return Record { kind: kind, fragment: fragment }
+}

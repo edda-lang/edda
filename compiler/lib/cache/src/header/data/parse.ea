@@ -1,0 +1,401 @@
+
+module cache.header.data.parse
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import local.addr.hash as hash_mod
+import local.header.boundary as boundary_mod
+import local.header.data.io.value as header_value
+import local.toon.lex as lex_mod
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(KvPair)
+
+
+public function parse(input: String, allocator: Allocator) -> header_value.ParsedHeader
+    with {allocator, err: alloc.AllocError, err: header_value.HeaderParseError, err: lex_mod.LexError}
+{
+    let body_offset: usize = boundary_mod.comment_block_end(input.bytes(), 0, 0)
+    if body_offset == 0 {
+        raise header_value.HeaderParseError.missing_marker
+    }
+    let lexed = lex_mod.lex(input, true, allocator)?
+    let header = build_header_from_lex(lexed, allocator)?
+    return header_value.ParsedHeader { header: header, body_offset: body_offset }
+}
+
+
+function build_header_from_lex(
+    lx: lex_mod.Lexed,
+    allocator: Allocator,
+) -> header_value.ArtifactHeader
+    with {allocator, err: alloc.AllocError, err: header_value.HeaderParseError}
+{
+    let n = lex_mod.len(lx)
+    if n == 0 { raise header_value.HeaderParseError.missing_marker }
+    if lex_mod.indent_at(lx, 0) != 0 { raise header_value.HeaderParseError.missing_marker }
+    if !string.equals(lex_mod.content_at(lx, 0), "@generated") {
+        raise header_value.HeaderParseError.missing_marker
+    }
+
+    let spec_opt = walk_top(lx, 1, n, Option_String.none, "spec", allocator)?
+    let hash_opt = walk_top(lx, 1, n, Option_String.none, "hash", allocator)?
+    let generator_opt = walk_top(lx, 1, n, Option_String.none, "generator", allocator)?
+    let body_version_opt = walk_inputs_for_body_version(lx, 1, n, Option_String.none, allocator)?
+    uninit nested_specs: Vec_String.Vec
+    Vec_String.new(init nested_specs, allocator)?
+    uninit nested_names: Vec_String.Vec
+    Vec_String.new(init nested_names, allocator)?
+    collect_nested(lx, 1, n, mutable nested_specs, mutable nested_names, allocator)?
+
+    let spec_str = require_present(take spec_opt, "spec")?
+    let hash_str = require_present(take hash_opt, "hash")?
+    let generator_str = require_present(take generator_opt, "generator")?
+    let body_version_str = require_present(take body_version_opt, "body_version")?
+
+    let hash_value: hash_mod.ArtifactHash = match hash_mod.parse_hex(hash_str) {
+        case .none        => raise header_value.HeaderParseError.malformed_hash
+        case .some(let h) => h
+    }
+    let body_byte: u8 = parse_body_version_byte(body_version_str)?
+    let body_version: hash_mod.BodyVersion = hash_mod.BodyVersion { value: body_byte }
+
+    return header_value.ArtifactHeader {
+        spec_invocation: spec_str,
+        hash: hash_value,
+        generator: generator_str,
+        body_version: body_version,
+        nested_specs: nested_specs,
+        nested_names: nested_names,
+    }
+}
+
+
+function walk_top(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    acc: Option_String,
+    key: String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return acc }
+    if lex_mod.indent_at(lx, i) != 0 {
+        return walk_top(lx, i + 1, n, acc, key, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    return match split_kv(line, allocator)? {
+        case .none => walk_top(lx, i + 1, n, acc, key, allocator)?
+        case .some(let kv) => {
+            if string.equals(kv.key, key) {
+                Option_String.some(value: kv.value)
+            } else {
+                walk_top(lx, i + 1, n, acc, key, allocator)?
+            }
+        }
+    }
+}
+
+
+function walk_inputs_for_body_version(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    acc: Option_String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return acc }
+    if lex_mod.indent_at(lx, i) != 0 {
+        return walk_inputs_for_body_version(lx, i + 1, n, acc, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !line_starts_with_key(line, "inputs") {
+        return walk_inputs_for_body_version(lx, i + 1, n, acc, allocator)?
+    }
+    return scan_body_version_within(lx, i + 1, n, acc, allocator)?
+}
+
+function scan_body_version_within(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    acc: Option_String,
+    allocator: Allocator,
+) -> Option_String
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return acc }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth == 0 { return acc }
+    if depth != 1 {
+        return scan_body_version_within(lx, i + 1, n, acc, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    return match split_kv(line, allocator)? {
+        case .none => scan_body_version_within(lx, i + 1, n, acc, allocator)?
+        case .some(let kv) => {
+            if string.equals(kv.key, "body_version") {
+                Option_String.some(value: kv.value)
+            } else {
+                scan_body_version_within(lx, i + 1, n, acc, allocator)?
+            }
+        }
+    }
+}
+
+
+function collect_nested(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    specs: mutable Vec_String.Vec,
+    names: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    if lex_mod.indent_at(lx, i) != 0 {
+        return collect_nested(lx, i + 1, n, mutable specs, mutable names, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !line_starts_with_key(line, "inputs") {
+        return collect_nested(lx, i + 1, n, mutable specs, mutable names, allocator)?
+    }
+    return scan_nested_block(lx, i + 1, n, mutable specs, mutable names, allocator)?
+}
+
+function scan_nested_block(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    specs: mutable Vec_String.Vec,
+    names: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth == 0 { return () }
+    if depth != 1 {
+        return scan_nested_block(lx, i + 1, n, mutable specs, mutable names, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    if !line_starts_with_key(line, "nested") {
+        return scan_nested_block(lx, i + 1, n, mutable specs, mutable names, allocator)?
+    }
+    let tail = line_value_part(line, allocator)?
+    if string.equals(tail, "[]") {
+        return ()
+    }
+    return collect_nested_entries(lx, i + 1, n, mutable specs, mutable names, allocator)?
+}
+
+function collect_nested_entries(
+    lx: lex_mod.Lexed,
+    i: usize,
+    n: usize,
+    specs: mutable Vec_String.Vec,
+    names: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires n <= lex_mod.len(lx)
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return () }
+    let depth = lex_mod.indent_at(lx, i)
+    if depth < 2 { return () }
+    if depth != 2 {
+        return collect_nested_entries(lx, i + 1, n, mutable specs, mutable names, allocator)?
+    }
+    let line = lex_mod.content_at(lx, i)
+    return match split_kv(line, allocator)? {
+        case .none => collect_nested_entries(lx, i + 1, n, mutable specs, mutable names, allocator)?
+        case .some(let kv) => {
+            Vec_String.push(mutable specs, take kv.key, allocator)?
+            Vec_String.push(mutable names, take kv.value, allocator)?
+            collect_nested_entries(lx, i + 1, n, mutable specs, mutable names, allocator)?
+        }
+    }
+}
+
+
+public type KvPair {
+    key: String
+    value: String
+}
+
+function split_kv(line: String, allocator: Allocator) -> Option_KvPair
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    return match find_byte(bytes, 0, bytes.len(), 58) {
+        case .none => Option_KvPair.none
+        case .some(let colon) => {
+            let key = slice_to_string(bytes, 0, colon, allocator)?
+            let value_start = skip_spaces(bytes, colon + 1, bytes.len())
+            let value = slice_to_string(bytes, value_start, bytes.len(), allocator)?
+            Option_KvPair.some(value: KvPair { key: key, value: value })
+        }
+    }
+}
+
+function line_value_part(line: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = line.bytes()
+    return match find_byte(bytes, 0, bytes.len(), 58) {
+        case .none           => string.clone(line, allocator)?
+        case .some(let colon) => {
+            let value_start = skip_spaces(bytes, colon + 1, bytes.len())
+            slice_to_string(bytes, value_start, bytes.len(), allocator)?
+        }
+    }
+}
+
+function line_starts_with_key(line: String, expected: String) -> bool {
+    let bytes = line.bytes()
+    return match find_byte(bytes, 0, bytes.len(), 58) {
+        case .none => false
+        case .some(let colon) => bytes_equal(bytes, 0, colon, expected.bytes())
+    }
+}
+
+function bytes_equal(bytes: [u8], lo: usize, hi: usize, other: [u8]) -> bool
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    if hi - lo != other.len() { return false }
+    return bytes_equal_acc(bytes, lo, other, 0, hi - lo)
+}
+
+function bytes_equal_acc(bytes: [u8], lo: usize, other: [u8], i: usize, n: usize) -> bool
+    requires lo + n <= bytes.len()
+    requires n <= other.len()
+    requires i <= n
+    decreases n - i
+{
+    if i >= n { return true }
+    if bytes[lo + i] != other[i] { return false }
+    return bytes_equal_acc(bytes, lo, other, i + 1, n)
+}
+
+function skip_spaces(bytes: [u8], i: usize, end: usize) -> usize
+    requires i <= end
+    requires end <= bytes.len()
+    ensures result >= i
+    ensures result <= end
+    decreases end - i
+{
+    if i >= end { return i }
+    if bytes[i] != 32 { return i }
+    return skip_spaces(bytes, i + 1, end)
+}
+
+function find_byte(bytes: [u8], i: usize, end: usize, target: u8) -> Option_usize
+    requires i <= end
+    requires end <= bytes.len()
+    decreases end - i
+{
+    if i >= end { return Option_usize.none }
+    if bytes[i] == target { return Option_usize.some(value: i) }
+    return find_byte(bytes, i + 1, end, target)
+}
+
+function slice_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let len: usize = hi - lo
+    var buf: [u8] = allocator.alloc_array(u8, len)?
+    copy_range(bytes, lo, hi, mutable buf, 0)
+    return string.from_owned_utf8(take buf)
+}
+
+function copy_range(src: [u8], lo: usize, hi: usize, dst: mutable [u8], offset: usize) -> ()
+    requires lo <= hi
+    requires hi <= src.len()
+    requires offset + (hi - lo) <= dst.len()
+{
+    copy_range_acc(src, lo, hi, mutable dst, offset, 0)
+}
+
+function copy_range_acc(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    dst: mutable [u8],
+    offset: usize,
+    i: usize,
+) -> ()
+    requires lo <= hi
+    requires hi <= src.len()
+    requires offset + (hi - lo) <= dst.len()
+    requires i <= hi - lo
+    decreases (hi - lo) - i
+{
+    if i >= hi - lo { return () }
+    dst[offset + i] = src[lo + i]
+    copy_range_acc(src, lo, hi, mutable dst, offset, i + 1)
+}
+
+
+function parse_body_version_byte(s: String) -> u8
+    with {err: header_value.HeaderParseError}
+{
+    let bytes = s.bytes()
+    if bytes.len() != 4 { raise header_value.HeaderParseError.malformed_body_version }
+    if bytes[0] != 48 { raise header_value.HeaderParseError.malformed_body_version }
+    if bytes[1] != 120 && bytes[1] != 88 {
+        raise header_value.HeaderParseError.malformed_body_version
+    }
+    let hi = hex_to_nibble_or_raise(bytes[2])?
+    let lo = hex_to_nibble_or_raise(bytes[3])?
+    return (hi << 4) | lo
+}
+
+function hex_to_nibble_or_raise(b: u8) -> u8
+    with {err: header_value.HeaderParseError}
+{
+    if b >= 48 && b <= 57  { return b - 48 }
+    if b >= 97 && b <= 102 { return (b - 97) + 10 }
+    if b >= 65 && b <= 70  { return (b - 65) + 10 }
+    raise header_value.HeaderParseError.malformed_body_version
+}
+
+
+function require_present(opt: take Option_String, field_name: String) -> String
+    with {err: header_value.HeaderParseError}
+{
+    return match opt {
+        case .none       => raise header_value.HeaderParseError.missing_field(field: field_name)
+        case .some(let s) => s
+    }
+}

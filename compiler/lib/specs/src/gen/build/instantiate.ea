@@ -1,0 +1,227 @@
+
+module specs.gen.build.instantiate
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.interner as sym_interner_mod
+import intern.symbol as sym_mod
+import resolve.paths.modules as mt_mod
+import resolve.paths.imports as imports_mod
+import resolve.build.drive.surface.registry as registry_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.item as item_mod
+import syntax.ast.tree as tree_mod
+import cteval.state.value as value_mod
+import resolve.build.drive.surface.walk.catalogue.specsurface as specsurface_mod
+import resolve.build.drive.surface.walk.catalogue.disambig as rdis_mod
+import syntax.ast.ident as ident_mod
+import local.error as err_mod
+import local.subst.walk.map as map_mod
+import local.subst.item as item_subst_mod
+import local.subst.walk.tree.tree as tree_subst_mod
+
+
+spec std.mem.alloc.Box(item_mod.SpecInvocation)
+spec std.mem.alloc.Box(item_mod.FnDecl)
+spec std.mem.alloc.Box(item_mod.TypeDecl)
+spec std.mem.alloc.Box(item_mod.LetDecl)
+spec std.mem.alloc.Box(item_mod.Spec)
+
+spec std.collections.vec.Vec(item_mod.Item)
+spec std.collections.vec.Vec(item_mod.GenericParam)
+spec std.collections.vec.Vec(value_mod.ComptimeValue)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.core.option.Option(Vec_Symbol.Vec)
+
+
+public function build_renames(
+    spec_name: take String,
+    generics: Vec_GenericParam.Vec,
+    body: Vec_Item.Vec,
+    args: Vec_ComptimeValue.Vec,
+    arg_exprs: Vec_Expr.Vec,
+    at: span_mod.Span,
+    self_module: sym_mod.Symbol,
+    origin_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    registry: registry_mod.Registry,
+    mt: mt_mod.ModuleTree,
+    interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> map_mod.Subst
+    with {allocator, divergence, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    let body_names = body_item_names(body, allocator)?
+    var s = map_mod.build(take spec_name, generics, args, arg_exprs, at, origin_segs, import_scope, registry, mt, take body_names, allocator)?
+    collect_renames(mutable s, body, self_module, mutable interner, allocator)?
+    return s
+}
+
+
+public function instantiate_with(
+    s: map_mod.Subst,
+    body: Vec_Item.Vec,
+    synthesize_box_ptr: bool,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Item.Vec
+    Vec_Item.new(init out, allocator)?
+    let n = Vec_Item.len(body)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let it = Vec_Item.at(body, i)
+        let new_it = item_subst_mod.subst_item(it, s, synthesize_box_ptr, allocator)?
+        Vec_Item.push(mutable out, take new_it, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function body_item_names(body: Vec_Item.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit names: Vec_Symbol.Vec
+    Vec_Symbol.new(init names, allocator)?
+    let n = Vec_Item.len(body)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(body, i).kind {
+            case .function_(let b) => Vec_Symbol.push(mutable names, Box_FnDecl.get(b).name.name, allocator)?
+            case .type_decl(let b) => Vec_Symbol.push(mutable names, Box_TypeDecl.get(b).name.name, allocator)?
+            case .let_(let b) => Vec_Symbol.push(mutable names, Box_LetDecl.get(b).name.name, allocator)?
+            case .spec_(let b) => Vec_Symbol.push(mutable names, Box_Spec.get(b).name.name, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return names
+}
+
+
+function collect_renames(
+    s: mutable map_mod.Subst,
+    body: Vec_Item.Vec,
+    self_module: sym_mod.Symbol,
+    interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError, err: err_mod.SpecError}
+{
+    let n = Vec_Item.len(body)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Item.at(body, i).kind {
+            case .spec_invocation(let box) => {
+                let inv = Box_SpecInvocation.get(box)
+                let old_sym = specsurface_mod.mangle(inv.path, inv.args, mutable interner, allocator)?
+                let new_args = tree_subst_mod.subst_exprs(inv.args, s, allocator)?
+                let new_sym = specsurface_mod.mangle(inv.path, new_args, mutable interner, allocator)?
+                let target_sym = if registry_mod.is_colliding(s.registry, new_sym) {
+                    nested_disambiguated(new_sym, new_args, self_module, s, mutable interner, allocator)?
+                } else {
+                    new_sym
+                }
+                if old_sym.raw != target_sym.raw {
+                    map_mod.add_rename(mutable s, old_sym, target_sym, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function nested_disambiguated(
+    new_sym: sym_mod.Symbol,
+    new_args: Vec_Expr.Vec,
+    self_module: sym_mod.Symbol,
+    s: map_mod.Subst,
+    interner: mutable sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> sym_mod.Symbol
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var suffix: String = ""
+    let n = Vec_Expr.len(new_args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match Vec_Expr.at(new_args, i).kind {
+            case .path(let ap) => {
+                match nested_arg_segs(ap, self_module, s, interner, allocator)? {
+                    case .some(let segs) => { suffix = rdis_mod.append_path_suffix(suffix, segs, interner, allocator)? }
+                    case .none => ()
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return rdis_mod.finish_disambiguated(new_sym, suffix, mutable interner, allocator)?
+}
+
+
+function nested_arg_segs(
+    ap: ident_mod.Path,
+    self_module: sym_mod.Symbol,
+    s: map_mod.Subst,
+    interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Vec_Symbol_Vec.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_Ident.len(ap.segments)
+    if n == 0 as usize {
+        return Option_Vec_Symbol_Vec.Option.none
+    }
+    let leaf = Vec_Ident.at(ap.segments, n - 1).name
+    if !rdis_mod.is_nominal_leaf(leaf, interner, allocator)? {
+        return Option_Vec_Symbol_Vec.Option.none
+    }
+    if n == 1 as usize {
+        let h = Vec_Ident.at(ap.segments, 0 as usize).name
+        if map_mod.is_body_name(s, h) {
+            uninit segs: Vec_Symbol.Vec
+            Vec_Symbol.new(init segs, allocator)?
+            Vec_Symbol.push(mutable segs, self_module, allocator)?
+            Vec_Symbol.push(mutable segs, h, allocator)?
+            return Option_Vec_Symbol_Vec.Option.some(value: segs)
+        }
+        let primary = registry_mod.inst_primary_of(s.registry, h)
+        if primary.raw != sym_mod.empty().raw {
+            uninit isegs: Vec_Symbol.Vec
+            Vec_Symbol.new(init isegs, allocator)?
+            Vec_Symbol.push(mutable isegs, h, allocator)?
+            Vec_Symbol.push(mutable isegs, primary, allocator)?
+            return Option_Vec_Symbol_Vec.Option.some(value: isegs)
+        }
+        return Option_Vec_Symbol_Vec.Option.none
+    }
+    return Option_Vec_Symbol_Vec.Option.some(value: arg_path_to_syms(ap, allocator)?)
+}
+
+
+function arg_path_to_syms(p: ident_mod.Path, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Ident.at(p.segments, i).name, allocator)?
+        i = i + 1
+    }
+    return out
+}

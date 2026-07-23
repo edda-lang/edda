@@ -1,0 +1,131 @@
+
+module x64.encoding.encode.modrm
+
+import std.mem.alloc
+import std.collections.vec
+import object.bytes as bytes_mod
+import local.gen.sel.regs as regs_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public stable function modrm(mod_bits: u8, reg: u8, rm: u8) -> u8 {
+    return ((mod_bits & 0x03) << 6) | ((reg & 0x07) << 3) | (rm & 0x07)
+}
+
+public stable function sib(scale_log2: u8, index: u8, base: u8) -> u8 {
+    return ((scale_log2 & 0x03) << 6) | ((index & 0x07) << 3) | (base & 0x07)
+}
+
+public stable function mod_indirect() -> u8 {
+    return 0x00 as u8
+}
+
+public stable function mod_disp8() -> u8 {
+    return 0x01 as u8
+}
+
+public stable function mod_disp32() -> u8 {
+    return 0x02 as u8
+}
+
+public stable function mod_direct() -> u8 {
+    return 0x03 as u8
+}
+
+public function push_modrm_direct(
+    out: mutable Vec_u8.Vec,
+    reg: u8,
+    rm: u8,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u8(mutable out, modrm(mod_direct(), reg, rm), allocator)?
+}
+
+function mem_mode_for(disp: i32, is_rbp_base: bool) -> u8 {
+    if disp == 0 && !is_rbp_base {
+        return mod_indirect()
+    }
+    if disp >= -128 && disp <= 127 {
+        return mod_disp8()
+    }
+    return mod_disp32()
+}
+
+function push_disp(
+    out: mutable Vec_u8.Vec,
+    mode: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if mode == mod_disp8() {
+        bytes_mod.push_u8(mutable out, disp as u8 wrapping, allocator)?
+    }
+    if mode == mod_disp32() {
+        bytes_mod.push_i32_le(mutable out, disp, allocator)?
+    }
+}
+
+public function push_mem_base_disp(
+    out: mutable Vec_u8.Vec,
+    reg: u8,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let base_low3 = regs_mod.gp64_reg_low3(base)
+    let needs_sib = base_low3 == (4 as u8)
+    let is_rbp_base = base_low3 == (5 as u8)
+    let mode = mem_mode_for(disp, is_rbp_base)
+
+    if needs_sib {
+        bytes_mod.push_u8(mutable out, modrm(mode, reg, 4 as u8), allocator)?
+        bytes_mod.push_u8(mutable out, sib(0 as u8, 4 as u8, base_low3), allocator)?
+    } else {
+        bytes_mod.push_u8(mutable out, modrm(mode, reg, base_low3), allocator)?
+    }
+
+    push_disp(mutable out, mode, disp, allocator)?
+}
+
+public function push_mem_base_index_disp(
+    out: mutable Vec_u8.Vec,
+    reg: u8,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    let base_low3 = regs_mod.gp64_reg_low3(base)
+    let index_low3 = regs_mod.gp64_reg_low3(index)
+    let is_rbp_base = base_low3 == (5 as u8)
+    let mode = mem_mode_for(disp, is_rbp_base)
+
+    bytes_mod.push_u8(mutable out, modrm(mode, reg, 4 as u8), allocator)?
+    bytes_mod.push_u8(mutable out, sib(scale_log2, index_low3, base_low3), allocator)?
+    push_disp(mutable out, mode, disp, allocator)?
+}
+
+public function push_mem_rip_disp32(
+    out: mutable Vec_u8.Vec,
+    reg: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u8(mutable out, modrm(mod_indirect(), reg, 5 as u8), allocator)?
+    bytes_mod.push_i32_le(mutable out, disp, allocator)?
+}

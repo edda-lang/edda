@@ -1,0 +1,73 @@
+module httpserver.concurrent
+
+import std.mem.alloc
+import hermod.error as herr
+import hermod.message.request as request_mod
+import hermod.message.response as response_mod
+import local.serve as serve_mod
+import local.frame as frame
+
+public function serve_concurrent_round(
+    exec: Executor,
+    s: mutable serve_mod.Server,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: herr.CodecError},
+    allocator: Allocator,
+    cap: usize,
+) -> ()
+    with {exec, allocator, err: herr.TransportError}
+    requires cap > 0
+{
+    scope(exec) group {
+        let c0 = serve_mod.accept(mutable s)?
+        let a0 = alloc.fork(allocator)
+        let t0 = group.spawn(take c0 = c0, take allocator = a0) {
+            serve_mod.serve_connection_quiet(take c0, handler, mutable allocator, cap)
+        }
+        let c1 = serve_mod.accept(mutable s)?
+        let a1 = alloc.fork(allocator)
+        let t1 = group.spawn(take c1 = c1, take allocator = a1) {
+            serve_mod.serve_connection_quiet(take c1, handler, mutable allocator, cap)
+        }
+        let c2 = serve_mod.accept(mutable s)?
+        let a2 = alloc.fork(allocator)
+        let t2 = group.spawn(take c2 = c2, take allocator = a2) {
+            serve_mod.serve_connection_quiet(take c2, handler, mutable allocator, cap)
+        }
+        let c3 = serve_mod.accept(mutable s)?
+        let a3 = alloc.fork(allocator)
+        let t3 = group.spawn(take c3 = c3, take allocator = a3) {
+            serve_mod.serve_connection_quiet(take c3, handler, mutable allocator, cap)
+        }
+        let _ = t0.await
+        let _ = t1.await
+        let _ = t2.await
+        let _ = t3.await
+        ()
+    }
+}
+
+public function concurrent_window() -> usize { return 4 as usize }
+
+public function serve_concurrent_n(
+    exec: Executor,
+    s: mutable serve_mod.Server,
+    handler: function(request_mod.Request, mutable Allocator) -> response_mod.Response with {allocator, err: herr.CodecError},
+    allocator: mutable Allocator,
+    n: usize,
+) -> ()
+    with {exec, allocator, err: herr.TransportError}
+{
+    let cap = frame.default_max_request_bytes()
+    var remaining: usize = n
+    loop decreases remaining {
+        if remaining < concurrent_window() { break }
+        serve_concurrent_round(exec, mutable s, handler, allocator, cap)?
+        remaining = remaining - concurrent_window()
+    }
+    loop decreases remaining {
+        if remaining == 0 as usize { break }
+        let c = serve_mod.accept(mutable s)?
+        serve_mod.serve_connection_quiet(take c, handler, mutable allocator, cap)
+        remaining = remaining - (1 as usize)
+    }
+}

@@ -1,0 +1,182 @@
+
+module compile.check.runes.runes
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import intern.interner as interner_mod
+import manifest.manifest as manifest_mod
+import manifest.model.dependency.dependency as dep_mod
+import manifest.model.lockfile.lockfile as lf_mod
+import manifest.model.workspace.workspace as ws_mod
+import local.check.runes.build.build as build_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(lf_mod.Rune)
+spec std.core.option.Option(lf_mod.Rune)
+spec std.core.option.Option(dep_mod.Dependency)
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ws_mod.Workspace)
+
+
+public function compute_runes(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_Rune.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_Rune.Vec
+    Vec_Rune.new(init out, allocator)?
+    let root_m = build_mod.load_manifest_at(rfs, workspace_root, allocator)?
+    let m = match root_m {
+        case .none => return out
+        case .some(let loaded) => loaded
+    }
+    collect_manifest_runes(rfs, workspace_root, workspace_root, m, mutable out, mutable interner, mutable diags, allocator)?
+    let ws_opt = manifest_mod.workspace_of(m)
+    match ws_opt {
+        case .none => ()
+        case .some(let ws) => {
+            let root_seg = ws_mod.discover_root_of(ws)
+            let n = ws_mod.member_count(ws)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let member = ws_mod.member_at(ws, i)
+                let member_dir = join_three(workspace_root, root_seg, member, allocator)?
+                let member_m = build_mod.load_manifest_at(rfs, member_dir, allocator)?
+                match member_m {
+                    case .none => ()
+                    case .some(let loaded) =>
+                        collect_manifest_runes(rfs, workspace_root, member_dir, loaded, mutable out, mutable interner, mutable diags, allocator)?
+                }
+                i = i + 1
+            }
+        }
+    }
+    return out
+}
+
+
+function collect_manifest_runes(
+    rfs: ReadOnlyFilesystem,
+    project_root: String,
+    base_dir: String,
+    m: manifest_mod.LoadedManifest,
+    out: mutable Vec_Rune.Vec,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    let n = manifest_mod.dependency_count_of(m)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let dep_opt = manifest_mod.dependency_at(m, i)
+        match dep_opt {
+            case .none => ()
+            case .some(let dep) => {
+                let name = dep_mod.name(dep)
+                if !has_rune(out, name) {
+                    match dep_mod.source(dep) {
+                        case .path(let rel) => {
+                            let dep_root = normalize_join(base_dir, rel, allocator)?
+                            let rune_opt = build_mod.build_path_rune(rfs, dep_root, name, rel, mutable interner, allocator)?
+                            match rune_opt {
+                                case .none => ()
+                                case .some(let r) => Vec_Rune.push(mutable out, take r, allocator)?
+                            }
+                        }
+                        case .git(let url) => {
+                            let rune_opt = build_mod.build_git_rune(rfs, project_root, name, dep_mod.source(dep), url, mutable interner, mutable diags, allocator)?
+                            match rune_opt {
+                                case .none => ()
+                                case .some(let r) => Vec_Rune.push(mutable out, take r, allocator)?
+                            }
+                        }
+                        case _ => {
+                            let rune_opt = build_mod.build_archive_rune(rfs, project_root, name, dep_mod.source(dep), mutable diags, allocator)?
+                            match rune_opt {
+                                case .none => ()
+                                case .some(let r) => Vec_Rune.push(mutable out, take r, allocator)?
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function has_rune(runes: Vec_Rune.Vec, name: String) -> bool {
+    let n = Vec_Rune.len(runes)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return false }
+        if string.equals(lf_mod.name(Vec_Rune.at(runes, i)), name) {
+            return true
+        }
+        i = i + 1
+    }
+}
+
+
+function join_three(a: String, b: String, c: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(a, "/", allocator)?
+    let p2 = string.concat(p1, b, allocator)?
+    let p3 = string.concat(p2, "/", allocator)?
+    return string.concat(p3, c, allocator)?
+}
+
+
+function normalize_join(base: String, rel: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let joined_a = string.concat(base, "/", allocator)?
+    let joined = string.concat(joined_a, rel, allocator)?
+    let parts = string.split(joined, "/", allocator)?
+    uninit segs: Vec_String.Vec
+    Vec_String.new(init segs, allocator)?
+    let n = parts.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let part = parts[i]
+        if string.equals(part, "..") {
+            let depth = Vec_String.len(segs)
+            if depth > 0 {
+                let _ = Vec_String.remove(mutable segs, depth - 1)
+            }
+        } else {
+            if !string.equals(part, ".") && !string.is_empty(part) {
+                let owned = string.clone(part, allocator)?
+                Vec_String.push(mutable segs, take owned, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    var acc: String = if string.starts_with(joined, "/") { "/" } else { "" }
+    let m = Vec_String.len(segs)
+    var k: usize = 0
+    loop decreases (m - k) {
+        if k >= m { break }
+        if k > 0 {
+            acc = string.concat(acc, "/", allocator)?
+        }
+        acc = string.concat(acc, Vec_String.at(segs, k), allocator)?
+        k = k + 1
+    }
+    return acc
+}

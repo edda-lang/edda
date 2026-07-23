@@ -1,0 +1,164 @@
+
+module object.coff.codeview.emit.sym.symbols
+
+import std.mem.alloc
+import std.collections.vec
+
+import local.coff as coff_mod
+import local.bytes as bytes_mod
+import local.coff.codeview.emit.encode as enc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+spec std.collections.vec.Vec(enc_mod.CvFunction)
+spec std.collections.vec.Vec(enc_mod.CvLine)
+spec std.collections.vec.Vec(enc_mod.CvLocal)
+
+
+public function build_symbols(
+    out: mutable Vec_u8.Vec,
+    relocs: mutable Vec_CoffRelocation.Vec,
+    funcs: Vec_CvFunction.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u32_le(mutable out, enc_mod.subsec_symbols(), allocator)?
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let payload_start = Vec_u8.len(out)
+
+    let n = Vec_CvFunction.len(funcs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let fn_ = Vec_CvFunction.at(funcs, i)
+        emit_gproc32(mutable out, mutable relocs, fn_, allocator)?
+        emit_frameproc(mutable out, fn_, allocator)?
+        emit_locals_for(mutable out, mutable relocs, fn_, allocator)?
+        emit_end(mutable out, allocator)?
+        i += 1
+    }
+
+    enc_mod.patch_u32_le(mutable out, len_pos, (Vec_u8.len(out) - payload_start) as u32 wrapping)
+    enc_mod.pad_to_4(mutable out, allocator)?
+}
+
+
+function emit_gproc32(
+    out: mutable Vec_u8.Vec,
+    relocs: mutable Vec_CoffRelocation.Vec,
+    fn_: enc_mod.CvFunction,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let rec_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.sym_gproc32(), allocator)?
+
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, fn_.code_len, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, fn_.code_len, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+
+    let secrel_site = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let section_site = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u8(mutable out, 0 as u8, allocator)?
+    enc_mod.push_cstr(mutable out, fn_.name, allocator)?
+
+    enc_mod.pad_to_4(mutable out, allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - rec_start) as u32 wrapping)
+    enc_mod.record_secref_relocs(mutable relocs, secrel_site, section_site, fn_.symbol_index, allocator)?
+}
+
+
+function emit_frameproc(out: mutable Vec_u8.Vec, fn_: enc_mod.CvFunction, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let rec_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.sym_frameproc(), allocator)?
+
+    bytes_mod.push_u32_le(mutable out, fn_.code_len, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u32_le(mutable out, enc_mod.frameproc_flags_rbp(), allocator)?
+
+    enc_mod.pad_to_4(mutable out, allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - rec_start) as u32 wrapping)
+}
+
+
+function emit_locals_for(
+    out: mutable Vec_u8.Vec,
+    relocs: mutable Vec_CoffRelocation.Vec,
+    fn_: enc_mod.CvFunction,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_CvLocal.len(fn_.locals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        emit_local(mutable out, mutable relocs, Vec_CvLocal.at(fn_.locals, i), fn_.code_len, fn_.symbol_index, allocator)?
+        i += 1
+    }
+}
+
+
+function emit_local(
+    out: mutable Vec_u8.Vec,
+    relocs: mutable Vec_CoffRelocation.Vec,
+    loc: enc_mod.CvLocal,
+    code_len: u32,
+    symbol_index: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let rec_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.sym_local(), allocator)?
+    bytes_mod.push_u32_le(mutable out, loc.type_index, allocator)?
+    let flags = if loc.is_param { enc_mod.local_flag_param() } else { 0 as u16 }
+    bytes_mod.push_u16_le(mutable out, flags, allocator)?
+    enc_mod.push_cstr(mutable out, loc.name, allocator)?
+    enc_mod.pad_to_4(mutable out, allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - rec_start) as u32 wrapping)
+
+    let dlen_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let drec_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.sym_defrange_framepointer_rel(), allocator)?
+    bytes_mod.push_i32_le(mutable out, loc.frame_disp, allocator)?
+    let secrel_site = Vec_u8.len(out)
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    let section_site = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u16_le(mutable out, code_len as u16 wrapping, allocator)?
+    enc_mod.pad_to_4(mutable out, allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, dlen_pos, (Vec_u8.len(out) - drec_start) as u32 wrapping)
+    enc_mod.record_secref_relocs(mutable relocs, secrel_site, section_site, symbol_index, allocator)?
+}
+
+
+function emit_end(out: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u16_le(mutable out, 2 as u16, allocator)?
+    bytes_mod.push_u16_le(mutable out, enc_mod.sym_end(), allocator)?
+}

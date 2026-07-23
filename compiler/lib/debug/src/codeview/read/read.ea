@@ -1,0 +1,171 @@
+module debug.codeview.read.read
+
+import std.mem.alloc
+import std.collections.vec
+
+import object.coff as coff_mod
+import debug.codeview.cursor.cursor as cursor_mod
+import debug.model as model_mod
+import debug.codeview.files.files as files_mod
+import debug.codeview.lines.lines as lines_mod
+import debug.codeview.symbols.symbols as symbols_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+spec std.collections.vec.Vec(model_mod.LineEntry)
+spec std.collections.vec.Vec(model_mod.DebugFunction)
+spec std.collections.vec.Vec(lines_mod.LineBlock)
+
+
+public function c13_signature() -> u32 {
+    return 4 as u32
+}
+
+public function subsec_symbols() -> u32 {
+    return 0xf1 as u32
+}
+
+public function subsec_lines() -> u32 {
+    return 0xf2 as u32
+}
+
+public function subsec_stringtable() -> u32 {
+    return 0xf3 as u32
+}
+
+public function subsec_filechecksums() -> u32 {
+    return 0xf4 as u32
+}
+
+
+public function read_section(section: coff_mod.CoffSection, allocator: Allocator) -> model_mod.DebugInfo
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    return read_bytes(section.data, section.relocations, allocator)?
+}
+
+
+public function read_bytes(
+    bytes: Vec_u8.Vec,
+    relocs: Vec_CoffRelocation.Vec,
+    allocator: Allocator,
+) -> model_mod.DebugInfo
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    var cur = cursor_mod.at_start()
+    let sig = cursor_mod.read_u32_le(bytes, mutable cur)?
+    if sig != c13_signature() { raise model_mod.DebugError.bad_signature }
+
+    uninit funcs: Vec_DebugFunction.Vec
+    Vec_DebugFunction.new(init funcs, allocator)?
+    uninit blocks: Vec_LineBlock.Vec
+    Vec_LineBlock.new(init blocks, allocator)?
+    var ft = files_mod.empty(allocator)?
+    var string_base: usize = 0
+    var have_strings: bool = false
+
+    let total = Vec_u8.len(bytes)
+    var step: usize = 0
+    loop decreases total - step {
+        if step >= total { break }
+        if cursor_mod.remaining(bytes, cur) < (8 as usize) { break }
+        let kind = cursor_mod.read_u32_le(bytes, mutable cur)?
+        let len = cursor_mod.read_u32_le(bytes, mutable cur)?
+        let payload_lo = cur.pos
+        let payload_end = payload_lo + (len as usize)
+        let payload_hi = if payload_end > total { total } else { payload_end }
+
+        if kind == subsec_stringtable() {
+            string_base = payload_lo
+            have_strings = true
+        } else if kind == subsec_filechecksums() {
+            let base = if have_strings { string_base } else { payload_lo }
+            ft = files_mod.parse_filechecksums(bytes, payload_lo, payload_hi, base, allocator)?
+        } else if kind == subsec_symbols() {
+            symbols_mod.parse_symbols(bytes, relocs, payload_lo, payload_hi, mutable funcs, allocator)?
+        } else if kind == subsec_lines() {
+            let blk = lines_mod.parse_lines(bytes, relocs, payload_lo, payload_hi, allocator)?
+            Vec_LineBlock.push(mutable blocks, take blk, allocator)?
+        }
+
+        cursor_mod.seek(mutable cur, payload_end)
+        cursor_mod.align_to_4(mutable cur)
+        step += 1
+    }
+
+    let joined = join(funcs, blocks, ft, allocator)?
+    return model_mod.DebugInfo { functions: joined }
+}
+
+
+function join(
+    funcs: Vec_DebugFunction.Vec,
+    blocks: Vec_LineBlock.Vec,
+    ft: files_mod.FileTable,
+    allocator: Allocator,
+) -> Vec_DebugFunction.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit joined: Vec_DebugFunction.Vec
+    Vec_DebugFunction.new(init joined, allocator)?
+    let n = Vec_DebugFunction.len(funcs)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = Vec_DebugFunction.at(funcs, i)
+        let fid = block_file_for(blocks, f.symbol_index)
+        let entries = block_entries_for(blocks, f.symbol_index, allocator)?
+        let path = files_mod.lookup_path(ft, fid)
+        Vec_DebugFunction.push(
+            mutable joined,
+            take model_mod.DebugFunction {
+                symbol_index: f.symbol_index,
+                name: f.name,
+                code_len: f.code_len,
+                file_id: fid,
+                file_path: path,
+                lines: entries,
+                locals: f.locals,
+                facts: f.facts,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+    return joined
+}
+
+
+function block_file_for(blocks: Vec_LineBlock.Vec, symbol_index: u32) -> u32 {
+    let n = Vec_LineBlock.len(blocks)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let b = Vec_LineBlock.at(blocks, i)
+        if b.symbol_index == symbol_index { return b.file_id }
+        i += 1
+    }
+    return 0 as u32
+}
+
+
+function block_entries_for(
+    blocks: Vec_LineBlock.Vec,
+    symbol_index: u32,
+    allocator: Allocator,
+) -> Vec_LineEntry.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LineBlock.len(blocks)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let b = Vec_LineBlock.at(blocks, i)
+        if b.symbol_index == symbol_index { return b.entries }
+        i += 1
+    }
+    uninit empty_entries: Vec_LineEntry.Vec
+    Vec_LineEntry.new(init empty_entries, allocator)?
+    return empty_entries
+}

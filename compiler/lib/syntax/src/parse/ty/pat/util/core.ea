@@ -1,0 +1,667 @@
+
+module syntax.parse.ty.pat.util.core
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.literal as literal_mod
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+import local.parse.ty.pat.leaf.util as pat_util_mod
+import local.parse.ty.pat.atom as pat_atom_mod
+
+spec std.mem.alloc.Box(tree_mod.Pat)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(tree_mod.Pat)
+spec std.collections.vec.Vec(tree_mod.StructPatField)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.core.option.Option(tree_mod.SliceRest)
+
+
+public function parse_pat(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return parse_or_pat(tokens, pos, false, mutable diags, allocator)?
+}
+
+public function parse_match_pat(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return parse_or_pat(tokens, pos, true, mutable diags, allocator)?
+}
+
+
+function parse_or_pat(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let first_r = parse_pat_atom_or_at(tokens, pos, strict, mutable diags, allocator)?
+    match util_mod.peek(tokens, first_r.1) {
+        case .pipe => ()
+        case _ => return first_r
+    }
+    let first_span = first_r.0.span
+    uninit alternatives: Vec_Pat.Vec
+    Vec_Pat.new(init alternatives, allocator)?
+    Vec_Pat.push(mutable alternatives, first_r.0, allocator)?
+    var p = first_r.1
+    var last_span = first_span
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .pipe => ()
+            case _ => break
+        }
+        let next_r = parse_pat_atom_or_at(tokens, p + 1, strict, mutable diags, allocator)?
+        last_span = next_r.0.span
+        Vec_Pat.push(mutable alternatives, next_r.0, allocator)?
+        p = next_r.1
+    }
+    let full_span = pat_util_mod.merge_spans(first_span, last_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.or_(alternatives: alternatives),
+    }
+    return (pat, p)
+}
+
+
+function parse_pat_atom_or_at(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let atom_r = parse_pat_atom(tokens, pos, strict, mutable diags, allocator)?
+    match util_mod.peek(tokens, atom_r.1) {
+        case .at => ()
+        case _ => return atom_r
+    }
+    if !pat_util_mod.is_binding_pat(atom_r.0) {
+        let at_span = util_mod.span_at(tokens, atom_r.1)
+        util_mod.emit_error(mutable diags, at_span, "`@` binding requires a bare-identifier or `let <name>` binder on the left", allocator)?
+        return atom_r
+    }
+    let binder_name = pat_util_mod.extract_binding_name(atom_r.0)
+    let atom_span = atom_r.0.span
+    let after_at = atom_r.1 + 1
+    let inner_r = parse_pat_atom_or_at(tokens, after_at, strict, mutable diags, allocator)?
+    let inner_span = inner_r.0.span
+    let inner_box = Box_Pat.new(take inner_r.0, allocator)?
+    let full_span = pat_util_mod.merge_spans(atom_span, inner_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.at_binding(name: binder_name, inner: inner_box),
+    }
+    return (pat, inner_r.1)
+}
+
+
+function parse_pat_atom(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let tok = util_mod.peek(tokens, pos)
+    let span = util_mod.span_at(tokens, pos)
+    return match tok {
+        case .underscore => pat_util_mod.pat_simple(span, tree_mod.PatKind.wildcard, pos + 1)
+        case .kw_true => pat_atom_mod.parse_literal_or_range(tokens, pos, literal_mod.Literal.bool(value: true), span, mutable diags, allocator)?
+        case .kw_false => pat_atom_mod.parse_literal_or_range(tokens, pos, literal_mod.Literal.bool(value: false), span, mutable diags, allocator)?
+        case .int(let value, let base) => pat_atom_mod.parse_literal_or_range(tokens, pos, literal_mod.Literal.int(value: value, base: base), span, mutable diags, allocator)?
+        case .float(let sym) => pat_atom_mod.parse_literal_or_range(tokens, pos, literal_mod.Literal.float(sym: sym), span, mutable diags, allocator)?
+        case .str(let sym) => pat_atom_mod.parse_literal_or_range(tokens, pos, literal_mod.Literal.str(sym: sym), span, mutable diags, allocator)?
+        case .kw_let => pat_atom_mod.parse_let_binding(tokens, pos, mutable diags, allocator)?
+        case .dot => parse_leading_dot_variant(tokens, pos, strict, mutable diags, allocator)?
+        case .l_paren => parse_paren_or_tuple(tokens, pos, strict, mutable diags, allocator)?
+        case .l_bracket => parse_slice_pat(tokens, pos, strict, mutable diags, allocator)?
+        case .ident(let sym) => parse_ident_form(tokens, pos, sym, strict, mutable diags, allocator)?
+        case _ => pat_util_mod.fallback_error(tokens, pos, mutable diags, allocator)?
+    }
+}
+
+
+function parse_leading_dot_variant(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    let after_dot = pos + 1
+    match util_mod.peek(tokens, after_dot) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, after_dot)
+            let ident = ident_mod.Ident { name: sym, span: id_span }
+            uninit segments: Vec_Ident.Vec
+            Vec_Ident.new(init segments, allocator)?
+            Vec_Ident.push(mutable segments, ident, allocator)?
+            let path = ident_mod.Path { segments: segments, span: id_span }
+            let payload_r = parse_variant_payload(tokens, after_dot + 1, strict, mutable diags, allocator)?
+            let full_span = pat_util_mod.merge_spans(start_span, util_mod.span_at(tokens, payload_r.1 - 1))
+            let pat = tree_mod.Pat {
+                span: full_span,
+                kind: tree_mod.PatKind.variant(path: path, payload: payload_r.0),
+            }
+            return (pat, payload_r.1)
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, after_dot), "expected variant name after `.` in pattern", allocator)?
+            let pat = tree_mod.Pat { span: start_span, kind: tree_mod.PatKind.error }
+            return (pat, after_dot)
+        }
+    }
+}
+
+function parse_variant_payload(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.VariantPatPayload, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match util_mod.peek(tokens, pos) {
+        case .l_paren => parse_variant_tuple_payload(tokens, pos, strict, mutable diags, allocator)?
+        case .l_brace => pat_util_mod.recover_named_variant_payload(tokens, pos, mutable diags, allocator)?
+        case _ => (tree_mod.VariantPatPayload.none, pos)
+    }
+}
+
+function parse_variant_tuple_payload(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.VariantPatPayload, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit elements: Vec_Pat.Vec
+    Vec_Pat.new(init elements, allocator)?
+    var p = pos + 1
+    match util_mod.peek(tokens, p) {
+        case .r_paren => {
+            return (tree_mod.VariantPatPayload.tuple(elements: elements), p + 1)
+        }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        let pat_r = parse_or_pat(tokens, p, strict, mutable diags, allocator)?
+        Vec_Pat.push(mutable elements, pat_r.0, allocator)?
+        p = pat_r.1
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` in variant payload", allocator)?
+        }
+    }
+    return (tree_mod.VariantPatPayload.tuple(elements: elements), p)
+}
+
+
+function parse_paren_or_tuple(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let open_span = util_mod.span_at(tokens, pos)
+    let after_open = pos + 1
+    match util_mod.peek(tokens, after_open) {
+        case .r_paren => {
+            let close_span = util_mod.span_at(tokens, after_open)
+            let full_span = pat_util_mod.merge_spans(open_span, close_span)
+            let pat = tree_mod.Pat {
+                span: full_span,
+                kind: tree_mod.PatKind.literal(value: literal_mod.Literal.unit),
+            }
+            return (pat, after_open + 1)
+        }
+        case _ => ()
+    }
+    let first_r = parse_or_pat(tokens, after_open, strict, mutable diags, allocator)?
+    var p = first_r.1
+    match util_mod.peek(tokens, p) {
+        case .r_paren => {
+            let close_span = util_mod.span_at(tokens, p)
+            let full_span = pat_util_mod.merge_spans(open_span, close_span)
+            let inner = tree_mod.Pat { span: full_span, kind: first_r.0.kind }
+            return (inner, p + 1)
+        }
+        case _ => ()
+    }
+    uninit elements: Vec_Pat.Vec
+    Vec_Pat.new(init elements, allocator)?
+    Vec_Pat.push(mutable elements, first_r.0, allocator)?
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_paren => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+        let next_r = parse_or_pat(tokens, p, strict, mutable diags, allocator)?
+        Vec_Pat.push(mutable elements, next_r.0, allocator)?
+        p = next_r.1
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_paren => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `)` after tuple pattern", allocator)?
+        }
+    }
+    let full_span = pat_util_mod.merge_spans(open_span, close_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.tuple(elements: elements),
+    }
+    return (pat, p)
+}
+
+
+function parse_slice_pat(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let open_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    uninit prefix: Vec_Pat.Vec
+    Vec_Pat.new(init prefix, allocator)?
+    uninit suffix: Vec_Pat.Vec
+    Vec_Pat.new(init suffix, allocator)?
+    var rest: Option_SliceRest.Option = Option_SliceRest.none
+    var seen_rest: bool = false
+    match util_mod.peek(tokens, p) {
+        case .r_bracket => {
+            let close_span = util_mod.span_at(tokens, p)
+            let full_span = pat_util_mod.merge_spans(open_span, close_span)
+            let pat = tree_mod.Pat {
+                span: full_span,
+                kind: tree_mod.PatKind.slice(prefix: prefix, rest: rest, suffix: suffix),
+            }
+            return (pat, p + 1)
+        }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .dot_dot => {
+                let rest_start = util_mod.span_at(tokens, p)
+                if seen_rest {
+                    util_mod.emit_error(mutable diags, rest_start, "only one `..` rest marker is admitted in a slice pattern", allocator)?
+                }
+                let after_dotdot = p + 1
+                let binding_r = parse_optional_rest_binding(tokens, after_dotdot, allocator)?
+                let rest_span = pat_util_mod.merge_spans(rest_start, binding_r.0.span)
+                let entry = tree_mod.SliceRest { span: rest_span, binding: binding_r.0.name }
+                if !seen_rest {
+                    rest = Option_SliceRest.some(value: entry)
+                    seen_rest = true
+                }
+                p = binding_r.1
+            }
+            case _ => {
+                let elem_r = parse_or_pat(tokens, p, strict, mutable diags, allocator)?
+                if seen_rest {
+                    Vec_Pat.push(mutable suffix, elem_r.0, allocator)?
+                } else {
+                    Vec_Pat.push(mutable prefix, elem_r.0, allocator)?
+                }
+                p = elem_r.1
+            }
+        }
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_bracket => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_bracket => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, close_span, "expected `]` to close slice pattern", allocator)?
+        }
+    }
+    let full_span = pat_util_mod.merge_spans(open_span, close_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.slice(prefix: prefix, rest: rest, suffix: suffix),
+    }
+    return (pat, p)
+}
+
+type RestBindingResult {
+    name: Option_Ident.Option
+    span: span_mod.Span
+}
+
+function parse_optional_rest_binding(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    allocator: Allocator,
+) -> (RestBindingResult, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let dummy_span = util_mod.span_at(tokens, pos)
+    match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, pos)
+            let ident = ident_mod.Ident { name: sym, span: id_span }
+            let r = RestBindingResult { name: Option_Ident.some(value: ident), span: id_span }
+            return (r, pos + 1)
+        }
+        case _ => {
+            let r = RestBindingResult { name: Option_Ident.none, span: dummy_span }
+            return (r, pos)
+        }
+    }
+}
+
+
+function parse_ident_form(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    sym: symbol.Symbol,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match util_mod.peek_at(tokens, pos, 1) {
+        case .at => parse_ident_at_binding(tokens, pos, sym, strict, mutable diags, allocator)?
+        case _ => parse_path_form(tokens, pos, strict, mutable diags, allocator)?
+    }
+}
+
+function parse_ident_at_binding(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    sym: symbol.Symbol,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let id_span = util_mod.span_at(tokens, pos)
+    let binder = ident_mod.Ident { name: sym, span: id_span }
+    let after_at = pos + 2
+    let inner_r = parse_pat_atom_or_at(tokens, after_at, strict, mutable diags, allocator)?
+    let inner_span = inner_r.0.span
+    let inner_box = Box_Pat.new(take inner_r.0, allocator)?
+    let full_span = pat_util_mod.merge_spans(id_span, inner_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.at_binding(name: binder, inner: inner_box),
+    }
+    return (pat, inner_r.1)
+}
+
+
+function parse_path_form(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let path_r = pat_util_mod.parse_path(tokens, pos, allocator)?
+    let path = path_r.0
+    let path_span = path.span
+    let after_path = path_r.1
+    return match util_mod.peek(tokens, after_path) {
+        case .l_brace => parse_struct_pat(tokens, path, path_span, after_path, strict, mutable diags, allocator)?
+        case .l_paren => parse_path_variant_payload(tokens, path, path_span, after_path, strict, mutable diags, allocator)?
+        case _ => finish_path_no_payload(tokens, path, path_span, after_path, strict, mutable diags, allocator)?
+    }
+}
+
+function finish_path_no_payload(
+    tokens: [lexed_mod.Lexed],
+    path: ident_mod.Path,
+    path_span: span_mod.Span,
+    after_path: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if path.segments.len() > 1 {
+        let pat = tree_mod.Pat {
+            span: path_span,
+            kind: tree_mod.PatKind.variant(path: path, payload: tree_mod.VariantPatPayload.none),
+        }
+        return (pat, after_path)
+    }
+    let only_seg = match Vec_Ident.get(path.segments, 0) {
+        case .some(let s) => s
+        case .none => ident_mod.Ident { name: symbol.empty(), span: path_span }
+    }
+    if strict {
+        util_mod.emit_error(mutable diags, path_span, "bare identifier patterns are reserved; use `let <name>` to bind or `.<variant>` to match a sum-type variant", allocator)?
+        let pat = tree_mod.Pat { span: path_span, kind: tree_mod.PatKind.error }
+        return (pat, after_path)
+    }
+    let pat = tree_mod.Pat {
+        span: path_span,
+        kind: tree_mod.PatKind.binding(name: only_seg),
+    }
+    return (pat, after_path)
+}
+
+function parse_path_variant_payload(
+    tokens: [lexed_mod.Lexed],
+    path: ident_mod.Path,
+    path_span: span_mod.Span,
+    pos_at_lparen: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let payload_r = parse_variant_tuple_payload(tokens, pos_at_lparen, strict, mutable diags, allocator)?
+    let close_span = util_mod.span_at(tokens, payload_r.1 - 1)
+    let full_span = pat_util_mod.merge_spans(path_span, close_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.variant(path: path, payload: payload_r.0),
+    }
+    return (pat, payload_r.1)
+}
+
+
+function parse_struct_pat(
+    tokens: [lexed_mod.Lexed],
+    path: ident_mod.Path,
+    path_span: span_mod.Span,
+    pos_at_lbrace: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.Pat, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit fields: Vec_StructPatField.Vec
+    Vec_StructPatField.new(init fields, allocator)?
+    var p = pos_at_lbrace + 1
+    var rest: bool = false
+    match util_mod.peek(tokens, p) {
+        case .r_brace => {
+            let close_span = util_mod.span_at(tokens, p)
+            let full_span = pat_util_mod.merge_spans(path_span, close_span)
+            let pat = tree_mod.Pat {
+                span: full_span,
+                kind: tree_mod.PatKind.struct_(path: path, fields: fields, rest: false),
+            }
+            return (pat, p + 1)
+        }
+        case .dot_dot => {
+            p = p + 1
+            rest = true
+        }
+        case _ => ()
+    }
+    if !rest {
+        loop decreases (tokens.len() - p) {
+            let field_r = parse_struct_pat_field(tokens, p, strict, mutable diags, allocator)?
+            Vec_StructPatField.push(mutable fields, field_r.0, allocator)?
+            p = field_r.1
+            match util_mod.peek(tokens, p) {
+                case .comma => {
+                    p = p + 1
+                    match util_mod.peek(tokens, p) {
+                        case .r_brace => { break }
+                        case .eof => { break }
+                        case .dot_dot => {
+                            p = p + 1
+                            rest = true
+                            break
+                        }
+                        case _ => ()
+                    }
+                }
+                case _ => break
+            }
+        }
+    }
+    let close_span = util_mod.span_at(tokens, p)
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            if rest {
+                util_mod.emit_error(mutable diags, close_span, "expected `}` after `..` rest marker in struct pattern", allocator)?
+            } else {
+                util_mod.emit_error(mutable diags, close_span, "expected `}` to close struct pattern", allocator)?
+            }
+        }
+    }
+    let full_span = pat_util_mod.merge_spans(path_span, close_span)
+    let pat = tree_mod.Pat {
+        span: full_span,
+        kind: tree_mod.PatKind.struct_(path: path, fields: fields, rest: rest),
+    }
+    return (pat, p)
+}
+
+function parse_struct_pat_field(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    strict: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (tree_mod.StructPatField, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, pos)
+            let name = ident_mod.Ident { name: sym, span: id_span }
+            match util_mod.peek_at(tokens, pos, 1) {
+                case .colon => {
+                    let pat_r = parse_or_pat(tokens, pos + 2, strict, mutable diags, allocator)?
+                    let full_span = pat_util_mod.merge_spans(start_span, pat_r.0.span)
+                    let field = tree_mod.StructPatField {
+                        span: full_span,
+                        name: name,
+                        pat: pat_r.0,
+                    }
+                    return (field, pat_r.1)
+                }
+                case _ => {
+                    let shorthand_pat = tree_mod.Pat {
+                        span: id_span,
+                        kind: tree_mod.PatKind.binding(name: name),
+                    }
+                    let field = tree_mod.StructPatField {
+                        span: id_span,
+                        name: name,
+                        pat: shorthand_pat,
+                    }
+                    return (field, pos + 1)
+                }
+            }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, start_span, "expected field name in struct pattern", allocator)?
+            let dummy_ident = ident_mod.Ident { name: symbol.empty(), span: start_span }
+            let err_pat = tree_mod.Pat { span: start_span, kind: tree_mod.PatKind.error }
+            let field = tree_mod.StructPatField {
+                span: start_span,
+                name: dummy_ident,
+                pat: err_pat,
+            }
+            return (field, pos + 1)
+        }
+    }
+}

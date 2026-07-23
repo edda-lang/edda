@@ -1,0 +1,392 @@
+
+module std.compress.zstd.sequences
+
+import std.mem.alloc
+import std.collections.vec
+import local.bits.stream as bits
+import local.fse
+import local.block
+import local.fault
+
+spec std.collections.vec.Vec(u8)
+spec std.mem.alloc.Array(u8)
+spec std.mem.alloc.Array(i64)
+spec std.mem.alloc.Array(usize)
+
+
+public function execute(
+    src: [u8],
+    ctx: mutable block.Ctx,
+    lits: block.Lits,
+    out: mutable Vec_u8.Vec,
+    frame_base: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    if src.len() == 0 { raise fault.Fault.bad_sequences }
+    let b0: usize = src[0] as usize
+    var nseq: usize = 0
+    var p: usize = 1
+    if b0 == 0 {
+        append_literals(lits, 0, lits.len, mutable out, allocator)?
+        return
+    }
+    if b0 < 128 {
+        nseq = b0
+    } else if b0 < 255 {
+        if src.len() < 2 { raise fault.Fault.bad_sequences }
+        nseq = ((b0 - 128) << 8) | (src[1] as usize)
+        p = 2
+    } else {
+        if src.len() < 3 { raise fault.Fault.bad_sequences }
+        nseq = ((src[1] as usize) | ((src[2] as usize) << 8)) + 0x7F00
+        p = 3
+    }
+    if p >= src.len() { raise fault.Fault.bad_sequences }
+    let modes: usize = src[p] as usize
+    p = p + 1
+    if (modes & 0x03) != 0 { raise fault.Fault.bad_sequences }
+    let ll_mode: usize = (modes >> 6) & 3
+    let of_mode: usize = (modes >> 4) & 3
+    let ml_mode: usize = (modes >> 2) & 3
+    var cursor: usize = p
+    let ll_load: Loaded = load_table(src, cursor, ll_mode, 0, ctx.ll, ctx.ll_valid, allocator)?
+    ctx.ll = ll_load.table
+    ctx.ll_valid = true
+    cursor = ll_load.cursor
+    let of_load: Loaded = load_table(src, cursor, of_mode, 1, ctx.of, ctx.of_valid, allocator)?
+    ctx.of = of_load.table
+    ctx.of_valid = true
+    cursor = of_load.cursor
+    let ml_load: Loaded = load_table(src, cursor, ml_mode, 2, ctx.ml, ctx.ml_valid, allocator)?
+    ctx.ml = ml_load.table
+    ctx.ml_valid = true
+    cursor = ml_load.cursor
+    if cursor >= src.len() { raise fault.Fault.bad_sequences }
+    let tail: [u8] = src[cursor ..]
+    var b: bits.Back = bits.open_back(tail)
+    if b.overrun { raise fault.Fault.bad_sequences }
+    var ll_s: usize = fse.init_state(tail, mutable b, ctx.ll)
+    var of_s: usize = fse.init_state(tail, mutable b, ctx.of)
+    var ml_s: usize = fse.init_state(tail, mutable b, ctx.ml)
+    if b.overrun { raise fault.Fault.bad_sequences }
+    var lit_pos: usize = 0
+    var seq: usize = 0
+    loop
+        decreases nseq - seq
+    {
+        if seq >= nseq { break }
+        let of_code: usize = fse.symbol_at(ctx.of, of_s)? as usize
+        if of_code > 31 { raise fault.Fault.bad_sequences }
+        let of_extra: usize = bits.read_back(tail, mutable b, of_code)
+        let offset_value: usize = fse.pow2(of_code) + of_extra
+        let ml_code: usize = fse.symbol_at(ctx.ml, ml_s)? as usize
+        if ml_code > 52 { raise fault.Fault.bad_sequences }
+        let mb: usize = ml_bits(ml_code)
+        let match_len: usize = ml_base(ml_code) +| bits.read_back(tail, mutable b, mb)
+        let ll_code: usize = fse.symbol_at(ctx.ll, ll_s)? as usize
+        if ll_code > 35 { raise fault.Fault.bad_sequences }
+        let lb: usize = ll_bits(ll_code)
+        let lit_len: usize = ll_base(ll_code) +| bits.read_back(tail, mutable b, lb)
+        if b.overrun { raise fault.Fault.bad_sequences }
+        let offset: usize = resolve_offset(mutable ctx, offset_value, lit_len)?
+        if lit_pos +| lit_len > lits.len { raise fault.Fault.bad_sequences }
+        append_literals(lits, lit_pos, lit_len, mutable out, allocator)?
+        lit_pos = lit_pos + lit_len
+        copy_match(mutable out, offset, match_len, frame_base, allocator)?
+        seq += 1
+        if seq < nseq {
+            ll_s = fse.next_state(tail, mutable b, ctx.ll, ll_s)?
+            ml_s = fse.next_state(tail, mutable b, ctx.ml, ml_s)?
+            of_s = fse.next_state(tail, mutable b, ctx.of, of_s)?
+        }
+    }
+    if b.overrun { raise fault.Fault.bad_sequences }
+    if b.remaining != 0 { raise fault.Fault.bad_sequences }
+    if lit_pos > lits.len { raise fault.Fault.bad_sequences }
+    append_literals(lits, lit_pos, lits.len - lit_pos, mutable out, allocator)?
+}
+
+function append_literals(
+    lits: block.Lits,
+    start: usize,
+    count: usize,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    if start +| count > lits.len { raise fault.Fault.bad_sequences }
+    Vec_u8.extend_from_slice(mutable out, lits.data[start ..< start + count], allocator)?
+}
+
+function copy_match(
+    out: mutable Vec_u8.Vec,
+    offset: usize,
+    match_len: usize,
+    frame_base: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    let cur: usize = Vec_u8.len(out)
+    if offset == 0 { raise fault.Fault.bad_sequences }
+    if cur < frame_base { raise fault.Fault.bad_sequences }
+    if offset > cur - frame_base { raise fault.Fault.bad_sequences }
+    var k: usize = 0
+    loop
+        decreases match_len - k
+    {
+        if k >= match_len { break }
+        let idx: usize = cur - offset + k
+        if idx >= Vec_u8.len(out) { raise fault.Fault.bad_sequences }
+        let byte: u8 = Vec_u8.at(out, idx)
+        Vec_u8.push(mutable out, byte, allocator)?
+        k += 1
+    }
+}
+
+function resolve_offset(
+    ctx: mutable block.Ctx,
+    offset_value: usize,
+    lit_len: usize,
+) -> usize
+    with {err: fault.Fault}
+{
+    if offset_value > 3 {
+        let offset: usize = offset_value - 3
+        ctx.rep2 = ctx.rep1
+        ctx.rep1 = ctx.rep0
+        ctx.rep0 = offset
+        return offset
+    }
+    var idx: usize = offset_value
+    if lit_len == 0 { idx = idx + 1 }
+    if idx == 1 { return ctx.rep0 }
+    if idx == 2 {
+        let offset: usize = ctx.rep1
+        ctx.rep1 = ctx.rep0
+        ctx.rep0 = offset
+        return offset
+    }
+    if idx == 3 {
+        let offset: usize = ctx.rep2
+        ctx.rep2 = ctx.rep1
+        ctx.rep1 = ctx.rep0
+        ctx.rep0 = offset
+        return offset
+    }
+    if ctx.rep0 <= 1 { raise fault.Fault.bad_sequences }
+    let offset: usize = ctx.rep0 - 1
+    ctx.rep2 = ctx.rep1
+    ctx.rep1 = ctx.rep0
+    ctx.rep0 = offset
+    return offset
+}
+
+
+type Loaded {
+    table: fse.Table
+    cursor: usize
+}
+
+function load_table(
+    src: [u8],
+    start: usize,
+    mode: usize,
+    kind: usize,
+    prev: fse.Table,
+    prev_valid: bool,
+    allocator: Allocator,
+) -> Loaded
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    if mode == 0 {
+        return Loaded { table: predefined_table(kind, allocator)?, cursor: start }
+    }
+    if mode == 1 {
+        if start >= src.len() { raise fault.Fault.bad_sequences }
+        let sym: u8 = src[start]
+        return Loaded { table: rle_table(sym, allocator)?, cursor: start + 1 }
+    }
+    if mode == 2 {
+        if start >= src.len() { raise fault.Fault.bad_sequences }
+        let region: [u8] = src[start ..]
+        var f: bits.Fwd = bits.open_fwd()
+        var max_sym: usize = 36
+        var max_al: usize = 9
+        if kind == 1 {
+            max_sym = 32
+            max_al = 8
+        }
+        if kind == 2 {
+            max_sym = 53
+            max_al = 9
+        }
+        let norm: fse.Norm = fse.read_norm(region, mutable f, max_sym, max_al, allocator)?
+        let table: fse.Table = fse.build_table(norm, allocator)?
+        return Loaded { table: table, cursor: start +| bits.fwd_bytes_consumed(f) }
+    }
+    if !prev_valid { raise fault.Fault.bad_sequences }
+    return Loaded { table: prev, cursor: start }
+}
+
+function rle_table(sym: u8, allocator: Allocator) -> fse.Table
+    with {allocator, err: alloc.AllocError}
+{
+    var symbol: [u8] = Array_u8.alloc(allocator, 1)?
+    var tbits: [u8] = Array_u8.alloc(allocator, 1)?
+    var base: [usize] = Array_usize.alloc(allocator, 1)?
+    symbol[0] = sym
+    tbits[0] = 0
+    base[0] = 0
+    return fse.Table { al: 0, size: 1, symbol: symbol, bits: tbits, base: base }
+}
+
+function predefined_table(kind: usize, allocator: Allocator) -> fse.Table
+    with {allocator, err: alloc.AllocError, err: fault.Fault}
+{
+    var count: usize = 36
+    var al: usize = 6
+    if kind == 1 {
+        count = 29
+        al = 5
+    }
+    if kind == 2 {
+        count = 53
+        al = 6
+    }
+    var counts: [i64] = Array_i64.alloc(allocator, count)?
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        if kind == 0 { counts[i] = ll_norm(i) }
+        if kind == 1 { counts[i] = of_norm(i) }
+        if kind == 2 { counts[i] = ml_norm(i) }
+        i += 1
+    }
+    let norm: fse.Norm = fse.Norm { counts: counts, count: count, al: al }
+    return fse.build_table(norm, allocator)?
+}
+
+function ll_norm(i: usize) -> i64 {
+    if i == 0 { return 4 }
+    if i == 1 { return 3 }
+    if i <= 12 { return 2 }
+    if i <= 15 { return 1 }
+    if i <= 24 { return 2 }
+    if i == 25 { return 3 }
+    if i == 26 { return 2 }
+    if i <= 31 { return 1 }
+    return -1
+}
+
+function of_norm(i: usize) -> i64 {
+    if i <= 5 { return 1 }
+    if i <= 8 { return 2 }
+    if i <= 23 { return 1 }
+    return -1
+}
+
+function ml_norm(i: usize) -> i64 {
+    if i == 0 { return 1 }
+    if i == 1 { return 4 }
+    if i == 2 { return 3 }
+    if i <= 8 { return 2 }
+    if i <= 45 { return 1 }
+    return -1
+}
+
+function ll_base(code: usize where code <= 35) -> usize {
+    if code <= 15 { return code }
+    if code == 16 { return 16 }
+    if code == 17 { return 18 }
+    if code == 18 { return 20 }
+    if code == 19 { return 22 }
+    if code == 20 { return 24 }
+    if code == 21 { return 28 }
+    if code == 22 { return 32 }
+    if code == 23 { return 40 }
+    if code == 24 { return 48 }
+    if code == 25 { return 64 }
+    if code == 26 { return 128 }
+    if code == 27 { return 256 }
+    if code == 28 { return 512 }
+    if code == 29 { return 1024 }
+    if code == 30 { return 2048 }
+    if code == 31 { return 4096 }
+    if code == 32 { return 8192 }
+    if code == 33 { return 16384 }
+    if code == 34 { return 32768 }
+    return 65536
+}
+
+function ll_bits(code: usize where code <= 35) -> usize
+    ensures result <= 16
+{
+    if code <= 15 { return 0 }
+    if code <= 19 { return 1 }
+    if code <= 21 { return 2 }
+    if code <= 23 { return 3 }
+    if code == 24 { return 4 }
+    if code == 25 { return 6 }
+    if code == 26 { return 7 }
+    if code == 27 { return 8 }
+    if code == 28 { return 9 }
+    if code == 29 { return 10 }
+    if code == 30 { return 11 }
+    if code == 31 { return 12 }
+    if code == 32 { return 13 }
+    if code == 33 { return 14 }
+    if code == 34 { return 15 }
+    return 16
+}
+
+function ml_base(code: usize where code <= 52) -> usize {
+    if code <= 31 { return code + 3 }
+    if code == 32 { return 35 }
+    if code == 33 { return 37 }
+    if code == 34 { return 39 }
+    if code == 35 { return 41 }
+    if code == 36 { return 43 }
+    if code == 37 { return 47 }
+    if code == 38 { return 51 }
+    if code == 39 { return 59 }
+    if code == 40 { return 67 }
+    if code == 41 { return 83 }
+    if code == 42 { return 99 }
+    if code == 43 { return 131 }
+    if code == 44 { return 259 }
+    if code == 45 { return 515 }
+    if code == 46 { return 1027 }
+    if code == 47 { return 2051 }
+    if code == 48 { return 4099 }
+    if code == 49 { return 8195 }
+    if code == 50 { return 16387 }
+    if code == 51 { return 32771 }
+    return 65539
+}
+
+function ml_bits(code: usize where code <= 52) -> usize
+    ensures result <= 16
+{
+    if code <= 31 { return 0 }
+    if code <= 35 { return 1 }
+    if code <= 37 { return 2 }
+    if code <= 39 { return 3 }
+    if code <= 41 { return 4 }
+    if code == 42 { return 5 }
+    if code == 43 { return 7 }
+    if code == 44 { return 8 }
+    if code == 45 { return 9 }
+    if code == 46 { return 10 }
+    if code == 47 { return 11 }
+    if code == 48 { return 12 }
+    if code == 49 { return 13 }
+    if code == 50 { return 14 }
+    if code == 51 { return 15 }
+    return 16
+}

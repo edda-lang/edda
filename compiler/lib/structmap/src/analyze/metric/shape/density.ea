@@ -1,0 +1,264 @@
+
+module structmap.analyze.metric.shape.density
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import local.data.model as model
+import local.render.doc.emit as emit_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.ChildIndex)
+spec std.collections.vec.Vec(model.ModuleEntry)
+spec std.collections.vec.Vec(model.TypeEntry)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(DensityReport)
+spec std.core.option.Option(TopContributor)
+spec std.core.option.Option(usize)
+
+
+public function default_density_warn_loc() -> usize { return 250 }
+
+
+public type DensityReport {
+    directory: String
+    projected_loc: usize
+    top_contributor: Option_TopContributor.Option
+}
+
+public type TopContributor {
+    module_name: String
+    file_basename: String
+    function_rows: usize
+    type_rows: usize
+}
+
+
+public function compute_density(
+    tree: model.Tree,
+    files: emit_mod.RenderedFiles,
+    out: mutable Vec_DensityReport.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(tree.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let dir_path = Vec_String.at(tree.paths, i)
+        let loc = lookup_projected_loc(files, dir_path, allocator)?
+        let top = compute_top_contributor(tree, i, allocator)?
+        Vec_DensityReport.push(
+            mutable out,
+            DensityReport {
+                directory: clone_str(dir_path, allocator)?,
+                projected_loc: loc,
+                top_contributor: top,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+}
+
+
+function lookup_projected_loc(
+    files: emit_mod.RenderedFiles,
+    dir_path: String,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let target = compose_index_path(dir_path, allocator)?
+    let n: usize = Vec_String.len(files.paths)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if string_equals(Vec_String.at(files.paths, i), target) {
+            let text = Vec_String.at(files.texts, i)
+            return count_lines(text)
+        }
+        i += 1
+    }
+    return 0
+}
+
+function compose_index_path(dir_path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let bytes = dir_path.bytes()
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_u8.push(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+    Vec_u8.push(mutable buf, 0x2F, allocator)?
+    let leaf = model.index_filename().bytes()
+    let m: usize = leaf.len()
+    var j: usize = 0
+    loop
+        decreases m - j
+    {
+        if j >= m { break }
+        Vec_u8.push(mutable buf, leaf[j], allocator)?
+        j += 1
+    }
+    let arr: [u8] = Vec_u8.into_array(take buf, allocator)?
+    return string.from_owned_utf8(take arr)
+}
+
+spec std.collections.vec.Vec(u8)
+
+function count_lines(text: String) -> usize {
+    let bytes = text.bytes()
+    let n: usize = bytes.len()
+    if n == 0 { return 0 }
+    var count: usize = 0
+    var i: usize = 0
+    var saw_content_after_nl: bool = false
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if bytes[i] == 0x0A {
+            count += 1
+            saw_content_after_nl = false
+        } else {
+            saw_content_after_nl = true
+        }
+        i += 1
+    }
+    if saw_content_after_nl {
+        count += 1
+    }
+    return count
+}
+
+
+function compute_top_contributor(
+    tree: model.Tree,
+    dir_idx: usize,
+    allocator: Allocator,
+) -> Option_TopContributor.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let modules_n: usize = Vec_ModuleEntry.len(tree.modules)
+    var best_idx_in_modules: usize = 0
+    var best_total: usize = 0
+    var have_best: bool = false
+    var m: usize = 0
+    loop
+        decreases modules_n - m
+    {
+        if m >= modules_n { break }
+        let mod_entry = Vec_ModuleEntry.at(tree.modules, m)
+        if mod_entry.dir_idx == dir_idx {
+            let total = count_rows_for_file(tree, dir_idx, mod_entry.file)
+            if !have_best || total > best_total {
+                best_idx_in_modules = m
+                best_total = total
+                have_best = true
+            }
+        }
+        m += 1
+    }
+    if !have_best {
+        return Option_TopContributor.none()
+    }
+    let chosen = Vec_ModuleEntry.at(tree.modules, best_idx_in_modules)
+    let file_basename = clone_str(chosen.file, allocator)?
+    let module_name = clone_str(chosen.name, allocator)?
+    let function_rows = count_functions_for_file(tree, dir_idx, chosen.file)
+    let type_rows = count_types_for_file(tree, dir_idx, chosen.file)
+    return Option_TopContributor.some(value: TopContributor {
+        module_name: module_name,
+        file_basename: file_basename,
+        function_rows: function_rows,
+        type_rows: type_rows,
+    })
+}
+
+function count_rows_for_file(tree: model.Tree, dir_idx: usize, file: String) -> usize {
+    return count_functions_for_file(tree, dir_idx, file) + count_types_for_file(tree, dir_idx, file)
+}
+
+function count_functions_for_file(tree: model.Tree, dir_idx: usize, file: String) -> usize {
+    let n: usize = Vec_FunctionEntry.len(tree.functions)
+    var c: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let r = Vec_FunctionEntry.at(tree.functions, i)
+        if r.dir_idx == dir_idx && string_equals(r.file, file) {
+            c += 1
+        }
+        i += 1
+    }
+    return c
+}
+
+function count_types_for_file(tree: model.Tree, dir_idx: usize, file: String) -> usize {
+    let n: usize = Vec_TypeEntry.len(tree.types_)
+    var c: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let r = Vec_TypeEntry.at(tree.types_, i)
+        if r.dir_idx == dir_idx && string_equals(r.file, file) {
+            c += 1
+        }
+        i += 1
+    }
+    return c
+}
+
+
+function string_equals(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    if an != bn { return false }
+    var i: usize = 0
+    loop
+        decreases an - i
+    {
+        if i >= an { break }
+        if ab[i] != bb[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function clone_str(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}

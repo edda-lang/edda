@@ -1,0 +1,108 @@
+module types.check.body.generics.generics
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.text.string
+import syntax.ast.tree as ast_tree
+import syntax.ast.item as ast_item_mod
+import hir.item as hir_item
+import hir.def as def_mod
+import intern.interner as interner_mod
+import types.pass.ty as ty_mod
+import types.ty.kind as ty_kind_mod
+import types.ty.interner as ty_interner_mod
+import types.effect.interner as effect_interner_mod
+import local.check.env.builtins as builtins_mod
+import local.check.env.lower.ty.ty as ty_lower_mod
+import local.check.body.defwrite.defwrite as defwrite_mod
+
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(ty_mod.TyId)
+
+spec std.core.option.Option(ast_tree.Ty)
+
+public function record_param_types(
+    sig: hir_item.HFnSignature,
+    builtins: builtins_mod.Builtins,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: mutable effect_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_lower_mod.GenericScope
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var gscope = build_generic_scope(sig, interner, mutable ty_interner, mutable local_types, allocator)?
+    ty_lower_mod.generic_scope_set_params(mutable gscope, sig.params)
+    let pn = Vec_HParam.len(sig.params)
+    var pi: usize = 0
+    loop decreases (pn - pi) {
+        if pi >= pn { break }
+        let p = Vec_HParam.at(sig.params, pi)
+        let pty = ty_lower_mod.lower_ast_ty(p.ty, builtins, interner, gscope, mutable ty_interner, mutable effect_interner, allocator)?
+        defwrite_mod.write_at_def_id(mutable local_types, p.def_id, pty, allocator)?
+        pi = pi + 1
+    }
+    return gscope
+}
+
+function build_generic_scope(
+    sig: hir_item.HFnSignature,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> ty_lower_mod.GenericScope
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var gscope = ty_lower_mod.empty_generic_scope(allocator)?
+    let cursor = add_type_generics(mutable gscope, sig.outbound_generics, sig.comptime_param_defs, 0, interner, mutable ty_interner, mutable local_types, allocator)?
+    let _ = add_type_generics(mutable gscope, sig.generics, sig.comptime_param_defs, cursor, interner, mutable ty_interner, mutable local_types, allocator)?
+    return gscope
+}
+
+function add_type_generics(
+    gscope: mutable ty_lower_mod.GenericScope,
+    gens: Vec_GenericParam.Vec,
+    defs: Vec_DefId.Vec,
+    start: usize,
+    interner: interner_mod.Interner,
+    ty_interner: mutable ty_interner_mod.Interner,
+    local_types: mutable Vec_TyId.Vec,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_GenericParam.len(gens)
+    var cursor = start
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let g = Vec_GenericParam.at(gens, i)
+        if is_type_generic(g) && cursor < Vec_DefId.len(defs) {
+            let def = Vec_DefId.at(defs, cursor)
+            let oty = ty_interner_mod.intern(mutable ty_interner, ty_kind_mod.CTy.opaque(def: def), allocator)?
+            defwrite_mod.write_at_def_id(mutable local_types, def, oty, allocator)?
+            ty_lower_mod.generic_scope_push(mutable gscope, g.name.name, oty, allocator)?
+            let name_bytes = interner_mod.lookup(interner, g.name.name)
+            let name_str = string.from_owned_utf8(take name_bytes)
+            ty_interner_mod.set_type_name(mutable ty_interner, oty, take name_str)
+        }
+        cursor = cursor + 1
+        i = i + 1
+    }
+    return cursor
+}
+
+function is_type_generic(g: ast_item_mod.GenericParam) -> bool {
+    return match g.ty {
+        case .some(let t) => match t.kind {
+            case .meta => true
+            case _ => false
+        }
+        case .none => false
+    }
+}

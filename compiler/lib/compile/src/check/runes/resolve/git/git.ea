@@ -1,0 +1,353 @@
+
+module compile.check.runes.resolve.git.git
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import std.os.process.spawn as spawn_mod
+import std.os.process.spawn.error as spawn_error_mod
+import std.os.process.wait as wait_mod
+import std.os.process.child as child_spec_mod
+import std.core.fmt as fmt_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+import manifest.manifest as manifest_mod
+import manifest.model.dependency.dependency as dep_mod
+import manifest.model.lockfile.lockfile as lf_mod
+import local.check.runes.resolve.cache.cache as cache_mod
+
+spec std.collections.vec.Vec(String)
+spec std.core.option.Option(String)
+spec std.core.option.Option(dep_mod.Dependency)
+spec std.core.option.Option(lf_mod.LoadedLockfile)
+
+
+public function materialize_git_deps(
+    subprocess: Subprocess,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    project_root: String,
+    m: manifest_mod.LoadedManifest,
+    lockfile_opt: Option_LoadedLockfile.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {subprocess, rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let n = manifest_mod.dependency_count_of(m)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let dep_opt = manifest_mod.dependency_at(m, i)
+        match dep_opt {
+            case .none => ()
+            case .some(let dep) => {
+                match dep_mod.source(dep) {
+                    case .git(let url) => {
+                        let locked = locked_rev_of(lockfile_opt, dep_mod.name(dep), allocator)?
+                        materialize_one(subprocess, rfs, wfs, project_root, dep_mod.name(dep), dep_mod.source(dep), url, locked, mutable diags, allocator)?
+                    }
+                    case _ => ()
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function locked_rev_of(
+    lockfile_opt: Option_LoadedLockfile.Option,
+    dep_name: String,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let lf = match lockfile_opt {
+        case .none => return Option_String.none
+        case .some(let loaded) => loaded
+    }
+    let n = lf_mod.rune_count(lf)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return Option_String.none }
+        let r = lf_mod.rune_at(lf, i)
+        if string.equals(lf_mod.name(r), dep_name) {
+            let src = lf_mod.source(r)
+            if string.starts_with(src, "git+") {
+                let parts = string.split(src, "#", allocator)?
+                if parts.len() > 1 as usize {
+                    return Option_String.some(value: string.clone(parts[1], allocator)?)
+                }
+            }
+            return Option_String.none
+        }
+        i = i + 1
+    }
+}
+
+
+function materialize_one(
+    p: Subprocess,
+    rfs: ReadOnlyFilesystem,
+    wfs: Filesystem,
+    project_root: String,
+    dep_name: String,
+    source: dep_mod.DependencySource,
+    url: String,
+    locked_rev: Option_String.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {p, rfs, wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let descriptor_opt = cache_mod.source_descriptor(dep_name, source, allocator)?
+    let descriptor = match descriptor_opt {
+        case .none => return
+        case .some(let d) => d
+    }
+    let checkout_dir = cache_mod.checkout_dir_of(project_root, dep_name, descriptor, allocator)?
+    if fs.path_exists(rfs, checkout_dir) { return }
+
+    let parts = string.split(url, "#", allocator)?
+    let base_url = string.clone(parts[0], allocator)?
+    let ref_opt = match locked_rev {
+        case .some(let rev) => Option_String.some(value: rev)
+        case .none => {
+            if parts.len() > 1 as usize {
+                Option_String.some(value: string.clone(parts[1], allocator)?)
+            } else {
+                Option_String.none
+            }
+        }
+    }
+
+    fs.create_dir_all(wfs, checkout_dir)?
+    let cloned = run_clone(p, base_url, checkout_dir, mutable diags, allocator)?
+    if !cloned { return }
+    match ref_opt {
+        case .none => ()
+        case .some(let git_ref) => {
+            let _ = run_checkout(p, checkout_dir, git_ref, mutable diags, allocator)?
+        }
+    }
+}
+
+
+public function resolved_rev_of(
+    rfs: ReadOnlyFilesystem,
+    checkout_dir: String,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let head_path = string.concat(checkout_dir, "/.git/HEAD", allocator)?
+    if !fs.path_exists(rfs, head_path) {
+        return Option_String.none
+    }
+    let head_raw = fs.read_to_string(rfs, head_path, allocator)?
+    let head = string.trim(head_raw, allocator)?
+    if !string.starts_with(head, "ref: ") {
+        return Option_String.some(value: head)
+    }
+    let hb = head.bytes()
+    let ref_name = string.bytes_slice_to_string(hb, 5 as usize, hb.len(), allocator)?
+    let ref_a = string.concat(checkout_dir, "/.git/", allocator)?
+    let ref_path = string.concat(ref_a, ref_name, allocator)?
+    if fs.path_exists(rfs, ref_path) {
+        let rev_raw = fs.read_to_string(rfs, ref_path, allocator)?
+        return Option_String.some(value: string.trim(rev_raw, allocator)?)
+    }
+    return packed_ref_rev(rfs, checkout_dir, ref_name, allocator)?
+}
+
+
+function packed_ref_rev(
+    rfs: ReadOnlyFilesystem,
+    checkout_dir: String,
+    ref_name: String,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let packed_path = string.concat(checkout_dir, "/.git/packed-refs", allocator)?
+    if !fs.path_exists(rfs, packed_path) {
+        return Option_String.none
+    }
+    let text = fs.read_to_string(rfs, packed_path, allocator)?
+    let lines = string.split(text, "\n", allocator)?
+    let n = lines.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { return Option_String.none }
+        let line = string.trim(lines[i], allocator)?
+        if !string.starts_with(line, "#") && !string.starts_with(line, "^") {
+            let fields = string.split(line, " ", allocator)?
+            if fields.len() > 1 as usize {
+                if string.equals(fields[1], ref_name) {
+                    return Option_String.some(value: string.clone(fields[0], allocator)?)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function run_clone(
+    p: Subprocess,
+    base_url: String,
+    checkout_dir: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {p, allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_String.Vec
+    Vec_String.new(init args, allocator)?
+    Vec_String.push(mutable args, string.clone("clone", allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone("--quiet", allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone(base_url, allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone(checkout_dir, allocator)?, allocator)?
+    return run_git(p, take args, mutable diags, allocator)?
+}
+
+
+function run_checkout(
+    p: Subprocess,
+    checkout_dir: String,
+    git_ref: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {p, allocator, err: alloc.AllocError}
+{
+    uninit args: Vec_String.Vec
+    Vec_String.new(init args, allocator)?
+    Vec_String.push(mutable args, string.clone("-C", allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone(checkout_dir, allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone("checkout", allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone("--quiet", allocator)?, allocator)?
+    Vec_String.push(mutable args, string.clone(git_ref, allocator)?, allocator)?
+    return run_git(p, take args, mutable diags, allocator)?
+}
+
+
+function run_git(
+    p: Subprocess,
+    args_vec: take Vec_String.Vec,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {p, allocator, err: alloc.AllocError}
+{
+    return handle err: spawn_error_mod.SpawnError -> spawn_fail(mutable diags, allocator)? {
+    handle err: wait_mod.WaitError -> wait_fail(mutable diags, allocator)? {
+        let outcome = spawn_git(p, take args_vec, allocator)?
+        check_git_outcome(mutable diags, outcome, allocator)?
+    }}
+}
+
+
+function spawn_git(
+    p: Subprocess,
+    args_vec: take Vec_String.Vec,
+    allocator: Allocator,
+) -> wait_mod.ExitOutcome
+    with {p, allocator, err: spawn_error_mod.SpawnError, err: wait_mod.WaitError, err: alloc.AllocError}
+{
+    let argv = Vec_String.into_array(take args_vec, allocator)?
+    let exe = string.clone("git", allocator)?
+    let p = restrict_to_git(p, allocator)?
+    let spec_init = child_spec_mod.of(take exe, take argv)
+    let spec_built = child_spec_mod.build(take spec_init)
+    let child = spawn_mod.spawn(p, take spec_built, allocator)?
+    return wait_mod.wait(take child)?
+}
+
+
+function restrict_to_git(
+    p: Subprocess,
+    allocator: Allocator,
+) -> Subprocess
+    with {p, allocator, err: alloc.AllocError}
+{
+    uninit allow: Vec_String.Vec
+    Vec_String.new(init allow, allocator)?
+    Vec_String.push(mutable allow, string.clone("git", allocator)?, allocator)?
+    let allowlist = Vec_String.into_array(take allow, allocator)?
+    return spawn_mod.allowing(p, allowlist)
+}
+
+
+function check_git_outcome(
+    diags: mutable diags_mod.Diagnostics,
+    o: wait_mod.ExitOutcome,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    return match o {
+        case .exited(let code) => {
+            if code != 0 as i32 {
+                emit_git_fail(mutable diags, code, allocator)?
+                false
+            } else {
+                true
+            }
+        }
+        case .signaled(let sig) => {
+            emit_git_fail(mutable diags, sig, allocator)?
+            false
+        }
+        case .wait_failed(_) => {
+            emit_git_note(mutable diags, "git process wait failed", allocator)?
+            false
+        }
+    }
+}
+
+
+function spawn_fail(diags: mutable diags_mod.Diagnostics, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    emit_git_note(mutable diags, "git failed to spawn — is git on PATH?", allocator)?
+    return false
+}
+
+
+function wait_fail(diags: mutable diags_mod.Diagnostics, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    emit_git_note(mutable diags, "git process wait failed", allocator)?
+    return false
+}
+
+
+function emit_git_fail(
+    diags: mutable diags_mod.Diagnostics,
+    code: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("git dependency fetch failed — 'git' exited with code ", fmt_mod.i64_to_string(code as i64, allocator)?, allocator)?
+    let d = diag_mod.error_at(diag_code_mod.manifest_error(), span_mod.dummy(), head)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function emit_git_note(
+    diags: mutable diags_mod.Diagnostics,
+    msg: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.manifest_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

@@ -1,0 +1,112 @@
+
+module syntax.parse.parser
+
+import std.mem.alloc
+import std.collections.vec
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import intern.interner as interner_mod
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.item as item_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.file as file_ast
+import local.lex.lexer as lexer_mod
+import local.parse.util as util_mod
+import local.parse.expr.forms.core as expr_mod
+import local.parse.item.dispatch as dispatch_mod
+
+spec std.collections.vec.Vec(item_mod.Item)
+spec std.collections.vec.Vec(lexed_mod.Lexed)
+
+public function parse_file(
+    tokens: [lexed_mod.Lexed],
+    file: file_mod.FileId,
+    out: init file_ast.File,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let items_r = parse_item_stream(tokens, 0, mutable diags, allocator)?
+    let file_span = compute_file_span(tokens, file)
+    out = file_ast.File {
+        span: file_span,
+        items: items_r.0,
+    }
+}
+
+function parse_item_stream(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (Vec_Item.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit items: Vec_Item.Vec
+    Vec_Item.new(init items, allocator)?
+    var p = pos
+    loop decreases (tokens.len() - p) {
+        let stop = match util_mod.peek(tokens, p) {
+            case .eof => true
+            case _ => false
+        }
+        if stop { break }
+        let iter_start = p
+        let item_r = dispatch_mod.parse_item(tokens, p, mutable diags, allocator, expr_mod.parse_expr, 0)?
+        Vec_Item.push(mutable items, item_r.0, allocator)?
+        p = item_r.1
+        if p == iter_start { p = p + 1 }
+    }
+    return (items, p)
+}
+
+public function parse_expr_from_bytes(
+    bytes: [u8],
+    file: file_mod.FileId,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> tree_mod.Expr
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit tokens: Vec_Lexed.Vec
+    Vec_Lexed.with_capacity(init tokens, bytes.len() / 4 + 8, allocator)?
+    lexer_mod.lex(bytes, file, mutable interner, mutable diags, mutable tokens, allocator)?
+    let tokens_slice = Vec_Lexed.into_array(take tokens, allocator)?
+    let r = expr_mod.parse_expr(tokens_slice, 0, mutable diags, allocator, 0)?
+    if !util_mod.at_eof(tokens_slice, r.1) {
+        let span = util_mod.span_at(tokens_slice, r.1)
+        util_mod.emit_error(mutable diags, span, "unexpected trailing tokens after expression", allocator)?
+    }
+    return r.0
+}
+
+public function parse_file_from_bytes(
+    bytes: [u8],
+    file: file_mod.FileId,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    out: init file_ast.File,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit tokens: Vec_Lexed.Vec
+    Vec_Lexed.with_capacity(init tokens, bytes.len() / 4 + 8, allocator)?
+    lexer_mod.lex(bytes, file, mutable interner, mutable diags, mutable tokens, allocator)?
+    let tokens_slice = Vec_Lexed.into_array(take tokens, allocator)?
+    uninit parsed: file_ast.File
+    parse_file(tokens_slice, file, init parsed, mutable diags, allocator)?
+    out = parsed
+}
+
+function compute_file_span(tokens: [lexed_mod.Lexed], file: file_mod.FileId) -> span_mod.Span {
+    let n = tokens.len()
+    if n == 0 {
+        return span_mod.empty_at(file, 0)
+    }
+    let last = tokens[n - 1]
+    return span_mod.span_of(file, 0, last.span.end)
+}

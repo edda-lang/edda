@@ -1,0 +1,217 @@
+
+module hermod.proto.headers
+
+import std.mem.alloc
+
+public type Header {
+    name: [u8]
+    value: [u8]
+}
+
+public type Headers {
+    entries: [Header]
+    len_box: [usize]
+}
+
+function _empty_header() -> Header {
+    return Header { name: "".bytes(), value: "".bytes() }
+}
+
+function _alloc_header_slots(allocator: Allocator, n: usize) -> [Header]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_usize_slots(allocator: Allocator, n: usize) -> [usize]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function headers_with_capacity(cap: usize, allocator: mutable Allocator) -> Headers
+    with {allocator, err: alloc.AllocError}
+{
+    let slots = _alloc_header_slots(allocator, cap)?
+    let len_box = _alloc_usize_slots(allocator, 1 as usize)?
+    len_box[0] = 0 as usize
+    return Headers { entries: slots, len_box: len_box }
+}
+
+public function headers_len(h: Headers) -> usize { return h.len_box[0] }
+
+public function headers_capacity(h: Headers) -> usize { return h.entries.len() }
+
+public function headers_is_empty(h: Headers) -> bool {
+    return h.len_box[0] == 0 as usize
+}
+
+public function headers_append(
+    h: mutable Headers,
+    name: [u8],
+    value: [u8],
+) -> ()
+    with {err: alloc.AllocError}
+{
+    let used = h.len_box[0]
+    if used >= h.entries.len() {
+        raise alloc.AllocError.out_of_memory
+    }
+    h.entries[used] = Header { name: name, value: value }
+    h.len_box[0] = used + 1 as usize
+}
+
+function _ascii_lower(b: u8) -> u8 {
+    if b >= 65 as u8 && b <= 90 as u8 {
+        return b + 32 as u8
+    }
+    return b
+}
+
+function _ascii_eq_insensitive(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if _ascii_lower(a[i]) != _ascii_lower(b[i]) { return false }
+        i += 1
+    }
+    return true
+}
+
+public function headers_at(h: Headers, i: usize where i < h.entries.len()) -> Header {
+    return h.entries[i]
+}
+
+public function headers_has(h: Headers, name: [u8]) -> bool {
+    let used = h.len_box[0]
+    var i: usize = 0
+    loop decreases used - i {
+        if i >= used { break }
+        if _ascii_eq_insensitive(h.entries[i].name, name) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+public function headers_find(h: Headers, name: [u8]) -> usize {
+    let used = h.len_box[0]
+    var i: usize = 0
+    loop decreases used - i {
+        if i >= used { break }
+        if _ascii_eq_insensitive(h.entries[i].name, name) {
+            return i
+        }
+        i += 1
+    }
+    return used
+}
+
+public function header_name(e: Header) -> [u8] { return e.name }
+
+public function header_value(e: Header) -> [u8] { return e.value }
+
+public function headers_value_or(h: Headers, name: [u8], fallback: [u8]) -> [u8] {
+    let idx = headers_find(h, name)
+    if idx >= h.len_box[0] { return fallback }
+    return h.entries[idx].value
+}
+
+public function headers_count_named(h: Headers, name: [u8]) -> usize {
+    let used = h.len_box[0]
+    var i: usize = 0
+    var n: usize = 0
+    loop decreases used - i {
+        if i >= used { break }
+        if _ascii_eq_insensitive(h.entries[i].name, name) { n += 1 }
+        i += 1
+    }
+    return n
+}
+
+public function headers_nth_named(h: Headers, name: [u8], n: usize) -> Header {
+    let used = h.len_box[0]
+    var i: usize = 0
+    var seen: usize = 0
+    loop decreases used - i {
+        if i >= used { break }
+        if _ascii_eq_insensitive(h.entries[i].name, name) {
+            if seen == n { return h.entries[i] }
+            seen += 1
+        }
+        i += 1
+    }
+    return _empty_header()
+}
+
+
+public type CsvAdvance {
+    span_lo: usize
+    span_hi: usize
+    next_from: usize
+}
+
+function _is_ows(b: u8) -> bool {
+    return b == (32 as u8) || b == (9 as u8)
+}
+
+function _skip_ows(value: [u8], lo: usize, hi: usize) -> usize {
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if !_is_ows(value[i]) { return i }
+        i += 1
+    }
+    return hi
+}
+
+function _trim_ows_tail(value: [u8], lo: usize, hi: usize) -> usize {
+    var j: usize = hi
+    loop decreases j + (1 as usize) {
+        if j <= lo { break }
+        let prev = j - (1 as usize)
+        if !_is_ows(value[prev]) { return j }
+        j = prev
+    }
+    return lo
+}
+
+public function csv_advance(value: [u8], from: usize) -> CsvAdvance {
+    let n = value.len()
+    let lo = _skip_ows(value, from, n)
+    if lo >= n {
+        return CsvAdvance {
+            span_lo: n,
+            span_hi: n,
+            next_from: n,
+        }
+    }
+    var i: usize = lo
+    loop decreases n - i {
+        if i >= n { break }
+        if value[i] == (44 as u8) { break }
+        i += 1
+    }
+    let comma = i
+    let hi = _trim_ows_tail(value, lo, comma)
+    let next_from = if comma >= n { n } else { comma + (1 as usize) }
+    return CsvAdvance {
+        span_lo: lo,
+        span_hi: hi,
+        next_from: next_from,
+    }
+}
+
+public function csv_done(adv: CsvAdvance) -> bool {
+    return adv.span_lo >= adv.span_hi && adv.next_from >= adv.span_hi
+}
+
+public function csv_count(value: [u8]) -> usize {
+    var n: usize = 0
+    var adv = csv_advance(value, 0 as usize)
+    loop decreases value.len() + (1 as usize) - adv.next_from {
+        if csv_done(adv) { break }
+        n += 1
+        adv = csv_advance(value, adv.next_from)
+    }
+    return n
+}

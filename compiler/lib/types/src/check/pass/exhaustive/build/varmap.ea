@@ -1,0 +1,134 @@
+
+module types.check.pass.exhaustive.build.varmap
+
+import std.mem.alloc
+import std.collections.vec
+import intern.symbol
+import syntax.ast.tree as ast_tree
+import syntax.ast.item as ast_item_mod
+import hir.item as hir_item
+import hir.def as def_mod
+import types.check.env.fields as fields_mod
+import types.check.pass.exhaustive.defs as defs_mod
+
+
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+
+
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(ast_item_mod.Variant)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(ast_tree.Ty)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(defs_mod.VariantSet)
+spec std.collections.vec.Vec(fields_mod.VariantNameList)
+
+
+public function build_var_maps(
+    items: Vec_HItem.Vec,
+    variant_names: Vec_VariantNameList.Vec,
+    allocator: Allocator,
+) -> defs_mod.VarMaps
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit local_defs: Vec_DefId.Vec
+    Vec_DefId.new(init local_defs, allocator)?
+    uninit local_sets: Vec_VariantSet.Vec
+    Vec_VariantSet.new(init local_sets, allocator)?
+    build_local_map(items, mutable local_defs, mutable local_sets, allocator)?
+    return defs_mod.VarMaps {
+        local_defs: local_defs,
+        local_sets: local_sets,
+        global_names: variant_names,
+    }
+}
+
+
+function build_local_map(
+    items: Vec_HItem.Vec,
+    local_defs: mutable Vec_DefId.Vec,
+    local_sets: mutable Vec_VariantSet.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .type_decl(let sig_box) => {
+                let sig = Box_HTypeSignature.get(sig_box)
+                match sig.kind {
+                    case .sum_(let variants) => {
+                        if !def_mod.is_error(item.def_id) {
+                            let names = collect_variant_names(variants, allocator)?
+                            let arities = collect_variant_arities(variants, allocator)?
+                            Vec_DefId.push(mutable local_defs, item.def_id, allocator)?
+                            Vec_VariantSet.push(
+                                mutable local_sets,
+                                defs_mod.VariantSet { variants: names, arities: arities },
+                                allocator,
+                            )?
+                        }
+                    }
+                    case _ => ()
+                }
+            }
+            case .spec_decl(_, let inner) => {
+                build_local_map(inner, mutable local_defs, mutable local_sets, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1 as usize
+    }
+}
+
+function collect_variant_names(
+    variants: Vec_Variant.Vec,
+    allocator: Allocator,
+) -> Vec_Symbol.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit names: Vec_Symbol.Vec
+    Vec_Symbol.new(init names, allocator)?
+    let n = Vec_Variant.len(variants)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let v = Vec_Variant.at(variants, i)
+        Vec_Symbol.push(mutable names, v.name.name, allocator)?
+        i = i + 1 as usize
+    }
+    return names
+}
+
+function collect_variant_arities(
+    variants: Vec_Variant.Vec,
+    allocator: Allocator,
+) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit arities: Vec_usize.Vec
+    Vec_usize.new(init arities, allocator)?
+    let n = Vec_Variant.len(variants)
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        let v = Vec_Variant.at(variants, i)
+        Vec_usize.push(mutable arities, variant_payload_arity(v.payload), allocator)?
+        i = i + 1 as usize
+    }
+    return arities
+}
+
+function variant_payload_arity(payload: ast_item_mod.VariantPayload) -> usize {
+    return match payload {
+        case .unit => 0 as usize
+        case .tuple(let elements) => Vec_Ty.len(elements)
+        case .struct_(let fields) => Vec_TypeField.len(fields)
+    }
+}

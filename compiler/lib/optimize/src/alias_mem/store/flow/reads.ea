@@ -1,0 +1,249 @@
+module optimize.alias_mem.store.flow.reads
+
+import std.collections.vec
+
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.term as mir_term_mod
+import mir.body.model as mir_body_mod
+import mir.id.local as mir_local_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.store.flow.model as model_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+
+public function read_anywhere(read_flags: Vec_bool.Vec, l: mir_local_mod.LocalId) -> bool {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_bool.len(read_flags) {
+        return Vec_bool.at(read_flags, idx)
+    }
+    return true
+}
+
+
+function mark_read(read_flags: mutable Vec_bool.Vec, l: mir_local_mod.LocalId) -> () {
+    let idx: usize = mir_local_mod.index(l)
+    if idx < Vec_bool.len(read_flags) {
+        Vec_bool.set_at(mutable read_flags, idx, true)
+    }
+}
+
+
+public function mark_block_reads(read_flags: mutable Vec_bool.Vec, block: mir_body_mod.BasicBlock) -> () {
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(block.statements, si)
+        mark_stmt_reads(mutable read_flags, stmt)
+        si += 1
+    }
+    mark_term_reads(mutable read_flags, block.terminator)
+}
+
+
+function mark_stmt_reads(read_flags: mutable Vec_bool.Vec, stmt: mir_stmt_mod.Statement) -> () {
+    match stmt.kind {
+        case .assign(let dest, let value) => {
+            mark_place_index_reads(mutable read_flags, dest)
+            mark_rvalue_reads(mutable read_flags, value)
+        }
+        case .storage_live(_) => ()
+        case .storage_dead(_) => ()
+        case .nop_ => ()
+    }
+}
+
+
+function mark_rvalue_reads(read_flags: mutable Vec_bool.Vec, rv: mir_rvalue_mod.Rvalue) -> () {
+    match rv {
+        case .use_(let operand) => mark_operand_reads(mutable read_flags, operand)
+        case .binary(_, let lhs, let rhs) => {
+            mark_operand_reads(mutable read_flags, lhs)
+            mark_operand_reads(mutable read_flags, rhs)
+        }
+        case .unary(_, let operand) => mark_operand_reads(mutable read_flags, operand)
+        case .cast(let operand, _, _, _) => mark_operand_reads(mutable read_flags, operand)
+        case .aggregate(_, let elems, _) => mark_operands_reads(mutable read_flags, elems)
+        case .ref_(_, let place) => mark_place_full_read(mutable read_flags, place)
+        case .len(let place) => mark_place_full_read(mutable read_flags, place)
+        case .discriminant(let place) => mark_place_full_read(mutable read_flags, place)
+        case .make_closure(_, let env) => mark_operand_reads(mutable read_flags, env)
+    }
+}
+
+
+function mark_operands_reads(read_flags: mutable Vec_bool.Vec, ops: Vec_Operand.Vec) -> () {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        mark_operand_reads(mutable read_flags, op)
+        i += 1
+    }
+}
+
+
+function mark_operand_reads(read_flags: mutable Vec_bool.Vec, op: mir_rvalue_mod.Operand) -> () {
+    match op {
+        case .copy_(let place, _) => mark_place_full_read(mutable read_flags, place)
+        case .move_(let place, _) => mark_place_full_read(mutable read_flags, place)
+        case .constant(_) => ()
+    }
+}
+
+
+function mark_place_full_read(read_flags: mutable Vec_bool.Vec, p: mir_place_mod.Place) -> () {
+    mark_read(mutable read_flags, escape_mod.base_local(p))
+    mark_place_index_reads(mutable read_flags, p)
+}
+
+
+function mark_place_index_reads(read_flags: mutable Vec_bool.Vec, p: mir_place_mod.Place) -> () {
+    let n: usize = mir_place_mod.proj_len(p)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(p, i)
+        match proj.kind {
+            case .index(let idx_local, _) => mark_read(mutable read_flags, idx_local)
+            case .slice_subrange(let lo_local, let hi_local, _) => {
+                mark_read(mutable read_flags, lo_local)
+                mark_read(mutable read_flags, hi_local)
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+}
+
+
+function mark_term_reads(read_flags: mutable Vec_bool.Vec, term: mir_term_mod.Terminator) -> () {
+    match term.kind {
+        case .goto_(_) => ()
+        case .branch(let cond, _, _) => mark_operand_reads(mutable read_flags, cond)
+        case .switch_(let discr, _) => mark_operand_reads(mutable read_flags, discr)
+        case .return_ => ()
+        case .unreachable_ => ()
+        case .raise_(let value, _) => mark_operand_reads(mutable read_flags, value)
+        case .panic_(let message) => mark_operand_reads(mutable read_flags, message)
+        case .call_(let callee, let args, let dest, _, _) => {
+            mark_operand_reads(mutable read_flags, callee)
+            mark_operands_reads(mutable read_flags, args)
+            mark_place_index_reads(mutable read_flags, dest)
+        }
+        case .drop_(let place, _, _) => mark_place_full_read(mutable read_flags, place)
+        case .coherence_enter(_, _) => ()
+        case .coherence_exit(_) => ()
+        case .spawn_(_, let args, let group_local, let handle_dest, _, _) => {
+            mark_operands_reads(mutable read_flags, args)
+            mark_read(mutable read_flags, group_local)
+            mark_place_index_reads(mutable read_flags, handle_dest)
+        }
+        case .await_(let handle, let dest, _, _) => {
+            mark_operand_reads(mutable read_flags, handle)
+            mark_place_index_reads(mutable read_flags, dest)
+        }
+    }
+}
+
+
+public function term_writes_local(term: mir_term_mod.Terminator, local: mir_local_mod.LocalId) -> bool {
+    return match term.kind {
+        case .call_(_, _, let dest, _, _) =>
+            escape_mod.is_bare(dest) && model_mod.same_local(escape_mod.base_local(dest), local)
+        case .spawn_(_, _, _, let handle_dest, _, _) =>
+            escape_mod.is_bare(handle_dest) && model_mod.same_local(escape_mod.base_local(handle_dest), local)
+        case .await_(_, let dest, _, _) =>
+            escape_mod.is_bare(dest) && model_mod.same_local(escape_mod.base_local(dest), local)
+        case _ => false
+    }
+}
+
+
+public function stmt_reads_local(stmt: mir_stmt_mod.Statement, target: mir_local_mod.LocalId) -> bool {
+    return match stmt.kind {
+        case .assign(let dest, let value) =>
+            place_index_reads_local(dest, target) || rvalue_reads_local(value, target)
+        case .storage_live(_) => false
+        case .storage_dead(_) => false
+        case .nop_ => false
+    }
+}
+
+
+function rvalue_reads_local(rv: mir_rvalue_mod.Rvalue, target: mir_local_mod.LocalId) -> bool {
+    return match rv {
+        case .use_(let operand) => operand_reads_local(operand, target)
+        case .binary(_, let lhs, let rhs) =>
+            operand_reads_local(lhs, target) || operand_reads_local(rhs, target)
+        case .unary(_, let operand) => operand_reads_local(operand, target)
+        case .cast(let operand, _, _, _) => operand_reads_local(operand, target)
+        case .aggregate(_, let elems, _) => operands_read_local(elems, target)
+        case .ref_(_, let place) => place_full_reads_local(place, target)
+        case .len(let place) => place_full_reads_local(place, target)
+        case .discriminant(let place) => place_full_reads_local(place, target)
+        case .make_closure(_, let env) => operand_reads_local(env, target)
+    }
+}
+
+
+function operands_read_local(ops: Vec_Operand.Vec, target: mir_local_mod.LocalId) -> bool {
+    let n: usize = Vec_Operand.len(ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let op = Vec_Operand.at(ops, i)
+        if operand_reads_local(op, target) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+
+function operand_reads_local(op: mir_rvalue_mod.Operand, target: mir_local_mod.LocalId) -> bool {
+    return match op {
+        case .copy_(let place, _) => place_full_reads_local(place, target)
+        case .move_(let place, _) => place_full_reads_local(place, target)
+        case .constant(_) => false
+    }
+}
+
+
+function place_full_reads_local(p: mir_place_mod.Place, target: mir_local_mod.LocalId) -> bool {
+    if model_mod.same_local(escape_mod.base_local(p), target) {
+        return true
+    }
+    return place_index_reads_local(p, target)
+}
+
+
+function place_index_reads_local(p: mir_place_mod.Place, target: mir_local_mod.LocalId) -> bool {
+    let n: usize = mir_place_mod.proj_len(p)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let proj = mir_place_mod.proj_at(p, i)
+        let hit: bool = match proj.kind {
+            case .index(let idx_local, _) => model_mod.same_local(idx_local, target)
+            case .slice_subrange(let lo_local, let hi_local, _) =>
+                model_mod.same_local(lo_local, target) || model_mod.same_local(hi_local, target)
+            case _ => false
+        }
+        if hit {
+            return true
+        }
+        i += 1
+    }
+    return false
+}

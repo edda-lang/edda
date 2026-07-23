@@ -1,0 +1,350 @@
+
+module compile.check.structdiag.structdiag
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import structmap.lib as structmap_mod
+import structmap.budget.model as bmodel
+import structmap.analyze.metric.shape.cluster as cluster_mod
+
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(bmodel.WorklistEntry)
+spec std.collections.vec.Vec(bmodel.FileGroup)
+spec std.collections.vec.Vec(bmodel.FatFile)
+spec std.collections.vec.Vec(cluster_mod.ClusterReport)
+spec std.collections.vec.Vec(cluster_mod.FilenameCluster)
+spec std.core.option.Option(String)
+spec std.core.option.Option(bmodel.Directive)
+
+
+public function push_structmap_diagnostics(
+    diags: mutable diags_mod.Diagnostics,
+    output: structmap_mod.EmitOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    push_budget_diagnostics(mutable diags, output.budget, allocator)?
+    push_cluster_diagnostics(mutable diags, output.cluster_reports, allocator)?
+}
+
+
+function push_budget_diagnostics(
+    diags: mutable diags_mod.Diagnostics,
+    report: bmodel.BudgetReport,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let worklist = report.worklist
+    let n: usize = Vec_WorklistEntry.len(worklist)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let entry = Vec_WorklistEntry.at(worklist, i)
+        let msg = budget_message(entry, allocator)?
+        let d = diag_mod.warn_at(diag_code_mod.structure_map_too_dense(), span_mod.dummy(), msg)
+        diags_mod.emit(mutable diags, d, allocator)?
+        i += 1
+    }
+}
+
+
+function budget_message(entry: bmodel.WorklistEntry, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let band = band_label(entry.band)
+    let head = match entry.gate {
+        case .per_node => f"Gate A (per-node, {band}): {entry.node} index.toon is ~{entry.token_cost} Opus-4.8 tokens — {entry.overage} over the {entry.ceiling}-token ceiling"
+        case .spine    => spine_headline(entry, band, allocator)?
+    }
+    let directive = directive_text_of(entry.directive, allocator)?
+    if string.equals(directive, "") {
+        return head
+    }
+    return f"{head} — {directive}"
+}
+
+
+function spine_headline(entry: bmodel.WorklistEntry, band: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match entry.directive {
+        case .some(let d) => match d {
+            case .hoarding_hub(let h) => f"Gate B (lean-hub, {band}): {entry.node} hoards {h.percent}% of its own subtree's interface (~{entry.token_cost} Opus-4.8 tokens) — a hub must be a lean conduit (≤ ⅓), not a reservoir"
+            case .atomic_hoard(let a) => f"Gate B (atomic-hoard, {band}): {entry.node} hosts {atomic_file_count(a)} call-disjoint non-partitionable files (~{a.tokens} Opus-4.8 tokens combined) that together exceed the single-read cap — a lone cohesive file is exempt, but ≥2 independent ones co-located force one over-budget read"
+            case _                    => f"Gate B (earn-your-place, {band}): {entry.node} carries no files of its own and has a single child directory — a pure conduit-of-one that neither carries nor branches (~{entry.token_cost} Opus-4.8 tokens)"
+        }
+        case .none => f"Gate B (earn-your-place, {band}): {entry.node} carries no files of its own and has a single child directory — a pure conduit-of-one that neither carries nor branches (~{entry.token_cost} Opus-4.8 tokens)"
+    }
+}
+
+
+function atomic_file_count(a: bmodel.AtomicHoard) -> usize {
+    return Vec_String.len(a.files)
+}
+
+
+function band_label(b: bmodel.Band) -> String {
+    return match b {
+        case .green => "green"
+        case .amber => "amber"
+        case .red   => "red"
+    }
+}
+
+
+function directive_text_of(directive: Option_Directive.Option, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match directive {
+        case .some(let d) => directive_text(d, allocator)?
+        case .none        => ""
+    }
+}
+
+
+function directive_text(d: bmodel.Directive, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match d {
+        case .wide_split(let ws)   => render_wide_split(ws, allocator)?
+        case .partition(let p)     => render_partition(p, allocator)?
+        case .hoarding_hub(let h)   => render_hoarding_hub(h, allocator)?
+        case .atomic_hoard(let a)  => render_atomic_hoard(a, allocator)?
+        case .flatten              => "merge this empty wrapper into its single child — every directory must carry (>=1 file) or branch (>=2 children); this does neither, so promote the child and remove the hop"
+    }
+}
+
+
+function render_wide_split(ws: bmodel.WideSplit, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: String = ""
+    let groups = ws.groups
+    let ng: usize = Vec_FileGroup.len(groups)
+    if ng >= 2 as usize {
+        let rendered = groups_rendered(groups, allocator)?
+        out = f"splits into {ng} call-disjoint groups: {rendered} — fan into {ng} sibling subdirectories one level down (name each by concern)"
+    }
+    let fats = ws.fat_files
+    let nf: usize = Vec_FatFile.len(fats)
+    var i: usize = 0
+    loop
+        decreases nf - i
+    {
+        if i >= nf { break }
+        let ff = Vec_FatFile.at(fats, i)
+        let cluster = join_capped(ff.cluster, 10 as usize, allocator)?
+        let braced = brace(cluster, allocator)?
+        let disp = dispatcher_suffix(ff.dispatcher, allocator)?
+        let piece = f"file {ff.file} (~{ff.tokens} Opus-4.8 tokens) alone exceeds the ceiling -> partition at {braced}{disp}"
+        out = append_piece(out, piece, allocator)?
+        i += 1
+    }
+    return out
+}
+
+
+function render_partition(p: bmodel.Partition, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let cluster = join_capped(p.cluster, 10 as usize, allocator)?
+    let braced = brace(cluster, allocator)?
+    let disp = dispatcher_suffix(p.dispatcher, allocator)?
+    return f"partition {p.file} — functions {braced} form a cluster disjoint from the rest{disp}; split them into a sibling module"
+}
+
+
+function render_hoarding_hub(h: bmodel.HoardingHub, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let groups = h.groups
+    let ng: usize = Vec_FileGroup.len(groups)
+    if ng >= 2 as usize {
+        let rendered = groups_rendered(groups, allocator)?
+        return f"distribute its own files DOWN into child subdirectories — they form {ng} call-disjoint groups: {rendered} (name each by concern)"
+    }
+    return "distribute its own files DOWN into a child subdirectory so the hub becomes a lean router over its descendants"
+}
+
+
+function render_atomic_hoard(a: bmodel.AtomicHoard, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let groups = a.groups
+    let ng: usize = Vec_FileGroup.len(groups)
+    let rendered = groups_rendered(groups, allocator)?
+    return f"distribute these {ng} call-disjoint non-partitionable files into their own leaf directories (one concern each): {rendered} — each is irreducible on its own, so isolating them keeps every over-cap interface a single-sitting read"
+}
+
+
+function groups_rendered(groups: Vec_FileGroup.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: String = ""
+    let n: usize = Vec_FileGroup.len(groups)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let g = Vec_FileGroup.at(groups, i)
+        let joined = join_capped(g.files, 6 as usize, allocator)?
+        let braced = brace(joined, allocator)?
+        if i > 0 as usize {
+            out = string.concat(out, ", ", allocator)?
+        }
+        out = string.concat(out, braced, allocator)?
+        i += 1
+    }
+    return out
+}
+
+
+function push_cluster_diagnostics(
+    diags: mutable diags_mod.Diagnostics,
+    reports: Vec_ClusterReport.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_ClusterReport.len(reports)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let report = Vec_ClusterReport.at(reports, i)
+        push_one_cluster_report(mutable diags, report, allocator)?
+        i += 1
+    }
+}
+
+
+function push_one_cluster_report(
+    diags: mutable diags_mod.Diagnostics,
+    report: cluster_mod.ClusterReport,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let clusters = report.clusters
+    let nc: usize = Vec_FilenameCluster.len(clusters)
+    var i: usize = 0
+    loop
+        decreases nc - i
+    {
+        if i >= nc { break }
+        let cluster = Vec_FilenameCluster.at(clusters, i)
+        let count: usize = Vec_String.len(cluster.members)
+        let msg = f"{report.directory}: {count} files share leading token `{cluster.leading_token}` — extract into `{cluster.leading_token}/`"
+        let d = diag_mod.warn_at(diag_code_mod.filename_encodes_hierarchy(), span_mod.dummy(), msg)
+        diags_mod.emit(mutable diags, d, allocator)?
+        i += 1
+    }
+    let unders = report.underscore_filenames
+    let nu: usize = Vec_String.len(unders)
+    var j: usize = 0
+    loop
+        decreases nu - j
+    {
+        if j >= nu { break }
+        let name = Vec_String.at(unders, j)
+        if !covered_by_cluster(clusters, name) {
+            let msg = f"{report.directory}: filename `{name}` contains `_` — Edda filenames use directories, not underscored stems"
+            let d = diag_mod.warn_at(diag_code_mod.filename_encodes_hierarchy(), span_mod.dummy(), msg)
+            diags_mod.emit(mutable diags, d, allocator)?
+        }
+        j += 1
+    }
+}
+
+
+function covered_by_cluster(clusters: Vec_FilenameCluster.Vec, name: String) -> bool {
+    let nc: usize = Vec_FilenameCluster.len(clusters)
+    var i: usize = 0
+    loop
+        decreases nc - i
+    {
+        if i >= nc { break }
+        let cluster = Vec_FilenameCluster.at(clusters, i)
+        let members = cluster.members
+        let nm: usize = Vec_String.len(members)
+        var j: usize = 0
+        loop
+            decreases nm - j
+        {
+            if j >= nm { break }
+            if string.equals(Vec_String.at(members, j), name) {
+                return true
+            }
+            j += 1
+        }
+        i += 1
+    }
+    return false
+}
+
+
+function join_capped(items: Vec_String.Vec, max: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_String.len(items)
+    let lim: usize = if n <= max { n } else { max }
+    var out: String = ""
+    var i: usize = 0
+    loop
+        decreases lim - i
+    {
+        if i >= lim { break }
+        if i > 0 as usize {
+            out = string.concat(out, ", ", allocator)?
+        }
+        out = string.concat(out, Vec_String.at(items, i), allocator)?
+        i += 1
+    }
+    if n > max {
+        let more: usize = n - max
+        out = string.concat(out, f", … ({more} more)", allocator)?
+    }
+    return out
+}
+
+
+function dispatcher_suffix(dispatcher: Option_String.Option, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match dispatcher {
+        case .some(let name) => f" (dispatcher `{name}`)"
+        case .none           => ""
+    }
+}
+
+
+function brace(inner: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let open = string.concat("{", inner, allocator)?
+    return string.concat(open, "}", allocator)?
+}
+
+
+function append_piece(acc: String, piece: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if string.equals(acc, "") {
+        return piece
+    }
+    let sep = string.concat(acc, "; ", allocator)?
+    return string.concat(sep, piece, allocator)?
+}

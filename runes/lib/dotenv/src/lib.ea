@@ -1,0 +1,185 @@
+module dotenv.lib
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import std.text.lines
+import std.os.fs
+import std.core.option
+
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(Pair)
+
+
+public type Pair {
+    key: String
+    value: String
+}
+
+
+function _slice_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires hi >= lo
+    requires hi <= bytes.len()
+{
+    let n = hi - lo
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[lo + i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _is_space(b: u8) -> bool {
+    return b == 0x20 || b == 0x09
+}
+
+function _trim_bounds_lo(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if !_is_space(bytes[i]) { break }
+        i += 1
+    }
+    return i
+}
+
+function _trim_bounds_hi(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    var j: usize = hi
+    loop decreases j - lo {
+        if j <= lo { break }
+        if !_is_space(bytes[j - 1]) { break }
+        j -= 1
+    }
+    return j
+}
+
+function _find_eq(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if bytes[i] == 0x3D { return i }
+        i += 1
+    }
+    return hi
+}
+
+function _strip_export(bytes: [u8], lo: usize, hi: usize) -> usize
+    requires lo <= hi
+    requires hi <= bytes.len()
+    ensures result >= lo
+    ensures result <= hi
+{
+    let prefix_len: usize = 7
+    if hi - lo < prefix_len { return lo }
+    if bytes[lo] != 0x65 { return lo }
+    if bytes[lo + 1] != 0x78 { return lo }
+    if bytes[lo + 2] != 0x70 { return lo }
+    if bytes[lo + 3] != 0x6F { return lo }
+    if bytes[lo + 4] != 0x72 { return lo }
+    if bytes[lo + 5] != 0x74 { return lo }
+    if bytes[lo + 6] != 0x20 { return lo }
+    return lo + prefix_len
+}
+
+function _strip_quotes(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let span = hi - lo
+    if span >= 2 {
+        let first = bytes[lo]
+        let last = bytes[hi - 1]
+        let is_double = first == 0x22 && last == 0x22
+        let is_single = first == 0x27 && last == 0x27
+        if is_double || is_single {
+            return _slice_to_string(bytes, lo + 1, hi - 1, allocator)?
+        }
+    }
+    return _slice_to_string(bytes, lo, hi, allocator)?
+}
+
+function _parse_line(bytes: [u8], lo: usize, hi: usize, out: mutable Vec_Pair.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires lo <= hi
+    requires hi <= bytes.len()
+{
+    let tl = _trim_bounds_lo(bytes, lo, hi)
+    let th = _trim_bounds_hi(bytes, tl, hi)
+    if tl >= th { return }
+    if bytes[tl] == 0x23 { return }
+    let body_lo = _strip_export(bytes, tl, th)
+    let bl2 = _trim_bounds_lo(bytes, body_lo, th)
+    let eq = _find_eq(bytes, bl2, th)
+    if eq >= th { return }
+    let key_hi = _trim_bounds_hi(bytes, bl2, eq)
+    if bl2 >= key_hi { return }
+    let key = _slice_to_string(bytes, bl2, key_hi, allocator)?
+    let val_lo = _trim_bounds_lo(bytes, eq + 1, th)
+    let val_hi = _trim_bounds_hi(bytes, val_lo, th)
+    let value = _strip_quotes(bytes, val_lo, val_hi, allocator)?
+    let pair = Pair { key: key, value: value }
+    Vec_Pair.push(mutable out, take pair, allocator)?
+}
+
+public function parse(content: String, allocator: Allocator) -> [Pair]
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = content.bytes()
+    let total = bytes.len()
+    uninit pairs: Vec_Pair.Vec
+    Vec_Pair.new(init pairs, allocator)?
+    var pos: usize = 0
+    loop decreases total + 1 - pos {
+        if pos > total { break }
+        match lines.next_line(bytes, pos) {
+            case .some(let entry) => {
+                _parse_line(bytes, entry.start, entry.end, mutable pairs, allocator)?
+                if entry.resume <= pos { break }
+                pos = entry.resume
+            }
+            case .none => break
+        }
+    }
+    return Vec_Pair.into_array(take pairs, allocator)?
+}
+
+public function load(fs: ReadOnlyFilesystem, path: String, allocator: Allocator) -> [Pair]
+    with {fs, allocator, err: alloc.AllocError, err: fs.FsError}
+{
+    let content = fs.read_to_string(path, allocator)?
+    return parse(content, allocator)?
+}
+
+public function get(pairs: [Pair], key: String) -> Option_String {
+    let n = pairs.len()
+    var found: Option_String = Option_String.none
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if string.equals(pairs[i].key, key) {
+            found = Option_String.some(value: pairs[i].value)
+        }
+        i += 1
+    }
+    return found
+}

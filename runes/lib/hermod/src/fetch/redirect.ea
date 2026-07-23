@@ -1,0 +1,71 @@
+
+module hermod.fetch.redirect
+
+import std.mem.alloc
+
+import local.error
+import local.message.response as response_mod
+import local.fetch.send as send_mod
+import local.fetch.response as fetch_resp_mod
+
+import uri.syntax.parse as ux_parse
+import uri.transform.resolve as ux_resolve
+import uri.codec.encode as ux_encode
+import uri.error as ux_error
+
+public function fetch_default_redirect_limit() -> usize {
+    return 5 as usize
+}
+
+function _resolve_location(
+    base_url: String, location: [u8], allocator: mutable Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, err: ux_error.ParseError}
+{
+    let base = ux_parse.parse(base_url, mutable allocator)?
+    let ref_ = ux_parse.parse_reference_bytes(location, mutable allocator)?
+    let resolved = ux_resolve.resolve(base, ref_, mutable allocator)?
+    return ux_encode.encode_to_string(resolved, mutable allocator)?
+}
+
+public function fetch_get_follow(
+    url: String,
+    max_redirects: usize,
+    net: Network,
+    fs: ReadOnlyFilesystem,
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {
+        net,
+        fs,
+        allocator,
+        err: error.UriError,
+        err: alloc.AllocError,
+        err: error.TransportError,
+        err: error.RedirectError,
+        err: error.CodecError,
+    }
+{
+    var current_url: String = url
+    var remaining: usize = max_redirects
+    loop decreases remaining + 1 as usize {
+        let resp = send_mod.fetch_get(current_url, net, fs, mutable allocator)?
+        if !fetch_resp_mod.is_redirect(resp) { return resp }
+        if remaining == 0 as usize {
+            raise error.RedirectError.too_many_redirects(limit: max_redirects)
+        }
+        remaining = remaining - 1 as usize
+        let loc = fetch_resp_mod.header_bytes_or(
+            resp, "Location".bytes(), "".bytes(),
+        )
+        if loc.len() == 0 as usize {
+            raise error.RedirectError.missing_location
+        }
+        current_url = handle err: ux_error.ParseError -> {
+            raise error.RedirectError.malformed_location
+        } {
+            _resolve_location(current_url, loc, mutable allocator)?
+        }
+    }
+    raise error.RedirectError.too_many_redirects(limit: max_redirects)
+}

@@ -1,0 +1,427 @@
+
+module std.encoding.asn1
+
+import std.core.option
+
+spec std.core.option.Option(Element)
+
+public type TagClass {
+    case universal
+    case application
+    case context
+    case private_class
+}
+
+public type Tag {
+    class: TagClass
+    constructed: bool
+    number: u32
+}
+
+public type Element {
+    tag: Tag
+    content_start: usize
+    content_end: usize
+    total_end: usize
+}
+
+public type Cursor {
+    pos: usize
+    end: usize
+}
+
+public type BitStringView {
+    content_start: usize
+    content_end: usize
+    unused_bits: u8 where unused_bits <= 7
+}
+
+public type UnboundedInteger {
+    is_negative: bool
+    magnitude_start: usize
+    magnitude_end: usize
+}
+
+public type Asn1Error {
+    case truncated
+    case indefinite_length_forbidden
+    case non_minimal_length
+    case length_overflow
+    case non_minimal_tag
+    case tag_overflow
+    case unexpected_tag
+    case unexpected_constructed
+    case unexpected_primitive
+    case trailing_bytes
+    case integer_empty
+    case integer_leading_zero
+    case integer_leading_sign_extension
+    case integer_overflow
+    case oid_empty
+    case oid_first_arc_overflow
+    case oid_arc_overflow
+    case oid_arc_non_minimal
+    case oid_buffer_too_small
+    case bool_non_canonical
+    case null_non_empty
+    case bit_string_empty
+    case bit_string_unused_bits_out_of_range
+    case bit_string_unused_bits_nonzero_padding
+}
+
+type _TagAt {
+    tag: Tag
+    after: usize
+}
+
+type _LenAt {
+    length: usize
+    after: usize
+}
+
+function _decode_class(bits: u8) -> TagClass {
+    if bits == 0 {
+        return TagClass.universal
+    }
+    if bits == 1 {
+        return TagClass.application
+    }
+    if bits == 2 {
+        return TagClass.context
+    }
+    return TagClass.private_class
+}
+
+function _read_tag_at(input: [u8], start: usize) -> _TagAt
+    with {err: Asn1Error}
+{
+    let n: usize = input.len()
+    if n <= start {
+        raise Asn1Error.truncated
+    }
+    let b0: u8 = input[start]
+    let class: TagClass = _decode_class((b0 >> 6) & 3)
+    let constructed: bool = (b0 & 32) != 0
+    let low5: u8 = b0 & 31
+    if low5 != 31 {
+        let tag = Tag { class: class, constructed: constructed, number: low5 as u32 }
+        return _TagAt { tag: tag, after: start + 1 }
+    }
+    var num: u32 = 0
+    var i: usize = start + 1
+    var seen_significant: bool = false
+    loop
+        decreases n - i
+    {
+        if i >= n {
+            raise Asn1Error.truncated
+        }
+        let b: u8 = input[i]
+        let chunk: u32 = (b & 127) as u32
+        if !seen_significant && chunk == 0 {
+            raise Asn1Error.non_minimal_tag
+        }
+        seen_significant = true
+        if num > 0x01FFFFFF {
+            raise Asn1Error.tag_overflow
+        }
+        num = (num << 7) | chunk
+        i += 1
+        if (b & 128) == 0 {
+            if num < 31 {
+                raise Asn1Error.non_minimal_tag
+            }
+            let tag = Tag { class: class, constructed: constructed, number: num }
+            return _TagAt { tag: tag, after: i }
+        }
+    }
+}
+
+function _read_length_at(input: [u8], start: usize) -> _LenAt
+    with {err: Asn1Error}
+{
+    let n: usize = input.len()
+    if n <= start {
+        raise Asn1Error.truncated
+    }
+    let b0: u8 = input[start]
+    if (b0 & 128) == 0 {
+        return _LenAt { length: b0 as usize, after: start + 1 }
+    }
+    let num_bytes: usize = (b0 & 127) as usize
+    if num_bytes == 0 {
+        raise Asn1Error.indefinite_length_forbidden
+    }
+    if num_bytes > 4 {
+        raise Asn1Error.length_overflow
+    }
+    let body_start: usize = start + 1
+    let remaining: usize = n - body_start
+    if num_bytes > remaining {
+        raise Asn1Error.truncated
+    }
+    if input[body_start] == 0 {
+        raise Asn1Error.non_minimal_length
+    }
+    var length: usize = 0
+    var i: usize = 0
+    loop
+        decreases num_bytes - i
+    {
+        if i >= num_bytes {
+            if length < 128 {
+                raise Asn1Error.non_minimal_length
+            }
+            return _LenAt { length: length, after: body_start + num_bytes }
+        }
+        length = (length << 8) | (input[body_start + i] as usize)
+        i += 1
+    }
+}
+
+public function read_element(input: [u8], offset: usize) -> Element
+    with {err: Asn1Error}
+{
+    let n: usize = input.len()
+    if offset > n {
+        raise Asn1Error.truncated
+    }
+    let t: _TagAt = _read_tag_at(input, offset)?
+    let l: _LenAt = _read_length_at(input, t.after)?
+    let remaining: usize = n - l.after
+    if l.length > remaining {
+        raise Asn1Error.truncated
+    }
+    let content_end: usize = l.after + l.length
+    return Element {
+        tag: t.tag,
+        content_start: l.after,
+        content_end: content_end,
+        total_end: content_end,
+    }
+}
+
+public function expect(
+    e: Element,
+    class: TagClass,
+    number: u32,
+    constructed: bool,
+) -> ()
+    with {err: Asn1Error}
+{
+    if !_tag_class_eq(e.tag.class, class) {
+        raise Asn1Error.unexpected_tag
+    }
+    if e.tag.number != number {
+        raise Asn1Error.unexpected_tag
+    }
+    if e.tag.constructed && !constructed {
+        raise Asn1Error.unexpected_constructed
+    }
+    if !e.tag.constructed && constructed {
+        raise Asn1Error.unexpected_primitive
+    }
+}
+
+function _tag_class_eq(a: TagClass, b: TagClass) -> bool {
+    return match (a, b) {
+        case (.universal, .universal) => true
+        case (.application, .application) => true
+        case (.context, .context) => true
+        case (.private_class, .private_class) => true
+        case (_, _) => false
+    }
+}
+
+public function children_cursor(e: Element) -> Cursor {
+    return Cursor { pos: e.content_start, end: e.content_end }
+}
+
+public function has_next(c: Cursor) -> bool {
+    return c.pos < c.end
+}
+
+public function next(c: mutable Cursor, input: [u8]) -> Option_Element.Option
+    with {err: Asn1Error}
+{
+    if c.pos >= c.end {
+        return Option_Element.Option.none
+    }
+    let child: Element = read_element(input, c.pos)?
+    if child.total_end > c.end {
+        raise Asn1Error.truncated
+    }
+    c.pos = child.total_end
+    return Option_Element.Option.some(value: child)
+}
+
+public function read_integer_u64(input: [u8], e: Element) -> u64
+    with {err: Asn1Error}
+{
+    let v: UnboundedInteger = read_integer_unbounded(input, e)?
+    if v.is_negative {
+        raise Asn1Error.integer_overflow
+    }
+    let len: usize = v.magnitude_end - v.magnitude_start
+    if len > 8 {
+        raise Asn1Error.integer_overflow
+    }
+    var value: u64 = 0
+    var i: usize = 0
+    loop
+        decreases len - i
+    {
+        if i >= len {
+            return value
+        }
+        value = (value << 8) | (input[v.magnitude_start + i] as u64)
+        i += 1
+    }
+}
+
+public function read_integer_unbounded(input: [u8], e: Element) -> UnboundedInteger
+    with {err: Asn1Error}
+{
+    if e.content_end <= e.content_start {
+        raise Asn1Error.integer_empty
+    }
+    let first: u8 = input[e.content_start]
+    let len: usize = e.content_end - e.content_start
+    let is_negative: bool = (first & 128) != 0
+    if len == 1 {
+        return UnboundedInteger {
+            is_negative: is_negative,
+            magnitude_start: e.content_start,
+            magnitude_end: e.content_end,
+        }
+    }
+    let second: u8 = input[e.content_start + 1]
+    if first == 0 && (second & 128) == 0 {
+        raise Asn1Error.integer_leading_zero
+    }
+    if first == 255 && (second & 128) != 0 {
+        raise Asn1Error.integer_leading_sign_extension
+    }
+    var magnitude_start: usize = e.content_start
+    let stripped: bool = (first == 0 && (second & 128) != 0) || (first == 255 && (second & 128) == 0)
+    if stripped {
+        magnitude_start = e.content_start + 1
+    }
+    return UnboundedInteger {
+        is_negative: is_negative,
+        magnitude_start: magnitude_start,
+        magnitude_end: e.content_end,
+    }
+}
+
+public function read_oid(input: [u8], e: Element, out: mutable [u32]) -> usize
+    with {err: Asn1Error}
+{
+    if e.content_end <= e.content_start {
+        raise Asn1Error.oid_empty
+    }
+    let cap: usize = out.len()
+    if cap < 2 {
+        raise Asn1Error.oid_buffer_too_small
+    }
+    let first: u8 = input[e.content_start]
+    var arc1: u32 = 0
+    var arc2: u32 = 0
+    if first < 40 {
+        arc1 = 0
+        arc2 = first as u32
+    } else if first < 80 {
+        arc1 = 1
+        arc2 = (first as u32) - 40
+    } else {
+        arc1 = 2
+        arc2 = (first as u32) - 80
+    }
+    out[0] = arc1
+    out[1] = arc2
+    var written: usize = 2
+    var i: usize = e.content_start + 1
+    var arc: u32 = 0
+    var seen_significant: bool = false
+    loop
+        decreases e.content_end - i
+    {
+        if i >= e.content_end {
+            if seen_significant {
+                raise Asn1Error.oid_arc_overflow
+            }
+            return written
+        }
+        let b: u8 = input[i]
+        let chunk: u32 = (b & 127) as u32
+        if !seen_significant && chunk == 0 && (b & 128) != 0 {
+            raise Asn1Error.oid_arc_non_minimal
+        }
+        seen_significant = true
+        if arc > 0x01FFFFFF {
+            raise Asn1Error.oid_arc_overflow
+        }
+        arc = (arc << 7) | chunk
+        i += 1
+        if (b & 128) == 0 {
+            if written >= cap {
+                raise Asn1Error.oid_buffer_too_small
+            }
+            out[written] = arc
+            written += 1
+            arc = 0
+            seen_significant = false
+        }
+    }
+}
+
+public function read_bool(input: [u8], e: Element) -> bool
+    with {err: Asn1Error}
+{
+    let len: usize = e.content_end - e.content_start
+    if len != 1 {
+        raise Asn1Error.bool_non_canonical
+    }
+    let b: u8 = input[e.content_start]
+    if b == 0 {
+        return false
+    }
+    if b == 255 {
+        return true
+    }
+    raise Asn1Error.bool_non_canonical
+}
+
+public function read_null(input: [u8], e: Element) -> ()
+    with {err: Asn1Error}
+{
+    if e.content_end != e.content_start {
+        raise Asn1Error.null_non_empty
+    }
+}
+
+public function read_bit_string(input: [u8], e: Element) -> BitStringView
+    with {err: Asn1Error}
+{
+    if e.content_end <= e.content_start {
+        raise Asn1Error.bit_string_empty
+    }
+    let unused: u8 = input[e.content_start]
+    if unused > 7 {
+        raise Asn1Error.bit_string_unused_bits_out_of_range
+    }
+    let data_start: usize = e.content_start + 1
+    let data_end: usize = e.content_end
+    if unused != 0 && data_end > data_start {
+        let last: u8 = input[data_end - 1]
+        let mask: u8 = ((1 as u8) << unused) - 1
+        if (last & mask) != 0 {
+            raise Asn1Error.bit_string_unused_bits_nonzero_padding
+        }
+    }
+    return BitStringView {
+        content_start: data_start,
+        content_end: data_end,
+        unused_bits: unused,
+    }
+}

@@ -1,0 +1,531 @@
+
+module cache.blob.mir.expr.read.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.literal as ast_literal_mod
+import local.blob.mir.ast.ops as ast_ops_mod
+import local.blob.mir.symbol.codec as symbol_codec_mod
+import local.blob.mir.pat.codec as pat_codec_mod
+import local.blob.mir.ty.read.codec as ty_codec_mod
+import local.blob.mir.expr.leaf.codec as leaf_mod
+
+
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.mem.alloc.Box(ast_tree_mod.Closure)
+spec std.mem.alloc.Box(ast_tree_mod.SpawnExpr)
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_tree_mod.Stmt)
+spec std.collections.vec.Vec(ast_tree_mod.MatchArm)
+spec std.collections.vec.Vec(ast_tree_mod.StructLitField)
+spec std.collections.vec.Vec(ast_tree_mod.CallArg)
+spec std.collections.vec.Vec(ast_tree_mod.SpawnArg)
+spec std.collections.vec.Vec(ast_tree_mod.FStringSeg)
+
+
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(ast_tree_mod.Expr)
+
+
+public function read_expr(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    let kind = match tag {
+        case 0 => ast_tree_mod.ExprKind.literal(value: ast_literal_mod.read_literal(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => ast_tree_mod.ExprKind.fstring(segments: read_fstring_seg_vec(bytes, mutable cur, mutable it, allocator)?)
+        case 2 => ast_tree_mod.ExprKind.path(path: ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?)
+        case 3 => {
+            let op = ast_ops_mod.read_bin_op(bytes, mutable cur)?
+            let lhs = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let rhs = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.binary(op: op, lhs: lhs, rhs: rhs)
+        }
+        case 4 => {
+            let op = ast_ops_mod.read_un_op(bytes, mutable cur)?
+            let operand = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.unary(op: op, expr: operand)
+        }
+        case 5 => {
+            let callee = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let args = read_call_arg_vec(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.call(callee: callee, args: args)
+        }
+        case 6 => {
+            let receiver = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let args = read_call_arg_vec(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.method_call(receiver: receiver, name: name, args: args)
+        }
+        case 7 => {
+            let receiver = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.field(receiver: receiver, name: name)
+        }
+        case 8 => {
+            let receiver = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let index = prim_mod.read_u32_le(bytes, mutable cur)?
+            ast_tree_mod.ExprKind.tuple_index(receiver: receiver, index: index)
+        }
+        case 9 => {
+            let receiver = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let index = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.positional(receiver: receiver, index: index)
+        }
+        case 10 => {
+            let receiver = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let index = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.index(receiver: receiver, index: index)
+        }
+        case 11 => {
+            let cond = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let then_block = read_block(bytes, mutable cur, mutable it, allocator)?
+            let else_branch = read_option_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.if_(cond: cond, then_block: then_block, else_branch: else_branch)
+        }
+        case 12 => {
+            let scrutinee = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let arms = read_match_arm_vec(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.match_(scrutinee: scrutinee, arms: arms)
+        }
+        case 13 => ast_tree_mod.ExprKind.block(body: read_block(bytes, mutable cur, mutable it, allocator)?)
+        case 14 => {
+            let inner = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let ty = leaf_mod.read_box_ty(bytes, mutable cur, mutable it, allocator, read_expr)?
+            let mode = ast_ops_mod.read_cast_mode(bytes, mutable cur)?
+            ast_tree_mod.ExprKind.cast(expr: inner, ty: ty, mode: mode)
+        }
+        case 15 => {
+            let lo = read_option_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let hi = read_option_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let kind = ast_ops_mod.read_range_kind(bytes, mutable cur)?
+            ast_tree_mod.ExprKind.range(lo: lo, hi: hi, kind: kind)
+        }
+        case 16 => ast_tree_mod.ExprKind.tuple(elements: read_expr_vec(bytes, mutable cur, mutable it, allocator)?)
+        case 17 => {
+            let path = ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?
+            let fields = read_struct_lit_field_vec(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.struct_lit(path: path, fields: fields)
+        }
+        case 18 => {
+            let body = read_block(bytes, mutable cur, mutable it, allocator)?
+            let label = leaf_mod.read_option_ident(bytes, mutable cur, mutable it, allocator)?
+            let decreases_ = read_option_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.loop_(body: body, label: label, decreases_: decreases_)
+        }
+        case 19 => {
+            let pat = leaf_mod.read_box_pat(bytes, mutable cur, mutable it, allocator, read_expr)?
+            let iter = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let body = read_block(bytes, mutable cur, mutable it, allocator)?
+            let label = leaf_mod.read_option_ident(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.for_(pat: pat, iter: iter, body: body, label: label)
+        }
+        case 20 => ast_tree_mod.ExprKind.try_(expr: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case 21 => ast_tree_mod.ExprKind.await_(expr: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case 22 => ast_tree_mod.ExprKind.raise_(expr: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case 23 => ast_tree_mod.ExprKind.panic_(expr: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case 24 => ast_tree_mod.ExprKind.return_(value: read_option_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case 25 => {
+            let label = leaf_mod.read_option_ident(bytes, mutable cur, mutable it, allocator)?
+            let value = read_option_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.break_(label: label, value: value)
+        }
+        case 26 => ast_tree_mod.ExprKind.continue_(label: leaf_mod.read_option_ident(bytes, mutable cur, mutable it, allocator)?)
+        case 27 => ast_tree_mod.ExprKind.comptime_(expr: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case 28 => ast_tree_mod.ExprKind.comptime_block(body: read_block(bytes, mutable cur, mutable it, allocator)?)
+        case 29 => {
+            let kind = ast_ops_mod.read_scope_kind(bytes, mutable cur)?
+            let name = leaf_mod.read_option_ident(bytes, mutable cur, mutable it, allocator)?
+            let body = read_block(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.scope_(kind: kind, name: name, body: body)
+        }
+        case 30 => ast_tree_mod.ExprKind.effect_row(row: ty_codec_mod.read_effect_row(bytes, mutable cur, mutable it, allocator, read_expr)?)
+        case 31 => {
+            let effect = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let ty = leaf_mod.read_box_ty(bytes, mutable cur, mutable it, allocator, read_expr)?
+            let binder = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let recovery = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let body = read_block(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.handle_(effect: effect, ty: ty, binder: binder, recovery: recovery, body: body)
+        }
+        case 32 => {
+            let payload = read_closure(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.closure(payload: Box_Closure.new(take payload, allocator)?)
+        }
+        case 33 => {
+            let payload = read_spawn_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.spawn(payload: Box_SpawnExpr.new(take payload, allocator)?)
+        }
+        case 34 => {
+            let bound = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let iter = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let body = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.forall_(bound: bound, iter: iter, body: body)
+        }
+        case 35 => {
+            let bound = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let iter = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            let body = read_box_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.ExprKind.exists_(bound: bound, iter: iter, body: body)
+        }
+        case 36 => ast_tree_mod.ExprKind.error
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown ExprKind tag")
+    }
+    return ast_tree_mod.Expr { span: span, kind: kind }
+}
+
+public function read_box_expr(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Box_Expr
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let e = read_expr(bytes, mutable cur, mutable it, allocator)?
+    return Box_Expr.new(take e, allocator)?
+}
+
+public function read_option_box_expr(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Box_Expr
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_Box_Expr.some(value: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+    }
+    return Option_Box_Expr.none
+}
+
+public function read_option_expr(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Expr
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_Expr.some(value: read_expr(bytes, mutable cur, mutable it, allocator)?)
+    }
+    return Option_Expr.none
+}
+
+public function read_expr_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Expr.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit elements: Vec_Expr.Vec
+    Vec_Expr.new(init elements, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let e = read_expr(bytes, mutable cur, mutable it, allocator)?
+        Vec_Expr.push(mutable elements, take e, allocator)?
+        i += 1
+    }
+    return elements
+}
+
+public function read_stmt(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.Stmt
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    let kind = match tag {
+        case 0 => {
+            let binding = ast_ops_mod.read_binding_mode(bytes, mutable cur)?
+            let pat = pat_codec_mod.read_pat(bytes, mutable cur, mutable it, allocator, read_expr)?
+            let ty = leaf_mod.read_option_ty(bytes, mutable cur, mutable it, allocator, read_expr)?
+            let init_ = read_option_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.StmtKind.let_(binding: binding, pat: pat, ty: ty, init_: init_)
+        }
+        case 1 => {
+            let target = read_expr(bytes, mutable cur, mutable it, allocator)?
+            let op = ast_ops_mod.read_assign_op(bytes, mutable cur)?
+            let rhs = read_expr(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.StmtKind.assign(target: target, op: op, rhs: rhs)
+        }
+        case 2 => ast_tree_mod.StmtKind.expr(value: read_expr(bytes, mutable cur, mutable it, allocator)?)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown StmtKind tag")
+    }
+    return ast_tree_mod.Stmt { span: span, kind: kind }
+}
+
+public function read_stmt_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Stmt.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit stmts: Vec_Stmt.Vec
+    Vec_Stmt.new(init stmts, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = read_stmt(bytes, mutable cur, mutable it, allocator)?
+        Vec_Stmt.push(mutable stmts, take s, allocator)?
+        i += 1
+    }
+    return stmts
+}
+
+public function read_block(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.Block
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let stmts = read_stmt_vec(bytes, mutable cur, mutable it, allocator)?
+    let trailing = read_option_box_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.Block { span: span, stmts: stmts, trailing: trailing }
+}
+
+public function read_match_arm(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.MatchArm
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let pat = pat_codec_mod.read_pat(bytes, mutable cur, mutable it, allocator, read_expr)?
+    let guard = read_option_expr(bytes, mutable cur, mutable it, allocator)?
+    let body = read_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.MatchArm { span: span, pat: pat, guard: guard, body: body }
+}
+
+public function read_match_arm_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_MatchArm.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit arms: Vec_MatchArm.Vec
+    Vec_MatchArm.new(init arms, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = read_match_arm(bytes, mutable cur, mutable it, allocator)?
+        Vec_MatchArm.push(mutable arms, take a, allocator)?
+        i += 1
+    }
+    return arms
+}
+
+public function read_struct_lit_field(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.StructLitField
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let mode = leaf_mod.read_option_call_mode(bytes, mutable cur)?
+    let value = read_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.StructLitField { span: span, name: name, mode: mode, value: value }
+}
+
+public function read_struct_lit_field_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_StructLitField.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit fields: Vec_StructLitField.Vec
+    Vec_StructLitField.new(init fields, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = read_struct_lit_field(bytes, mutable cur, mutable it, allocator)?
+        Vec_StructLitField.push(mutable fields, take f, allocator)?
+        i += 1
+    }
+    return fields
+}
+
+public function read_call_arg(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.CallArg
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let mode = leaf_mod.read_option_call_mode(bytes, mutable cur)?
+    let name = leaf_mod.read_option_ident(bytes, mutable cur, mutable it, allocator)?
+    let expr = read_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.CallArg { span: span, mode: mode, name: name, expr: expr }
+}
+
+public function read_call_arg_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_CallArg.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit args: Vec_CallArg.Vec
+    Vec_CallArg.new(init args, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = read_call_arg(bytes, mutable cur, mutable it, allocator)?
+        Vec_CallArg.push(mutable args, take a, allocator)?
+        i += 1
+    }
+    return args
+}
+
+public function read_closure(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.Closure
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let params = leaf_mod.read_param_vec(bytes, mutable cur, mutable it, allocator, read_expr)?
+    let ret = ty_codec_mod.read_ty(bytes, mutable cur, mutable it, allocator, read_expr)?
+    let effects = ty_codec_mod.read_option_effect_row(bytes, mutable cur, mutable it, allocator, read_expr)?
+    let captures_ = leaf_mod.read_option_vec_capture(bytes, mutable cur, mutable it, allocator)?
+    let body = read_block(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.Closure { span: span, params: params, ret: ret, effects: effects, captures_: captures_, body: body }
+}
+
+public function read_spawn_expr(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.SpawnExpr
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let scope_name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let args = read_spawn_arg_vec(bytes, mutable cur, mutable it, allocator)?
+    let body = read_block(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.SpawnExpr { span: span, scope_name: scope_name, args: args, body: body }
+}
+
+public function read_spawn_arg(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.SpawnArg
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let ty = leaf_mod.read_option_ty(bytes, mutable cur, mutable it, allocator, read_expr)?
+    let init_ = read_expr(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.SpawnArg { span: span, name: name, ty: ty, init_: init_ }
+}
+
+public function read_spawn_arg_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_SpawnArg.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit args: Vec_SpawnArg.Vec
+    Vec_SpawnArg.new(init args, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let a = read_spawn_arg(bytes, mutable cur, mutable it, allocator)?
+        Vec_SpawnArg.push(mutable args, take a, allocator)?
+        i += 1
+    }
+    return args
+}
+
+public function read_fstring_seg(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.FStringSeg
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_tree_mod.FStringSeg.text(sym: symbol_codec_mod.read_symbol(bytes, mutable cur, mutable it, allocator)?)
+        case 1 => ast_tree_mod.FStringSeg.interp(expr: read_box_expr(bytes, mutable cur, mutable it, allocator)?)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown FStringSeg tag")
+    }
+}
+
+public function read_fstring_seg_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_FStringSeg.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit segments: Vec_FStringSeg.Vec
+    Vec_FStringSeg.new(init segments, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = read_fstring_seg(bytes, mutable cur, mutable it, allocator)?
+        Vec_FStringSeg.push(mutable segments, take s, allocator)?
+        i += 1
+    }
+    return segments
+}

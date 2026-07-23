@@ -1,0 +1,230 @@
+
+module driver.entry
+
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import diagnostics.emit.collection as diags_mod
+import source.map as source_map_mod
+import source.read as source_read_mod
+import manifest.manifest as manifest_mod
+import manifest.build.parse as manifest_parse_mod
+import manifest.model.workspace.workspace as ws_mod
+import intern.interner as interner_mod
+import local.cli as cli_mod
+import local.dispatch as dispatch_mod
+import local.exit as exit_mod
+import local.render.render as render_mod
+
+
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ws_mod.Workspace)
+spec std.core.option.Option(String)
+
+
+public function run(
+    args: [String],
+    wfs: Filesystem,
+    rfs: ReadOnlyFilesystem,
+    subprocess: Subprocess,
+    out: Stdout,
+    clock: MonotonicClock,
+    wall_clock: Clock,
+    errout: Stderr,
+    workspace_root: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> i32
+    with {wfs, rfs, subprocess, out, clock, wall_clock, errout, allocator, err: fs.FsError, err: alloc.AllocError, panic, divergence, time(ops <= 1)}
+{
+    uninit map: source_map_mod.SourceMap
+    source_map_mod.new_map(init map, allocator)?
+
+    let parsed_opt = cli_mod.parse_args(args, mutable diags, allocator)?
+    let parsed = match parsed_opt {
+        case .some(let p) => p
+        case .none => {
+            render_mod.render_diagnostics(errout, diags, map, allocator)?
+            return exit_mod.exit_code_of(diags)
+        }
+    }
+
+    let effective_root = match parsed.manifest_path {
+        case .some(let p) => parent_dir(p, allocator)?
+        case .none => discover_workspace_root(rfs, workspace_root, allocator)?
+    }
+
+    uninit interner: interner_mod.Interner
+    interner_mod.new_interner(init interner, allocator)?
+
+    let run_code = dispatch_mod.dispatch(parsed, rfs, wfs, subprocess, out, clock, wall_clock, errout, effective_root, mutable map, mutable interner, mutable diags, allocator)?
+
+    render_mod.render_diagnostics(errout, diags, map, allocator)?
+    interner_mod.dispose(take interner)
+    let base = exit_mod.exit_code_of(diags)
+    return if base != 0 { base } else { run_code }
+}
+
+
+function parent_dir(path: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let segs = string.split(path, "/", allocator)?
+    let n = segs.len()
+    if n <= 1 as usize { return "." }
+    let last = n - 1
+    var acc: String = ""
+    var i: usize = 0
+    loop decreases (last - i) {
+        if i >= last { break }
+        if i == 0 as usize {
+            acc = string.clone(segs[i], allocator)?
+        } else {
+            let with_sep = string.concat(acc, "/", allocator)?
+            acc = string.concat(with_sep, segs[i], allocator)?
+        }
+        i = i + 1
+    }
+    if string.is_empty(acc) { return "/" }
+    return acc
+}
+
+
+function is_listed_member(ws: ws_mod.Workspace, candidate: String) -> bool {
+    let n = ws_mod.member_count(ws)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        if string.equals(ws_mod.member_at(ws, i), candidate) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function is_member_of_workspace(
+    rfs: ReadOnlyFilesystem,
+    m: manifest_mod.LoadedManifest,
+    ws_dir: String,
+    nearest_dir: String,
+    allocator: Allocator,
+) -> bool
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let ws = match manifest_mod.workspace_of(m) {
+        case .some(let w) => w
+        case .none => return false
+    }
+    let root_seg = ws_mod.discover_root_of(ws)
+    let ws_slash = string.concat(ws_dir, "/", allocator)?
+    let root_dir = string.concat(ws_slash, root_seg, allocator)?
+    let lib_prefix = string.concat(root_dir, "/", allocator)?
+    if !string.starts_with(nearest_dir, lib_prefix) { return false }
+    let parts = string.split(nearest_dir, lib_prefix, allocator)?
+    if parts.len() < 2 as usize { return false }
+    let segs = string.split(parts[1], "/", allocator)?
+    if segs.len() == 0 as usize || string.is_empty(segs[0]) { return false }
+    if is_listed_member(ws, segs[0]) { return true }
+    match ws_mod.discover(ws) {
+        case .none => return false
+        case .some(_) => ()
+    }
+    let member_dir = string.concat(lib_prefix, segs[0], allocator)?
+    let member_toml = string.concat(member_dir, "/package.toml", allocator)?
+    return fs.path_exists(rfs, member_toml)
+}
+
+function find_enclosing_workspace_root(
+    rfs: ReadOnlyFilesystem,
+    nearest_dir: String,
+    map: mutable source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let max_depth: usize = 64
+    var dir: String = parent_dir(nearest_dir, allocator)?
+    var depth: usize = 0
+    loop decreases (max_depth - depth) {
+        if depth >= max_depth { break }
+        let toml = string.concat(dir, "/package.toml", allocator)?
+        if fs.path_exists(rfs, toml) {
+            let fid = source_read_mod.read_file(rfs, mutable map, take toml, allocator)?
+            let content = source_map_mod.file_content_of(map, fid)
+            let m_opt = manifest_parse_mod.parse_manifest(content, fid, mutable diags, allocator)?
+            match m_opt {
+                case .some(let m) => if manifest_mod.has_workspace(m) {
+                    return if is_member_of_workspace(rfs, m, dir, nearest_dir, allocator)? {
+                        Option_String.some(value: dir)
+                    } else {
+                        Option_String.none
+                    }
+                }
+                case .none => ()
+            }
+        }
+        let parent = parent_dir(dir, allocator)?
+        if string.equals(parent, dir) { break }
+        dir = parent
+        depth = depth + 1
+    }
+    return Option_String.none
+}
+
+function discover_workspace_root(
+    rfs: ReadOnlyFilesystem,
+    start: String,
+    allocator: Allocator,
+) -> String
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+
+    let max_depth: usize = 64
+    let norm_start = string.replace(start, "\\", "/", allocator)?
+
+    var nearest_dir: String = ""
+    var nearest_is_workspace: bool = false
+    var have_nearest: bool = false
+    var dir: String = norm_start
+    var depth: usize = 0
+    loop decreases (max_depth - depth) {
+        if depth >= max_depth { break }
+        let toml = string.concat(dir, "/package.toml", allocator)?
+        if fs.path_exists(rfs, toml) {
+            let fid = source_read_mod.read_file(rfs, mutable scratch_map, take toml, allocator)?
+            let content = source_map_mod.file_content_of(scratch_map, fid)
+            let m_opt = manifest_parse_mod.parse_manifest(content, fid, mutable scratch_diags, allocator)?
+            match m_opt {
+                case .some(let m) => {
+                    have_nearest = true
+                    nearest_dir = dir
+                    nearest_is_workspace = manifest_mod.has_workspace(m)
+                }
+                case .none => ()
+            }
+            if have_nearest { break }
+        }
+        let parent = parent_dir(dir, allocator)?
+        if string.equals(parent, dir) { break }
+        dir = parent
+        depth = depth + 1
+    }
+
+    if !have_nearest { return start }
+    if nearest_is_workspace {
+        if string.equals(norm_start, nearest_dir) { return nearest_dir }
+        let lib_prefix = string.concat(nearest_dir, "/lib/", allocator)?
+        if string.starts_with(norm_start, lib_prefix) { return nearest_dir }
+        return start
+    }
+
+    return match find_enclosing_workspace_root(rfs, nearest_dir, mutable scratch_map, mutable scratch_diags, allocator)? {
+        case .some(let ws_dir) => ws_dir
+        case .none => nearest_dir
+    }
+}

@@ -1,0 +1,150 @@
+
+module compile.phase.emit.write.name
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+
+import intern.interner as interner_mod
+import mir.file.store as mir_file_mod
+import hir.build.file as origin_file_mod
+import syntax.ast.item as ast_item_mod
+import syntax.ast.ident as ast_ident_mod
+import symname.lib as symname_mod
+
+
+spec std.collections.vec.Vec(origin_file_mod.HirFile)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(ast_ident_mod.Ident)
+spec std.collections.vec.Vec(String)
+
+
+public function package_basename(
+    file: mir_file_mod.MirFile,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let nf = Vec_HirFile.len(file.hir_files)
+    if nf == 0 as usize { return "" }
+    uninit common: Vec_String.Vec
+    Vec_String.new(init common, allocator)?
+    var have_any: bool = false
+    var i: usize = 1
+    loop decreases nf - i {
+        if i >= nf { break }
+        let hf = Vec_HirFile.at(file.hir_files, i)
+        let segs = module_decl_segments(hf, interner, allocator)?
+        if !Vec_String.is_empty(segs) {
+            if have_any {
+                intersect_in_place(mutable common, segs)
+            } else {
+                copy_into(mutable common, segs, allocator)?
+                have_any = true
+            }
+        }
+        i += 1
+    }
+    if !have_any { return "" }
+    return join_strings(common, allocator)?
+}
+
+
+function module_decl_segments(
+    hf: origin_file_mod.HirFile,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_String.Vec
+    Vec_String.new(init out, allocator)?
+    let items = hf.source.items
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .module_(let decl) => {
+                let segs = decl.path.segments
+                let m = Vec_Ident.len(segs)
+                var j: usize = 0
+                loop decreases m - j {
+                    if j >= m { break }
+                    let seg = Vec_Ident.at(segs, j)
+                    let part = symname_mod.extern_symbol(seg.name, interner, allocator)?
+                    Vec_String.push(mutable out, take part, allocator)?
+                    j += 1
+                }
+                return out
+            }
+            case _ => ()
+        }
+        i += 1
+    }
+    return out
+}
+
+
+function copy_into(
+    dst: mutable Vec_String.Vec,
+    src: Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(src)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let part = string.clone(Vec_String.at(src, i), allocator)?
+        Vec_String.push(mutable dst, take part, allocator)?
+        i += 1
+    }
+}
+
+
+function intersect_in_place(
+    common: mutable Vec_String.Vec,
+    other: Vec_String.Vec,
+) -> () {
+    let lc = Vec_String.len(common)
+    let lo = Vec_String.len(other)
+    let m = if lc < lo { lc } else { lo }
+    var k: usize = 0
+    loop decreases m - k {
+        if k >= m { break }
+        if !string.equals(Vec_String.at(common, k), Vec_String.at(other, k)) { break }
+        k += 1
+    }
+    loop decreases (Vec_String.len(common) + 1 as usize) {
+        if Vec_String.len(common) <= k { break }
+        let _ = Vec_String.pop(mutable common)
+    }
+}
+
+
+function join_strings(
+    segments: Vec_String.Vec,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_String.len(segments)
+    var acc: String = ""
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let seg = Vec_String.at(segments, i)
+        if string.is_empty(acc) {
+            acc = string.clone(seg, allocator)?
+        } else {
+            let joined = string.concat(acc, "_", allocator)?
+            acc = string.concat(joined, seg, allocator)?
+        }
+        i += 1
+    }
+    return acc
+}

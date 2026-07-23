@@ -1,0 +1,283 @@
+module optimize.alias_mem.sroa.plan.step.rewrite
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.local as mir_local_mod
+
+import types.pass.ty as ty_mod
+import hir.node as node_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.sroa.model as model_mod
+import local.alias_mem.sroa.plan.step.leaf.scan as scan_mod
+import local.alias_mem.sroa.plan.plan as plan_mod
+
+
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+spec std.collections.vec.Vec(mir_place_mod.Projection)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+
+public function rewrite_all_blocks(
+    plan: model_mod.Plan,
+    body: mutable mir_body_mod.MirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        rewrite_block(plan, mutable body, bi, allocator)?
+        bi += 1
+    }
+}
+
+
+function rewrite_block(
+    plan: model_mod.Plan,
+    body: mutable mir_body_mod.MirBody,
+    block_index: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires block_index < Vec_BasicBlock.len(body.blocks)
+{
+    let original = Vec_BasicBlock.at(body.blocks, block_index)
+
+    uninit fresh_stmts: Vec_Statement.Vec
+    Vec_Statement.new(init fresh_stmts, allocator)?
+
+    let n_stmts: usize = Vec_Statement.len(original.statements)
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(original.statements, si)
+        rewrite_statement_into(plan, mutable fresh_stmts, stmt, allocator)?
+        si += 1
+    }
+
+    let rebuilt = mir_body_mod.BasicBlock {
+        node_id_origin: original.node_id_origin,
+        statements: fresh_stmts,
+        terminator: original.terminator,
+        coherence_region: original.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, block_index, take rebuilt)
+}
+
+
+function rewrite_statement_into(
+    plan: model_mod.Plan,
+    out: mutable Vec_Statement.Vec,
+    stmt: mir_stmt_mod.Statement,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match stmt.kind {
+        case .assign(let dest, let value) =>
+            rewrite_assign_into(plan, mutable out, stmt.origin, dest, value, allocator)?
+        case .storage_live(let local) =>
+            emit_storage(plan, mutable out, stmt.origin, local, true, allocator)?
+        case .storage_dead(let local) =>
+            emit_storage(plan, mutable out, stmt.origin, local, false, allocator)?
+        case .nop_ =>
+            Vec_Statement.push(mutable out, take stmt, allocator)?
+    }
+}
+
+
+function rewrite_assign_into(
+    plan: model_mod.Plan,
+    out: mutable Vec_Statement.Vec,
+    origin: node_mod.NodeId,
+    dest: mir_place_mod.Place,
+    value: mir_rvalue_mod.Rvalue,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let dest_base: usize = mir_local_mod.index(escape_mod.base_local(dest))
+    let dest_ci: i64 = plan_mod.candidate_index_for_base(plan, dest_base)
+    if dest_ci >= 0 {
+        if escape_mod.is_bare(dest) {
+            explode_aggregate_into(plan, mutable out, origin, dest_ci as usize, value, allocator)?
+            return
+        }
+    }
+
+    let new_value = rewrite_rvalue(plan, value)
+    let stmt = mir_stmt_mod.Statement {
+        origin: origin,
+        kind: mir_stmt_mod.MStmtKind.assign(dest: dest, value: new_value),
+    }
+    Vec_Statement.push(mutable out, take stmt, allocator)?
+}
+
+
+function explode_aggregate_into(
+    plan: model_mod.Plan,
+    out: mutable Vec_Statement.Vec,
+    origin: node_mod.NodeId,
+    ci: usize,
+    value: mir_rvalue_mod.Rvalue,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match value {
+        case .aggregate(_, let elems, _) => {
+            let n: usize = Vec_Operand.len(elems)
+            var fi: usize = 0
+            loop decreases n - fi {
+                if fi >= n { break }
+                let elem_op = Vec_Operand.at(elems, fi)
+                let rewritten_op = rewrite_operand(plan, elem_op)
+                let target = plan_mod.field_local_for(plan, ci, fi)
+                if mir_local_mod.is_error(target) == false {
+                    let dest_place = bare_place(target)
+                    let stmt = mir_stmt_mod.Statement {
+                        origin: origin,
+                        kind: mir_stmt_mod.MStmtKind.assign(
+                            dest: dest_place,
+                            value: mir_rvalue_mod.Rvalue.use_(operand: rewritten_op),
+                        ),
+                    }
+                    Vec_Statement.push(mutable out, take stmt, allocator)?
+                }
+                fi += 1
+            }
+        }
+        case _ => ()
+    }
+}
+
+
+function emit_storage(
+    plan: model_mod.Plan,
+    out: mutable Vec_Statement.Vec,
+    origin: node_mod.NodeId,
+    local: mir_local_mod.LocalId,
+    is_live: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let base_index: usize = mir_local_mod.index(local)
+    let ci: i64 = plan_mod.candidate_index_for_base(plan, base_index)
+    if ci < 0 {
+        let stmt = mir_stmt_mod.Statement {
+            origin: origin,
+            kind: storage_kind(local, is_live),
+        }
+        Vec_Statement.push(mutable out, take stmt, allocator)?
+        return
+    }
+
+    if ci as usize >= Vec_u32.len(plan.candidate_n_fields) {
+        return
+    }
+    let n_fields: usize = Vec_u32.at(plan.candidate_n_fields, ci as usize) as usize
+    var fi: usize = 0
+    loop decreases n_fields - fi {
+        if fi >= n_fields { break }
+        let target = plan_mod.field_local_for(plan, ci as usize, fi)
+        if mir_local_mod.is_error(target) == false {
+            let stmt = mir_stmt_mod.Statement {
+                origin: origin,
+                kind: storage_kind(target, is_live),
+            }
+            Vec_Statement.push(mutable out, take stmt, allocator)?
+        }
+        fi += 1
+    }
+}
+
+
+function storage_kind(local: mir_local_mod.LocalId, is_live: bool) -> mir_stmt_mod.MStmtKind {
+    if is_live {
+        return mir_stmt_mod.MStmtKind.storage_live(local: local)
+    }
+    return mir_stmt_mod.MStmtKind.storage_dead(local: local)
+}
+
+
+function rewrite_rvalue(
+    plan: model_mod.Plan,
+    rv: mir_rvalue_mod.Rvalue,
+) -> mir_rvalue_mod.Rvalue
+{
+    return match rv {
+        case .use_(let operand) =>
+            mir_rvalue_mod.Rvalue.use_(operand: rewrite_operand(plan, operand))
+        case .binary(let op, let lhs, let rhs) =>
+            mir_rvalue_mod.Rvalue.binary(
+                op: op,
+                lhs: rewrite_operand(plan, lhs),
+                rhs: rewrite_operand(plan, rhs),
+            )
+        case .unary(let op, let operand) =>
+            mir_rvalue_mod.Rvalue.unary(op: op, operand: rewrite_operand(plan, operand))
+        case .cast(let operand, let from, let to, let kind) =>
+            mir_rvalue_mod.Rvalue.cast(
+                operand: rewrite_operand(plan, operand),
+                from: from,
+                to: to,
+                kind: kind,
+            )
+        case .make_closure(let code, let env) =>
+            mir_rvalue_mod.Rvalue.make_closure(code: code, env: rewrite_operand(plan, env))
+        case _ => rv
+    }
+}
+
+
+function rewrite_operand(
+    plan: model_mod.Plan,
+    op: mir_rvalue_mod.Operand,
+) -> mir_rvalue_mod.Operand
+{
+    return match op {
+        case .copy_(let place, let ty) => rewrite_copy_operand(plan, place, ty)
+        case .move_(_, _) => op
+        case .constant(_) => op
+    }
+}
+
+
+function rewrite_copy_operand(
+    plan: model_mod.Plan,
+    place: mir_place_mod.Place,
+    ty: ty_mod.TyId,
+) -> mir_rvalue_mod.Operand
+{
+    let base_index: usize = mir_local_mod.index(escape_mod.base_local(place))
+    let ci: i64 = plan_mod.candidate_index_for_base(plan, base_index)
+    if ci < 0 {
+        return mir_rvalue_mod.Operand.copy_(place: place, ty: ty)
+    }
+    let field_idx: i64 = scan_mod.single_field_index(place)
+    if field_idx < 0 {
+        return mir_rvalue_mod.Operand.copy_(place: place, ty: ty)
+    }
+    let target = plan_mod.field_local_for(plan, ci as usize, field_idx as usize)
+    if mir_local_mod.is_error(target) {
+        return mir_rvalue_mod.Operand.copy_(place: place, ty: ty)
+    }
+    let new_place = bare_place(target)
+    return mir_rvalue_mod.Operand.copy_(place: new_place, ty: ty)
+}
+
+
+function bare_place(local: mir_local_mod.LocalId) -> mir_place_mod.Place {
+    return mir_place_mod.bare(local)
+}

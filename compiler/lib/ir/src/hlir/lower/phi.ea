@@ -1,0 +1,345 @@
+
+module ir.hlir.lower.phi
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import hir.node as node_mod
+
+import local.hlir.op as hlir_op_mod
+
+import local.lir.tree.body as lir_body_mod
+import local.lir.tree.reg as lir_reg_mod
+import local.lir.op as lir_op_mod
+import local.lir.term as lir_term_mod
+import local.lir.id.vreg as vreg_mod
+import local.lir.id.block as block_id_mod
+import local.lir.id.op as op_id_mod
+import local.lir.id.region as lir_region_mod
+
+
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(op_id_mod.LirOpId)
+spec std.collections.vec.Vec(vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_term_mod.LirSwitchCase)
+
+spec std.core.option.Option(lir_reg_mod.PReg)
+spec std.core.option.Option(lir_region_mod.LirRegionId)
+
+
+public function materialize_block_args(
+    body: mutable lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LirBlock.len(body.blocks)
+    var b: usize = 1
+    loop decreases n - b {
+        if b >= n { break }
+        materialize_block(mutable body, b, allocator)?
+        b += 1
+    }
+    clear_merge_params(mutable body, allocator)?
+}
+
+
+function materialize_block(
+    body: mutable lir_body_mod.LirBody,
+    b: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let block = Vec_LirBlock.at(body.blocks, b)
+    let origin = block.terminator.origin
+    match block.terminator.kind {
+        case .jump(let target, let args) => {
+            if Vec_LirVRegId.len(args) == 0 { return }
+            var ops2 = block.ops
+            emit_edge_copies(mutable body, mutable ops2, origin, args, target, allocator)?
+            let rebuilt = lir_body_mod.LirBlock {
+                node_id_origin: block.node_id_origin,
+                params: block.params,
+                ops: ops2,
+                terminator: lir_term_mod.LirTerminator {
+                    origin: origin,
+                    kind: lir_term_mod.LirTermKind.jump(
+                        target: target,
+                        args: empty_vreg_ids(allocator)?,
+                    ),
+                },
+                coherence_region: block.coherence_region,
+            }
+            Vec_LirBlock.set_at(mutable body.blocks, b, take rebuilt)
+        }
+        case .branch_if(let cond, let true_, let true_args, let false_, let false_args) => {
+            let any = Vec_LirVRegId.len(true_args) > 0 || Vec_LirVRegId.len(false_args) > 0
+            if !any { return }
+            let t2 = route_edge(mutable body, origin, true_, true_args, allocator)?
+            let f2 = route_edge(mutable body, origin, false_, false_args, allocator)?
+            let rebuilt = lir_body_mod.LirBlock {
+                node_id_origin: block.node_id_origin,
+                params: block.params,
+                ops: block.ops,
+                terminator: lir_term_mod.LirTerminator {
+                    origin: origin,
+                    kind: lir_term_mod.LirTermKind.branch_if(
+                        cond: cond,
+                        true_: t2,
+                        true_args: empty_vreg_ids(allocator)?,
+                        false_: f2,
+                        false_args: empty_vreg_ids(allocator)?,
+                    ),
+                },
+                coherence_region: block.coherence_region,
+            }
+            Vec_LirBlock.set_at(mutable body.blocks, b, take rebuilt)
+        }
+        case .switch_(let discr, let targets) => {
+            if !switch_has_args(targets) { return }
+            let routed = route_switch(mutable body, origin, targets, allocator)?
+            let rebuilt = lir_body_mod.LirBlock {
+                node_id_origin: block.node_id_origin,
+                params: block.params,
+                ops: block.ops,
+                terminator: lir_term_mod.LirTerminator {
+                    origin: origin,
+                    kind: lir_term_mod.LirTermKind.switch_(
+                        discr: discr,
+                        targets: routed,
+                    ),
+                },
+                coherence_region: block.coherence_region,
+            }
+            Vec_LirBlock.set_at(mutable body.blocks, b, take rebuilt)
+        }
+        case _ => ()
+    }
+}
+
+
+function switch_has_args(targets: lir_term_mod.LirSwitchTargets) -> bool {
+    if Vec_LirVRegId.len(targets.default_args) > 0 { return true }
+    let n = Vec_LirSwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_LirSwitchCase.at(targets.cases, i)
+        if Vec_LirVRegId.len(c.args) > 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+function route_switch(
+    body: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    targets: lir_term_mod.LirSwitchTargets,
+    allocator: Allocator,
+) -> lir_term_mod.LirSwitchTargets
+    with {allocator, err: alloc.AllocError}
+{
+    uninit cases: Vec_LirSwitchCase.Vec
+    Vec_LirSwitchCase.new(init cases, allocator)?
+    let n = Vec_LirSwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_LirSwitchCase.at(targets.cases, i)
+        let routed_target = route_edge(mutable body, origin, c.target, c.args, allocator)?
+        let routed = lir_term_mod.LirSwitchCase {
+            value: c.value,
+            target: routed_target,
+            args: empty_vreg_ids(allocator)?,
+        }
+        Vec_LirSwitchCase.push(mutable cases, take routed, allocator)?
+        i += 1
+    }
+    let routed_default = route_edge(mutable body, origin, targets.default, targets.default_args, allocator)?
+    return lir_term_mod.LirSwitchTargets {
+        cases: cases,
+        default: routed_default,
+        default_args: empty_vreg_ids(allocator)?,
+    }
+}
+
+
+function route_edge(
+    body: mutable lir_body_mod.LirBody,
+    origin: node_mod.NodeId,
+    target: block_id_mod.LirBlockId,
+    args: Vec_LirVRegId.Vec,
+    allocator: Allocator,
+) -> block_id_mod.LirBlockId
+    with {allocator, err: alloc.AllocError}
+{
+    if Vec_LirVRegId.len(args) == 0 { return target }
+    uninit ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ops, allocator)?
+    emit_edge_copies(mutable body, mutable ops, origin, args, target, allocator)?
+    uninit params: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init params, allocator)?
+    let blk = lir_body_mod.LirBlock {
+        node_id_origin: origin,
+        params: params,
+        ops: ops,
+        terminator: lir_term_mod.LirTerminator {
+            origin: origin,
+            kind: lir_term_mod.LirTermKind.jump(
+                target: target,
+                args: empty_vreg_ids(allocator)?,
+            ),
+        },
+        coherence_region: Option_LirRegionId.none,
+    }
+    return lir_body_mod.push_block(mutable body, take blk, allocator)?
+}
+
+
+function emit_edge_copies(
+    body: mutable lir_body_mod.LirBody,
+    ops: mutable Vec_LirOpId.Vec,
+    origin: node_mod.NodeId,
+    args: Vec_LirVRegId.Vec,
+    target: block_id_mod.LirBlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let ti = target.raw as usize
+    if ti >= Vec_LirBlock.len(body.blocks) { return }
+    let params = Vec_LirBlock.at(body.blocks, ti).params
+    let n_args = Vec_LirVRegId.len(args)
+    let n_params = Vec_LirVRegId.len(params)
+    let k = if n_args < n_params { n_args } else { n_params }
+
+    if !copies_overlap(args, params, k) {
+        var i: usize = 0
+        loop decreases k - i {
+            if i >= k { break }
+            push_copy(mutable body, mutable ops, origin, Vec_LirVRegId.at(args, i), Vec_LirVRegId.at(params, i), allocator)?
+            i += 1
+        }
+        return
+    }
+
+    uninit tmps: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init tmps, allocator)?
+    var i: usize = 0
+    loop decreases k - i {
+        if i >= k { break }
+        let param = Vec_LirVRegId.at(params, i)
+        let info = Vec_LirVReg.at(body.vregs, param.raw as usize)
+        let fresh = lir_reg_mod.LirVReg {
+            class_: info.class_,
+            pin: Option_PReg.none,
+            ty: info.ty,
+            size: info.size,
+            int_width: info.int_width,
+            int_signed: info.int_signed,
+            is_ref: info.is_ref,
+        }
+        let tmp = lir_body_mod.push_vreg(mutable body, take fresh, allocator)?
+        push_copy(mutable body, mutable ops, origin, Vec_LirVRegId.at(args, i), tmp, allocator)?
+        Vec_LirVRegId.push(mutable tmps, take tmp, allocator)?
+        i += 1
+    }
+    var j: usize = 0
+    loop decreases k - j {
+        if j >= k { break }
+        push_copy(mutable body, mutable ops, origin, Vec_LirVRegId.at(tmps, j), Vec_LirVRegId.at(params, j), allocator)?
+        j += 1
+    }
+}
+
+function copies_overlap(
+    args: Vec_LirVRegId.Vec,
+    params: Vec_LirVRegId.Vec,
+    k: usize,
+) -> bool
+{
+    var i: usize = 0
+    loop decreases k - i {
+        if i >= k { break }
+        let a = Vec_LirVRegId.at(args, i)
+        var j: usize = 0
+        loop decreases k - j {
+            if j >= k { break }
+            if a.raw == Vec_LirVRegId.at(params, j).raw { return true }
+            j += 1
+        }
+        i += 1
+    }
+    return false
+}
+
+function push_copy(
+    body: mutable lir_body_mod.LirBody,
+    ops: mutable Vec_LirOpId.Vec,
+    origin: node_mod.NodeId,
+    src: vreg_mod.LirVRegId,
+    dst: vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let op = lir_op_mod.LirOp {
+        origin: origin,
+        kind: lir_op_mod.LirOpKind.copy_(src: src, dst: dst),
+        flags: flat_flags(),
+    }
+    let id = lir_body_mod.push_op(mutable body, take op, allocator)?
+    Vec_LirOpId.push(mutable ops, take id, allocator)?
+}
+
+function flat_flags() -> hlir_op_mod.OpFlags {
+    return hlir_op_mod.OpFlags {
+        overflow_safe: false,
+        in_bounds: false,
+        nonzero_divisor: false,
+        range_safe: false,
+        intrinsic: hlir_op_mod.Intrinsic.none,
+        div_overflow: hlir_op_mod.DivOverflow.trap,
+        div_overflow_safe: false,
+        extern_call: false,
+        extern_ret_size: 0 as u32,
+    }
+}
+
+function empty_vreg_ids(allocator: Allocator) -> Vec_LirVRegId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ids: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init ids, allocator)?
+    return ids
+}
+
+
+function clear_merge_params(
+    body: mutable lir_body_mod.LirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_LirBlock.len(body.blocks)
+    var b: usize = 2
+    loop decreases n - b {
+        if b >= n { break }
+        let block = Vec_LirBlock.at(body.blocks, b)
+        if Vec_LirVRegId.len(block.params) > 0 {
+            let rebuilt = lir_body_mod.LirBlock {
+                node_id_origin: block.node_id_origin,
+                params: empty_vreg_ids(allocator)?,
+                ops: block.ops,
+                terminator: block.terminator,
+                coherence_region: block.coherence_region,
+            }
+            Vec_LirBlock.set_at(mutable body.blocks, b, take rebuilt)
+        }
+        b += 1
+    }
+}

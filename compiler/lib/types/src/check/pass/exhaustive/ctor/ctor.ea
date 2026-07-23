@@ -1,0 +1,197 @@
+
+module types.check.pass.exhaustive.ctor.ctor
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol
+import hir.build.file as hir_file
+import hir.tree as hir_tree
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check.env.builtins as builtins_mod
+import types.check.env.fields as fields_mod
+import types.check.body.literal.literal as literal_mod
+import types.check.pass.exhaustive.defs as defs_mod
+import types.ty.name as ty_name_mod
+import diagnostics.code as code_mod
+import diagnostics.emit.collection as coll_mod
+import diagnostics.emit.diagnostic as diag_mod
+
+
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(defs_mod.VariantSet)
+spec std.collections.vec.Vec(fields_mod.FieldTyList)
+
+
+spec std.core.option.Option(defs_mod.VariantSet)
+
+
+public function check_ctor(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    def: def_mod.DefId,
+    variant: symbol.Symbol,
+    args: Vec_HArg.Vec,
+    maps: defs_mod.VarMaps,
+    field_tys: Vec_FieldTyList.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let set = match lookup_local(maps, def) {
+        case .some(let s) => s
+        case .none => return
+    }
+    let n = Vec_Symbol.len(set.variants)
+    var k: usize = 0 as usize
+    var found: usize = n
+    loop decreases (n - k) {
+        if k >= n { break }
+        let cand = Vec_Symbol.at(set.variants, k)
+        if cand.raw == variant.raw {
+            found = k
+            break
+        }
+        k = k + 1 as usize
+    }
+    if found >= n {
+        return
+    }
+    if found >= Vec_usize.len(set.arities) {
+        return
+    }
+    let expected = Vec_usize.at(set.arities, found)
+    let got = Vec_HArg.len(args)
+    if expected != got {
+        emit_ctor_error(file, node_id, "variant constructor supplied the wrong number of payload arguments", mutable diags, allocator)?
+        return
+    }
+    check_ctor_elem_types(file, def, found, args, field_tys, node_types, ty_interner, builtins, mutable diags, allocator)?
+}
+
+function lookup_local(
+    maps: defs_mod.VarMaps,
+    def: def_mod.DefId,
+) -> Option_VariantSet.Option {
+    if def_mod.is_error(def) {
+        return Option_VariantSet.none
+    }
+    let n = Vec_DefId.len(maps.local_defs)
+    var i: usize = n
+    loop decreases i {
+        if i == 0 { break }
+        i = i - 1 as usize
+        if Vec_DefId.at(maps.local_defs, i).raw == def.raw {
+            if i >= Vec_VariantSet.len(maps.local_sets) {
+                return Option_VariantSet.none
+            }
+            return Option_VariantSet.some(value: Vec_VariantSet.at(maps.local_sets, i))
+        }
+    }
+    return Option_VariantSet.none
+}
+
+function check_ctor_elem_types(
+    file: hir_file.HirFile,
+    def: def_mod.DefId,
+    found: usize,
+    args: Vec_HArg.Vec,
+    field_tys: Vec_FieldTyList.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let di = def_mod.index(def)
+    if di >= Vec_FieldTyList.len(field_tys) {
+        return
+    }
+    let flist = Vec_FieldTyList.at(field_tys, di)
+    if found >= Vec_TyId.len(flist.tys) {
+        return
+    }
+    let payload_ty = Vec_TyId.at(flist.tys, found)
+    if ty_mod.is_error(payload_ty) {
+        return
+    }
+    match ty_interner_mod.lookup(ty_interner, payload_ty) {
+        case .tuple_(let elem_tys) => {
+            check_args_against_elems(file, args, elem_tys, node_types, ty_interner, builtins, mutable diags, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+function check_args_against_elems(
+    file: hir_file.HirFile,
+    args: Vec_HArg.Vec,
+    elem_tys: Vec_TyId.Vec,
+    node_types: Vec_TyId.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    builtins: builtins_mod.Builtins,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let na = Vec_HArg.len(args)
+    let ne = Vec_TyId.len(elem_tys)
+    var i: usize = 0 as usize
+    loop decreases (na - i) {
+        if i >= na { break }
+        if i >= ne { break }
+        let a = Vec_HArg.at(args, i)
+        let arg_ty = node_type_at(node_types, a.expr.node_id)
+        let decl_ty = Vec_TyId.at(elem_tys, i)
+        if !literal_mod.payload_arg_ok(a.expr, arg_ty, decl_ty, builtins, ty_interner, node_types) {
+            let expected_name = ty_name_mod.name_of(decl_ty, ty_interner, allocator)?
+            let found_name = ty_name_mod.name_of(arg_ty, ty_interner, allocator)?
+            let msg = f"expected `{expected_name}`, found `{found_name}`"
+            emit_ctor_error(file, a.expr.node_id, msg, mutable diags, allocator)?
+        }
+        i = i + 1 as usize
+    }
+}
+
+function emit_ctor_error(
+    file: hir_file.HirFile,
+    node_id: node_mod.NodeId,
+    msg: String,
+    diags: mutable coll_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match hir_file.span_of_opt(file, node_id) {
+        case .some(let span) => {
+            let d = diag_mod.error_at(code_mod.typecheck_error(), span, msg)
+            coll_mod.emit(mutable diags, take d, allocator)?
+        }
+        case .none => ()
+    }
+}
+
+function node_type_at(node_types: Vec_TyId.Vec, n: node_mod.NodeId) -> ty_mod.TyId {
+    let i = node_mod.index(n)
+    if i >= Vec_TyId.len(node_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(node_types, i)
+}

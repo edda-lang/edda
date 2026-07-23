@@ -1,0 +1,198 @@
+
+module structmap.render.sections.effects
+
+import std.mem.alloc
+import std.collections.vec
+import local.data.model as model
+import local.render.toon as toon
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(model.FunctionEntry)
+
+public function render(buf: mutable Vec_u8.Vec, tree: model.Tree, dir_idx: usize, allocator: Allocator) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    let rows = collect_rows(tree, dir_idx, allocator)?
+    let count = Vec_String.len(rows)
+    if count == 0 { return false }
+    toon.push_str(mutable buf, "effects[", allocator)?
+    toon.push_usize_decimal(mutable buf, count, allocator)?
+    toon.push_str(mutable buf, "]{id,row}:\n", allocator)?
+    var i: usize = 0
+    loop
+        decreases count - i
+    {
+        if i >= count { break }
+        toon.push_str(mutable buf, "  ", allocator)?
+        toon.push_usize_decimal(mutable buf, i, allocator)?
+        toon.push_byte(mutable buf, 0x2C, allocator)?
+        toon.push_quoted(mutable buf, Vec_String.at(rows, i), allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        i += 1
+    }
+    return true
+}
+
+public function collect_rows(tree: model.Tree, dir_idx: usize, allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit rows: Vec_String.Vec
+    Vec_String.new(init rows, allocator)?
+    let total: usize = Vec_FunctionEntry.len(tree.functions)
+    var i: usize = 0
+    loop
+        decreases total - i
+    {
+        if i >= total { break }
+        let r = Vec_FunctionEntry.at(tree.functions, i)
+        if r.dir_idx == dir_idx {
+            if Vec_String.len(r.declared_effects) > 0 {
+                let rs = row_string(r.declared_effects, allocator)?
+                if !contains(rows, rs) {
+                    Vec_String.push(mutable rows, rs, allocator)?
+                }
+            }
+            if Vec_String.len(r.effect_cone) > 0 && !set_equal(r.effect_cone, r.declared_effects) {
+                let cs = row_string(r.effect_cone, allocator)?
+                if !contains(rows, cs) {
+                    Vec_String.push(mutable rows, cs, allocator)?
+                }
+            }
+        }
+        i += 1
+    }
+    sort_rows(mutable rows)
+    return rows
+}
+
+function sort_rows(rows: mutable Vec_String.Vec) -> () {
+    let n: usize = Vec_String.len(rows)
+    if n <= 1 { return }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        var min: usize = i
+        var j: usize = i + 1
+        loop
+            decreases n - j
+        {
+            if j >= n { break }
+            if row_less(Vec_String.at(rows, j), Vec_String.at(rows, min)) {
+                min = j
+            }
+            j += 1
+        }
+        if min != i {
+            let a = Vec_String.at(rows, i)
+            let b = Vec_String.at(rows, min)
+            Vec_String.set_at(mutable rows, i, take b)
+            Vec_String.set_at(mutable rows, min, take a)
+        }
+        i += 1
+    }
+}
+
+function row_less(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    let min_n: usize = if an < bn { an } else { bn }
+    var i: usize = 0
+    loop
+        decreases min_n - i
+    {
+        if i >= min_n { break }
+        if ab[i] < bb[i] { return true }
+        if ab[i] > bb[i] { return false }
+        i += 1
+    }
+    return an < bn
+}
+
+public function row_string(members: Vec_String.Vec, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let n: usize = Vec_String.len(members)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if i > 0 {
+            toon.push_str(mutable buf, ", ", allocator)?
+        }
+        toon.push_str(mutable buf, Vec_String.at(members, i), allocator)?
+        i += 1
+    }
+    return toon.finish_string(take buf, allocator)?
+}
+
+public function id_of(rows: Vec_String.Vec, target: String) -> usize {
+    let n: usize = Vec_String.len(rows)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if str_eq(Vec_String.at(rows, i), target) { return i }
+        i += 1
+    }
+    return n
+}
+
+public function set_equal(a: Vec_String.Vec, b: Vec_String.Vec) -> bool {
+    let na: usize = Vec_String.len(a)
+    let nb: usize = Vec_String.len(b)
+    var i: usize = 0
+    loop
+        decreases na - i
+    {
+        if i >= na { break }
+        if !contains(b, Vec_String.at(a, i)) { return false }
+        i += 1
+    }
+    var j: usize = 0
+    loop
+        decreases nb - j
+    {
+        if j >= nb { break }
+        if !contains(a, Vec_String.at(b, j)) { return false }
+        j += 1
+    }
+    return true
+}
+
+function contains(v: Vec_String.Vec, s: String) -> bool {
+    let n: usize = Vec_String.len(v)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if str_eq(Vec_String.at(v, i), s) { return true }
+        i += 1
+    }
+    return false
+}
+
+function str_eq(a: String, b: String) -> bool {
+    let ab: [u8] = a.bytes()
+    let bb: [u8] = b.bytes()
+    let n: usize = ab.len()
+    if n != bb.len() { return false }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if ab[i] != bb[i] { return false }
+        i += 1
+    }
+    return true
+}

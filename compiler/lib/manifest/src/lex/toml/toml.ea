@@ -1,0 +1,311 @@
+
+module manifest.lex.toml.toml
+
+import std.collections.vec
+import std.mem.alloc
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+
+spec std.collections.vec.Vec(TomlToken)
+
+public type TomlToken {
+    case lbracket(at: span_mod.Span)
+    case rbracket(at: span_mod.Span)
+    case equals(at: span_mod.Span)
+    case comma(at: span_mod.Span)
+    case newline(at: span_mod.Span)
+    case bare_key(at: span_mod.Span)
+    case string_lit(at: span_mod.Span)
+    case bool_lit(at: span_mod.Span, value: bool)
+    case int_lit(at: span_mod.Span)
+    case eof(at: span_mod.Span)
+    case error(at: span_mod.Span)
+}
+
+public function token_span(t: TomlToken) -> span_mod.Span {
+    return match t {
+        case .lbracket(let sp)      => sp
+        case .rbracket(let sp)      => sp
+        case .equals(let sp)        => sp
+        case .comma(let sp)         => sp
+        case .newline(let sp)       => sp
+        case .bare_key(let sp)      => sp
+        case .string_lit(let sp)    => sp
+        case .bool_lit(let sp, _)   => sp
+        case .int_lit(let sp)       => sp
+        case .eof(let sp)           => sp
+        case .error(let sp)         => sp
+    }
+}
+
+public function tokenize(bytes: [u8], file: file_mod.FileId, out: mutable Vec_TomlToken.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var pos: usize = 0
+    let n = bytes.len()
+    loop decreases (n - pos) {
+        if pos >= n { break }
+        let b = bytes[pos]
+
+        if b == 0x20 || b == 0x09 {
+            pos = pos + 1
+            continue
+        }
+        if b == 0x0A {
+            Vec_TomlToken.push(mutable out, TomlToken.newline(at: sp(file, pos, pos + 1)), allocator)?
+            pos = pos + 1
+            continue
+        }
+        if b == 0x0D {
+            let end = if pos + 1 < n && bytes[pos + 1] == 0x0A { pos + 2 } else { pos + 1 }
+            Vec_TomlToken.push(mutable out, TomlToken.newline(at: sp(file, pos, end)), allocator)?
+            pos = end
+            continue
+        }
+        if b == 0x23 {
+            pos = pos + 1
+            pos = skip_to_eol(bytes, pos)
+            continue
+        }
+        if b == 0x5B {
+            Vec_TomlToken.push(mutable out, TomlToken.lbracket(at: sp(file, pos, pos + 1)), allocator)?
+            pos = pos + 1
+            continue
+        }
+        if b == 0x5D {
+            Vec_TomlToken.push(mutable out, TomlToken.rbracket(at: sp(file, pos, pos + 1)), allocator)?
+            pos = pos + 1
+            continue
+        }
+        if b == 0x3D {
+            Vec_TomlToken.push(mutable out, TomlToken.equals(at: sp(file, pos, pos + 1)), allocator)?
+            pos = pos + 1
+            continue
+        }
+        if b == 0x2C {
+            Vec_TomlToken.push(mutable out, TomlToken.comma(at: sp(file, pos, pos + 1)), allocator)?
+            pos = pos + 1
+            continue
+        }
+        if b == 0x22 {
+            pos = lex_string(bytes, file, pos, mutable out, allocator)?
+            continue
+        }
+        if is_ident_start(b) {
+            pos = lex_ident_or_bool(bytes, file, pos, mutable out, allocator)?
+            continue
+        }
+        if is_digit(b) {
+            pos = lex_int(bytes, file, pos, mutable out, allocator)?
+            continue
+        }
+
+        Vec_TomlToken.push(mutable out, TomlToken.error(at: sp(file, pos, pos + 1)), allocator)?
+        pos = pos + 1
+    }
+    Vec_TomlToken.push(mutable out, TomlToken.eof(at: sp(file, n, n)), allocator)?
+}
+
+
+function lex_string(bytes: [u8], file: file_mod.FileId, start: usize, out: mutable Vec_TomlToken.Vec, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires start < bytes.len()
+    ensures result > start
+{
+    let n = bytes.len()
+    var p = start + 1
+    loop decreases (n - p) {
+        if p >= n {
+            Vec_TomlToken.push(mutable out, TomlToken.error(at: sp(file, start, n)), allocator)?
+            return n
+        }
+        let b = bytes[p]
+        if b == 0x22 {
+            Vec_TomlToken.push(mutable out, TomlToken.string_lit(at: sp(file, start, p + 1)), allocator)?
+            return p + 1
+        }
+        if b == 0x5C {
+            Vec_TomlToken.push(mutable out, TomlToken.error(at: sp(file, start, p + 1)), allocator)?
+            return p + 1
+        }
+        if b == 0x0A {
+            Vec_TomlToken.push(mutable out, TomlToken.error(at: sp(file, start, p)), allocator)?
+            return p
+        }
+        p = p + 1
+    }
+    Vec_TomlToken.push(mutable out, TomlToken.error(at: sp(file, start, n)), allocator)?
+    return n
+}
+
+function lex_ident_or_bool(bytes: [u8], file: file_mod.FileId, start: usize, out: mutable Vec_TomlToken.Vec, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires start < bytes.len()
+    ensures result > start
+{
+    let n = bytes.len()
+    var p = start + 1
+    loop decreases (n - p) {
+        if p >= n { break }
+        if !is_ident_continue(bytes[p]) { break }
+        p = p + 1
+    }
+    let span = sp(file, start, p)
+    let text = bytes[start..<p]
+    if bytes_eq_str(text, "true") {
+        Vec_TomlToken.push(mutable out, TomlToken.bool_lit(at: span, value: true), allocator)?
+        return p
+    }
+    if bytes_eq_str(text, "false") {
+        Vec_TomlToken.push(mutable out, TomlToken.bool_lit(at: span, value: false), allocator)?
+        return p
+    }
+    Vec_TomlToken.push(mutable out, TomlToken.bare_key(at: span), allocator)?
+    return p
+}
+
+function lex_int(bytes: [u8], file: file_mod.FileId, start: usize, out: mutable Vec_TomlToken.Vec, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires start < bytes.len()
+    ensures result > start
+{
+    let n = bytes.len()
+    var p = start + 1
+    loop decreases (n - p) {
+        if p >= n { break }
+        if !is_digit(bytes[p]) { break }
+        p = p + 1
+    }
+    Vec_TomlToken.push(mutable out, TomlToken.int_lit(at: sp(file, start, p)), allocator)?
+    return p
+}
+
+function skip_to_eol(bytes: [u8], start: usize) -> usize
+    requires start <= bytes.len()
+    ensures result >= start
+    ensures result <= bytes.len()
+{
+    var p = start
+    loop decreases (bytes.len() - p) {
+        if p >= bytes.len() { return bytes.len() }
+        if bytes[p] == 0x0A { return p }
+        p = p + 1
+    }
+    return bytes.len()
+}
+
+
+function is_digit(b: u8) -> bool {
+    return b >= 0x30 && b <= 0x39
+}
+
+function is_ident_start(b: u8) -> bool {
+    return (b >= 0x61 && b <= 0x7A) || (b >= 0x41 && b <= 0x5A) || b == 0x5F
+}
+
+function is_ident_continue(b: u8) -> bool {
+    return is_ident_start(b) || is_digit(b) || b == 0x2D || b == 0x2E
+}
+
+
+function sp(file: file_mod.FileId, start: usize, end: usize where start <= end) -> span_mod.Span {
+    return span_mod.span_of(file, start, end)
+}
+
+
+function bytes_eq_str(b: [u8], s: String) -> bool {
+    let sb = s.bytes()
+    if b.len() != sb.len() { return false }
+    var i: usize = 0
+    loop decreases (b.len() - i) {
+        if i >= b.len() { return true }
+        if b[i] != sb[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+
+public function is_eof(t: TomlToken) -> bool {
+    return match t {
+        case .eof(_) => true
+        case _       => false
+    }
+}
+
+public function is_newline(t: TomlToken) -> bool {
+    return match t {
+        case .newline(_) => true
+        case _           => false
+    }
+}
+
+public function is_lbracket(t: TomlToken) -> bool {
+    return match t {
+        case .lbracket(_) => true
+        case _            => false
+    }
+}
+
+public function is_rbracket(t: TomlToken) -> bool {
+    return match t {
+        case .rbracket(_) => true
+        case _            => false
+    }
+}
+
+public function is_equals(t: TomlToken) -> bool {
+    return match t {
+        case .equals(_) => true
+        case _          => false
+    }
+}
+
+public function is_comma(t: TomlToken) -> bool {
+    return match t {
+        case .comma(_) => true
+        case _         => false
+    }
+}
+
+public function is_bare_key(t: TomlToken) -> bool {
+    return match t {
+        case .bare_key(_) => true
+        case _            => false
+    }
+}
+
+public function is_string_lit(t: TomlToken) -> bool {
+    return match t {
+        case .string_lit(_) => true
+        case _              => false
+    }
+}
+
+public function is_bool_true(t: TomlToken) -> bool {
+    return match t {
+        case .bool_lit(_, let v) => v
+        case _                   => false
+    }
+}
+
+public function is_bool_false(t: TomlToken) -> bool {
+    return match t {
+        case .bool_lit(_, let v) => !v
+        case _                   => false
+    }
+}
+
+public function is_lex_error(t: TomlToken) -> bool {
+    return match t {
+        case .error(_) => true
+        case _         => false
+    }
+}
+
+public function is_int_lit(t: TomlToken) -> bool {
+    return match t {
+        case .int_lit(_) => true
+        case _           => false
+    }
+}

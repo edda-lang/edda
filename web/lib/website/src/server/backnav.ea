@@ -1,0 +1,254 @@
+module website.server.backnav
+
+import std.mem.alloc
+import std.text.string
+import hermod.message.request as request_mod
+import hermod.proto.headers as headers_mod
+import textbuilder.builder as tb
+spec std.core.option.Option(String)
+
+function _alloc_u8(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+    extern "__edda_alloc_array"
+
+function _copy_str(b: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = b.len()
+    let buf = _alloc_u8(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = b[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _find_from(b: [u8], from: usize, target: u8) -> usize
+    requires from <= b.len()
+    ensures result >= from
+    ensures result <= b.len()
+{
+    let n = b.len()
+    var i: usize = from
+    loop decreases n - i {
+        if i >= n { break }
+        if b[i] == target { break }
+        i += 1
+    }
+    return i
+}
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function _find_substr(haystack: [u8], from: usize, needle: [u8]) -> usize {
+    let n = haystack.len()
+    let m = needle.len()
+    if m == 0 as usize { return from }
+    if from >= n { return n }
+    if from + m > n { return n }
+    var i: usize = from
+    let last = n - m
+    loop decreases last - i {
+        if i > last { break }
+        if _bytes_eq(haystack[i..<i + m], needle) { return i }
+        i += 1
+    }
+    return n
+}
+
+function _authority_start(b: [u8]) -> usize {
+    let n = b.len()
+    let colon = _find_from(b, 0 as usize, 58 as u8)
+    if colon >= n { return n }
+    if colon + (3 as usize) > n { return n }
+    if b[colon + (1 as usize)] != 47 as u8 { return n }
+    if b[colon + (2 as usize)] != 47 as u8 { return n }
+    return colon + (3 as usize)
+}
+
+function _same_origin_path(referer: [u8], own_host: [u8]) -> [u8] {
+    let n = referer.len()
+    if n == 0 as usize { return referer[0 as usize..<0 as usize] }
+    let authority = _authority_start(referer)
+    if authority >= n { return referer[0 as usize..<0 as usize] }
+    let slash = _find_from(referer, authority, 47 as u8)
+    let host = referer[authority..<slash]
+    if !_bytes_eq(host, own_host) { return referer[0 as usize..<0 as usize] }
+    if slash >= n { return referer[0 as usize..<0 as usize] }
+    return referer[slash..<n]
+}
+
+public function path_only(target: [u8]) -> [u8] {
+    let q = _find_from(target, 0 as usize, 63 as u8)
+    return target[0 as usize..<q]
+}
+
+function _query_only(target: [u8]) -> [u8] {
+    let n = target.len()
+    let q = _find_from(target, 0 as usize, 63 as u8)
+    if q >= n { return target[0 as usize..<0 as usize] }
+    return target[q + (1 as usize)..<n]
+}
+
+function _has_trail_key(query: [u8]) -> bool {
+    if query.len() < 2 as usize { return false }
+    if query[0] != 116 as u8 { return false }
+    if query[1] != 61 as u8 { return false }
+    return true
+}
+
+function _trail_param(query: [u8]) -> [u8] {
+    if !_has_trail_key(query) { return query[0 as usize..<0 as usize] }
+    return query[2 as usize..<query.len()]
+}
+
+function _last_segment(trail: [u8]) -> [u8] {
+    let n = trail.len()
+    if n == 0 as usize { return trail }
+    var last_comma: usize = n
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if trail[i] == 44 as u8 { last_comma = i }
+        i += 1
+    }
+    if last_comma >= n { return trail }
+    return trail[last_comma + (1 as usize)..<n]
+}
+
+function _drop_last_segment(trail: [u8]) -> [u8] {
+    let n = trail.len()
+    var last_comma: usize = n
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if trail[i] == 44 as u8 { last_comma = i }
+        i += 1
+    }
+    if last_comma >= n { return trail[0 as usize..<0 as usize] }
+    return trail[0 as usize..<last_comma]
+}
+
+function _count_commas(b: [u8]) -> usize {
+    let n = b.len()
+    var i: usize = 0
+    var c: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if b[i] == 44 as u8 { c += 1 }
+        i += 1
+    }
+    return c
+}
+
+function _drop_oldest(b: [u8], keep: usize) -> [u8] {
+    let segments = _count_commas(b) + (1 as usize)
+    if segments <= keep { return b }
+    let drop = segments - keep
+    let n = b.len()
+    var i: usize = 0
+    var seen: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if b[i] == 44 as u8 {
+            seen += 1
+            if seen == drop { return b[i + (1 as usize)..<n] }
+        }
+        i += 1
+    }
+    return b
+}
+
+function _consolidated(trail: [u8], current: [u8]) -> [u8] {
+    if _bytes_eq(_last_segment(trail), current) { return _drop_last_segment(trail) }
+    return trail
+}
+
+public function of(req: request_mod.Request, current: [u8], target: [u8], allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let query = _query_only(target)
+    if _has_trail_key(query) {
+        let trail = _consolidated(_trail_param(query), current)
+        let back_path = _last_segment(trail)
+        if back_path.len() == 0 as usize { return Option_String.Option.none }
+        return Option_String.Option.some(value: _copy_str(back_path, allocator)?)
+    }
+    let headers = request_mod.request_headers(req)
+    let raw = headers_mod.headers_value_or(headers, "Referer".bytes(), "".bytes())
+    let own_host = headers_mod.headers_value_or(headers, "Host".bytes(), "".bytes())
+    let path = _same_origin_path(raw, own_host)
+    if path.len() == 0 as usize { return Option_String.Option.none }
+    if _bytes_eq(path, current) { return Option_String.Option.none }
+    return Option_String.Option.some(value: _copy_str(path, allocator)?)
+}
+
+public function back_trail(target: [u8], current: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let trail = _consolidated(_trail_param(_query_only(target)), current)
+    return _copy_str(_drop_last_segment(trail), allocator)?
+}
+
+public function forward_trail(target: [u8], current: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let trail = _consolidated(_trail_param(_query_only(target)), current)
+    if _bytes_eq(_last_segment(trail), current) {
+        return _copy_str(_drop_oldest(trail, 6 as usize), allocator)?
+    }
+    var b = tb.new(allocator)?
+    if trail.len() > 0 as usize {
+        tb.push_bytes(mutable b, trail, allocator)?
+        tb.push_byte(mutable b, 44 as u8, allocator)?
+    }
+    tb.push_bytes(mutable b, current, allocator)?
+    let joined = tb.to_bytes(b, allocator)?
+    return _copy_str(_drop_oldest(joined, 6 as usize), allocator)?
+}
+
+function _matches_back_prefix(html: [u8], i: usize) -> bool {
+    let marker = "<div class=\"back\"><a ".bytes()
+    let m = marker.len()
+    if i < m { return false }
+    return _bytes_eq(html[i - m..<i], marker)
+}
+
+public function inject_trails(html: [u8], back: String, forward: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let href_marker = "href=\"/".bytes()
+    let n = html.len()
+    var out = tb.new(allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let m = _find_substr(html, i, href_marker)
+        if m >= n {
+            tb.push_bytes(mutable out, html[i..<n], allocator)?
+            i = n
+            continue
+        }
+        let value_start = m + href_marker.len()
+        let quote = _find_from(html, value_start, 34 as u8)
+        let use_back = _matches_back_prefix(html, m)
+        let trail = if use_back { back } else { forward }
+        tb.push_bytes(mutable out, html[i..<quote], allocator)?
+        tb.push_str(mutable out, "?t=", allocator)?
+        tb.push_str(mutable out, trail, allocator)?
+        i = quote
+    }
+    return tb.to_bytes(out, allocator)?
+}

@@ -1,0 +1,198 @@
+
+module tls.handshake.server.hello
+
+import std.mem.alloc
+import local.error
+import local.wire
+import local.version as version_mod
+import local.crypto.ciphersuite as suite_mod
+import local.crypto.group as group_mod
+import local.handshake.extension as ext_type
+import local.handshake.kind as hs_kind
+import local.handshake.message as hs_msg
+import local.handshake.extensions as exts_mod
+
+unstable public type ParsedServerHello {
+    server_random: [u8]
+    cipher_suite: suite_mod.CipherSuite
+    server_key_share_group: group_mod.NamedGroup
+    server_key_share_key: [u8]
+}
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_bytes(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u8_slots(allocator, n)?
+    }
+}
+
+function _slice_copy(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    if hi < lo || hi > src.len() { raise error.TlsError.bad_handshake }
+    let n = hi - lo
+    var out = _alloc_bytes(allocator, n)?
+    var i: usize = 0 as usize
+    loop decreases n - i {
+        if i >= n { break }
+        out[i] = src[lo + i]
+        i = i + (1 as usize)
+    }
+    return out
+}
+
+function _empty_bytes() -> [u8] { return "".bytes() }
+
+function _process_one_extension(
+    body: [u8],
+    pos: usize,
+    out_group: mutable [u16],
+    out_key: mutable [[u8]],
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: error.TlsError}
+{
+    let ext_type_wire = wire.read_u16_be(body, pos)?
+    let ext_len = wire.read_u16_be(body, pos + (2 as usize))? as usize
+    let body_lo = pos + (4 as usize)
+    let body_hi = body_lo + ext_len
+    if body_hi > body.len() { raise error.TlsError.bad_handshake }
+    let parsed = ext_type.extension_type_from_wire(ext_type_wire)
+    match parsed {
+        case .supported_versions => {
+            if ext_len != (2 as usize) { raise error.TlsError.bad_handshake }
+            let sel = wire.read_u16_be(body, body_lo)?
+            if sel != version_mod.tls13_value() { raise error.TlsError.unsupported_version }
+        }
+        case .key_share => {
+            if ext_len < (4 as usize) { raise error.TlsError.bad_handshake }
+            let g_wire = wire.read_u16_be(body, body_lo)?
+            let key_len = wire.read_u16_be(body, body_lo + (2 as usize))? as usize
+            if (4 as usize) + key_len != ext_len { raise error.TlsError.bad_handshake }
+            let group = group_mod.named_group_from_wire(g_wire)?
+            out_group[0 as usize] = group_mod.named_group_wire(group)
+            out_key[0 as usize] = _slice_copy(body, body_lo + (4 as usize), body_lo + (4 as usize) + key_len, allocator)?
+        }
+        case _ => {
+        }
+    }
+    return body_hi
+}
+
+public function decode_server_hello(
+    body: [u8],
+    allocator: Allocator,
+) -> ParsedServerHello
+    with {allocator, err: error.TlsError}
+{
+    if body.len() < (38 as usize) { raise error.TlsError.bad_handshake }
+    var pos: usize = 0 as usize
+    if wire.read_u16_be(body, pos)? != version_mod.legacy_record_version() {
+        raise error.TlsError.bad_handshake
+    }
+    pos = pos + (2 as usize)
+    let server_random = _slice_copy(body, pos, pos + (32 as usize), allocator)?
+    pos = pos + (32 as usize)
+    let sid_len = wire.read_u8(body, pos)? as usize
+    pos = pos + (1 as usize)
+    if sid_len > (32 as usize) { raise error.TlsError.bad_handshake }
+    pos = pos + sid_len
+    let suite = suite_mod.ciphersuite_from_wire(wire.read_u16_be(body, pos)?)?
+    pos = pos + (2 as usize)
+    if wire.read_u8(body, pos)? != (0 as u8) { raise error.TlsError.bad_handshake }
+    pos = pos + (1 as usize)
+    let ext_total = wire.read_u16_be(body, pos)? as usize
+    pos = pos + (2 as usize)
+    let ext_end = pos + ext_total
+    if ext_end > body.len() { raise error.TlsError.bad_handshake }
+    var group_slot = _alloc_u16_slot(allocator)?
+    var key_slot = _alloc_key_slot(allocator)?
+    group_slot[0 as usize] = 0 as u16
+    key_slot[0 as usize] = _empty_bytes()
+    var ext_pos = pos
+    loop decreases ext_end - ext_pos {
+        if ext_pos >= ext_end { break }
+        ext_pos = _process_one_extension(
+            body,
+            ext_pos,
+            mutable group_slot,
+            mutable key_slot,
+            allocator,
+        )?
+    }
+    if key_slot[0 as usize].len() == (0 as usize) {
+        raise error.TlsError.bad_handshake
+    }
+    let final_group = group_mod.named_group_from_wire(group_slot[0 as usize])?
+    return ParsedServerHello {
+        server_random: server_random,
+        cipher_suite: suite,
+        server_key_share_group: final_group,
+        server_key_share_key: key_slot[0 as usize],
+    }
+}
+
+function _alloc_u16_slot(allocator: Allocator) -> [u16]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_u16_slots(allocator, 1 as usize)?
+    }
+}
+
+function _alloc_u16_slots(allocator: Allocator, n: usize) -> [u16]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_key_slot(allocator: Allocator) -> [[u8]]
+    with {allocator, err: error.TlsError}
+{
+    return handle err: alloc.AllocError -> (raise error.TlsError.out_of_memory) {
+        _alloc_key_slots(allocator, 1 as usize)?
+    }
+}
+
+function _alloc_key_slots(allocator: Allocator, n: usize) -> [[u8]]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function encode_server_hello(
+    server_random: [u8] where server_random.len() == 32,
+    session_id_echo: [u8] where session_id_echo.len() <= 32,
+    suite: suite_mod.CipherSuite,
+    server_public_key: [u8] where server_public_key.len() == 32,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.TlsError}
+{
+    let ext_size: usize = 46 as usize
+    let body_len = (40 as usize) + session_id_echo.len() + ext_size
+    let total = hs_msg.header_len() + body_len
+    var buf = _alloc_bytes(allocator, total)?
+    var pos = hs_msg.write_header(
+        mutable buf,
+        0 as usize,
+        hs_kind.HandshakeKind.server_hello,
+        body_len as u32,
+    )?
+    pos = wire.write_u16_be(mutable buf, pos, version_mod.legacy_record_version())?
+    pos = wire.write_bytes(mutable buf, pos, server_random)?
+    pos = wire.write_u8(mutable buf, pos, session_id_echo.len() as u8)?
+    pos = wire.write_bytes(mutable buf, pos, session_id_echo)?
+    pos = wire.write_u16_be(mutable buf, pos, suite_mod.ciphersuite_wire(suite))?
+    pos = wire.write_u8(mutable buf, pos, 0 as u8)?
+    pos = wire.write_u16_be(mutable buf, pos, ext_size as u16)?
+    pos = exts_mod.write_server_extensions(mutable buf, pos, server_public_key)?
+    let _ = pos
+    return buf
+}

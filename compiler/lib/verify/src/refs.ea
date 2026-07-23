@@ -1,0 +1,324 @@
+
+module verify.refs
+
+import std.collections.vec
+
+import hir.def as def_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as hlir_term_mod
+import ir.hlir.id.value as value_mod
+import ir.hlir.id.op as op_id_mod
+
+import local.error as error_mod
+
+
+spec std.collections.vec.Vec(value_mod.ValueId)
+spec std.collections.vec.Vec(op_id_mod.OpId)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(hlir_term_mod.SwitchCase)
+
+
+public function check_value_references(body: hlir_body_mod.HlirBody) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    let n_values = Vec_HlirValue.len(body.values)
+    let n_ops = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop decreases n_ops - i {
+        if i >= n_ops { break }
+        let op = Vec_HlirOp.at(body.ops, i)
+        check_op_value_refs(body.def_id, op, n_values)?
+        i += 1
+    }
+
+    let n_blocks = Vec_HlirBlock.len(body.blocks)
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        check_term_value_refs(body.def_id, block.terminator, n_values)?
+        b += 1
+    }
+}
+
+function check_op_value_refs(
+    def: def_mod.DefId,
+    op: hlir_op_mod.HlirOp,
+    n_values: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    check_value_id(def, op.result_, n_values)?
+    match op.kind {
+        case .binary(_, let lhs, let rhs) => {
+            check_value_id(def, lhs, n_values)?
+            check_value_id(def, rhs, n_values)?
+        }
+        case .unary(_, let operand) => check_value_id(def, operand, n_values)?
+        case .cast(let value, _, _, _) => check_value_id(def, value, n_values)?
+        case .call_(let callee, let args) => {
+            check_value_id(def, callee, n_values)?
+            check_value_id_vec(def, args, n_values)?
+        }
+        case .call_indirect(let callee, let args) => {
+            check_value_id(def, callee, n_values)?
+            check_value_id_vec(def, args, n_values)?
+        }
+        case .make_closure(_, let env) => check_value_id(def, env, n_values)?
+        case .field(let operand, _) => check_value_id(def, operand, n_values)?
+        case .index(let operand, let index_v) => {
+            check_value_id(def, operand, n_values)?
+            check_value_id(def, index_v, n_values)?
+        }
+        case .slice_subrange(let operand, let lo_v, let hi_v) => {
+            check_value_id(def, operand, n_values)?
+            check_value_id(def, lo_v, n_values)?
+            check_value_id(def, hi_v, n_values)?
+        }
+        case .len(let operand) => check_value_id(def, operand, n_values)?
+        case .discriminant(let operand) => check_value_id(def, operand, n_values)?
+        case .aggregate(_, let elems) => check_value_id_vec(def, elems, n_values)?
+        case .ref_(_, let operand) => check_value_id(def, operand, n_values)?
+        case .deref_(let operand) => check_value_id(def, operand, n_values)?
+        case .field_addr(let operand, _) => check_value_id(def, operand, n_values)?
+        case .index_addr(let operand, let index_v) => {
+            check_value_id(def, operand, n_values)?
+            check_value_id(def, index_v, n_values)?
+        }
+        case .subrange_addr(let operand, let lo_v, let hi_v) => {
+            check_value_id(def, operand, n_values)?
+            check_value_id(def, lo_v, n_values)?
+            check_value_id(def, hi_v, n_values)?
+        }
+        case .deref_addr(let operand) => check_value_id(def, operand, n_values)?
+        case .store_(let addr, let value) => {
+            check_value_id(def, addr, n_values)?
+            check_value_id(def, value, n_values)?
+        }
+        case .literal(_) => ()
+        case .stack_alloc(_) => ()
+        case .err_flag => ()
+    }
+}
+
+function check_term_value_refs(
+    def: def_mod.DefId,
+    term: hlir_term_mod.HlirTerminator,
+    n_values: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    match term.kind {
+        case .goto_(_, let args) => check_value_id_vec(def, args, n_values)?
+        case .branch(let cond, _, let true_args, _, let false_args) => {
+            check_value_id(def, cond, n_values)?
+            check_value_id_vec(def, true_args, n_values)?
+            check_value_id_vec(def, false_args, n_values)?
+        }
+        case .switch_(let discr, let targets) => {
+            check_value_id(def, discr, n_values)?
+            check_switch_value_refs(def, targets, n_values)?
+        }
+        case .return_(let values) => check_value_id_vec(def, values, n_values)?
+        case .raise_(let value, _) => check_value_id(def, value, n_values)?
+        case .panic_(let message) => check_value_id(def, message, n_values)?
+        case .drop_(let value, _, _, _) => check_value_id(def, value, n_values)?
+        case .unreachable_ => ()
+        case .coherence_enter(_, _) => ()
+        case .coherence_exit(_) => ()
+    }
+}
+
+function check_switch_value_refs(
+    def: def_mod.DefId,
+    targets: hlir_term_mod.SwitchTargets,
+    n_values: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    let n = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_SwitchCase.at(targets.cases, i)
+        check_value_id_vec(def, c.args, n_values)?
+        i += 1
+    }
+    check_value_id_vec(def, targets.default_args, n_values)?
+}
+
+
+public function check_control_references(body: hlir_body_mod.HlirBody) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    let n_blocks = Vec_HlirBlock.len(body.blocks)
+    let n_ops = Vec_HlirOp.len(body.ops)
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        let block = Vec_HlirBlock.at(body.blocks, b)
+        check_block_op_refs(body.def_id, block, n_ops)?
+        check_term_block_refs(body.def_id, block.terminator, n_blocks)?
+        b += 1
+    }
+}
+
+function check_block_op_refs(
+    def: def_mod.DefId,
+    block: hlir_body_mod.HlirBlock,
+    n_ops: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    let n = Vec_OpId.len(block.ops)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let o = Vec_OpId.at(block.ops, i)
+        if o.raw == 0 {
+            raise error_mod.violation(
+                def,
+                error_mod.BoundaryFact.control_reference_in_range,
+                "block op list references the sentinel op id 0",
+            )
+        }
+        if (o.raw as usize) >= n_ops {
+            raise error_mod.violation(
+                def,
+                error_mod.BoundaryFact.control_reference_in_range,
+                "block op list references an op id out of range",
+            )
+        }
+        i += 1
+    }
+}
+
+function check_term_block_refs(
+    def: def_mod.DefId,
+    term: hlir_term_mod.HlirTerminator,
+    n_blocks: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    match term.kind {
+        case .goto_(let target, _) => check_block_id(def, target.raw, n_blocks)?
+        case .branch(_, let true_, _, let false_, _) => {
+            check_block_id(def, true_.raw, n_blocks)?
+            check_block_id(def, false_.raw, n_blocks)?
+        }
+        case .switch_(_, let targets) => check_switch_block_refs(def, targets, n_blocks)?
+        case .raise_(_, let unwind) => check_unwind_block_ref(def, unwind, n_blocks)?
+        case .drop_(_, _, let target, let unwind) => {
+            check_block_id(def, target.raw, n_blocks)?
+            check_unwind_block_ref(def, unwind, n_blocks)?
+        }
+        case .coherence_enter(let body_entry, let exit) => {
+            check_block_id(def, body_entry.raw, n_blocks)?
+            check_block_id(def, exit.raw, n_blocks)?
+        }
+        case .coherence_exit(let target) => check_block_id(def, target.raw, n_blocks)?
+        case .return_(_) => ()
+        case .panic_(_) => ()
+        case .unreachable_ => ()
+    }
+}
+
+function check_switch_block_refs(
+    def: def_mod.DefId,
+    targets: hlir_term_mod.SwitchTargets,
+    n_blocks: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    let n = Vec_SwitchCase.len(targets.cases)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let c = Vec_SwitchCase.at(targets.cases, i)
+        check_block_id(def, c.target.raw, n_blocks)?
+        i += 1
+    }
+    check_block_id(def, targets.default.raw, n_blocks)?
+}
+
+function check_unwind_block_ref(
+    def: def_mod.DefId,
+    unwind: hlir_term_mod.UnwindAction,
+    n_blocks: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    match unwind {
+        case .cleanup(let target) => check_block_id(def, target.raw, n_blocks)?
+        case .continue_ => ()
+        case .unreachable_ => ()
+    }
+}
+
+
+function check_value_id(
+    def: def_mod.DefId,
+    v: value_mod.ValueId,
+    n_values: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    if v.raw == 0 {
+        raise error_mod.violation(
+            def,
+            error_mod.BoundaryFact.value_reference_in_range,
+            "operand references the sentinel value id 0",
+        )
+    }
+    if (v.raw as usize) >= n_values {
+        raise error_mod.violation(
+            def,
+            error_mod.BoundaryFact.value_reference_in_range,
+            "operand references a value id out of range",
+        )
+    }
+}
+
+function check_value_id_vec(
+    def: def_mod.DefId,
+    ids: Vec_ValueId.Vec,
+    n_values: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    let n = Vec_ValueId.len(ids)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let v = Vec_ValueId.at(ids, i)
+        check_value_id(def, v, n_values)?
+        i += 1
+    }
+}
+
+function check_block_id(
+    def: def_mod.DefId,
+    raw: u32,
+    n_blocks: usize,
+) -> ()
+    with {err: error_mod.BoundaryError}
+{
+    if raw == 0 {
+        raise error_mod.violation(
+            def,
+            error_mod.BoundaryFact.control_reference_in_range,
+            "terminator references the sentinel block id 0",
+        )
+    }
+    if (raw as usize) >= n_blocks {
+        raise error_mod.violation(
+            def,
+            error_mod.BoundaryFact.control_reference_in_range,
+            "terminator references a block id out of range",
+        )
+    }
+}

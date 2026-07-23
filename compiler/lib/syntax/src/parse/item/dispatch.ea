@@ -1,0 +1,310 @@
+
+module syntax.parse.item.dispatch
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.kind as kind_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.attr as attr_ast
+import syntax.ast.item as item_ast
+import local.parse.util as util_mod
+import local.parse.attr as attr_mod
+import local.parse.item.simple.simple as simple_mod
+import local.parse.item.fn.fn as fn_mod
+import local.parse.item.nominal.nominal as nominal_mod
+import local.parse.item.generic.generic as generic_mod
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(attr_ast.Attribute)
+spec std.mem.alloc.Box(item_ast.FnDecl)
+spec std.mem.alloc.Box(item_ast.TypeDecl)
+spec std.mem.alloc.Box(item_ast.Spec)
+spec std.mem.alloc.Box(item_ast.SpecInvocation)
+spec std.mem.alloc.Box(item_ast.LetDecl)
+spec std.mem.alloc.Box(item_ast.Derive)
+spec std.core.option.Option(item_ast.Stability)
+spec std.core.option.Option(item_ast.Linearity)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public function parse_item(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.Item, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let start_span = util_mod.span_at(tokens, pos)
+    let attrs_r = attr_mod.parse_item_attributes(tokens, pos, mutable diags, allocator)?
+    var p = attrs_r.1
+    var stability: Option_Stability.Option = Option_Stability.none
+    match util_mod.peek(tokens, p) {
+        case .ident(let sym) where symbol.is_unstable(sym) => {
+            stability = Option_Stability.some(value: item_ast.Stability.unstable_)
+            p = p + 1
+        }
+        case _ => ()
+    }
+    var visibility: item_ast.Visibility = item_ast.Visibility.module_
+    match util_mod.peek(tokens, p) {
+        case .kw_public => {
+            visibility = item_ast.Visibility.public_
+            p = p + 1
+        }
+        case _ => ()
+    }
+    let refinement_stable = peek_stable_modifier(tokens, p)
+    if refinement_stable { p = p + 1 }
+    if refinement_stable {
+        match util_mod.peek(tokens, p) {
+            case .kw_function => { stability = Option_Stability.some(value: item_ast.Stability.stable_(since: Option_Symbol.none)) }
+            case .kw_type => { stability = Option_Stability.some(value: item_ast.Stability.stable_(since: Option_Symbol.none)) }
+            case .kw_spec => { stability = Option_Stability.some(value: item_ast.Stability.stable_(since: Option_Symbol.none)) }
+            case _ => ()
+        }
+    }
+    let linearity_r = peek_linearity(tokens, p)
+    let linearity = linearity_r.0
+    if linearity_r.1 > p { p = linearity_r.1 }
+    let kind_r = dispatch_kind(tokens, p, stability, visibility, refinement_stable, linearity, mutable diags, allocator, parse_expr_fn, depth)?
+    let end_span = util_mod.span_at(tokens, kind_r.1 - 1)
+    let full_span = merge_spans(start_span, end_span)
+    let item = item_ast.Item {
+        span: full_span,
+        attributes: attrs_r.0,
+        kind: kind_r.0,
+    }
+    return (item, kind_r.1)
+}
+
+
+function peek_stable_modifier(tokens: [lexed_mod.Lexed], pos: usize) -> bool {
+    return match util_mod.peek(tokens, pos) {
+        case .ident(let sym) where symbol.is_stable(sym) => match util_mod.peek_at(tokens, pos, 1) {
+            case .kw_function => true
+            case .kw_type => true
+            case .kw_spec => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function peek_linearity(tokens: [lexed_mod.Lexed], pos: usize) -> (Option_Linearity.Option, usize) {
+    let linearity_opt = match util_mod.peek(tokens, pos) {
+        case .kw_affine => Option_Linearity.some(value: item_ast.Linearity.affine_)
+        case .kw_linear => Option_Linearity.some(value: item_ast.Linearity.linear_)
+        case _ => Option_Linearity.none
+    }
+    let has_linearity = match linearity_opt {
+        case .some(_) => true
+        case .none => false
+    }
+    if !has_linearity { return (Option_Linearity.none, pos) }
+    return match util_mod.peek_at(tokens, pos, 1) {
+        case .kw_type => (linearity_opt, pos + 1)
+        case _ => (Option_Linearity.none, pos)
+    }
+}
+
+
+function dispatch_kind(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    refinement_stable: bool,
+    linearity: Option_Linearity.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match util_mod.peek(tokens, pos) {
+        case .kw_function => dispatch_fn(tokens, pos, stability, visibility, refinement_stable, mutable diags, allocator, parse_expr_fn, depth)?
+        case .kw_type => dispatch_type(tokens, pos, stability, visibility, linearity, mutable diags, allocator, parse_expr_fn, depth)?
+        case .kw_spec => dispatch_spec(tokens, pos, stability, visibility, mutable diags, allocator, parse_expr_fn, depth)?
+        case .kw_let => dispatch_let(tokens, pos, visibility, mutable diags, allocator, parse_expr_fn, depth)?
+        case .kw_import => dispatch_import(tokens, pos, mutable diags, allocator)?
+        case .kw_module => dispatch_module(tokens, pos, allocator)?
+        case .kw_derive => dispatch_derive(tokens, pos, mutable diags, allocator)?
+        case _ => recover_unrecognised_item(tokens, pos, mutable diags, allocator)?
+    }
+}
+
+function dispatch_fn(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    refinement_stable: bool,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decl_r = fn_mod.parse_fn_decl(tokens, pos, stability, visibility, refinement_stable, mutable diags, allocator, parse_expr_fn, depth)?
+    let box = Box_FnDecl.new(decl_r.0, allocator)?
+    return (item_ast.ItemKind.function_(decl: box), decl_r.1)
+}
+
+function dispatch_type(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    linearity: Option_Linearity.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decl_r = nominal_mod.parse_type_decl(tokens, pos, stability, visibility, linearity, mutable diags, allocator, parse_expr_fn, depth)?
+    let box = Box_TypeDecl.new(decl_r.0, allocator)?
+    return (item_ast.ItemKind.type_decl(decl: box), decl_r.1)
+}
+
+function dispatch_spec(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    stability: Option_Stability.Option,
+    visibility: item_ast.Visibility,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let dispatch_r = generic_mod.parse_spec_or_invocation(tokens, pos, stability, visibility, mutable diags, allocator, parse_expr_fn, parse_item, depth)?
+    return match dispatch_r.0 {
+        case .declaration(let decl) => {
+            let box = Box_Spec.new(decl, allocator)?
+            (item_ast.ItemKind.spec_(decl: box), dispatch_r.1)
+        }
+        case .invocation(let inv) => {
+            let box = Box_SpecInvocation.new(inv, allocator)?
+            (item_ast.ItemKind.spec_invocation(invocation: box), dispatch_r.1)
+        }
+    }
+}
+
+function dispatch_let(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    visibility: item_ast.Visibility,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decl_r = simple_mod.parse_let_item(tokens, pos, visibility, mutable diags, allocator, parse_expr_fn, depth)?
+    let box = Box_LetDecl.new(decl_r.0, allocator)?
+    return (item_ast.ItemKind.let_(decl: box), decl_r.1)
+}
+
+function dispatch_import(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decl_r = simple_mod.parse_import(tokens, pos, mutable diags, allocator)?
+    return (item_ast.ItemKind.import_(decl: decl_r.0), decl_r.1)
+}
+
+function dispatch_module(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    allocator: Allocator,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decl_r = simple_mod.parse_module(tokens, pos, allocator)?
+    return (item_ast.ItemKind.module_(decl: decl_r.0), decl_r.1)
+}
+
+function dispatch_derive(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let decl_r = simple_mod.parse_derive(tokens, pos, mutable diags, allocator)?
+    let box = Box_Derive.new(decl_r.0, allocator)?
+    return (item_ast.ItemKind.derive_(decl: box), decl_r.1)
+}
+
+
+function is_item_boundary_token(tok: kind_mod.Token) -> bool {
+    return match tok {
+        case .kw_function => true
+        case .kw_type => true
+        case .kw_spec => true
+        case .kw_let => true
+        case .kw_import => true
+        case .kw_module => true
+        case .kw_derive => true
+        case .kw_public => true
+        case .at => true
+        case .eof => true
+        case _ => false
+    }
+}
+
+function recover_unrecognised_item(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (item_ast.ItemKind, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    util_mod.emit_error(mutable diags, span, "expected item — `function`, `type`, `spec`, `let`, `import`, `module`, or `derive`", allocator)?
+    var p = pos
+    loop
+        decreases (tokens.len() - p)
+    {
+        if is_item_boundary_token(util_mod.peek(tokens, p)) { break }
+        p = p + 1
+    }
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    let dummy = ident_mod.Ident { name: symbol.empty(), span: span }
+    Vec_Ident.push(mutable segments, dummy, allocator)?
+    let path = ident_mod.Path { segments: segments, span: span }
+    let decl = item_ast.ModuleDecl { span: span, path: path }
+    return (item_ast.ItemKind.module_(decl: decl), p)
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

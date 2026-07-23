@@ -1,0 +1,356 @@
+
+module ir.hlir.tree.node.lower
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+import hir.build.file as hir_file_mod
+import hir.node as node_mod
+import types.ty.interner as ty_interner_mod
+import target.triple as triple_mod
+
+import local.hlir.tree.node.file as hlir_file_mod
+import local.hlir.tree.body as hlir_body_mod
+import local.hlir.op as hlir_op_mod
+
+import local.lir.tree.file as lir_file_mod
+import local.lir.tree.body as lir_body_mod
+import local.lir.attrs as lir_attrs_mod
+import local.lir.error as lir_error_mod
+import local.lir.tree.reg as lir_reg_mod
+import local.lir.id.op as lir_op_id_mod
+import local.hlir.id.op as hlir_op_id_mod
+
+import local.hlir.lower.ids as lower_ids_mod
+import local.hlir.lower.term as lower_term_mod
+import local.hlir.lower.phi as phi_mod
+import local.hlir.tree.node.sizing as sizing_mod
+import local.hlir.tree.oplower.kind as oplower_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBody)
+spec std.collections.vec.Vec(hlir_body_mod.HlirBlock)
+spec std.collections.vec.Vec(hlir_body_mod.HlirValue)
+spec std.collections.vec.Vec(hlir_op_mod.HlirOp)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(hlir_body_mod.HlirDebugLocal)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+spec std.collections.vec.Vec(oplower_mod.LirOpRun)
+
+
+spec std.core.option.Option(lir_reg_mod.PReg)
+spec std.core.option.Option(u32)
+
+
+public function lower_file(
+    out: init lir_file_mod.LirFile,
+    file: hlir_file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit staging: lir_file_mod.LirFile
+    lir_file_mod.new(init staging, allocator)?
+    copy_hir_files(mutable staging, file, allocator)?
+    lower_all_bodies(mutable staging, file, ty_interner, target, allocator)?
+    out = staging
+}
+
+public function lower_body(
+    out: init lir_body_mod.LirBody,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let entry_origin = entry_block_node_origin(body)
+    let l_attrs = lir_attrs_mod.from_hlir(body.fn_attrs)
+
+    uninit staging: lir_body_mod.LirBody
+    lir_body_mod.new_body(
+        init staging,
+        body.def_id,
+        body.origin_file,
+        entry_origin,
+        l_attrs,
+        body.symbol,
+        allocator,
+    )?
+
+    mint_vregs(mutable staging, body, ty_interner, target, allocator)?
+    uninit remap: Vec_LirOpRun.Vec
+    Vec_LirOpRun.new(init remap, allocator)?
+    transcribe_ops(mutable staging, mutable remap, body, ty_interner, allocator)?
+    transcribe_blocks(mutable staging, remap, body, allocator)?
+    phi_mod.materialize_block_args(mutable staging, allocator)?
+    copy_debug_locals(mutable staging, body, allocator)?
+    out = lir_body_mod.set_agg_layouts(take staging, body.agg_layouts)
+}
+
+
+function copy_debug_locals(
+    out: mutable lir_body_mod.LirBody,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HlirDebugLocal.len(body.debug_locals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let dl = Vec_HlirDebugLocal.at(body.debug_locals, i)
+        lir_body_mod.push_debug_local(mutable out, dl.value_raw, dl.name, dl.ty, allocator)?
+        i += 1
+    }
+}
+
+
+function copy_hir_files(
+    out: mutable lir_file_mod.LirFile,
+    file: hlir_file_mod.HlirFile,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(file.hir_files)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        let hf = Vec_HirFile.at(file.hir_files, i)
+        Vec_HirFile.push(mutable out.hir_files, take hf, allocator)?
+        i += 1
+    }
+}
+
+function lower_all_bodies(
+    out: mutable lir_file_mod.LirFile,
+    file: hlir_file_mod.HlirFile,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_HlirBody.len(file.bodies)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let hbody = Vec_HlirBody.at(file.bodies, i)
+        let prior = lower_and_register(mutable out, hbody, ty_interner, target, allocator)?
+        match prior {
+            case .some(_) => raise lir_error_mod.LirError.internal_lowering_invariant(
+                at: span_mod.dummy(),
+                message: "duplicate DefId encountered during HLIR → LIR file lowering",
+            )
+            case .none => ()
+        }
+        i += 1
+    }
+}
+
+function lower_and_register(
+    out: mutable lir_file_mod.LirFile,
+    hbody: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Option_u32.Option
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    uninit lbody: lir_body_mod.LirBody
+    lower_body(init lbody, hbody, ty_interner, target, allocator)?
+    return lir_file_mod.register_body(mutable out, take lbody, allocator)?
+}
+
+function entry_block_node_origin(body: hlir_body_mod.HlirBody) -> node_mod.NodeId {
+    let n = Vec_HlirBlock.len(body.blocks)
+    if n < 2 { return node_mod.error() }
+    let entry = Vec_HlirBlock.at(body.blocks, 1)
+    return entry.node_id_origin
+}
+
+
+function mint_vregs(
+    out: mutable lir_body_mod.LirBody,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_values = Vec_HlirValue.len(body.values)
+    let n_params_us = body.n_params as usize
+
+    var i: usize = 1
+    loop decreases (n_params_us + 1) - i {
+        if i > n_params_us { break }
+        let v = Vec_HlirValue.at(body.values, i)
+        let psize = sizing_mod.vreg_size_for(v.ty, body.agg_layouts, ty_interner, target)
+        let _ = lir_body_mod.mint_param_vreg(
+            mutable out,
+            sizing_mod.vreg_class_for(v.ty, ty_interner),
+            Option_PReg.none,
+            v.ty,
+            psize,
+            sizing_mod.int_resize_width(v.ty, ty_interner),
+            sizing_mod.int_resize_signed(v.ty, ty_interner),
+            lir_reg_mod.is_by_memory(psize),
+            allocator,
+        )?
+        i += 1
+    }
+
+    var j: usize = n_params_us + 1
+    loop decreases n_values - j {
+        if j >= n_values { break }
+        let v = Vec_HlirValue.at(body.values, j)
+        let size = sizing_mod.vreg_size_for(v.ty, body.agg_layouts, ty_interner, target)
+        let vreg = lir_reg_mod.LirVReg {
+            class_: sizing_mod.vreg_class_for(v.ty, ty_interner),
+            pin: Option_PReg.none,
+            ty: v.ty,
+            size: size,
+            int_width: sizing_mod.int_resize_width(v.ty, ty_interner),
+            int_signed: sizing_mod.int_resize_signed(v.ty, ty_interner),
+            is_ref: value_is_ref(body, v.def, size),
+        }
+        let _ = lir_body_mod.push_vreg(mutable out, take vreg, allocator)?
+        j += 1
+    }
+}
+
+
+function value_is_ref(body: hlir_body_mod.HlirBody, def: hlir_body_mod.HlirValueDef, size: u32) -> bool {
+    if !lir_reg_mod.is_by_memory(size) { return false }
+    return match def {
+        case .block_param(_, _) => true
+        case .op_result(let op) => is_addr_producing_op(Vec_HlirOp.at(body.ops, hlir_op_id_mod.index(op)).kind)
+    }
+}
+
+
+function is_addr_producing_op(kind: hlir_op_mod.HlirOpKind) -> bool {
+    return match kind {
+        case .ref_(_, _) => true
+        case .field_addr(_, _) => true
+        case .index_addr(_, _) => true
+        case .subrange_addr(_, _, _) => true
+        case .deref_addr(_) => true
+        case .stack_alloc(_) => true
+        case .deref_(_) => true
+        case .field(_, _) => true
+        case .index(_, _) => true
+        case _ => false
+    }
+}
+
+
+function transcribe_ops(
+    out: mutable lir_body_mod.LirBody,
+    remap: mutable Vec_LirOpRun.Vec,
+    body: hlir_body_mod.HlirBody,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let sentinel = oplower_mod.run_of_one(lir_op_id_mod.LirOpId { raw: 0 as u32 }, allocator)?
+    Vec_LirOpRun.push(mutable remap, take sentinel, allocator)?
+
+    let n = Vec_HlirOp.len(body.ops)
+    var i: usize = 1
+    loop decreases n - i {
+        if i >= n { break }
+        let hop = Vec_HlirOp.at(body.ops, i)
+        let run = oplower_mod.lower_op(mutable out, hop, body, ty_interner, allocator)?
+        Vec_LirOpRun.push(mutable remap, take run, allocator)?
+        i += 1
+    }
+}
+
+
+function transcribe_blocks(
+    out: mutable lir_body_mod.LirBody,
+    remap: Vec_LirOpRun.Vec,
+    body: hlir_body_mod.HlirBody,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let n = Vec_HlirBlock.len(body.blocks)
+    if n < 2 { return }
+
+    let h_entry = Vec_HlirBlock.at(body.blocks, 1)
+    let l_entry = lower_block(h_entry, remap, allocator)?
+    Vec_LirBlock.set_at(mutable out.blocks, 1, take l_entry)
+
+    var i: usize = 2
+    loop decreases n - i {
+        if i >= n { break }
+        let hblock = Vec_HlirBlock.at(body.blocks, i)
+        let lblock = lower_block(hblock, remap, allocator)?
+        let _ = lir_body_mod.push_block(mutable out, take lblock, allocator)?
+        i += 1
+    }
+}
+
+function expand_op_ids(
+    src: Vec_OpId.Vec,
+    remap: Vec_LirOpRun.Vec,
+    allocator: Allocator,
+) -> Vec_LirOpId.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init out, allocator)?
+    let n = Vec_OpId.len(src)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let o = Vec_OpId.at(src, i)
+        let idx = o.raw as usize
+        if idx < Vec_LirOpRun.len(remap) {
+            let run = Vec_LirOpRun.at(remap, idx)
+            let m = Vec_LirOpId.len(run.ids)
+            var j: usize = 0
+            loop decreases m - j {
+                if j >= m { break }
+                Vec_LirOpId.push(mutable out, take Vec_LirOpId.at(run.ids, j), allocator)?
+                j += 1
+            }
+        }
+        i += 1
+    }
+    return out
+}
+
+function lower_block(
+    block: hlir_body_mod.HlirBlock,
+    remap: Vec_LirOpRun.Vec,
+    allocator: Allocator,
+) -> lir_body_mod.LirBlock
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let params = lower_ids_mod.convert_value_id_vec(block.params, allocator)?
+    let ops = expand_op_ids(block.ops, remap, allocator)?
+    let terminator = lower_term_mod.lower_terminator(block.terminator, allocator)?
+    let coherence = lower_term_mod.convert_coherence_region(block.coherence_region)
+    return lir_body_mod.LirBlock {
+        node_id_origin: block.node_id_origin,
+        params: params,
+        ops: ops,
+        terminator: terminator,
+        coherence_region: coherence,
+    }
+}

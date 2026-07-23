@@ -1,0 +1,140 @@
+
+module uri.codec.encode
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import uri.value
+
+spec option.Option(String)
+spec option.Option(u16)
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _digit_count(n: u16) -> usize {
+    if n < (10 as u16)    { return 1 as usize }
+    if n < (100 as u16)   { return 2 as usize }
+    if n < (1000 as u16)  { return 3 as usize }
+    if n < (10000 as u16) { return 4 as usize }
+    return 5 as usize
+}
+
+function _write_digits(buf: mutable [u8], pos: usize, n: u16) -> usize {
+    let w = _digit_count(n)
+    var v: u32 = n as u32
+    var k: usize = w
+    loop decreases k {
+        if k == 0 as usize { break }
+        k = k - 1 as usize
+        let d = v % (10 as u32)
+        buf[pos + k] = ((d & (0xFF as u32)) +% (48 as u32)) as u8
+        v = v / (10 as u32)
+    }
+    return pos + w
+}
+
+
+function _measure_authority(u: value.Uri) -> usize {
+    return match u.host {
+        case .some(let h) => {
+            let ui_size = match u.userinfo {
+                case .some(let ui) => ui.bytes().len() + 1 as usize
+                case .none         => 0 as usize
+            }
+            let port_size = match u.port {
+                case .some(let p) => 1 as usize + _digit_count(p)
+                case .none        => 0 as usize
+            }
+            2 as usize + ui_size + h.bytes().len() + port_size
+        }
+        case .none => 0 as usize
+    }
+}
+
+function _measure_delimited(opt: Option_String) -> usize {
+    return match opt {
+        case .some(let s) => 1 as usize + s.bytes().len()
+        case .none        => 0 as usize
+    }
+}
+
+function _measure_uri(u: value.Uri) -> usize {
+    return u.scheme.bytes().len() + 1 as usize
+        + _measure_authority(u)
+        + u.path.bytes().len()
+        + _measure_delimited(u.query)
+        + _measure_delimited(u.fragment)
+}
+
+
+function _write_bytes(buf: mutable [u8], pos: usize, src: [u8]) -> usize {
+    let n = src.len()
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[pos + i] = src[i]
+        i = i + 1 as usize
+    }
+    return pos + n
+}
+
+function _encode_uri(u: value.Uri, buf: mutable [u8], pos: usize) -> usize {
+    var p: usize = _write_bytes(buf, pos, u.scheme.bytes())
+    buf[p] = 58 as u8
+    p = p + 1 as usize
+    match u.host {
+        case .some(let h) => {
+            buf[p] = 47 as u8; p = p + 1 as usize
+            buf[p] = 47 as u8; p = p + 1 as usize
+            match u.userinfo {
+                case .some(let ui) => {
+                    p = _write_bytes(mutable buf, p, ui.bytes())
+                    buf[p] = 64 as u8
+                    p = p + 1 as usize
+                }
+                case .none => {}
+            }
+            p = _write_bytes(mutable buf, p, h.bytes())
+            match u.port {
+                case .some(let port_v) => {
+                    buf[p] = 58 as u8
+                    p = p + 1 as usize
+                    p = _write_digits(mutable buf, p, port_v)
+                }
+                case .none => {}
+            }
+        }
+        case .none => {}
+    }
+    p = _write_bytes(mutable buf, p, u.path.bytes())
+    match u.query {
+        case .some(let q) => {
+            buf[p] = 63 as u8
+            p = p + 1 as usize
+            p = _write_bytes(mutable buf, p, q.bytes())
+        }
+        case .none => {}
+    }
+    match u.fragment {
+        case .some(let f) => {
+            buf[p] = 35 as u8
+            p = p + 1 as usize
+            p = _write_bytes(mutable buf, p, f.bytes())
+        }
+        case .none => {}
+    }
+    return p
+}
+
+
+public function encode_to_string(u: value.Uri, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let need = _measure_uri(u)
+    var buf = _alloc_byte_slab(allocator, need)?
+    let end = _encode_uri(u, mutable buf, 0 as usize)
+    return string.bytes_slice_to_string(buf, 0, end, allocator)?
+}

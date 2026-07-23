@@ -1,0 +1,129 @@
+
+module pgsql.client.session.auth.sasl
+
+import std.text.str
+import local.error
+
+
+public type ServerFirst {
+    combined_nonce: [u8]
+    salt_b64: [u8]
+    iterations: i64
+}
+
+public type ServerFinal {
+    case ok(verifier_b64: [u8])
+    case err(server_error: [u8])
+}
+
+
+public function attr_nonce() -> u8 { return 114 as u8 }
+
+public function attr_salt() -> u8 { return 115 as u8 }
+
+public function attr_iterations() -> u8 { return 105 as u8 }
+
+public function attr_channel_binding() -> u8 { return 99 as u8 }
+
+public function attr_proof() -> u8 { return 112 as u8 }
+
+public function attr_verifier() -> u8 { return 118 as u8 }
+
+public function attr_error() -> u8 { return 101 as u8 }
+
+public function attr_mandatory() -> u8 { return 109 as u8 }
+
+
+function _byte_eq() -> u8 { return 61 as u8 }
+
+function _byte_comma() -> u8 { return 44 as u8 }
+
+
+type _Attr {
+    key: u8
+    value_lo: usize
+    value_hi: usize
+    next_pos: usize
+}
+
+function _next_attr(src: [u8], pos: usize) -> _Attr
+    with {err: error.ProtocolError}
+{
+    let n = src.len()
+    if pos + (2 as usize) > n {
+        raise error.ProtocolError.malformed_message
+    }
+    let key = src[pos]
+    if src[pos + (1 as usize)] != _byte_eq() {
+        raise error.ProtocolError.malformed_message
+    }
+    let value_lo = pos + (2 as usize)
+    var i: usize = value_lo
+    loop decreases n - i {
+        if i >= n { break }
+        if src[i] == _byte_comma() { break }
+        i = i + (1 as usize)
+    }
+    let value_hi = i
+    let next_pos = if i < n { i + (1 as usize) } else { n }
+    return _Attr {
+        key: key,
+        value_lo: value_lo,
+        value_hi: value_hi,
+        next_pos: next_pos,
+    }
+}
+
+
+function _parse_iter_count(s: [u8]) -> i64
+    with {err: error.ProtocolError}
+{
+    return handle err: str.ParseIntError -> (raise error.ProtocolError.malformed_message) {
+        str.parse_i64(s)?
+    }
+}
+
+
+public function parse_server_first(src: [u8]) -> ServerFirst
+    with {err: error.ProtocolError}
+{
+    let a1 = _next_attr(src, 0 as usize)?
+    if a1.key == attr_mandatory() {
+        raise error.ProtocolError.unsupported_protocol_version
+    }
+    if a1.key != attr_nonce() {
+        raise error.ProtocolError.malformed_message
+    }
+    let nonce = src[a1.value_lo..<a1.value_hi]
+
+    let a2 = _next_attr(src, a1.next_pos)?
+    if a2.key != attr_salt() {
+        raise error.ProtocolError.malformed_message
+    }
+    let salt = src[a2.value_lo..<a2.value_hi]
+
+    let a3 = _next_attr(src, a2.next_pos)?
+    if a3.key != attr_iterations() {
+        raise error.ProtocolError.malformed_message
+    }
+    let iter = _parse_iter_count(src[a3.value_lo..<a3.value_hi])?
+
+    return ServerFirst {
+        combined_nonce: nonce,
+        salt_b64: salt,
+        iterations: iter,
+    }
+}
+
+public function parse_server_final(src: [u8]) -> ServerFinal
+    with {err: error.ProtocolError}
+{
+    let a = _next_attr(src, 0 as usize)?
+    if a.key == attr_verifier() {
+        return ServerFinal.ok(verifier_b64: src[a.value_lo..<a.value_hi])
+    }
+    if a.key == attr_error() {
+        return ServerFinal.err(server_error: src[a.value_lo..<a.value_hi])
+    }
+    raise error.ProtocolError.malformed_message
+}

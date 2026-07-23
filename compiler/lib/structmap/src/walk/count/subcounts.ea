@@ -1,0 +1,341 @@
+
+module structmap.walk.count.subcounts
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import local.data.model as model
+import local.render.toon as toon
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.StringMap(u32)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(model.ChildIndex)
+spec std.collections.vec.Vec(model.ModuleEntry)
+spec std.collections.vec.Vec(model.TypeEntry)
+spec std.collections.vec.Vec(model.FunctionEntry)
+spec std.collections.vec.Vec(model.InvariantEntry)
+spec std.collections.vec.Vec(model.PatternEntry)
+spec std.collections.vec.Vec(model.DocEntry)
+spec std.collections.vec.Vec(model.TrustEntry)
+
+function headline_cap() -> usize { return 12 }
+
+public function own_totals(tree: model.Tree, dir_idx: usize) -> (u32, u32) {
+    let types_count = count_types_own(tree, dir_idx)
+    let functions = count_functions_own(tree, dir_idx)
+    return (types_count, functions)
+}
+
+function count_types_own(tree: model.Tree, dir_idx: usize) -> u32 {
+    let types_n: usize = Vec_TypeEntry.len(tree.types_)
+    var total: u32 = 0
+    var j: usize = 0
+    loop
+        decreases types_n - j
+    {
+        if j >= types_n { break }
+        if Vec_TypeEntry.at(tree.types_, j).dir_idx == dir_idx {
+            total += 1 as u32
+        }
+        j += 1
+    }
+    return total
+}
+
+function count_functions_own(tree: model.Tree, dir_idx: usize) -> u32 {
+    let functions_n: usize = Vec_FunctionEntry.len(tree.functions)
+    var total: u32 = 0
+    var j: usize = 0
+    loop
+        decreases functions_n - j
+    {
+        if j >= functions_n { break }
+        if Vec_FunctionEntry.at(tree.functions, j).dir_idx == dir_idx {
+            total += 1 as u32
+        }
+        j += 1
+    }
+    return total
+}
+
+function is_public(v: model.Visibility) -> bool {
+    return match v {
+        case .public_ => true
+        case .module_ => false
+    }
+}
+
+function count_public_own(tree: model.Tree, dir_idx: usize) -> usize {
+    var total: usize = 0
+    let types_n: usize = Vec_TypeEntry.len(tree.types_)
+    var i: usize = 0
+    loop
+        decreases types_n - i
+    {
+        if i >= types_n { break }
+        let t = Vec_TypeEntry.at(tree.types_, i)
+        if t.dir_idx == dir_idx && is_public(t.visibility) {
+            total += 1
+        }
+        i += 1
+    }
+    let functions_n: usize = Vec_FunctionEntry.len(tree.functions)
+    var j: usize = 0
+    loop
+        decreases functions_n - j
+    {
+        if j >= functions_n { break }
+        let f = Vec_FunctionEntry.at(tree.functions, j)
+        if f.dir_idx == dir_idx && is_public(f.visibility) {
+            total += 1
+        }
+        j += 1
+    }
+    return total
+}
+
+function push_name_capped(
+    buf: mutable Vec_u8.Vec,
+    name: String,
+    emitted: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    if emitted >= headline_cap() { return emitted }
+    if emitted > 0 {
+        Vec_u8.push(mutable buf, 0x20, allocator)?
+    }
+    toon.push_str(mutable buf, name, allocator)?
+    return emitted + 1
+}
+
+function push_leaf_capped(
+    buf: mutable Vec_u8.Vec,
+    qualified: String,
+    emitted: usize,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    if emitted >= headline_cap() { return emitted }
+    if emitted > 0 {
+        Vec_u8.push(mutable buf, 0x20, allocator)?
+    }
+    let bytes = qualified.bytes()
+    let n: usize = bytes.len()
+    var start: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if bytes[i] == 0x2E { start = i + 1 }
+        i += 1
+    }
+    var k: usize = start
+    loop
+        decreases n - k
+    {
+        if k >= n { break }
+        Vec_u8.push(mutable buf, bytes[k], allocator)?
+        k += 1
+    }
+    return emitted + 1
+}
+
+public function package_summary(
+    tree: model.Tree,
+    allocator: Allocator,
+) -> model.PackageSummary
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let types_total: u32 = Vec_TypeEntry.len(tree.types_) as u32
+    let functions_total: u32 = Vec_FunctionEntry.len(tree.functions) as u32
+    let headline = package_headline(tree, allocator)?
+    return model.PackageSummary {
+        types: types_total,
+        functions: functions_total,
+        public_names: headline,
+    }
+}
+
+function sorted_dir_indices(tree: model.Tree, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n: usize = Vec_String.len(tree.paths)
+    uninit order: Vec_usize.Vec
+    Vec_usize.new(init order, allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        Vec_usize.push(mutable order, i, allocator)?
+        i += 1
+    }
+    var a: usize = 0
+    loop
+        decreases n - a
+    {
+        if a >= n { break }
+        var best: usize = a
+        var b: usize = a + 1
+        loop
+            decreases n - b
+        {
+            if b >= n { break }
+            let pb = Vec_String.at(tree.paths, Vec_usize.at(order, b))
+            let pbest = Vec_String.at(tree.paths, Vec_usize.at(order, best))
+            if string_less(pb, pbest) { best = b }
+            b += 1
+        }
+        if best != a {
+            let tmp = Vec_usize.at(order, a)
+            Vec_usize.set_at(mutable order, a, Vec_usize.at(order, best))
+            Vec_usize.set_at(mutable order, best, tmp)
+        }
+        a += 1
+    }
+    return order
+}
+
+function string_less(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    let n = if an < bn { an } else { bn }
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if ab[i] != bb[i] { return ab[i] < bb[i] }
+        i += 1
+    }
+    return an < bn
+}
+
+function count_public_package(tree: model.Tree) -> usize {
+    var total: usize = 0
+    let types_n: usize = Vec_TypeEntry.len(tree.types_)
+    var i: usize = 0
+    loop
+        decreases types_n - i
+    {
+        if i >= types_n { break }
+        if is_public(Vec_TypeEntry.at(tree.types_, i).visibility) { total += 1 }
+        i += 1
+    }
+    let functions_n: usize = Vec_FunctionEntry.len(tree.functions)
+    var j: usize = 0
+    loop
+        decreases functions_n - j
+    {
+        if j >= functions_n { break }
+        if is_public(Vec_FunctionEntry.at(tree.functions, j).visibility) { total += 1 }
+        j += 1
+    }
+    return total
+}
+
+function package_headline(tree: model.Tree, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let total = count_public_package(tree)
+    let order = sorted_dir_indices(tree, allocator)?
+    let dirs_n: usize = Vec_usize.len(order)
+    var emitted: usize = 0
+    var d: usize = 0
+    loop
+        decreases dirs_n - d
+    {
+        if d >= dirs_n { break }
+        let dir_idx = Vec_usize.at(order, d)
+        let types_n: usize = Vec_TypeEntry.len(tree.types_)
+        var i: usize = 0
+        loop
+            decreases types_n - i
+        {
+            if i >= types_n { break }
+            let t = Vec_TypeEntry.at(tree.types_, i)
+            if t.dir_idx == dir_idx && is_public(t.visibility) {
+                emitted = push_name_capped(mutable buf, t.name, emitted, allocator)?
+            }
+            i += 1
+        }
+        let functions_n: usize = Vec_FunctionEntry.len(tree.functions)
+        var j: usize = 0
+        loop
+            decreases functions_n - j
+        {
+            if j >= functions_n { break }
+            let f = Vec_FunctionEntry.at(tree.functions, j)
+            if f.dir_idx == dir_idx && is_public(f.visibility) {
+                emitted = push_leaf_capped(mutable buf, f.qualified_name, emitted, allocator)?
+            }
+            j += 1
+        }
+        d += 1
+    }
+    if total > headline_cap() {
+        Vec_u8.push(mutable buf, 0x20, allocator)?
+        Vec_u8.push(mutable buf, 0xE2, allocator)?
+        Vec_u8.push(mutable buf, 0x80, allocator)?
+        Vec_u8.push(mutable buf, 0xA6, allocator)?
+    }
+    return toon.finish_string(take buf, allocator)?
+}
+
+public function public_headline(
+    tree: model.Tree,
+    dir_idx: usize,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    let total = count_public_own(tree, dir_idx)
+    var emitted: usize = 0
+    let types_n: usize = Vec_TypeEntry.len(tree.types_)
+    var i: usize = 0
+    loop
+        decreases types_n - i
+    {
+        if i >= types_n { break }
+        let t = Vec_TypeEntry.at(tree.types_, i)
+        if t.dir_idx == dir_idx && is_public(t.visibility) {
+            emitted = push_name_capped(mutable buf, t.name, emitted, allocator)?
+        }
+        i += 1
+    }
+    let functions_n: usize = Vec_FunctionEntry.len(tree.functions)
+    var j: usize = 0
+    loop
+        decreases functions_n - j
+    {
+        if j >= functions_n { break }
+        let f = Vec_FunctionEntry.at(tree.functions, j)
+        if f.dir_idx == dir_idx && is_public(f.visibility) {
+            emitted = push_leaf_capped(mutable buf, f.qualified_name, emitted, allocator)?
+        }
+        j += 1
+    }
+    if total > headline_cap() {
+        Vec_u8.push(mutable buf, 0x20, allocator)?
+        Vec_u8.push(mutable buf, 0xE2, allocator)?
+        Vec_u8.push(mutable buf, 0x80, allocator)?
+        Vec_u8.push(mutable buf, 0xA6, allocator)?
+    }
+    return toon.finish_string(take buf, allocator)?
+}

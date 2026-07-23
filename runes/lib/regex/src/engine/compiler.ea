@@ -1,0 +1,125 @@
+
+module regex.engine.compiler
+
+import std.mem.alloc
+import regex.syntax.grammar.ast
+import regex.syntax.grammar.mode
+import regex.syntax.errors
+import regex.engine.exec.program
+import local.engine.compiler.alloc as compiler_alloc
+import local.engine.compiler.count as compiler_count
+import local.engine.compiler.emit as compiler_emit
+
+spec std.mem.alloc.Box(ast.RegexAst)
+
+function _max_instructions() -> u32 {
+    return 100000 as u32
+}
+
+function _box_root(node: take ast.RegexAst, allocator: Allocator) -> Box_RegexAst
+    with {allocator, err: errors.CompileError}
+{
+    return handle err: alloc.AllocError -> { raise errors.CompileError.allocation_failed } {
+        Box_RegexAst.new(take node, allocator)?
+    }
+}
+
+
+function _is_anchored(b: Box_RegexAst) -> bool
+    decreases box_depth(b)
+{
+    let node = b.get()
+    return match node {
+        case .anchor_node(let a) => _anchor_starts_input(a)
+        case .concat(let items)  => {
+            if items.len() == 0 as usize {
+                false
+            } else {
+                _is_anchored(items[0 as usize])
+            }
+        }
+        case .alternate(let bs) => {
+            let n = bs.len()
+            if n == 0 as usize {
+                false
+            } else {
+                var i: usize = 0 as usize
+                var all_ok: bool = true
+                loop decreases n - i + 1 as usize {
+                    if i >= n { break }
+                    if !_is_anchored(bs[i]) {
+                        all_ok = false
+                        break
+                    }
+                    i = i + 1 as usize
+                }
+                all_ok
+            }
+        }
+        case .group_node(let inner, _) => _is_anchored(inner)
+        case _ => false
+    }
+}
+
+function _anchor_starts_input(a: ast.Anchor) -> bool {
+    return match a {
+        case .start_of_text => true
+        case .start_of_line => true
+        case _              => false
+    }
+}
+
+
+public function compile_ast(
+    node: ast.RegexAst,
+    num_captures: u32,
+    flags: mode.Flags,
+    allocator: mutable Allocator,
+) -> program.Program
+    with {allocator, err: errors.CompileError, divergence}
+{
+    let root = _box_root(take node, allocator)?
+    let (body_count, class_count) = compiler_count.count(root)?
+    let start_anchored = _is_anchored(root)
+    let total = body_count +% (3 as u32)
+    if total > _max_instructions() {
+        raise errors.CompileError.pattern_too_long
+    }
+    let instructions = compiler_alloc.alloc_instr_slots(allocator, total as usize)?
+    let class_table  = compiler_alloc.alloc_class_slots(allocator, class_count as usize)?
+    let instr_cursor = compiler_alloc.alloc_u32_slots(allocator, 1 as usize)?
+    let class_cursor = compiler_alloc.alloc_u32_slots(allocator, 1 as usize)?
+    let feature_flags = compiler_alloc.alloc_u32_slots(allocator, 1 as usize)?
+    instr_cursor[0 as usize] = 0 as u32
+    class_cursor[0 as usize] = 0 as u32
+    feature_flags[0 as usize] = 0 as u32
+
+    let ctx = compiler_emit.EmitCtx {
+        instructions: instructions,
+        class_table: class_table,
+        instr_cursor: instr_cursor,
+        class_cursor: class_cursor,
+        feature_flags: feature_flags,
+    }
+    let _ = compiler_emit.push_instr(ctx, program.Instruction.save(slot: 0 as u32))?
+    let body_node = Box_RegexAst.unbox(take root, mutable allocator)
+    compiler_emit.emit(body_node, ctx, flags, mutable allocator)?
+    let _ = compiler_emit.push_instr(ctx, program.Instruction.save(slot: 1 as u32))?
+    let _ = compiler_emit.push_instr(ctx, program.Instruction.match_op)?
+
+    let final_len = ctx.instr_cursor[0 as usize] as usize
+    let final_classes = ctx.class_cursor[0 as usize] as usize
+    let trimmed_instr = instructions[0 as usize..<final_len]
+    let trimmed_class = class_table[0 as usize..<final_classes]
+    let has_la = compiler_emit.has_lookaround(ctx)
+    let has_br = compiler_emit.has_backref(ctx)
+    return program.program_of(
+        take trimmed_instr,
+        take trimmed_class,
+        num_captures,
+        start_anchored,
+        has_la,
+        has_br,
+        flags,
+    )
+}

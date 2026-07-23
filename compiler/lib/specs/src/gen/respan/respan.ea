@@ -1,0 +1,864 @@
+module specs.gen.respan.respan
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import span.loc.pos.span as span_mod
+import span.file as file_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.item as item_mod
+
+
+spec std.mem.alloc.Box(tree_mod.Expr)
+spec std.mem.alloc.Box(tree_mod.Pat)
+spec std.mem.alloc.Box(tree_mod.Ty)
+spec std.mem.alloc.Box(item_mod.FnDecl)
+spec std.mem.alloc.Box(item_mod.TypeDecl)
+spec std.mem.alloc.Box(item_mod.Spec)
+spec std.mem.alloc.Box(item_mod.SpecInvocation)
+spec std.mem.alloc.Box(item_mod.LetDecl)
+spec std.mem.alloc.Box(item_mod.Derive)
+
+
+spec std.collections.vec.Vec(item_mod.Item)
+spec std.collections.vec.Vec(tree_mod.Expr)
+spec std.collections.vec.Vec(tree_mod.Pat)
+spec std.collections.vec.Vec(tree_mod.Ty)
+spec std.collections.vec.Vec(tree_mod.Stmt)
+spec std.collections.vec.Vec(tree_mod.MatchArm)
+spec std.collections.vec.Vec(tree_mod.StructLitField)
+spec std.collections.vec.Vec(tree_mod.StructPatField)
+spec std.collections.vec.Vec(tree_mod.CallArg)
+spec std.collections.vec.Vec(tree_mod.Param)
+spec std.collections.vec.Vec(tree_mod.FnTyParam)
+spec std.collections.vec.Vec(tree_mod.EffectMember)
+spec std.collections.vec.Vec(tree_mod.FStringSeg)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(item_mod.GenericParam)
+spec std.collections.vec.Vec(item_mod.AdmitsConstraint)
+spec std.collections.vec.Vec(item_mod.TypeField)
+spec std.collections.vec.Vec(item_mod.Variant)
+spec std.collections.vec.Vec(tree_mod.RefinementClause)
+
+
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(tree_mod.Expr)
+spec std.core.option.Option(tree_mod.Ty)
+spec std.core.option.Option(tree_mod.EffectRow)
+spec std.core.option.Option(tree_mod.SliceRest)
+spec std.core.option.Option(ident_mod.Ident)
+
+
+public type Relocator {
+    file: file_mod.FileId
+    next: usize
+}
+
+
+public function new_relocator(file: file_mod.FileId) -> Relocator {
+    return Relocator { file: file, next: 0 }
+}
+
+
+function fresh(r: mutable Relocator) -> span_mod.Span {
+    let n = r.next
+    r.next = r.next +% 1
+    return span_mod.span_of(r.file, n, n)
+}
+
+
+public function respan_items(
+    items: Vec_Item.Vec,
+    file: file_mod.FileId,
+    allocator: Allocator,
+) -> Vec_Item.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    var r = new_relocator(file)
+    uninit out: Vec_Item.Vec
+    Vec_Item.new(init out, allocator)?
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let it = item(mutable r, Vec_Item.at(items, i), allocator)?
+        Vec_Item.push(mutable out, take it, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function ident(r: mutable Relocator, id: ident_mod.Ident) -> ident_mod.Ident {
+    return ident_mod.Ident { name: id.name, span: fresh(mutable r) }
+}
+
+function opt_ident(r: mutable Relocator, o: Option_Ident.Option) -> Option_Ident.Option {
+    return match o {
+        case .some(let id) => Option_Ident.some(value: ident(mutable r, id))
+        case .none => Option_Ident.none
+    }
+}
+
+function path(r: mutable Relocator, p: ident_mod.Path, allocator: Allocator) -> ident_mod.Path
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    let n = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Ident.push(mutable segs, ident(mutable r, Vec_Ident.at(p.segments, i)), allocator)?
+        i = i + 1
+    }
+    return ident_mod.Path { segments: segs, span: fresh(mutable r) }
+}
+
+
+function ty(r: mutable Relocator, t: tree_mod.Ty, allocator: Allocator) -> tree_mod.Ty
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = match t.kind {
+        case .path(let p) => tree_mod.TyKind.path(path: path(mutable r, p, allocator)?)
+        case .tuple(let elems) => tree_mod.TyKind.tuple(elements: tys(mutable r, elems, allocator)?)
+        case .slice(let elem) => tree_mod.TyKind.slice(elem: ty_box(mutable r, elem, allocator)?)
+        case .unit => tree_mod.TyKind.unit
+        case .function_(let params, let ret, let effects) => tree_mod.TyKind.function_(
+            params: fn_ty_params(mutable r, params, allocator)?,
+            ret: ty_box(mutable r, ret, allocator)?,
+            effects: opt_effect_row(mutable r, effects, allocator)?,
+        )
+        case .meta => tree_mod.TyKind.meta
+        case .comptime_(let inner) => tree_mod.TyKind.comptime_(inner: ty_box(mutable r, inner, allocator)?)
+        case .refined(let base, let pred) => tree_mod.TyKind.refined(
+            base: ty_box(mutable r, base, allocator)?,
+            pred: expr(mutable r, pred, allocator)?,
+        )
+        case .error => tree_mod.TyKind.error
+    }
+    return tree_mod.Ty { span: fresh(mutable r), kind: k }
+}
+
+function ty_box(r: mutable Relocator, b: Box_Ty, allocator: Allocator) -> Box_Ty
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let inner = ty(mutable r, Box_Ty.get(b), allocator)?
+    return Box_Ty.new(take inner, allocator)?
+}
+
+function opt_ty(r: mutable Relocator, o: Option_Ty.Option, allocator: Allocator) -> Option_Ty.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match o {
+        case .some(let t) => Option_Ty.some(value: ty(mutable r, t, allocator)?)
+        case .none => Option_Ty.none
+    }
+}
+
+function tys(r: mutable Relocator, v: Vec_Ty.Vec, allocator: Allocator) -> Vec_Ty.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Ty.Vec
+    Vec_Ty.new(init out, allocator)?
+    let n = Vec_Ty.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let st = ty(mutable r, Vec_Ty.at(v, i), allocator)?
+        Vec_Ty.push(mutable out, take st, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function fn_ty_param(r: mutable Relocator, p: tree_mod.FnTyParam, allocator: Allocator) -> tree_mod.FnTyParam
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.FnTyParam {
+        span: fresh(mutable r),
+        name: opt_ident(mutable r, p.name),
+        mode: p.mode,
+        ty: ty(mutable r, p.ty, allocator)?,
+    }
+}
+
+function fn_ty_params(r: mutable Relocator, v: Vec_FnTyParam.Vec, allocator: Allocator) -> Vec_FnTyParam.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_FnTyParam.Vec
+    Vec_FnTyParam.new(init out, allocator)?
+    let n = Vec_FnTyParam.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let np = fn_ty_param(mutable r, Vec_FnTyParam.at(v, i), allocator)?
+        Vec_FnTyParam.push(mutable out, take np, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function param(r: mutable Relocator, p: tree_mod.Param, allocator: Allocator) -> tree_mod.Param
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.Param {
+        span: fresh(mutable r),
+        name: ident(mutable r, p.name),
+        mode: p.mode,
+        ty: ty(mutable r, p.ty, allocator)?,
+    }
+}
+
+function params(r: mutable Relocator, v: Vec_Param.Vec, allocator: Allocator) -> Vec_Param.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Param.Vec
+    Vec_Param.new(init out, allocator)?
+    let n = Vec_Param.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let np = param(mutable r, Vec_Param.at(v, i), allocator)?
+        Vec_Param.push(mutable out, take np, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function effect_member(r: mutable Relocator, m: tree_mod.EffectMember, allocator: Allocator) -> tree_mod.EffectMember
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match m {
+        case .capability(let name) => tree_mod.EffectMember.capability(name: ident(mutable r, name))
+        case .named(let name, let t) => tree_mod.EffectMember.named(name: ident(mutable r, name), ty: ty(mutable r, t, allocator)?)
+        case .spread(let p) => tree_mod.EffectMember.spread(path: path(mutable r, p, allocator)?)
+        case .graded(let kind, let bound) => tree_mod.EffectMember.graded(kind: ident(mutable r, kind), bound: expr_box(mutable r, bound, allocator)?)
+    }
+}
+
+function effect_row(r: mutable Relocator, row: tree_mod.EffectRow, allocator: Allocator) -> tree_mod.EffectRow
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_EffectMember.Vec
+    Vec_EffectMember.new(init out, allocator)?
+    let n = Vec_EffectMember.len(row.members)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nm = effect_member(mutable r, Vec_EffectMember.at(row.members, i), allocator)?
+        Vec_EffectMember.push(mutable out, take nm, allocator)?
+        i = i + 1
+    }
+    return tree_mod.EffectRow { span: fresh(mutable r), members: out }
+}
+
+function opt_effect_row(r: mutable Relocator, o: Option_EffectRow.Option, allocator: Allocator) -> Option_EffectRow.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match o {
+        case .some(let row) => Option_EffectRow.some(value: effect_row(mutable r, row, allocator)?)
+        case .none => Option_EffectRow.none
+    }
+}
+
+
+function refinement_clause(r: mutable Relocator, c: tree_mod.RefinementClause, allocator: Allocator) -> tree_mod.RefinementClause
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.RefinementClause { span: fresh(mutable r), kind: c.kind, pred: expr(mutable r, c.pred, allocator)? }
+}
+
+function refinement_clauses(r: mutable Relocator, v: Vec_RefinementClause.Vec, allocator: Allocator) -> Vec_RefinementClause.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_RefinementClause.Vec
+    Vec_RefinementClause.new(init out, allocator)?
+    let n = Vec_RefinementClause.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nc = refinement_clause(mutable r, Vec_RefinementClause.at(v, i), allocator)?
+        Vec_RefinementClause.push(mutable out, take nc, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function expr(r: mutable Relocator, e: tree_mod.Expr, allocator: Allocator) -> tree_mod.Expr
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = match e.kind {
+        case .literal(let value) => tree_mod.ExprKind.literal(value: value)
+        case .fstring(let segs) => tree_mod.ExprKind.fstring(segments: fstring_segs(mutable r, segs, allocator)?)
+        case .path(let p) => tree_mod.ExprKind.path(path: path(mutable r, p, allocator)?)
+        case .binary(let op, let lhs, let rhs) => tree_mod.ExprKind.binary(op: op, lhs: expr_box(mutable r, lhs, allocator)?, rhs: expr_box(mutable r, rhs, allocator)?)
+        case .unary(let op, let x) => tree_mod.ExprKind.unary(op: op, expr: expr_box(mutable r, x, allocator)?)
+        case .call(let callee, let args) => tree_mod.ExprKind.call(callee: expr_box(mutable r, callee, allocator)?, args: call_args(mutable r, args, allocator)?)
+        case .method_call(let recv, let name, let args) => tree_mod.ExprKind.method_call(receiver: expr_box(mutable r, recv, allocator)?, name: ident(mutable r, name), args: call_args(mutable r, args, allocator)?)
+        case .field(let recv, let name) => tree_mod.ExprKind.field(receiver: expr_box(mutable r, recv, allocator)?, name: ident(mutable r, name))
+        case .tuple_index(let recv, let idx) => tree_mod.ExprKind.tuple_index(receiver: expr_box(mutable r, recv, allocator)?, index: idx)
+        case .positional(let precv, let pidx) => tree_mod.ExprKind.positional(receiver: expr_box(mutable r, precv, allocator)?, index: expr_box(mutable r, pidx, allocator)?)
+        case .index(let recv, let idx) => tree_mod.ExprKind.index(receiver: expr_box(mutable r, recv, allocator)?, index: expr_box(mutable r, idx, allocator)?)
+        case .if_(let cond, let then_block, let else_branch) => tree_mod.ExprKind.if_(cond: expr_box(mutable r, cond, allocator)?, then_block: block(mutable r, then_block, allocator)?, else_branch: opt_box_expr(mutable r, else_branch, allocator)?)
+        case .match_(let scrut, let arms) => tree_mod.ExprKind.match_(scrutinee: expr_box(mutable r, scrut, allocator)?, arms: match_arms(mutable r, arms, allocator)?)
+        case .block(let body) => tree_mod.ExprKind.block(body: block(mutable r, body, allocator)?)
+        case .cast(let x, let t, let mode) => tree_mod.ExprKind.cast(expr: expr_box(mutable r, x, allocator)?, ty: ty_box(mutable r, t, allocator)?, mode: mode)
+        case .range(let lo, let hi, let kind) => tree_mod.ExprKind.range(lo: opt_box_expr(mutable r, lo, allocator)?, hi: opt_box_expr(mutable r, hi, allocator)?, kind: kind)
+        case .tuple(let elems) => tree_mod.ExprKind.tuple(elements: exprs(mutable r, elems, allocator)?)
+        case .struct_lit(let p, let fields) => tree_mod.ExprKind.struct_lit(path: path(mutable r, p, allocator)?, fields: struct_lit_fields(mutable r, fields, allocator)?)
+        case .loop_(let body, let label, let decreases_) => tree_mod.ExprKind.loop_(body: block(mutable r, body, allocator)?, label: opt_ident(mutable r, label), decreases_: opt_box_expr(mutable r, decreases_, allocator)?)
+        case .for_(let pat, let iter, let body, let label) => tree_mod.ExprKind.for_(pat: pat_box(mutable r, pat, allocator)?, iter: expr_box(mutable r, iter, allocator)?, body: block(mutable r, body, allocator)?, label: opt_ident(mutable r, label))
+        case .try_(let x) => tree_mod.ExprKind.try_(expr: expr_box(mutable r, x, allocator)?)
+        case .await_(let x) => tree_mod.ExprKind.await_(expr: expr_box(mutable r, x, allocator)?)
+        case .raise_(let x) => tree_mod.ExprKind.raise_(expr: expr_box(mutable r, x, allocator)?)
+        case .panic_(let x) => tree_mod.ExprKind.panic_(expr: expr_box(mutable r, x, allocator)?)
+        case .return_(let value) => tree_mod.ExprKind.return_(value: opt_box_expr(mutable r, value, allocator)?)
+        case .break_(let label, let value) => tree_mod.ExprKind.break_(label: opt_ident(mutable r, label), value: opt_box_expr(mutable r, value, allocator)?)
+        case .continue_(let label) => tree_mod.ExprKind.continue_(label: opt_ident(mutable r, label))
+        case .comptime_(let x) => tree_mod.ExprKind.comptime_(expr: expr_box(mutable r, x, allocator)?)
+        case .comptime_block(let body) => tree_mod.ExprKind.comptime_block(body: block(mutable r, body, allocator)?)
+        case .scope_(let kind, let name, let body) => tree_mod.ExprKind.scope_(kind: kind, name: opt_ident(mutable r, name), body: block(mutable r, body, allocator)?)
+        case .effect_row(let row) => tree_mod.ExprKind.effect_row(row: effect_row(mutable r, row, allocator)?)
+        case .handle_(let effect, let t, let binder, let recovery, let body) => tree_mod.ExprKind.handle_(effect: ident(mutable r, effect), ty: ty_box(mutable r, t, allocator)?, binder: ident(mutable r, binder), recovery: expr_box(mutable r, recovery, allocator)?, body: block(mutable r, body, allocator)?)
+        case .closure(let payload) => tree_mod.ExprKind.closure(payload: payload)
+        case .spawn(let payload) => tree_mod.ExprKind.spawn(payload: payload)
+        case .forall_(let bound, let iter, let body) => tree_mod.ExprKind.forall_(bound: ident(mutable r, bound), iter: expr_box(mutable r, iter, allocator)?, body: expr_box(mutable r, body, allocator)?)
+        case .exists_(let bound, let iter, let body) => tree_mod.ExprKind.exists_(bound: ident(mutable r, bound), iter: expr_box(mutable r, iter, allocator)?, body: expr_box(mutable r, body, allocator)?)
+        case .error => tree_mod.ExprKind.error
+    }
+    return tree_mod.Expr { span: fresh(mutable r), kind: k }
+}
+
+function expr_box(r: mutable Relocator, b: Box_Expr, allocator: Allocator) -> Box_Expr
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let inner = expr(mutable r, Box_Expr.get(b), allocator)?
+    return Box_Expr.new(take inner, allocator)?
+}
+
+function opt_box_expr(r: mutable Relocator, o: Option_Box_Expr.Option, allocator: Allocator) -> Option_Box_Expr.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match o {
+        case .some(let b) => Option_Box_Expr.some(value: expr_box(mutable r, b, allocator)?)
+        case .none => Option_Box_Expr.none
+    }
+}
+
+function opt_expr(r: mutable Relocator, o: Option_Expr.Option, allocator: Allocator) -> Option_Expr.Option
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match o {
+        case .some(let x) => Option_Expr.some(value: expr(mutable r, x, allocator)?)
+        case .none => Option_Expr.none
+    }
+}
+
+function exprs(r: mutable Relocator, v: Vec_Expr.Vec, allocator: Allocator) -> Vec_Expr.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Expr.Vec
+    Vec_Expr.new(init out, allocator)?
+    let n = Vec_Expr.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let x = expr(mutable r, Vec_Expr.at(v, i), allocator)?
+        Vec_Expr.push(mutable out, take x, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function fstring_seg(r: mutable Relocator, seg: tree_mod.FStringSeg, allocator: Allocator) -> tree_mod.FStringSeg
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match seg {
+        case .text(let sym) => tree_mod.FStringSeg.text(sym: sym)
+        case .interp(let inner) => tree_mod.FStringSeg.interp(expr: expr_box(mutable r, inner, allocator)?)
+    }
+}
+
+function fstring_segs(r: mutable Relocator, v: Vec_FStringSeg.Vec, allocator: Allocator) -> Vec_FStringSeg.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_FStringSeg.Vec
+    Vec_FStringSeg.new(init out, allocator)?
+    let n = Vec_FStringSeg.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let seg = Vec_FStringSeg.at(v, i)
+        let ns = fstring_seg(mutable r, seg, allocator)?
+        Vec_FStringSeg.push(mutable out, take ns, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function call_arg(r: mutable Relocator, a: tree_mod.CallArg, allocator: Allocator) -> tree_mod.CallArg
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.CallArg { span: fresh(mutable r), mode: a.mode, name: opt_ident(mutable r, a.name), expr: expr(mutable r, a.expr, allocator)? }
+}
+
+function call_args(r: mutable Relocator, v: Vec_CallArg.Vec, allocator: Allocator) -> Vec_CallArg.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_CallArg.Vec
+    Vec_CallArg.new(init out, allocator)?
+    let n = Vec_CallArg.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let na = call_arg(mutable r, Vec_CallArg.at(v, i), allocator)?
+        Vec_CallArg.push(mutable out, take na, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function struct_lit_field(r: mutable Relocator, f: tree_mod.StructLitField, allocator: Allocator) -> tree_mod.StructLitField
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.StructLitField { span: fresh(mutable r), name: ident(mutable r, f.name), mode: f.mode, value: expr(mutable r, f.value, allocator)? }
+}
+
+function struct_lit_fields(r: mutable Relocator, v: Vec_StructLitField.Vec, allocator: Allocator) -> Vec_StructLitField.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_StructLitField.Vec
+    Vec_StructLitField.new(init out, allocator)?
+    let n = Vec_StructLitField.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nf = struct_lit_field(mutable r, Vec_StructLitField.at(v, i), allocator)?
+        Vec_StructLitField.push(mutable out, take nf, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function struct_pat_field(r: mutable Relocator, f: tree_mod.StructPatField, allocator: Allocator) -> tree_mod.StructPatField
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.StructPatField { span: fresh(mutable r), name: ident(mutable r, f.name), pat: pat(mutable r, f.pat, allocator)? }
+}
+
+function struct_pat_fields(r: mutable Relocator, v: Vec_StructPatField.Vec, allocator: Allocator) -> Vec_StructPatField.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_StructPatField.Vec
+    Vec_StructPatField.new(init out, allocator)?
+    let n = Vec_StructPatField.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nf = struct_pat_field(mutable r, Vec_StructPatField.at(v, i), allocator)?
+        Vec_StructPatField.push(mutable out, take nf, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function match_arm(r: mutable Relocator, a: tree_mod.MatchArm, allocator: Allocator) -> tree_mod.MatchArm
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.MatchArm {
+        span: fresh(mutable r),
+        pat: pat(mutable r, a.pat, allocator)?,
+        guard: opt_expr(mutable r, a.guard, allocator)?,
+        body: expr(mutable r, a.body, allocator)?,
+    }
+}
+
+function match_arms(r: mutable Relocator, v: Vec_MatchArm.Vec, allocator: Allocator) -> Vec_MatchArm.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_MatchArm.Vec
+    Vec_MatchArm.new(init out, allocator)?
+    let n = Vec_MatchArm.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let na = match_arm(mutable r, Vec_MatchArm.at(v, i), allocator)?
+        Vec_MatchArm.push(mutable out, take na, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function pat(r: mutable Relocator, p: tree_mod.Pat, allocator: Allocator) -> tree_mod.Pat
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = match p.kind {
+        case .wildcard => tree_mod.PatKind.wildcard
+        case .binding(let name) => tree_mod.PatKind.binding(name: ident(mutable r, name))
+        case .literal(let value) => tree_mod.PatKind.literal(value: value)
+        case .range(let lo, let hi, let inclusive) => tree_mod.PatKind.range(lo: lo, hi: hi, inclusive: inclusive)
+        case .tuple(let elems) => tree_mod.PatKind.tuple(elements: pats(mutable r, elems, allocator)?)
+        case .slice(let prefix, let rest, let suffix) => tree_mod.PatKind.slice(prefix: pats(mutable r, prefix, allocator)?, rest: opt_slice_rest(mutable r, rest), suffix: pats(mutable r, suffix, allocator)?)
+        case .variant(let pth, let payload) => tree_mod.PatKind.variant(path: path(mutable r, pth, allocator)?, payload: variant_pat_payload(mutable r, payload, allocator)?)
+        case .struct_(let pth, let fields, let rest) => tree_mod.PatKind.struct_(path: path(mutable r, pth, allocator)?, fields: struct_pat_fields(mutable r, fields, allocator)?, rest: rest)
+        case .or_(let alts) => tree_mod.PatKind.or_(alternatives: pats(mutable r, alts, allocator)?)
+        case .at_binding(let name, let inner) => tree_mod.PatKind.at_binding(name: ident(mutable r, name), inner: pat_box(mutable r, inner, allocator)?)
+        case .guard(let inner, let cond) => tree_mod.PatKind.guard(pat: pat_box(mutable r, inner, allocator)?, cond: expr(mutable r, cond, allocator)?)
+        case .error => tree_mod.PatKind.error
+    }
+    return tree_mod.Pat { span: fresh(mutable r), kind: k }
+}
+
+function pat_box(r: mutable Relocator, b: Box_Pat, allocator: Allocator) -> Box_Pat
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let inner = pat(mutable r, Box_Pat.get(b), allocator)?
+    return Box_Pat.new(take inner, allocator)?
+}
+
+function pats(r: mutable Relocator, v: Vec_Pat.Vec, allocator: Allocator) -> Vec_Pat.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Pat.Vec
+    Vec_Pat.new(init out, allocator)?
+    let n = Vec_Pat.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let np = pat(mutable r, Vec_Pat.at(v, i), allocator)?
+        Vec_Pat.push(mutable out, take np, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function opt_slice_rest(r: mutable Relocator, o: Option_SliceRest.Option) -> Option_SliceRest.Option {
+    return match o {
+        case .some(let sr) => Option_SliceRest.some(value: tree_mod.SliceRest { span: fresh(mutable r), binding: opt_ident(mutable r, sr.binding) })
+        case .none => Option_SliceRest.none
+    }
+}
+
+function variant_pat_payload(r: mutable Relocator, vp: tree_mod.VariantPatPayload, allocator: Allocator) -> tree_mod.VariantPatPayload
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match vp {
+        case .none => tree_mod.VariantPatPayload.none
+        case .tuple(let elems) => tree_mod.VariantPatPayload.tuple(elements: pats(mutable r, elems, allocator)?)
+        case .struct_(let fields) => tree_mod.VariantPatPayload.struct_(fields: struct_pat_fields(mutable r, fields, allocator)?)
+    }
+}
+
+
+function stmt(r: mutable Relocator, s: tree_mod.Stmt, allocator: Allocator) -> tree_mod.Stmt
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = match s.kind {
+        case .let_(let binding, let p, let t, let init_) => tree_mod.StmtKind.let_(binding: binding, pat: pat(mutable r, p, allocator)?, ty: opt_ty(mutable r, t, allocator)?, init_: opt_expr(mutable r, init_, allocator)?)
+        case .assign(let target, let op, let rhs) => tree_mod.StmtKind.assign(target: expr(mutable r, target, allocator)?, op: op, rhs: expr(mutable r, rhs, allocator)?)
+        case .expr(let value) => tree_mod.StmtKind.expr(value: expr(mutable r, value, allocator)?)
+    }
+    return tree_mod.Stmt { span: fresh(mutable r), kind: k }
+}
+
+function stmts(r: mutable Relocator, v: Vec_Stmt.Vec, allocator: Allocator) -> Vec_Stmt.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Stmt.Vec
+    Vec_Stmt.new(init out, allocator)?
+    let n = Vec_Stmt.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ns = stmt(mutable r, Vec_Stmt.at(v, i), allocator)?
+        Vec_Stmt.push(mutable out, take ns, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function block(r: mutable Relocator, b: tree_mod.Block, allocator: Allocator) -> tree_mod.Block
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return tree_mod.Block {
+        span: fresh(mutable r),
+        stmts: stmts(mutable r, b.stmts, allocator)?,
+        trailing: opt_box_expr(mutable r, b.trailing, allocator)?,
+    }
+}
+
+
+function item(r: mutable Relocator, it: item_mod.Item, allocator: Allocator) -> item_mod.Item
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let k = match it.kind {
+        case .function_(let decl) => item_mod.ItemKind.function_(decl: fn_decl_box(mutable r, decl, allocator)?)
+        case .type_decl(let decl) => item_mod.ItemKind.type_decl(decl: type_decl_box(mutable r, decl, allocator)?)
+        case .spec_(let decl) => item_mod.ItemKind.spec_(decl: spec_box(mutable r, decl, allocator)?)
+        case .spec_invocation(let inv) => item_mod.ItemKind.spec_invocation(invocation: spec_invocation_box(mutable r, inv, allocator)?)
+        case .let_(let decl) => item_mod.ItemKind.let_(decl: let_decl_box(mutable r, decl, allocator)?)
+        case .import_(let imp) => item_mod.ItemKind.import_(decl: import_decl(mutable r, imp, allocator)?)
+        case .module_(let m) => item_mod.ItemKind.module_(decl: module_decl(mutable r, m, allocator)?)
+        case .derive_(let decl) => item_mod.ItemKind.derive_(decl: derive_box(mutable r, decl, allocator)?)
+    }
+    return item_mod.Item { span: fresh(mutable r), attributes: it.attributes, kind: k }
+}
+
+function fn_decl_box(r: mutable Relocator, b: Box_FnDecl, allocator: Allocator) -> Box_FnDecl
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_FnDecl.get(b)
+    let nd = item_mod.FnDecl {
+        span: fresh(mutable r),
+        stability: d.stability,
+        visibility: d.visibility,
+        refinement_stable: d.refinement_stable,
+        name: ident(mutable r, d.name),
+        outbound_generics: generic_params(mutable r, d.outbound_generics, allocator)?,
+        generics: generic_params(mutable r, d.generics, allocator)?,
+        params: params(mutable r, d.params, allocator)?,
+        return_mode: d.return_mode,
+        return_ty: opt_ty(mutable r, d.return_ty, allocator)?,
+        effects: opt_effect_row(mutable r, d.effects, allocator)?,
+        refinements: refinement_clauses(mutable r, d.refinements, allocator)?,
+        body: fn_body(mutable r, d.body, allocator)?,
+    }
+    return Box_FnDecl.new(take nd, allocator)?
+}
+
+function fn_body(r: mutable Relocator, body: item_mod.FnBody, allocator: Allocator) -> item_mod.FnBody
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match body {
+        case .block_(let blk) => item_mod.FnBody.block_(body: block(mutable r, blk, allocator)?)
+        case .extern_(let _sp, let _nsp, let name, let dll) => item_mod.FnBody.extern_(span: fresh(mutable r), name_span: fresh(mutable r), name: name, dll: dll)
+    }
+}
+
+function generic_param(r: mutable Relocator, gp: item_mod.GenericParam, allocator: Allocator) -> item_mod.GenericParam
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return item_mod.GenericParam {
+        span: fresh(mutable r),
+        kind: gp.kind,
+        name: ident(mutable r, gp.name),
+        ty: opt_ty(mutable r, gp.ty, allocator)?,
+        admits: admits_constraints(mutable r, gp.admits, allocator)?,
+    }
+}
+
+function generic_params(r: mutable Relocator, v: Vec_GenericParam.Vec, allocator: Allocator) -> Vec_GenericParam.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_GenericParam.Vec
+    Vec_GenericParam.new(init out, allocator)?
+    let n = Vec_GenericParam.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ng = generic_param(mutable r, Vec_GenericParam.at(v, i), allocator)?
+        Vec_GenericParam.push(mutable out, take ng, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function admits_constraint(r: mutable Relocator, c: item_mod.AdmitsConstraint, allocator: Allocator) -> item_mod.AdmitsConstraint
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match c {
+        case .op(let _sp, let op) => item_mod.AdmitsConstraint.op(span: fresh(mutable r), op: op)
+        case .lit(let _sp, let value) => item_mod.AdmitsConstraint.lit(span: fresh(mutable r), value: value)
+        case .member(let _sp, let name, let t) => item_mod.AdmitsConstraint.member(span: fresh(mutable r), name: ident(mutable r, name), ty: ty(mutable r, t, allocator)?)
+    }
+}
+
+function admits_constraints(r: mutable Relocator, v: Vec_AdmitsConstraint.Vec, allocator: Allocator) -> Vec_AdmitsConstraint.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_AdmitsConstraint.Vec
+    Vec_AdmitsConstraint.new(init out, allocator)?
+    let n = Vec_AdmitsConstraint.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nc = admits_constraint(mutable r, Vec_AdmitsConstraint.at(v, i), allocator)?
+        Vec_AdmitsConstraint.push(mutable out, take nc, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function type_decl_box(r: mutable Relocator, b: Box_TypeDecl, allocator: Allocator) -> Box_TypeDecl
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_TypeDecl.get(b)
+    let nd = item_mod.TypeDecl {
+        span: fresh(mutable r),
+        stability: d.stability,
+        visibility: d.visibility,
+        linearity: d.linearity,
+        name: ident(mutable r, d.name),
+        generics: generic_params(mutable r, d.generics, allocator)?,
+        kind: type_decl_kind(mutable r, d.kind, allocator)?,
+        synthesize_box_ptr: d.synthesize_box_ptr,
+    }
+    return Box_TypeDecl.new(take nd, allocator)?
+}
+
+function type_decl_kind(r: mutable Relocator, k: item_mod.TypeDeclKind, allocator: Allocator) -> item_mod.TypeDeclKind
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match k {
+        case .product(let fields) => item_mod.TypeDeclKind.product(fields: type_fields(mutable r, fields, allocator)?)
+        case .sum(let vs) => item_mod.TypeDeclKind.sum(variants: variants(mutable r, vs, allocator)?)
+    }
+}
+
+function type_field(r: mutable Relocator, f: item_mod.TypeField, allocator: Allocator) -> item_mod.TypeField
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return item_mod.TypeField { span: fresh(mutable r), name: ident(mutable r, f.name), ty: ty(mutable r, f.ty, allocator)?, refinement: opt_expr(mutable r, f.refinement, allocator)? }
+}
+
+function type_fields(r: mutable Relocator, v: Vec_TypeField.Vec, allocator: Allocator) -> Vec_TypeField.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_TypeField.Vec
+    Vec_TypeField.new(init out, allocator)?
+    let n = Vec_TypeField.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nf = type_field(mutable r, Vec_TypeField.at(v, i), allocator)?
+        Vec_TypeField.push(mutable out, take nf, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function variant(r: mutable Relocator, vt: item_mod.Variant, allocator: Allocator) -> item_mod.Variant
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return item_mod.Variant { span: fresh(mutable r), name: ident(mutable r, vt.name), payload: variant_payload(mutable r, vt.payload, allocator)? }
+}
+
+function variants(r: mutable Relocator, v: Vec_Variant.Vec, allocator: Allocator) -> Vec_Variant.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Variant.Vec
+    Vec_Variant.new(init out, allocator)?
+    let n = Vec_Variant.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let nv = variant(mutable r, Vec_Variant.at(v, i), allocator)?
+        Vec_Variant.push(mutable out, take nv, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function variant_payload(r: mutable Relocator, vp: item_mod.VariantPayload, allocator: Allocator) -> item_mod.VariantPayload
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return match vp {
+        case .unit => item_mod.VariantPayload.unit
+        case .tuple(let elems) => item_mod.VariantPayload.tuple(elements: tys(mutable r, elems, allocator)?)
+        case .struct_(let fields) => item_mod.VariantPayload.struct_(fields: type_fields(mutable r, fields, allocator)?)
+    }
+}
+
+function spec_box(r: mutable Relocator, b: Box_Spec, allocator: Allocator) -> Box_Spec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_Spec.get(b)
+    let nd = item_mod.Spec {
+        span: fresh(mutable r),
+        stability: d.stability,
+        visibility: d.visibility,
+        name: ident(mutable r, d.name),
+        generics: generic_params(mutable r, d.generics, allocator)?,
+        where_clauses: refinement_clauses(mutable r, d.where_clauses, allocator)?,
+        body: respan_body(mutable r, d.body, allocator)?,
+    }
+    return Box_Spec.new(take nd, allocator)?
+}
+
+function respan_body(r: mutable Relocator, v: Vec_Item.Vec, allocator: Allocator) -> Vec_Item.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Item.Vec
+    Vec_Item.new(init out, allocator)?
+    let n = Vec_Item.len(v)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let ni = item(mutable r, Vec_Item.at(v, i), allocator)?
+        Vec_Item.push(mutable out, take ni, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function spec_invocation_box(r: mutable Relocator, b: Box_SpecInvocation, allocator: Allocator) -> Box_SpecInvocation
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let v = Box_SpecInvocation.get(b)
+    let nv = item_mod.SpecInvocation { span: fresh(mutable r), path: path(mutable r, v.path, allocator)?, args: exprs(mutable r, v.args, allocator)? }
+    return Box_SpecInvocation.new(take nv, allocator)?
+}
+
+function let_decl_box(r: mutable Relocator, b: Box_LetDecl, allocator: Allocator) -> Box_LetDecl
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_LetDecl.get(b)
+    let nd = item_mod.LetDecl {
+        span: fresh(mutable r),
+        visibility: d.visibility,
+        name: ident(mutable r, d.name),
+        ty: ty(mutable r, d.ty, allocator)?,
+        init_: expr(mutable r, d.init_, allocator)?,
+    }
+    return Box_LetDecl.new(take nd, allocator)?
+}
+
+function import_decl(r: mutable Relocator, imp: item_mod.Import, allocator: Allocator) -> item_mod.Import
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return item_mod.Import { span: fresh(mutable r), path: path(mutable r, imp.path, allocator)?, alias: opt_ident(mutable r, imp.alias), selection: imp.selection }
+}
+
+function module_decl(r: mutable Relocator, m: item_mod.ModuleDecl, allocator: Allocator) -> item_mod.ModuleDecl
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    return item_mod.ModuleDecl { span: fresh(mutable r), path: path(mutable r, m.path, allocator)? }
+}
+
+function derive_box(r: mutable Relocator, b: Box_Derive, allocator: Allocator) -> Box_Derive
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let d = Box_Derive.get(b)
+    uninit names: Vec_Ident.Vec
+    Vec_Ident.new(init names, allocator)?
+    let n = Vec_Ident.len(d.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Ident.push(mutable names, ident(mutable r, Vec_Ident.at(d.items, i)), allocator)?
+        i = i + 1
+    }
+    let nd = item_mod.Derive { span: fresh(mutable r), items: names, target: path(mutable r, d.target, allocator)? }
+    return Box_Derive.new(take nd, allocator)?
+}

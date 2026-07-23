@@ -1,0 +1,167 @@
+
+module arm64.abi.misc.regutil
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import span.loc.pos.span as span_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+
+import local.gen.regs as regs_mod
+import local.encoding.instr.dp.reg.reg as dp_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+
+spec std.core.option.Option(i64)
+
+
+public function mov_if_diff(
+    code: mutable Vec_u8.Vec,
+    dst: regs_mod.GpReg,
+    src: regs_mod.GpReg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if regs_mod.gp_reg_num(dst) != regs_mod.gp_reg_num(src) {
+        dp_mod.encode_mov_reg(mutable code, true, dst, src, allocator)?
+    }
+}
+
+public function rhs_reg(
+    body: lir_body_mod.LirBody,
+    rhs: lir_reg_mod.Operand,
+) -> regs_mod.GpReg
+    with {err: lir_error_mod.LirError}
+{
+    return match rhs {
+        case .vreg(let id) => gp_of_pinned_vreg(body, id)?
+        case .preg(let p) => gp_of_preg(p)?
+        case .imm(_) => raise unsupported()
+    }
+}
+
+public function fp_rhs_num(
+    body: lir_body_mod.LirBody,
+    rhs: lir_reg_mod.Operand,
+) -> u8
+    with {err: lir_error_mod.LirError}
+{
+    return match rhs {
+        case .vreg(let id) => fp_num_of_pinned_vreg(body, id)?
+        case .preg(let p) => fp_num_of_preg(p)?
+        case .imm(_) => raise unsupported()
+    }
+}
+
+public function operand_imm(operand: lir_reg_mod.Operand) -> Option_i64.Option {
+    return match operand {
+        case .imm(let value) => Option_i64.some(value: value)
+        case _ => Option_i64.none
+    }
+}
+
+public function gp_of_preg(p: lir_reg_mod.PReg) -> regs_mod.GpReg
+    with {err: lir_error_mod.LirError}
+{
+    return match regs_mod.gp_of_preg(p) {
+        case .some(let r) => r
+        case .none => raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: PReg.raw outside the GP register window",
+        )
+    }
+}
+
+public function unsupported() -> lir_error_mod.LirError {
+    return lir_error_mod.LirError.unsupported_hlir_form(
+        at: span_mod.dummy(),
+        kind: lir_error_mod.LirUnsupportedKind.reserved_,
+    )
+}
+
+public function vreg_at(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> lir_reg_mod.LirVReg
+    with {err: lir_error_mod.LirError}
+{
+    let idx = vreg_id.raw as usize
+    if idx == 0 {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: op references sentinel vreg id 0",
+        )
+    }
+    if idx >= Vec_LirVReg.len(body.vregs) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: vreg id out of range",
+        )
+    }
+    return Vec_LirVReg.at(body.vregs, idx)
+}
+
+public function gp_of_pinned_vreg(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> regs_mod.GpReg
+    with {err: lir_error_mod.LirError}
+{
+    let vreg = vreg_at(body, vreg_id)?
+    return match vreg.pin {
+        case .none => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+        case .some(let p) => gp_of_preg(p)?
+    }
+}
+
+public function vreg_is_fp(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> bool
+    with {err: lir_error_mod.LirError}
+{
+    let vreg = vreg_at(body, vreg_id)?
+    return match vreg.class_ {
+        case .fp => true
+        case _ => false
+    }
+}
+
+public function fp_num_of_preg(p: lir_reg_mod.PReg) -> u8
+    with {err: lir_error_mod.LirError}
+{
+    if p.raw >= (32 as u32) {
+        raise lir_error_mod.LirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "arm64.gen.emit: PReg.raw outside the SIMD/FP register window",
+        )
+    }
+    return p.raw as u8
+}
+
+public function fp_num_of_pinned_vreg(
+    body: lir_body_mod.LirBody,
+    vreg_id: lir_vreg_mod.LirVRegId,
+) -> u8
+    with {err: lir_error_mod.LirError}
+{
+    let vreg = vreg_at(body, vreg_id)?
+    return match vreg.pin {
+        case .none => raise lir_error_mod.LirError.unsupported_hlir_form(
+            at: span_mod.dummy(),
+            kind: lir_error_mod.LirUnsupportedKind.reserved_,
+        )
+        case .some(let p) => fp_num_of_preg(p)?
+    }
+}

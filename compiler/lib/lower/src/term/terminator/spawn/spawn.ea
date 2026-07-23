@@ -1,0 +1,164 @@
+
+module lower.term.terminator.spawn.spawn
+
+import std.mem.alloc
+import std.collections.vec
+
+import span.loc.pos.span as span_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+
+import mir.body.model as mir_body_mod
+import mir.term as mir_term_mod
+import mir.rvalue as mir_rvalue_mod
+import mir.place as mir_place_mod
+import mir.id.block as mir_block_mod
+import mir.id.local as mir_local_mod
+
+import ir.hlir.tree.body as hlir_body_mod
+import ir.hlir.op as hlir_op_mod
+import ir.hlir.term as hlir_term_mod
+import ir.hlir.error as hlir_error_mod
+import ir.hlir.id.value as hlir_value_mod
+import ir.hlir.id.op as hlir_op_id_mod
+
+import resolve.build.builtins as builtins_mod
+
+import local.term.support.support as support_mod
+import local.term.support.place as place_mod
+import local.term.support.flags as flags_mod
+import local.flow.plan.plan as plan_mod
+import local.term.terminator.blockarg.blockarg as blockarg_mod
+
+
+spec std.collections.vec.Vec(hlir_value_mod.ValueId)
+spec std.collections.vec.Vec(hlir_op_id_mod.OpId)
+spec std.collections.vec.Vec(mir_rvalue_mod.Operand)
+
+
+public function lower_spawn(
+    out: mutable hlir_body_mod.HlirBody,
+    env: mutable Vec_ValueId.Vec,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    child: def_mod.DefId,
+    args: Vec_Operand.Vec,
+    group_local: mir_local_mod.LocalId,
+    handle_dest: mir_place_mod.Place,
+    return_: mir_block_mod.BlockId,
+    unwind: mir_term_mod.UnwindAction,
+    body: mir_body_mod.MirBody,
+    plan: plan_mod.MergePlan,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_term_mod.HlirTermKind
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let callee_val = fn_ref_value(mutable out, mutable ops, origin, builtins_mod.task_spawn_reserved(), ty_interner, allocator)?
+    uninit arg_vals: Vec_ValueId.Vec
+    Vec_ValueId.new(init arg_vals, allocator)?
+    let child_val = fn_ref_value(mutable out, mutable ops, origin, child, ty_interner, allocator)?
+    Vec_ValueId.push(mutable arg_vals, take child_val, allocator)?
+    let captured = blockarg_mod.lower_operand_vec(mutable out, env, mutable ops, origin, args, false, body, ty_interner, allocator)?
+    append_value_vec(mutable arg_vals, captured, allocator)?
+    let group_val = support_mod.env_get(env, group_local)
+    if hlir_value_mod.is_error(group_val) {
+        raise hlir_error_mod.HlirError.internal_lowering_invariant(
+            at: span_mod.dummy(),
+            message: "MIR spawn group capability read before definition during MIR -> HLIR lowering",
+        )
+    }
+    Vec_ValueId.push(mutable arg_vals, take group_val, allocator)?
+
+    let dest_nproj = mir_place_mod.proj_len(handle_dest)
+    let ty = if dest_nproj == (0 as usize) {
+        support_mod.local_ty(body, handle_dest.local)
+    } else {
+        mir_place_mod.proj_at(handle_dest, dest_nproj - (1 as usize)).result_ty
+    }
+    let result_val = hlir_body_mod.push_value(
+        mutable out,
+        take support_mod.fresh_op_result(ty),
+        allocator,
+    )?
+    let op = hlir_op_mod.HlirOp {
+        origin: origin,
+        kind: hlir_op_mod.HlirOpKind.call_(callee: callee_val, args: arg_vals),
+        result_: result_val,
+        flags: flags_mod.intrinsic_flags(hlir_op_mod.Intrinsic.none, false, 0 as u32),
+    }
+    let op_id = hlir_body_mod.push_op(mutable out, take op, allocator)?
+    support_mod.bind_op_result(mutable out, result_val, op_id)
+    Vec_OpId.push(mutable ops, take op_id, allocator)?
+    if dest_nproj == (0 as usize) {
+        support_mod.env_set(mutable env, handle_dest.local, result_val)
+    } else {
+        place_mod.store_to_place(mutable out, env, mutable ops, origin, handle_dest, result_val, body, allocator)?
+    }
+    match unwind {
+        case .handler(let err_bb) => {
+            let flag_val = hlir_body_mod.push_value(
+                mutable out,
+                take support_mod.fresh_op_result(ty),
+                allocator,
+            )?
+            let flag_op = hlir_op_mod.HlirOp {
+                origin: origin,
+                kind: hlir_op_mod.HlirOpKind.err_flag,
+                result_: flag_val,
+                flags: flags_mod.intrinsic_flags(hlir_op_mod.Intrinsic.none, false, 0 as u32),
+            }
+            let flag_id = hlir_body_mod.push_op(mutable out, take flag_op, allocator)?
+            support_mod.bind_op_result(mutable out, flag_val, flag_id)
+            Vec_OpId.push(mutable ops, take flag_id, allocator)?
+            return hlir_term_mod.HlirTermKind.branch(
+                cond: flag_val,
+                true_: blockarg_mod.block_id_of(err_bb),
+                true_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, err_bb, body, plan, ty_interner, allocator)?,
+                false_: blockarg_mod.block_id_of(return_),
+                false_args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, return_, body, plan, ty_interner, allocator)?,
+            )
+        }
+        case _ => ()
+    }
+    return hlir_term_mod.HlirTermKind.goto_(
+        target: blockarg_mod.block_id_of(return_),
+        args: blockarg_mod.args_for_target(mutable out, env, mutable ops, origin, return_, body, plan, ty_interner, allocator)?,
+    )
+}
+
+function fn_ref_value(
+    out: mutable hlir_body_mod.HlirBody,
+    ops: mutable Vec_OpId.Vec,
+    origin: node_mod.NodeId,
+    def: def_mod.DefId,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> hlir_value_mod.ValueId
+    with {allocator, err: alloc.AllocError, err: hlir_error_mod.HlirError}
+{
+    let c = mir_rvalue_mod.Constant {
+        ty: ty_mod.error(),
+        kind: mir_rvalue_mod.ConstantKind.fn_ref(def: def),
+    }
+    return support_mod.materialize_literal(mutable out, mutable ops, origin, c, ty_interner, allocator)?
+}
+
+function append_value_vec(
+    dst: mutable Vec_ValueId.Vec,
+    src: Vec_ValueId.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_ValueId.len(src)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let v = Vec_ValueId.at(src, i)
+        Vec_ValueId.push(mutable dst, take v, allocator)?
+        i += 1
+    }
+}

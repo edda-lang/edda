@@ -1,0 +1,367 @@
+
+module std.net.dns
+
+import std.os.raw
+import std.os.pages
+import std.net.ip
+import local.win
+
+
+public type DnsError {
+    case no_nameserver
+    case name_too_long
+    case query_failed
+    case bad_response
+    case not_found(host: String)
+}
+
+
+function release_page(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, 4096)?
+    }
+}
+
+function write_cstr(dst: u64, s: String) -> () {
+    let b: [u8] = s.bytes()
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        raw.store_u8(dst +% (i as u64), b[i])
+        i = i + 1
+    }
+    raw.store_u8(dst +% (b.len() as u64), 0)
+}
+
+function rd_u16(base: u64, off: u64) -> u16 {
+    return ((raw.load_u8(base +% off) as u16) << 8) | (raw.load_u8(base +% off +% 1) as u16)
+}
+
+function fill_sockaddr(dst: u64, addr: ip.Ipv4Addr, port: u16) -> () {
+    raw.store_u8(dst, 2)
+    raw.store_u8(dst +% 1, 0)
+    raw.store_u8(dst +% 2, (port >> 8) as u8)
+    raw.store_u8(dst +% 3, (port & 0xFF) as u8)
+    raw.store_u8(dst +% 4, addr.a)
+    raw.store_u8(dst +% 5, addr.b)
+    raw.store_u8(dst +% 6, addr.c)
+    raw.store_u8(dst +% 7, addr.d)
+    var i: u64 = 8
+    loop
+        decreases 16 - i
+    {
+        if i >= 16 { break }
+        raw.store_u8(dst +% i, 0)
+        i = i + 1
+    }
+}
+
+
+function emit_label(dst: u64, pos: u64, hb: [u8], lo: usize, hi: usize) -> u64
+    with {err: DnsError}
+{
+    if hi < lo { raise DnsError.name_too_long }
+    let llen: usize = hi - lo
+    if llen > 63 { raise DnsError.name_too_long }
+    raw.store_u8(dst +% pos, llen as u8)
+    var p: u64 = pos +% 1
+    var j: usize = lo
+    loop
+        decreases hi - j
+    {
+        if j >= hi { break }
+        raw.store_u8(dst +% p, hb[j])
+        p = p +% 1
+        j = j + 1
+    }
+    return pos +% 1 +% (llen as u64)
+}
+
+function write_qname(dst: u64, hb: [u8]) -> u64
+    with {err: DnsError}
+{
+    var pos: u64 = 0
+    var lo: usize = 0
+    var i: usize = 0
+    loop
+        decreases hb.len() - i
+    {
+        if i >= hb.len() { break }
+        if hb[i] == 0x2E {
+            pos = emit_label(dst, pos, hb, lo, i)?
+            lo = i + 1
+        }
+        i = i + 1
+    }
+    pos = emit_label(dst, pos, hb, lo, hb.len())?
+    raw.store_u8(dst +% pos, 0)
+    return pos +% 1
+}
+
+function build_query(base: u64, host: String) -> u64
+    with {err: DnsError}
+{
+    let hb: [u8] = host.bytes()
+    if hb.len() == 0 || hb.len() > 253 { raise DnsError.name_too_long }
+    raw.store_u8(base, 0x12)
+    raw.store_u8(base +% 1, 0x34)
+    raw.store_u8(base +% 2, 0x01)
+    raw.store_u8(base +% 3, 0x00)
+    raw.store_u8(base +% 4, 0x00)
+    raw.store_u8(base +% 5, 0x01)
+    var z: u64 = 6
+    loop
+        decreases 12 - z
+    {
+        if z >= 12 { break }
+        raw.store_u8(base +% z, 0)
+        z = z + 1
+    }
+    let qn: u64 = write_qname(base +% 12, hb)?
+    let q: u64 = 12 +% qn
+    raw.store_u8(base +% q, 0x00)
+    raw.store_u8(base +% (q +% 1), 0x01)
+    raw.store_u8(base +% (q +% 2), 0x00)
+    raw.store_u8(base +% (q +% 3), 0x01)
+    return q +% 4
+}
+
+
+function skip_name(base: u64, off: u64, n: u64) -> u64 {
+    var p: u64 = off
+    if p > n { return n }
+    var fuel: u64 = n +% 1
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { return n }
+        fuel = fuel -% 1
+        if p >= n { return n }
+        let len: u8 = raw.load_u8(base +% p)
+        if len == 0 { return p +% 1 }
+        if (len & 0xC0) == 0xC0 { return p +% 2 }
+        p = p +% 1 +% (len as u64)
+    }
+}
+
+function parse_response(base: u64, n: u64, host: String) -> ip.Ipv4Addr
+    with {err: DnsError}
+{
+    if n < 12 { raise DnsError.bad_response }
+    let rcode: u8 = raw.load_u8(base +% 3) & 0x0F
+    if rcode != 0 { raise DnsError.not_found(host: host) }
+    let qd: u64 = rd_u16(base, 4) as u64
+    let an: u64 = rd_u16(base, 6) as u64
+    if an == 0 { raise DnsError.not_found(host: host) }
+
+    var off: u64 = 12
+    var qc: u64 = 0
+    loop
+        decreases qd - qc
+    {
+        if qc >= qd { break }
+        off = skip_name(base, off, n)
+        off = off +% 4
+        qc = qc +% 1
+    }
+
+    var ac: u64 = 0
+    loop
+        decreases an - ac
+    {
+        if ac >= an { break }
+        off = skip_name(base, off, n)
+        if off +% 10 > n { raise DnsError.bad_response }
+        let typ: u16 = rd_u16(base, off)
+        let cls: u16 = rd_u16(base, off +% 2)
+        let rdlen: u64 = rd_u16(base, off +% 8) as u64
+        let rdoff: u64 = off +% 10
+        if typ == 1 && cls == 1 && rdlen == 4 {
+            if rdoff +% 4 > n { raise DnsError.bad_response }
+            return ip.new_v4(
+                raw.load_u8(base +% rdoff),
+                raw.load_u8(base +% (rdoff +% 1)),
+                raw.load_u8(base +% (rdoff +% 2)),
+                raw.load_u8(base +% (rdoff +% 3)),
+            )
+        }
+        off = rdoff +% rdlen
+        ac = ac +% 1
+    }
+    raise DnsError.not_found(host: host)
+}
+
+
+function skip_ws(base: u64, off: u64, n: u64) -> u64 {
+    var p: u64 = off
+    if p > n { return n }
+    loop
+        decreases n - p
+    {
+        if p >= n { return p }
+        let c: u8 = raw.load_u8(base +% p)
+        if c != 0x20 && c != 0x09 { return p }
+        p = p +% 1
+    }
+}
+
+function token_end(base: u64, off: u64, n: u64) -> u64 {
+    var p: u64 = off
+    if p > n { return n }
+    loop
+        decreases n - p
+    {
+        if p >= n { return p }
+        let c: u8 = raw.load_u8(base +% p)
+        if c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D || c == 0 { return p }
+        p = p +% 1
+    }
+}
+
+function next_line(base: u64, off: u64, n: u64) -> u64 {
+    var p: u64 = off
+    if p > n { return n }
+    loop
+        decreases n - p
+    {
+        if p >= n { return n }
+        let c: u8 = raw.load_u8(base +% p)
+        p = p +% 1
+        if c == 0x0A { return p }
+    }
+}
+
+function is_nameserver_line(base: u64, ls: u64, n: u64) -> bool {
+    if ls +% 10 > n { return false }
+    if raw.load_u8(base +% ls) != 0x6E { return false }
+    if raw.load_u8(base +% (ls +% 1)) != 0x61 { return false }
+    if raw.load_u8(base +% (ls +% 2)) != 0x6D { return false }
+    if raw.load_u8(base +% (ls +% 3)) != 0x65 { return false }
+    if raw.load_u8(base +% (ls +% 4)) != 0x73 { return false }
+    if raw.load_u8(base +% (ls +% 5)) != 0x65 { return false }
+    if raw.load_u8(base +% (ls +% 6)) != 0x72 { return false }
+    if raw.load_u8(base +% (ls +% 7)) != 0x76 { return false }
+    if raw.load_u8(base +% (ls +% 8)) != 0x65 { return false }
+    if raw.load_u8(base +% (ls +% 9)) != 0x72 { return false }
+    if ls +% 10 >= n { return true }
+    let c: u8 = raw.load_u8(base +% (ls +% 10))
+    return c == 0x20 || c == 0x09
+}
+
+function scan_nameserver(base: u64, n: u64) -> ip.Ipv4Addr
+    with {err: DnsError}
+{
+    var packed: u32 = 0
+    var found: bool = false
+    var ls: u64 = 0
+    var fuel: u64 = n +% 1
+    loop
+        decreases fuel
+    {
+        if found { break }
+        if fuel == 0 { break }
+        fuel = fuel -% 1
+        if ls >= n { break }
+        if is_nameserver_line(base, ls, n) {
+            let ts: u64 = skip_ws(base, ls +% 10, n)
+            let te: u64 = token_end(base, ts, n)
+            if te > ts {
+                let slice: [u8] = raw.slice_from_raw(base +% ts, (te -% ts) as usize)
+                handle err: ip.ParseAddrError as _e -> () {
+                    let a: ip.Ipv4Addr = ip.parse_v4(slice)?
+                    packed = ip.to_u32(a)
+                    found = true
+                }
+            }
+        }
+        ls = next_line(base, ls, n)
+    }
+    if !found { raise DnsError.no_nameserver }
+    return ip.from_u32(packed)
+}
+
+function read_resolv_conf(fs: ReadOnlyFilesystem) -> ip.Ipv4Addr
+    with {fs, err: DnsError}
+{
+    let pg: u64 = handle err: pages.PageError as _e -> (raise DnsError.no_nameserver) {
+        pages.map(4096)?
+    }
+    write_cstr(pg, "/etc/resolv.conf")
+    let fd: i64 = raw.syscall6(257, 0xFFFFFFFFFFFFFF9C, pg, 0, 0, 0, 0)
+    if fd < 0 {
+        release_page(pg)
+        raise DnsError.no_nameserver
+    }
+    let r: i64 = raw.syscall6(0, fd as u64, pg +% 2048, 2000, 0, 0, 0)
+    let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+    if r <= 0 {
+        release_page(pg)
+        raise DnsError.no_nameserver
+    }
+    let addr: ip.Ipv4Addr = handle err: DnsError as e -> {
+        release_page(pg)
+        raise e
+    } { scan_nameserver(pg +% 2048, r as u64)? }
+    release_page(pg)
+    return addr
+}
+
+
+public function resolve_v4(net: Network, fs: ReadOnlyFilesystem, host: String) -> ip.Ipv4Addr
+    with {net, fs, err: DnsError}
+{
+    comptime if target_has("windows") {
+        return handle err: win.WinDnsError as e -> (raise match e {
+            case .name_too_long      => DnsError.name_too_long
+            case .query_failed       => DnsError.query_failed
+            case .not_found(let h)   => DnsError.not_found(host: h)
+        }) {
+            win.resolve_v4_win(net, host)?
+        }
+    } else {
+        return resolve_v4_unix(net, fs, host)?
+    }
+}
+
+function resolve_v4_unix(net: Network, fs: ReadOnlyFilesystem, host: String) -> ip.Ipv4Addr
+    with {net, fs, err: DnsError}
+{
+    let ns: ip.Ipv4Addr = read_resolv_conf(fs)?
+    let pg: u64 = handle err: pages.PageError as _e -> (raise DnsError.query_failed) {
+        pages.map(4096)?
+    }
+    let qlen: u64 = handle err: DnsError as e -> {
+        release_page(pg)
+        raise e
+    } { build_query(pg, host)? }
+    fill_sockaddr(pg +% 1792, ns, 53)
+    raw.store_u64(pg +% 1808, 5)
+    raw.store_u64(pg +% 1816, 0)
+    let fd: i64 = raw.syscall6(41, 2, 2, 0, 0, 0, 0)
+    if fd < 0 {
+        release_page(pg)
+        raise DnsError.query_failed
+    }
+    let _ = raw.syscall6(54, fd as u64, 1, 20, pg +% 1808, 16, 0)
+    let sr: i64 = raw.syscall6(44, fd as u64, pg, qlen, 0, pg +% 1792, 16)
+    if sr < 0 {
+        let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+        release_page(pg)
+        raise DnsError.query_failed
+    }
+    let rr: i64 = raw.syscall6(45, fd as u64, pg +% 1024, 512, 0, 0, 0)
+    let _ = raw.syscall6(3, fd as u64, 0, 0, 0, 0, 0)
+    if rr <= 0 {
+        release_page(pg)
+        raise DnsError.query_failed
+    }
+    let addr: ip.Ipv4Addr = handle err: DnsError as e -> {
+        release_page(pg)
+        raise e
+    } { parse_response(pg +% 1024, rr as u64, host)? }
+    release_page(pg)
+    return addr
+}

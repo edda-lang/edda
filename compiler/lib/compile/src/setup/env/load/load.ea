@@ -1,0 +1,283 @@
+
+module compile.setup.env.load.load
+
+import std.collections.vec
+import std.collections.sort.strings as sort_mod
+import std.core.option
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+import source.map as source_map_mod
+import source.read as source_read_mod
+import manifest.manifest as manifest_mod
+import manifest.build.parse as manifest_parse_mod
+import manifest.model.workspace.workspace as ws_mod
+
+
+spec std.collections.vec.Vec(manifest_mod.LoadedManifest)
+spec std.collections.vec.Vec(String)
+
+
+spec std.core.option.Option(manifest_mod.LoadedManifest)
+spec std.core.option.Option(ws_mod.Workspace)
+
+
+public function manifest_load(
+    rfs: ReadOnlyFilesystem,
+    map: mutable source_map_mod.SourceMap,
+    package_root: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_LoadedManifest.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let toml_path = string.concat(package_root, "/package.toml", allocator)?
+    if !fs.path_exists(rfs, toml_path) {
+        emit_manifest_not_found(mutable diags, toml_path, allocator)?
+        return Option_LoadedManifest.none
+    }
+    let file_id = source_read_mod.read_file(rfs, mutable map, take toml_path, allocator)?
+    let content = source_map_mod.file_content_of(map, file_id)
+    let parsed = manifest_parse_mod.parse_manifest(content, file_id, mutable diags, allocator)?
+    return match parsed {
+        case .none => Option_LoadedManifest.none
+        case .some(let m) =>
+            Option_LoadedManifest.some(value: resolve_discovery(rfs, package_root, take m, allocator)?)
+    }
+}
+
+
+public function manifest_load_workspace_members(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    manifest: manifest_mod.LoadedManifest,
+    map: mutable source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Vec_LoadedManifest.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit out: Vec_LoadedManifest.Vec
+    Vec_LoadedManifest.new(init out, allocator)?
+    let ws_opt = workspace_of(manifest)
+    let ws = match ws_opt {
+        case .none => return out
+        case .some(let w) => w
+    }
+
+    load_each_member(rfs, mutable map, workspace_root, ws, mutable out, mutable diags, allocator)?
+    return out
+}
+
+
+function resolve_discovery(
+    rfs: ReadOnlyFilesystem,
+    package_root: String,
+    manifest: take manifest_mod.LoadedManifest,
+    allocator: Allocator,
+) -> manifest_mod.LoadedManifest
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let ws_opt = workspace_of(manifest)
+    return match ws_opt {
+        case .none => manifest
+        case .some(let w) => maybe_materialize(rfs, package_root, take manifest, w, allocator)?
+    }
+}
+
+
+function maybe_materialize(
+    rfs: ReadOnlyFilesystem,
+    package_root: String,
+    manifest: take manifest_mod.LoadedManifest,
+    ws: ws_mod.Workspace,
+    allocator: Allocator,
+) -> manifest_mod.LoadedManifest
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    if !discover_root_empty(ws) {
+        return manifest
+    }
+    let discover_root = string.concat(package_root, "/", allocator)?
+    let discover_root_full = string.concat(discover_root, ws_mod.discover_root_of(ws), allocator)?
+    let discovered = discover_lib_members(rfs, discover_root_full, allocator)?
+    let new_ws = ws_mod.workspace_of(take discovered, ws_mod.discover(ws))
+    return manifest_mod.with_workspace(take manifest, take new_ws)
+}
+
+
+function discover_root_empty(ws: ws_mod.Workspace) -> bool {
+    return match ws_mod.discover(ws) {
+        case .none => false
+        case .some(let d) => match d {
+            case .lib_root  => ws_mod.member_count(ws) == 0 as usize
+            case .path(_)   => ws_mod.member_count(ws) == 0 as usize
+        }
+    }
+}
+
+
+function discover_lib_members(
+    rfs: ReadOnlyFilesystem,
+    lib_root: String,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit names: Vec_String.Vec
+    Vec_String.new(init names, allocator)?
+    handle err: fs.FsError as e -> match e {
+        case .not_found(_)       => ()
+        case .not_a_directory(_) => ()
+        case _                   => raise e
+    } {
+        walk_members(rfs, lib_root, "", mutable names, 64 as usize, allocator)?
+    }
+    let n = Vec_String.len(names)
+    if n <= 1 as usize {
+        return names
+    }
+    var arr: [String] = Vec_String.into_array(take names, allocator)?
+    sort_mod.sort_strings(mutable arr)
+    return array_to_vec(arr, allocator)?
+}
+
+
+function walk_members(
+    rfs: ReadOnlyFilesystem,
+    dir: String,
+    rel: String,
+    out: mutable Vec_String.Vec,
+    fuel: usize,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 as usize {
+        return
+    }
+    let manifest_path = join_path(dir, "package.toml", allocator)?
+    if fs.path_exists(rfs, manifest_path) {
+        if !string.is_empty(rel) {
+            Vec_String.push(mutable out, string.clone(rel, allocator)?, allocator)?
+        }
+        return
+    }
+    let entries = fs.read_dir(rfs, dir, allocator)?
+    let n = entries.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        let entry = entries[i]
+        if !string.starts_with(entry, ".") && !string.ends_with(entry, ".ea") {
+            let child_dir = join_path(dir, entry, allocator)?
+            let child_rel = child_rel_of(rel, entry, allocator)?
+            handle err: fs.FsError as e -> match e {
+                case .not_found(_)       => ()
+                case .not_a_directory(_) => ()
+                case _                   => raise e
+            } {
+                walk_members(rfs, child_dir, child_rel, mutable out, fuel - 1 as usize, allocator)?
+            }
+        }
+        i = i + 1 as usize
+    }
+}
+
+
+function child_rel_of(rel: String, entry: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if string.is_empty(rel) {
+        return string.clone(entry, allocator)?
+    }
+    return join_path(rel, entry, allocator)?
+}
+
+
+function join_path(a: String, b: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let s = string.concat(a, "/", allocator)?
+    return string.concat(s, b, allocator)?
+}
+
+
+function array_to_vec(arr: [String], allocator: Allocator) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_String.Vec
+    let n = arr.len()
+    Vec_String.with_capacity(init v, n, allocator)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        Vec_String.push(mutable v, string.clone(arr[i], allocator)?, allocator)?
+        i = i + 1 as usize
+    }
+    return v
+}
+
+
+public function workspace_of(m: manifest_mod.LoadedManifest) -> Option_Workspace.Option {
+    return match m {
+        case .package(_, _, _, let ws_opt, _, _, _) => ws_opt
+        case .workspace_only(let w, _, _, _, _) => Option_Workspace.some(value: w)
+    }
+}
+
+
+function load_each_member(
+    rfs: ReadOnlyFilesystem,
+    map: mutable source_map_mod.SourceMap,
+    workspace_root: String,
+    ws: ws_mod.Workspace,
+    out: mutable Vec_LoadedManifest.Vec,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let root_segment = ws_mod.discover_root_of(ws)
+    let n = ws_mod.member_count(ws)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let member_name = ws_mod.member_at(ws, i)
+        let member_dir = member_directory(workspace_root, root_segment, member_name, allocator)?
+        let m_opt = manifest_load(rfs, mutable map, member_dir, mutable diags, allocator)?
+        match m_opt {
+            case .some(let m) => Vec_LoadedManifest.push(mutable out, take m, allocator)?
+            case .none => ()
+        }
+        i = i + 1
+    }
+}
+
+function member_directory(workspace_root: String, root_segment: String, member: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let a = string.concat(workspace_root, "/", allocator)?
+    let b = string.concat(a, root_segment, allocator)?
+    let prefix = string.concat(b, "/", allocator)?
+    return string.concat(prefix, member, allocator)?
+}
+
+
+function emit_manifest_not_found(diags: mutable diags_mod.Diagnostics, toml_path: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let head = string.concat("failed to load manifest at `", toml_path, allocator)?
+    let msg = string.concat(head, "`", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.parse_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

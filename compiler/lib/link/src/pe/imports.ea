@@ -1,0 +1,306 @@
+
+module link.pe.imports
+
+import std.mem.alloc
+import std.collections.vec
+import object.bytes as bytes_mod
+import local.emit.layout as layout_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(ImportFunction)
+spec std.collections.vec.Vec(ImportDll)
+spec std.collections.vec.Vec(ImportSymbol)
+
+
+public type ImportFunction {
+    name: String
+}
+
+
+public type ImportDll {
+    name: String
+    functions: Vec_ImportFunction.Vec
+}
+
+
+public type ImportSymbol {
+    name: String
+    iat_rva: u32
+}
+
+
+public type IdataResult {
+    data: Vec_u8.Vec
+    import_dir_rva: u32
+    import_dir_size: u32
+    iat_rva: u32
+    iat_size: u32
+    symbols: Vec_ImportSymbol.Vec
+}
+
+
+function hintname_size(name: String) -> u32 {
+    let n = name.bytes().len() as u32
+    return layout_mod.align_up((2 as u32) + n + (1 as u32), 2 as u32)
+}
+
+
+function thunk_bytes(nfunc: u32) -> u32 {
+    return (nfunc + (1 as u32)) * (8 as u32)
+}
+
+
+function plan_idata(
+    dlls: Vec_ImportDll.Vec,
+    idata_rva: u32,
+    ilt_rel: mutable Vec_u32.Vec,
+    iat_rel: mutable Vec_u32.Vec,
+    name_rel: mutable Vec_u32.Vec,
+    hintname_rel: mutable Vec_u32.Vec,
+    symbols: mutable Vec_ImportSymbol.Vec,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let n_dll = Vec_ImportDll.len(dlls)
+    let dir_size = ((n_dll as u32) + (1 as u32)) * (20 as u32)
+
+    var off = dir_size
+    var d: usize = 0
+    loop decreases (n_dll - d) {
+        if d >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, d)
+        let here = off
+        Vec_u32.push(mutable ilt_rel, take here, allocator)?
+        off = off + thunk_bytes(Vec_ImportFunction.len(dll.functions) as u32)
+        d = d + 1
+    }
+
+    var e: usize = 0
+    loop decreases (n_dll - e) {
+        if e >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, e)
+        let here = off
+        Vec_u32.push(mutable iat_rel, take here, allocator)?
+        var slot_rva = idata_rva + off
+        let nf = Vec_ImportFunction.len(dll.functions)
+        var f: usize = 0
+        loop decreases (nf - f) {
+            if f >= nf { break }
+            let fn = Vec_ImportFunction.at(dll.functions, f)
+            let sym = ImportSymbol { name: fn.name, iat_rva: slot_rva }
+            Vec_ImportSymbol.push(mutable symbols, take sym, allocator)?
+            slot_rva = slot_rva + (8 as u32)
+            f = f + 1
+        }
+        off = off + thunk_bytes(nf as u32)
+        e = e + 1
+    }
+
+    var g: usize = 0
+    loop decreases (n_dll - g) {
+        if g >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, g)
+        let nf = Vec_ImportFunction.len(dll.functions)
+        var f: usize = 0
+        loop decreases (nf - f) {
+            if f >= nf { break }
+            let fn = Vec_ImportFunction.at(dll.functions, f)
+            let here = off
+            Vec_u32.push(mutable hintname_rel, take here, allocator)?
+            off = off + hintname_size(fn.name)
+            f = f + 1
+        }
+        g = g + 1
+    }
+
+    var h: usize = 0
+    loop decreases (n_dll - h) {
+        if h >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, h)
+        let here = off
+        Vec_u32.push(mutable name_rel, take here, allocator)?
+        off = off + (dll.name.bytes().len() as u32) + (1 as u32)
+        h = h + 1
+    }
+
+    return off
+}
+
+
+function emit_directory(
+    out: mutable Vec_u8.Vec,
+    dlls: Vec_ImportDll.Vec,
+    idata_rva: u32,
+    ilt_rel: Vec_u32.Vec,
+    iat_rel: Vec_u32.Vec,
+    name_rel: Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_dll = Vec_ImportDll.len(dlls)
+    var d: usize = 0
+    loop decreases (n_dll - d) {
+        if d >= n_dll { break }
+        bytes_mod.push_u32_le(mutable out, idata_rva + Vec_u32.at(ilt_rel, d), allocator)?
+        bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+        bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+        bytes_mod.push_u32_le(mutable out, idata_rva + Vec_u32.at(name_rel, d), allocator)?
+        bytes_mod.push_u32_le(mutable out, idata_rva + Vec_u32.at(iat_rel, d), allocator)?
+        d = d + 1
+    }
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+}
+
+
+function emit_thunks(
+    out: mutable Vec_u8.Vec,
+    dlls: Vec_ImportDll.Vec,
+    idata_rva: u32,
+    hintname_rel: Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_dll = Vec_ImportDll.len(dlls)
+    var gi: usize = 0
+    var d: usize = 0
+    loop decreases (n_dll - d) {
+        if d >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, d)
+        let nf = Vec_ImportFunction.len(dll.functions)
+        var f: usize = 0
+        loop decreases (nf - f) {
+            if f >= nf { break }
+            bytes_mod.push_u64_le(mutable out, (idata_rva + Vec_u32.at(hintname_rel, gi)) as u64, allocator)?
+            gi = gi + 1
+            f = f + 1
+        }
+        bytes_mod.push_u64_le(mutable out, 0 as u64, allocator)?
+        d = d + 1
+    }
+}
+
+
+function emit_hintnames(
+    out: mutable Vec_u8.Vec,
+    dlls: Vec_ImportDll.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_dll = Vec_ImportDll.len(dlls)
+    var d: usize = 0
+    loop decreases (n_dll - d) {
+        if d >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, d)
+        let nf = Vec_ImportFunction.len(dll.functions)
+        var f: usize = 0
+        loop decreases (nf - f) {
+            if f >= nf { break }
+            let fn = Vec_ImportFunction.at(dll.functions, f)
+            emit_hintname(mutable out, fn.name, allocator)?
+            f = f + 1
+        }
+        d = d + 1
+    }
+}
+
+
+function emit_hintname(out: mutable Vec_u8.Vec, name: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let written = emit_cstr(mutable out, name, allocator)?
+    if ((written + (2 as usize)) % (2 as usize)) != (0 as usize) {
+        bytes_mod.push_u8(mutable out, 0 as u8, allocator)?
+    }
+}
+
+
+function emit_cstr(out: mutable Vec_u8.Vec, name: String, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = name.bytes()
+    let n = nb.len()
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        bytes_mod.push_u8(mutable out, nb[i], allocator)?
+        i = i + 1
+    }
+    bytes_mod.push_u8(mutable out, 0 as u8, allocator)?
+    return n + (1 as usize)
+}
+
+
+function emit_dllnames(out: mutable Vec_u8.Vec, dlls: Vec_ImportDll.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_dll = Vec_ImportDll.len(dlls)
+    var d: usize = 0
+    loop decreases (n_dll - d) {
+        if d >= n_dll { break }
+        let dll = Vec_ImportDll.at(dlls, d)
+        let _ = emit_cstr(mutable out, dll.name, allocator)?
+        d = d + 1
+    }
+}
+
+
+public function build_idata(dlls: Vec_ImportDll.Vec, idata_rva: u32, allocator: Allocator) -> IdataResult
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ilt_rel: Vec_u32.Vec
+    Vec_u32.new(init ilt_rel, allocator)?
+    uninit iat_rel: Vec_u32.Vec
+    Vec_u32.new(init iat_rel, allocator)?
+    uninit name_rel: Vec_u32.Vec
+    Vec_u32.new(init name_rel, allocator)?
+    uninit hintname_rel: Vec_u32.Vec
+    Vec_u32.new(init hintname_rel, allocator)?
+    uninit symbols: Vec_ImportSymbol.Vec
+    Vec_ImportSymbol.new(init symbols, allocator)?
+
+    let total = plan_idata(dlls, idata_rva, mutable ilt_rel, mutable iat_rel, mutable name_rel, mutable hintname_rel, mutable symbols, allocator)?
+
+    let n_dll = Vec_ImportDll.len(dlls)
+    let import_dir_size = ((n_dll as u32) + (1 as u32)) * (20 as u32)
+    let iat_region_rva = if Vec_u32.len(iat_rel) > (0 as usize) {
+        idata_rva + Vec_u32.at(iat_rel, 0 as usize)
+    } else {
+        idata_rva
+    }
+    let iat_end_off = if Vec_u32.len(hintname_rel) > (0 as usize) {
+        Vec_u32.at(hintname_rel, 0 as usize)
+    } else if Vec_u32.len(name_rel) > (0 as usize) {
+        Vec_u32.at(name_rel, 0 as usize)
+    } else {
+        total
+    }
+    let iat_region_end = idata_rva + iat_end_off
+
+    uninit data: Vec_u8.Vec
+    Vec_u8.new(init data, allocator)?
+    emit_directory(mutable data, dlls, idata_rva, ilt_rel, iat_rel, name_rel, allocator)?
+    emit_thunks(mutable data, dlls, idata_rva, hintname_rel, allocator)?
+    emit_thunks(mutable data, dlls, idata_rva, hintname_rel, allocator)?
+    emit_hintnames(mutable data, dlls, allocator)?
+    emit_dllnames(mutable data, dlls, allocator)?
+
+    return IdataResult {
+        data: data,
+        import_dir_rva: idata_rva,
+        import_dir_size: import_dir_size,
+        iat_rva: iat_region_rva,
+        iat_size: iat_region_end - iat_region_rva,
+        symbols: symbols,
+    }
+}

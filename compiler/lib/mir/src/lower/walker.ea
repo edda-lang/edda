@@ -1,0 +1,4826 @@
+
+module mir.lower.walker
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.math.scalar as scalar_mod
+import hir.tree as hir_tree
+import hir.def as def_mod
+import hir.node as node_mod
+import intern.symbol as symbol_mod
+import syntax.ast.ops as ast_ops
+import syntax.ast.ident as ident_mod
+import syntax.ast.tree as ast_pat_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import target.triple as triple_mod
+import cteval.state.value as comptime_value_mod
+import local.place as place_mod
+import local.rvalue as rvalue_mod
+import local.body.model as body_mod
+import local.stmt as stmt_mod
+import local.term as term_mod
+import local.id.local as local_mod
+import local.id.block as block_mod
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.build.ctx.obligation.obligation as obligation_mod
+import local.lower.build.ctx.postcond.postcond as postcond_mod
+import local.lower.build.ctx.obligation.guard as guard_mod
+import local.lower.build.overflow.desugar as checked_mod
+import local.lower.build.scan.pattern as pattern_mod
+import local.lower.pattern.decide.build as build_mod
+import local.lower.bridge as bridge
+import local.lower.eqmap.targets as eqmap_mod
+import resolve.build.builtins as builtins_mod
+import types.check.env.sig as sig_mod
+import types.effect.row as effect_row_mod
+import cteval.builtin.target.layout.compute.engine as engine_mod
+
+
+spec std.collections.vec.Vec(sig_mod.FnSig)
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HCapture)
+spec std.collections.vec.Vec(hir_tree.HClosureParam)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.collections.vec.Vec(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(ast_pat_mod.StructPatField)
+spec std.mem.alloc.Box(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(place_mod.Projection)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.collections.vec.Vec(ByRefSlot)
+
+
+spec std.core.option.Option(local_mod.LocalId)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(body_mod.RegionId)
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(ast_pat_mod.SliceRest)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.core.option.Option(checked_mod.CheckedOp)
+spec std.core.option.Option(comptime_value_mod.ComptimeValue)
+spec std.core.option.Option(bridge.BridgeKind)
+spec std.core.option.Option(rvalue_mod.Operand)
+spec std.core.option.Option(eqmap_mod.EqTarget)
+spec std.core.option.Option(sig_mod.FnSig)
+spec std.core.option.Option(Vec_DefId)
+spec std.core.option.Option(ast_pat_mod.Expr)
+
+
+public function lower_literal(
+    lit: hir_tree.HLiteral,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+) -> rvalue_mod.Constant
+{
+    return match lit {
+        case .int(let value, _) => rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.int_(bits: value),
+        }
+        case .float(_, let value) => rvalue_mod.Constant {
+            ty: result_ty,
+            kind: float_constant_kind(value, result_ty, types_out),
+        }
+        case .str(let sym) => rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.str_(symbol: sym),
+        }
+        case .bool(let value) => rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.bool_(value: value),
+        }
+        case .unit => rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.unit_,
+        }
+    }
+}
+
+
+function float_constant_kind(
+    value: f64,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+) -> rvalue_mod.ConstantKind {
+    let f32_ty = types_out.builtins.f32_
+    if result_ty.raw == f32_ty.raw {
+        return rvalue_mod.ConstantKind.float_(
+            bits: scalar_mod.f32_to_bits(value as f32 saturating) as u64,
+            width: rvalue_mod.FloatWidth.f32_,
+        )
+    }
+    return rvalue_mod.ConstantKind.float_(
+        bits: scalar_mod.f64_to_bits(value),
+        width: rvalue_mod.FloatWidth.f64_,
+    )
+}
+
+
+public function binding_place(
+    builder: builder_mod.LowerCtx,
+    def_id: def_mod.DefId,
+    local_id: local_mod.LocalId,
+    allocator: Allocator,
+) -> place_mod.Place
+    with {allocator, err: alloc.AllocError}
+{
+    return match builder_mod.by_ref_param_ty(builder, def_id) {
+        case .some(let value_ty) => {
+            var p = builder_mod.local_place(local_id)
+            place_mod.push_projection(
+                mutable p,
+                place_mod.Projection {
+                    kind: place_mod.ProjectionKind.deref_,
+                    result_ty: value_ty,
+                },
+                allocator,
+            )?
+            p
+        }
+        case .none => builder_mod.local_place(local_id)
+    }
+}
+
+public function lower_use(
+    builder: mutable builder_mod.LowerCtx,
+    def_id: def_mod.DefId,
+    result_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    match builder_mod.lookup_local(builder, def_id) {
+        case .some(let local_id) => {
+            return rvalue_mod.Operand.copy_(
+                place: binding_place(builder, def_id, local_id, allocator)?,
+                ty: result_ty,
+            )
+        }
+        case .none => ()
+    }
+    builder_mod.record_shim(mutable builder, def_id, allocator)?
+    let shim_def = def_mod.from_raw(def_id.raw | (2147483648 as u32))
+    let env_zero = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.int_(bits: 0 as u128),
+        },
+    )
+    return emit_rvalue_into_temp(
+        mutable builder,
+        rvalue_mod.Rvalue.make_closure(code: shim_def, env: env_zero),
+        result_ty,
+        node_mod.error(),
+        allocator,
+    )?
+}
+
+
+
+
+public function lower_expr_as_operand(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return match expr.kind {
+        case .literal(let lit) => rvalue_mod.Operand.constant(
+            c: lower_literal(lit, result_ty, types_out),
+        )
+        case .use_(let def_id) => lower_use(mutable builder, def_id, result_ty, allocator)?
+        case .field(_, _) => lower_place_as_operand(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .positional(_, _) => lower_place_as_operand(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .index(_, _) => lower_place_as_operand(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .subrange(_, _, _, _) => lower_place_as_operand(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .binary(_, _, _) => lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .unary(_, _) => lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .tuple(_) => lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .struct_lit(_, _) => lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .range(_, _, _) => lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .variant_ctor(_, _, _) => lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+        case .cast(let inner_box, _, let cast_mode) => lower_cast_operand(mutable builder, expr, inner_box, cast_mode, result_ty, types_out, ty_interner, allocator)?
+        case .call(let callee_def, let args) => lower_call_or_method(
+            mutable builder,
+            expr.node_id,
+            callee_def,
+            args,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .dyn_call(let callee_box, let args) => {
+            let callee_expr = Box_HExpr.get(callee_box)
+            match lower_dyn_variant_ctor(mutable builder, expr.node_id, callee_expr, args, result_ty, types_out, ty_interner, allocator)? {
+                case .some(let ctor_op) => ctor_op
+                case .none => {
+                    let callee_ty = check_mod.type_of_node(types_out, callee_expr.node_id)
+                    let callee_op = lower_expr_as_operand(mutable builder, callee_expr, callee_ty, types_out, ty_interner, allocator)?
+                    lower_call_expr(
+                        mutable builder,
+                        expr.node_id,
+                        callee_op,
+                        args,
+                        result_ty,
+                        types_out,
+                        ty_interner,
+                        allocator,
+                    )?
+                }
+            }
+        }
+        case .method_call(let name, let args) => lower_method_call_operand(
+            mutable builder,
+            expr.node_id,
+            name,
+            args,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .raise_(let value_box) => lower_raise_expr(
+            mutable builder,
+            expr.node_id,
+            Box_HExpr.get(value_box),
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .return_(let value_opt) => lower_return_expr(
+            mutable builder,
+            expr.node_id,
+            value_opt,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .block_(let body) => lower_block(mutable builder, body, types_out, ty_interner, allocator)?
+        case .if_(let cond_box, let then_block, let else_opt) => lower_if_expr(
+            mutable builder,
+            expr.node_id,
+            Box_HExpr.get(cond_box),
+            then_block,
+            else_opt,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .loop_(let body, let label, _) => lower_loop_expr(
+            mutable builder,
+            expr.node_id,
+            body,
+            label,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .break_(let label, let value_opt) => lower_break_expr(
+            mutable builder,
+            expr.node_id,
+            label,
+            value_opt,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .continue_(let label) => lower_continue_expr(
+            mutable builder,
+            expr.node_id,
+            label,
+            result_ty,
+            allocator,
+        )?
+        case .panic_(let msg_box) => lower_panic_expr(
+            mutable builder,
+            expr.node_id,
+            Box_HExpr.get(msg_box),
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .match_(let scrut_box, let arms) => lower_match_expr(
+            mutable builder,
+            expr.node_id,
+            Box_HExpr.get(scrut_box),
+            arms,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .scope_(let kind, _, let body) => lower_scope_expr(
+            mutable builder,
+            expr.node_id,
+            kind,
+            body,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .handle_(_, let binder, let recovery, let body) => lower_handle_expr(
+            mutable builder,
+            expr.node_id,
+            binder,
+            Box_HExpr.get(recovery),
+            body,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .closure(let c) => lower_closure_operand(mutable builder, Box_HClosure.get(c), expr.node_id, result_ty, types_out, ty_interner, allocator)?
+        case .spawn_(let sp) => lower_spawn_expr(mutable builder, Box_HSpawn.get(sp), expr.node_id, result_ty, types_out, ty_interner, allocator)?
+        case .comptime_(_) => lower_comptime_operand(builder, expr.node_id, result_ty)
+        case .comptime_block(_) => lower_comptime_operand(builder, expr.node_id, result_ty)
+        case .comptime_for(_, _, _, _, _) => lower_comptime_operand(builder, expr.node_id, result_ty)
+        case .forall_(_, _, _) => panic("walker.lower_expr_as_operand: forall_ in expression position is a HIR lowering-invariant violation (refinement-only quantifier reached MIR); upstream HIR should have rejected via error[forall_in_expr]")
+        case .exists_(_, _, _) => panic("walker.lower_expr_as_operand: exists_ in expression position is a HIR lowering-invariant violation (refinement-only quantifier reached MIR); upstream HIR should have rejected via error[exists_in_expr]")
+        case .error => rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: result_ty,
+                kind: rvalue_mod.ConstantKind.zero_init,
+            },
+        )
+        case _ => {
+            builder_mod.record_unlowered(mutable builder, expr.node_id, allocator)?
+            rvalue_mod.Operand.constant(
+                c: rvalue_mod.Constant {
+                    ty: result_ty,
+                    kind: rvalue_mod.ConstantKind.zero_init,
+                },
+            )
+        }
+    }
+}
+
+
+function lower_closure_operand(
+    builder: mutable builder_mod.LowerCtx,
+    closure: hir_tree.HClosure,
+    node_id: node_mod.NodeId,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let base = builder_mod.closure_base(builder)
+    let lifted_def = def_mod.DefId { raw: base +% node_id.raw }
+    let return_ty = closure_return_ty(result_ty, ty_interner)
+    let nc = Vec_HCapture.len(closure.captures)
+
+    if nc == 0 as usize {
+        let pc = builder_mod.PendingClosure {
+            def_id: lifted_def,
+            name: symbol_mod.empty(),
+            params: closure.params,
+            body: closure.body,
+            return_ty: return_ty,
+            prepend_env: true,
+            has_capture: false,
+            capture_def: def_mod.error(),
+            capture_name: symbol_mod.empty(),
+            capture_ty: ty_mod.error(),
+            pointer_backed: false,
+            env_ty: ty_mod.error(),
+            captures: closure.captures,
+            spawn_result_ty: ty_mod.error(),
+        }
+        builder_mod.record_closure(mutable builder, take pc, allocator)?
+        let usize_ty = types_out.builtins.usize_
+        let env_op = rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: usize_ty,
+                kind: rvalue_mod.ConstantKind.int_(bits: 0 as u128),
+            },
+        )
+        let make = rvalue_mod.Rvalue.make_closure(code: lifted_def, env: env_op)
+        return emit_rvalue_into_temp(mutable builder, make, result_ty, node_id, allocator)?
+    }
+
+    if nc == 1 as usize {
+        let cap = Vec_HCapture.at(closure.captures, 0)
+        let cap_is_let = match cap.mode {
+            case .let_ => true
+            case .take_ => false
+        }
+        let cty = check_mod.type_of_local(types_out, cap.def_id)
+        let pw = builder_mod.pointer_width(builder)
+        if cap_is_let && cap_is_packable(cty, ty_interner, pw) {
+            let clocal = match builder_mod.lookup_local(builder, cap.def_id) {
+                case .some(let l) => l
+                case .none => panic("walker.lower_closure_operand: capture def has no bound local — capture must reference an enclosing binding")
+            }
+            let usize_ty = types_out.builtins.usize_
+            let cplace = builder_mod.local_place(clocal)
+            let pack = rvalue_mod.Rvalue.cast(
+                operand: rvalue_mod.Operand.copy_(place: cplace, ty: cty),
+                from: cty,
+                to: usize_ty,
+                kind: rvalue_mod.CastKind.int_to_int(mode: rvalue_mod.OverflowMode.wrapping_),
+            )
+            let env_op = emit_rvalue_into_temp(mutable builder, pack, usize_ty, node_id, allocator)?
+            let pc = builder_mod.PendingClosure {
+                def_id: lifted_def,
+                name: symbol_mod.empty(),
+                params: closure.params,
+                body: closure.body,
+                return_ty: return_ty,
+                prepend_env: true,
+                has_capture: true,
+                capture_def: cap.def_id,
+                capture_name: cap.name,
+                capture_ty: cty,
+                pointer_backed: false,
+                env_ty: ty_mod.error(),
+                captures: closure.captures,
+                spawn_result_ty: ty_mod.error(),
+            }
+            builder_mod.record_closure(mutable builder, take pc, allocator)?
+            let make = rvalue_mod.Rvalue.make_closure(code: lifted_def, env: env_op)
+            return emit_rvalue_into_temp(mutable builder, make, result_ty, node_id, allocator)?
+        }
+    }
+
+    let env_ty = builder_mod.closure_env_ty_of(builder, node_id)
+    if ty_mod.is_error(env_ty) {
+        builder_mod.record_unlowered(mutable builder, node_id, allocator)?
+        return unsupported_closure_operand(result_ty)
+    }
+    if builder_mod.closure_escapes_of(builder, node_id) {
+        if !closure_has_allocator(closure, types_out, ty_interner) {
+            builder_mod.record_closure_escapes_without_allocator(mutable builder, node_id, allocator)?
+            return unsupported_closure_operand(result_ty)
+        }
+        return match captured_allocator_operand(builder, closure, types_out, ty_interner) {
+            case .some(let alloc_op) => {
+                let heap_env = build_heap_env(mutable builder, closure.captures, env_ty, alloc_op, node_id, types_out, ty_interner, allocator)?
+                finish_pointer_closure(mutable builder, lifted_def, closure, return_ty, env_ty, heap_env, result_ty, node_id, allocator)?
+            }
+            case .none => {
+                builder_mod.record_unlowered(mutable builder, node_id, allocator)?
+                unsupported_closure_operand(result_ty)
+            }
+        }
+    }
+    let env_op = build_pointer_env(mutable builder, closure.captures, env_ty, node_id, types_out, ty_interner, allocator)?
+    return finish_pointer_closure(mutable builder, lifted_def, closure, return_ty, env_ty, env_op, result_ty, node_id, allocator)?
+}
+
+
+function closure_has_allocator(
+    closure: hir_tree.HClosure,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    let nc = Vec_HCapture.len(closure.captures)
+    var i: usize = 0
+    loop decreases (nc - i) {
+        if i >= nc { break }
+        let cap = Vec_HCapture.at(closure.captures, i)
+        if check_mod.ty_is_allocator(check_mod.type_of_local(types_out, cap.def_id), ty_interner) {
+            return true
+        }
+        i = i + 1
+    }
+    let np = Vec_HClosureParam.len(closure.params)
+    var j: usize = 0
+    loop decreases (np - j) {
+        if j >= np { break }
+        let p = Vec_HClosureParam.at(closure.params, j)
+        if check_mod.ty_is_allocator(check_mod.type_of_local(types_out, p.def_id), ty_interner) {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+
+function build_env_tuple_local(
+    builder: mutable builder_mod.LowerCtx,
+    captures: Vec_HCapture.Vec,
+    env_ty: ty_mod.TyId,
+    node_id: node_mod.NodeId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit elems: Vec_Operand.Vec
+    Vec_Operand.new(init elems, allocator)?
+    let nc = Vec_HCapture.len(captures)
+    var i: usize = 0
+    loop decreases (nc - i) {
+        if i >= nc { break }
+        let cap = Vec_HCapture.at(captures, i)
+        let cty = check_mod.type_of_local(types_out, cap.def_id)
+        if check_mod.ty_is_allocator(cty, ty_interner) {
+            i = i + 1
+            continue
+        }
+        let clocal = match builder_mod.lookup_local(builder, cap.def_id) {
+            case .some(let l) => l
+            case .none => panic("walker.build_env_tuple_local: capture def has no bound local — capture must reference an enclosing binding")
+        }
+        let cplace = builder_mod.local_place(clocal)
+        Vec_Operand.push(mutable elems, rvalue_mod.Operand.copy_(place: cplace, ty: cty), allocator)?
+        i = i + 1
+    }
+
+    let env_tuple_local = builder_mod.alloc_local(
+        mutable builder,
+        env_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: node_id),
+        allocator,
+    )?
+    let env_tuple_place = builder_mod.local_place(env_tuple_local)
+    let agg = rvalue_mod.Rvalue.aggregate(
+        kind: rvalue_mod.AggregateKind.tuple,
+        elems: elems,
+        result_ty: env_ty,
+    )
+    let agg_stmt = stmt_mod.Statement {
+        origin: node_id,
+        kind: stmt_mod.MStmtKind.assign(dest: env_tuple_place, value: agg),
+    }
+    builder_mod.push_stmt(mutable builder, take agg_stmt, allocator)?
+    return env_tuple_local
+}
+
+
+function build_pointer_env(
+    builder: mutable builder_mod.LowerCtx,
+    captures: Vec_HCapture.Vec,
+    env_ty: ty_mod.TyId,
+    node_id: node_mod.NodeId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let env_tuple_local = build_env_tuple_local(mutable builder, captures, env_ty, node_id, types_out, ty_interner, allocator)?
+    return addr_of_local(mutable builder, env_tuple_local, rvalue_mod.BorrowKind.shared, types_out, node_id, allocator)?
+}
+
+
+function build_heap_env(
+    builder: mutable builder_mod.LowerCtx,
+    captures: Vec_HCapture.Vec,
+    env_ty: ty_mod.TyId,
+    alloc_op: rvalue_mod.Operand,
+    node_id: node_mod.NodeId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let env_tuple_local = build_env_tuple_local(mutable builder, captures, env_ty, node_id, types_out, ty_interner, allocator)?
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, env_ty, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, env_ty, ty_interner, types_out, triple, 1)
+    let env_ptr = addr_of_local(mutable builder, env_tuple_local, rvalue_mod.BorrowKind.shared, types_out, node_id, allocator)?
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, alloc_op, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, env_ptr, allocator)?
+    let raw_def = builtins_mod.alloc_raw_reserved()
+    let raw_callee = callee_operand_for_def(raw_def, types_out)
+    return emit_raising_bridge_call(mutable builder, node_id, raw_callee, args, types_out.builtins.heap_ptr, ty_mod.error(), true, types_out, allocator)?
+}
+
+
+function captured_allocator_operand(
+    builder: builder_mod.LowerCtx,
+    closure: hir_tree.HClosure,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+) -> Option_Operand.Option
+    with {divergence}
+{
+    let nc = Vec_HCapture.len(closure.captures)
+    var i: usize = 0
+    loop decreases (nc - i) {
+        if i >= nc { break }
+        let cap = Vec_HCapture.at(closure.captures, i)
+        let cty = check_mod.type_of_local(types_out, cap.def_id)
+        if check_mod.ty_is_allocator(cty, ty_interner) {
+            match builder_mod.lookup_local(builder, cap.def_id) {
+                case .some(let l) => {
+                    let cplace = builder_mod.local_place(l)
+                    return Option_Operand.some(value: rvalue_mod.Operand.copy_(place: cplace, ty: cty))
+                }
+                case .none => ()
+            }
+        }
+        i = i + 1
+    }
+    return Option_Operand.none
+}
+
+
+function finish_pointer_closure(
+    builder: mutable builder_mod.LowerCtx,
+    lifted_def: def_mod.DefId,
+    closure: hir_tree.HClosure,
+    return_ty: ty_mod.TyId,
+    env_ty: ty_mod.TyId,
+    env_op: rvalue_mod.Operand,
+    result_ty: ty_mod.TyId,
+    node_id: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let pc = builder_mod.PendingClosure {
+        def_id: lifted_def,
+        name: symbol_mod.empty(),
+        params: closure.params,
+        body: closure.body,
+        return_ty: return_ty,
+        prepend_env: true,
+        has_capture: false,
+        capture_def: def_mod.error(),
+        capture_name: symbol_mod.empty(),
+        capture_ty: ty_mod.error(),
+        pointer_backed: true,
+        env_ty: env_ty,
+        captures: closure.captures,
+        spawn_result_ty: ty_mod.error(),
+    }
+    builder_mod.record_closure(mutable builder, take pc, allocator)?
+    let make = rvalue_mod.Rvalue.make_closure(code: lifted_def, env: env_op)
+    return emit_rvalue_into_temp(mutable builder, make, result_ty, node_id, allocator)?
+}
+
+
+function unsupported_closure_operand(result_ty: ty_mod.TyId) -> rvalue_mod.Operand {
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.unit_,
+        },
+    )
+}
+
+
+function cap_is_packable(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner, pointer_width: usize) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let kind) => match kind {
+            case .i8_ => true
+            case .i16_ => true
+            case .i32_ => true
+            case .u8_ => true
+            case .u16_ => true
+            case .u32_ => true
+            case .isize_ => true
+            case .usize_ => true
+            case .i64_ => pointer_width >= 8 as usize
+            case .u64_ => pointer_width >= 8 as usize
+            case _ => false
+        }
+        case .refined(let base, _) => cap_is_packable(base, ty_interner, pointer_width)
+        case _ => false
+    }
+}
+
+
+function emit_rvalue_into_temp(
+    builder: mutable builder_mod.LowerCtx,
+    rvalue: rvalue_mod.Rvalue,
+    result_ty: ty_mod.TyId,
+    node_id: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let temp_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: node_id),
+        allocator,
+    )?
+    let dest_place = builder_mod.local_place(temp_local)
+    maybe_note_div_obligation(mutable builder, rvalue, allocator)?
+    maybe_note_cast_obligation(mutable builder, rvalue, allocator)?
+    maybe_note_overflow_obligation(mutable builder, rvalue, allocator)?
+    let assign_stmt = stmt_mod.Statement {
+        origin: node_id,
+        kind: stmt_mod.MStmtKind.assign(dest: dest_place, value: rvalue),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    let return_place = builder_mod.local_place(temp_local)
+    return rvalue_mod.Operand.copy_(place: return_place, ty: result_ty)
+}
+
+
+function maybe_note_div_obligation(
+    builder: mutable builder_mod.LowerCtx,
+    rvalue: rvalue_mod.Rvalue,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match rvalue {
+        case .binary(let op, _, let rhs) => match op {
+            case .div(let mode, _, _) => {
+                note_const_divisor(mutable builder, rhs, allocator)?
+                note_div_overflow_if_trapping(mutable builder, mode, allocator)?
+            }
+            case .mod_(let mode, _, _) => {
+                note_const_divisor(mutable builder, rhs, allocator)?
+                note_div_overflow_if_trapping(mutable builder, mode, allocator)?
+            }
+            case _ => ()
+        }
+        case _ => ()
+    }
+}
+
+
+function note_div_overflow_if_trapping(
+    builder: mutable builder_mod.LowerCtx,
+    mode: rvalue_mod.OverflowMode,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match mode {
+        case .trapping => builder_mod.push_div_overflow(mutable builder, allocator)?
+        case _ => ()
+    }
+}
+
+
+function maybe_note_cast_obligation(
+    builder: mutable builder_mod.LowerCtx,
+    rvalue: rvalue_mod.Rvalue,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match rvalue {
+        case .cast(_, _, _, let kind) => match kind {
+            case .int_to_int(let mode) => match mode {
+                case .trapping => builder_mod.push_narrowing_cast_range(mutable builder, allocator)?
+                case _ => ()
+            }
+            case _ => ()
+        }
+        case _ => ()
+    }
+}
+
+
+function maybe_note_overflow_obligation(
+    builder: mutable builder_mod.LowerCtx,
+    rvalue: rvalue_mod.Rvalue,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match rvalue {
+        case .binary(let op, _, _) => match op {
+            case .add(let mode) => note_overflow_if_trapping(mutable builder, mode, allocator)?
+            case .sub(let mode) => note_overflow_if_trapping(mutable builder, mode, allocator)?
+            case .mul(let mode) => note_overflow_if_trapping(mutable builder, mode, allocator)?
+            case _ => ()
+        }
+        case _ => ()
+    }
+}
+
+
+function note_overflow_if_trapping(
+    builder: mutable builder_mod.LowerCtx,
+    mode: rvalue_mod.OverflowMode,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match mode {
+        case .trapping => builder_mod.push_int_overflow(mutable builder, allocator)?
+        case _ => ()
+    }
+}
+
+
+function note_const_divisor(
+    builder: mutable builder_mod.LowerCtx,
+    rhs: rvalue_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match rhs {
+        case .constant(let c) => match c.kind {
+            case .int_(let bits) => {
+                if bits >= 1 as u128 && bits <= 9223372036854775807 as u128 {
+                    builder_mod.push_div_by_zero_const(mutable builder, bits, allocator)?
+                }
+            }
+            case _ => ()
+        }
+        case .copy_(let place, _) => {
+            if place_mod.proj_len(place) == 0 {
+                builder_mod.push_div_by_zero_dynamic(mutable builder, allocator)?
+            }
+        }
+        case .move_(let place, _) => {
+            if place_mod.proj_len(place) == 0 {
+                builder_mod.push_div_by_zero_dynamic(mutable builder, allocator)?
+            }
+        }
+    }
+}
+
+function lower_comptime_operand(
+    builder: builder_mod.LowerCtx,
+    node_id: node_mod.NodeId,
+    result_ty: ty_mod.TyId,
+) -> rvalue_mod.Operand
+    with {divergence}
+{
+    return match builder_mod.comptime_value_of(builder, node_id) {
+        case .some(let v) => rvalue_mod.Operand.constant(
+            c: comptime_value_to_constant(v, result_ty),
+        )
+        case .none => rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: result_ty,
+                kind: rvalue_mod.ConstantKind.zero_init,
+            },
+        )
+    }
+}
+
+function comptime_value_to_constant(
+    v: comptime_value_mod.ComptimeValue,
+    result_ty: ty_mod.TyId,
+) -> rvalue_mod.Constant {
+    return rvalue_mod.Constant {
+        ty: result_ty,
+        kind: comptime_value_to_constant_kind(v),
+    }
+}
+
+function comptime_value_to_constant_kind(
+    v: comptime_value_mod.ComptimeValue,
+) -> rvalue_mod.ConstantKind {
+    return match v {
+        case .bool_(let b) => rvalue_mod.ConstantKind.bool_(value: b)
+        case .int_signed(let s_v, _) =>
+            rvalue_mod.ConstantKind.int_(bits: (s_v as u64 wrapping) as u128)
+        case .int_unsigned(let u_v, _) =>
+            rvalue_mod.ConstantKind.int_(bits: u_v as u128)
+        case .float_f32(let f) => rvalue_mod.ConstantKind.float_(
+            bits: scalar_mod.f32_to_bits(f) as u64,
+            width: rvalue_mod.FloatWidth.f32_,
+        )
+        case .float_f64(let f) => rvalue_mod.ConstantKind.float_(
+            bits: scalar_mod.f64_to_bits(f),
+            width: rvalue_mod.FloatWidth.f64_,
+        )
+        case .string_(let sym) => rvalue_mod.ConstantKind.str_(symbol: sym)
+        case .unit_ => rvalue_mod.ConstantKind.unit_
+        case _ => rvalue_mod.ConstantKind.zero_init
+    }
+}
+
+function closure_return_ty(fn_ty: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> ty_mod.TyId {
+    return match ty_interner_mod.lookup(ty_interner, fn_ty) {
+        case .fn_(_, let ret, _) => ret
+        case _ => ty_mod.error()
+    }
+}
+
+public function lower_expr_as_place(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> place_mod.Place
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return match expr.kind {
+        case .use_(let def_id) => match builder_mod.lookup_local(builder, def_id) {
+            case .some(let local_id) => binding_place(builder, def_id, local_id, allocator)?
+            case .none => {
+                let temp_local = lower_expr_as_temp(mutable builder, expr, types_out, ty_interner, allocator)?
+                builder_mod.local_place(temp_local)
+            }
+        }
+        case .field(let receiver_box, let accessor) => {
+            let receiver = Box_HExpr.get(receiver_box)
+            let field_idx = match accessor {
+                case .indexed(let i) => i
+                case .named(let sym) => {
+                    let recv_ty = check_mod.type_of_node(types_out, receiver.node_id)
+                    match check_mod.resolve_field_index(types_out, ty_interner, recv_ty, sym) {
+                        case .some(let ix) => ix
+                        case .none => 0 as u32
+                    }
+                }
+            }
+            var base = lower_expr_as_place(mutable builder, receiver, types_out, ty_interner, allocator)?
+            let field_ty = check_mod.type_of_node(types_out, expr.node_id)
+            place_mod.push_projection(
+                mutable base,
+                place_mod.Projection {
+                    kind: place_mod.ProjectionKind.field(idx: field_idx),
+                    result_ty: field_ty,
+                },
+                allocator,
+            )?
+            base
+        }
+        case .positional(let receiver_box, let index_box) => {
+            let receiver = Box_HExpr.get(receiver_box)
+            let field_idx = positional_const_index(Box_HExpr.get(index_box))
+            var base = lower_expr_as_place(mutable builder, receiver, types_out, ty_interner, allocator)?
+            let field_ty = check_mod.type_of_node(types_out, expr.node_id)
+            let recv_ty = check_mod.type_of_node(types_out, receiver.node_id)
+            let proj_kind = match check_mod.sum_def_of_ty(types_out, recv_ty) {
+                case .some(_) => place_mod.ProjectionKind.variant_payload(variant_idx: field_idx)
+                case .none => place_mod.ProjectionKind.field(idx: field_idx)
+            }
+            place_mod.push_projection(
+                mutable base,
+                place_mod.Projection {
+                    kind: proj_kind,
+                    result_ty: field_ty,
+                },
+                allocator,
+            )?
+            base
+        }
+        case .index(let receiver_box, let idx_box) => {
+            let receiver = Box_HExpr.get(receiver_box)
+            var base = lower_expr_as_place(mutable builder, receiver, types_out, ty_interner, allocator)?
+            let idx_expr = Box_HExpr.get(idx_box)
+            let idx_local = lower_expr_as_temp(mutable builder, idx_expr, types_out, ty_interner, allocator)?
+            let elem_ty = check_mod.type_of_node(types_out, expr.node_id)
+            place_mod.push_projection(
+                mutable base,
+                place_mod.Projection {
+                    kind: place_mod.ProjectionKind.index(idx_local: idx_local, proven: false),
+                    result_ty: elem_ty,
+                },
+                allocator,
+            )?
+            builder_mod.push_index_in_bounds(mutable builder, allocator)?
+            base
+        }
+        case .subrange(let receiver_box, let lo_box, let hi_box, let inclusive) => {
+            let receiver = Box_HExpr.get(receiver_box)
+            let recv_local = lower_expr_as_temp(mutable builder, receiver, types_out, ty_interner, allocator)?
+            let usize_ty = types_out.builtins.usize_
+            let lo_local = match lo_box {
+                case .some(let b) => lower_expr_as_temp(mutable builder, Box_HExpr.get(b), types_out, ty_interner, allocator)?
+                case .none => build_mod.materialize_usize_const(mutable builder, 0 as u128, usize_ty, expr.node_id, allocator)?
+            }
+            let hi_local = match hi_box {
+                case .some(let b) => {
+                    let base_hi = lower_expr_as_temp(mutable builder, Box_HExpr.get(b), types_out, ty_interner, allocator)?
+                    if inclusive {
+                        bump_local(mutable builder, base_hi, usize_ty, expr.node_id, allocator)?
+                    } else {
+                        base_hi
+                    }
+                }
+                case .none => build_mod.materialize_len(mutable builder, recv_local, usize_ty, expr.node_id, allocator)?
+            }
+            let result_ty = check_mod.type_of_node(types_out, expr.node_id)
+            builder_mod.push_slice_subrange_in_bounds(mutable builder, allocator)?
+            let result_local = build_mod.project_into_local(
+                mutable builder,
+                recv_local,
+                place_mod.ProjectionKind.slice_subrange(lo_local: lo_local, hi_local: hi_local, proven: false),
+                result_ty,
+                expr.node_id,
+                allocator,
+            )?
+            builder_mod.local_place(result_local)
+        }
+        case .method_call(_, _) => {
+            let temp_local = lower_expr_as_temp(mutable builder, expr, types_out, ty_interner, allocator)?
+            builder_mod.local_place(temp_local)
+        }
+        case .call(_, _) => {
+            let temp_local = lower_expr_as_temp(mutable builder, expr, types_out, ty_interner, allocator)?
+            builder_mod.local_place(temp_local)
+        }
+        case _ => {
+            builder_mod.record_unlowered(mutable builder, expr.node_id, allocator)?
+            builder_mod.local_place(local_mod.LocalId { raw: 0 })
+        }
+    }
+}
+
+
+function bump_local(
+    builder: mutable builder_mod.LowerCtx,
+    base: local_mod.LocalId,
+    usize_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let dest = builder_mod.alloc_local(
+        mutable builder,
+        usize_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let lhs = rvalue_mod.Operand.copy_(place: builder_mod.local_place(base), ty: usize_ty)
+    let one = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant { ty: usize_ty, kind: rvalue_mod.ConstantKind.int_(bits: 1 as u128) },
+    )
+    let dest_place = builder_mod.local_place(dest)
+    let st = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: dest_place,
+            value: rvalue_mod.Rvalue.binary(
+                op: rvalue_mod.MBinOp.add(mode: rvalue_mod.OverflowMode.trapping),
+                lhs: lhs,
+                rhs: one,
+            ),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take st, allocator)?
+    return dest
+}
+
+
+public function lower_expr_as_temp(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let result_ty = check_mod.type_of_node(types_out, expr.node_id)
+    let operand = lower_expr_as_operand(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+    let temp_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: expr.node_id),
+        allocator,
+    )?
+    let dest_place = builder_mod.local_place(temp_local)
+    let assign_stmt = stmt_mod.Statement {
+        origin: expr.node_id,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: dest_place,
+            value: rvalue_mod.Rvalue.use_(operand: operand),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    return temp_local
+}
+
+
+public function lower_expr_as_rvalue(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Rvalue
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return match expr.kind {
+        case .binary(let op, let lhs_box, let rhs_box) => {
+            let lhs_expr = Box_HExpr.get(lhs_box)
+            let rhs_expr = Box_HExpr.get(rhs_box)
+            match op {
+                case .and => {
+                    let sc_ty = check_mod.type_of_node(types_out, expr.node_id)
+                    let value_op = lower_short_circuit(mutable builder, expr.node_id, true, lhs_expr, rhs_expr, sc_ty, types_out, ty_interner, allocator)?
+                    return rvalue_mod.Rvalue.use_(operand: value_op)
+                }
+                case .or => {
+                    let sc_ty = check_mod.type_of_node(types_out, expr.node_id)
+                    let value_op = lower_short_circuit(mutable builder, expr.node_id, false, lhs_expr, rhs_expr, sc_ty, types_out, ty_interner, allocator)?
+                    return rvalue_mod.Rvalue.use_(operand: value_op)
+                }
+                case _ => ()
+            }
+            let lhs_ty = check_mod.type_of_node(types_out, lhs_expr.node_id)
+            let rhs_ty = check_mod.type_of_node(types_out, rhs_expr.node_id)
+            match eq_dispatch_of(builder, op, lhs_ty) {
+                case .some(let target) => {
+                    let eq_lhs = lower_expr_as_operand(mutable builder, lhs_expr, lhs_ty, types_out, ty_interner, allocator)?
+                    let eq_rhs = lower_expr_as_operand(mutable builder, rhs_expr, rhs_ty, types_out, ty_interner, allocator)?
+                    let value_op = lower_nominal_eq_call(
+                        mutable builder, expr.node_id, op, target,
+                        take eq_lhs, take eq_rhs,
+                        types_out, ty_interner, allocator,
+                    )?
+                    return rvalue_mod.Rvalue.use_(operand: value_op)
+                }
+                case .none => ()
+            }
+            let lhs_op = lower_expr_as_operand(mutable builder, lhs_expr, lhs_ty, types_out, ty_interner, allocator)?
+            let rhs_op = lower_expr_as_operand(mutable builder, rhs_expr, rhs_ty, types_out, ty_interner, allocator)?
+            match checked_op_of(op) {
+                case .some(let checked_kind) => {
+                    let value_op = checked_mod.desugar_checked_binop(
+                        mutable builder,
+                        expr.node_id,
+                        checked_kind,
+                        lhs_op,
+                        rhs_op,
+                        lhs_ty,
+                        types_out,
+                        ty_interner,
+                        allocator,
+                    )?
+                    return rvalue_mod.Rvalue.use_(operand: value_op)
+                }
+                case .none => ()
+            }
+            if is_signed_mod(op, lhs_ty, ty_interner) {
+                note_const_divisor(mutable builder, rhs_op, allocator)?
+                builder_mod.push_div_overflow(mutable builder, allocator)?
+                let value_op = checked_mod.desugar_signed_mod(
+                    mutable builder,
+                    expr.node_id,
+                    lhs_op,
+                    rhs_op,
+                    lhs_ty,
+                    types_out,
+                    allocator,
+                )?
+                return rvalue_mod.Rvalue.use_(operand: value_op)
+            }
+            rvalue_mod.Rvalue.binary(op: lower_binop(op), lhs: lhs_op, rhs: rhs_op)
+        }
+        case .unary(let op, let expr_box) => {
+            let inner = Box_HExpr.get(expr_box)
+            let inner_ty = check_mod.type_of_node(types_out, inner.node_id)
+            let inner_op = lower_expr_as_operand(mutable builder, inner, inner_ty, types_out, ty_interner, allocator)?
+            rvalue_mod.Rvalue.unary(op: lower_unop(op), operand: inner_op)
+        }
+        case .cast(let inner_box, _, let mode) => {
+            let inner = Box_HExpr.get(inner_box)
+            let from_ty = check_mod.type_of_node(types_out, inner.node_id)
+            let to_ty = check_mod.type_of_node(types_out, expr.node_id)
+            let inner_op = lower_expr_as_operand(mutable builder, inner, from_ty, types_out, ty_interner, allocator)?
+            let kind = derive_cast_kind(from_ty, to_ty, mode, ty_interner)
+            match kind {
+                case .int_to_int(let cast_mode) => match cast_mode {
+                    case .checked_ => {
+                        let value_op = checked_mod.desugar_checked_cast(
+                            mutable builder,
+                            expr.node_id,
+                            inner_op,
+                            from_ty,
+                            to_ty,
+                            types_out,
+                            ty_interner,
+                            allocator,
+                        )?
+                        return rvalue_mod.Rvalue.use_(operand: value_op)
+                    }
+                    case _ => ()
+                }
+                case _ => ()
+            }
+            rvalue_mod.Rvalue.cast(operand: inner_op, from: from_ty, to: to_ty, kind: kind)
+        }
+        case .tuple(let elements) => {
+            let result_ty = check_mod.type_of_node(types_out, expr.node_id)
+            let operands = lower_elements_as_operands(mutable builder, elements, types_out, ty_interner, allocator)?
+            rvalue_mod.Rvalue.aggregate(
+                kind: rvalue_mod.AggregateKind.tuple,
+                elems: operands,
+                result_ty: result_ty,
+            )
+        }
+        case .struct_lit(let struct_def, let fields) => {
+            let result_ty = check_mod.type_of_node(types_out, expr.node_id)
+            let operands = lower_args(mutable builder, fields, types_out, ty_interner, allocator)?
+            rvalue_mod.Rvalue.aggregate(
+                kind: rvalue_mod.AggregateKind.record(def: struct_def),
+                elems: operands,
+                result_ty: result_ty,
+            )
+        }
+        case .range(let lo_box, let hi_box, _) => {
+            let result_ty = check_mod.type_of_node(types_out, expr.node_id)
+            let operands = lower_range_operands(mutable builder, lo_box, hi_box, types_out, ty_interner, allocator)?
+            rvalue_mod.Rvalue.aggregate(
+                kind: rvalue_mod.AggregateKind.record(def: record_def_of_ty(ty_interner, result_ty)),
+                elems: operands,
+                result_ty: result_ty,
+            )
+        }
+        case .variant_ctor(let vdef, let variant, let vargs) => {
+            let result_ty = check_mod.type_of_node(types_out, expr.node_id)
+            let operands = lower_args(mutable builder, vargs, types_out, ty_interner, allocator)?
+            rvalue_mod.Rvalue.aggregate(
+                kind: rvalue_mod.AggregateKind.variant(def: vdef, variant_idx: variant_index_of(types_out, vdef, variant)),
+                elems: operands,
+                result_ty: result_ty,
+            )
+        }
+        case _ => {
+            builder_mod.record_unlowered(mutable builder, expr.node_id, allocator)?
+            let sentinel_ty = check_mod.type_of_node(types_out, expr.node_id)
+            rvalue_mod.Rvalue.use_(
+                operand: rvalue_mod.Operand.constant(
+                    c: rvalue_mod.Constant {
+                        ty: sentinel_ty,
+                        kind: rvalue_mod.ConstantKind.zero_init,
+                    },
+                ),
+            )
+        }
+    }
+}
+
+
+function lower_range_operands(
+    builder: mutable builder_mod.LowerCtx,
+    lo_box: Box_HExpr,
+    hi_box: Box_HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit operands: Vec_Operand.Vec
+    Vec_Operand.new(init operands, allocator)?
+    let lo = Box_HExpr.get(lo_box)
+    let lo_ty = check_mod.type_of_node(types_out, lo.node_id)
+    let lo_op = lower_expr_as_operand(mutable builder, lo, lo_ty, types_out, ty_interner, allocator)?
+    Vec_Operand.push(mutable operands, take lo_op, allocator)?
+    let hi = Box_HExpr.get(hi_box)
+    let hi_ty = check_mod.type_of_node(types_out, hi.node_id)
+    let hi_op = lower_expr_as_operand(mutable builder, hi, hi_ty, types_out, ty_interner, allocator)?
+    Vec_Operand.push(mutable operands, take hi_op, allocator)?
+    return operands
+}
+
+
+function record_def_of_ty(ty_interner: ty_interner_mod.Interner, t: ty_mod.TyId) -> def_mod.DefId {
+    if (t.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return def_mod.error()
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .record(let d) => d
+        case _ => def_mod.error()
+    }
+}
+
+
+function variant_index_of(types_out: check_mod.TypeOutput, def: def_mod.DefId, variant: symbol_mod.Symbol) -> u32 {
+    return match check_mod.variant_index_of(types_out, def, variant) {
+        case .some(let idx) => idx
+        case .none => 0
+    }
+}
+
+
+function lower_elements_as_operands(
+    builder: mutable builder_mod.LowerCtx,
+    elements: Vec_HExpr.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit operands: Vec_Operand.Vec
+    Vec_Operand.new(init operands, allocator)?
+    let n: usize = Vec_HExpr.len(elements)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let elem = Vec_HExpr.at(elements, i)
+        let elem_ty = check_mod.type_of_node(types_out, elem.node_id)
+        let elem_op = lower_expr_as_operand(mutable builder, elem, elem_ty, types_out, ty_interner, allocator)?
+        Vec_Operand.push(mutable operands, take elem_op, allocator)?
+        i = i + 1
+    }
+    return operands
+}
+
+
+function lower_via_rvalue(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let nat = check_mod.type_of_node(types_out, expr.node_id)
+    let rvalue = lower_expr_as_rvalue(mutable builder, expr, types_out, ty_interner, allocator)?
+    if needs_wide_widen(nat, result_ty, ty_interner) {
+        let inner = emit_rvalue_into_temp(mutable builder, rvalue, nat, expr.node_id, allocator)?
+        let cast_rv = rvalue_mod.Rvalue.cast(
+            operand: inner,
+            from: nat,
+            to: result_ty,
+            kind: rvalue_mod.CastKind.int_to_int(mode: rvalue_mod.OverflowMode.wrapping_),
+        )
+        return emit_rvalue_into_temp(mutable builder, cast_rv, result_ty, expr.node_id, allocator)?
+    }
+    return emit_rvalue_into_temp(mutable builder, rvalue, result_ty, expr.node_id, allocator)?
+}
+
+
+function needs_wide_widen(
+    from_ty: ty_mod.TyId,
+    to_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool
+    with {divergence}
+{
+    return wide_int_kind(to_ty, ty_interner) != (0 as u8)
+        && wide_int_kind(from_ty, ty_interner) == (0 as u8)
+        && cast_is_integer(from_ty, ty_interner)
+}
+
+
+function positional_const_index(e: hir_tree.HExpr) -> u32 {
+    return match e.kind {
+        case .literal(let lit) => match lit {
+            case .int(let v, _) => v as u32 wrapping
+            case _ => 0 as u32
+        }
+        case _ => 0 as u32
+    }
+}
+
+function lower_place_as_operand(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let place = lower_expr_as_place(mutable builder, expr, types_out, ty_interner, allocator)?
+    return rvalue_mod.Operand.copy_(place: place, ty: result_ty)
+}
+
+
+function is_signed_mod(
+    op: ast_ops.BinOp,
+    operand_ty: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+) -> bool {
+    return match op {
+        case .mod => checked_mod.int_shape(operand_ty, ty_interner).signed_
+        case _ => false
+    }
+}
+
+function checked_op_of(op: ast_ops.BinOp) -> Option_CheckedOp.Option {
+    return match op {
+        case .check_add => Option_CheckedOp.some(value: checked_mod.CheckedOp.add_)
+        case .check_sub => Option_CheckedOp.some(value: checked_mod.CheckedOp.sub_)
+        case .check_mul => Option_CheckedOp.some(value: checked_mod.CheckedOp.mul_)
+        case .check_mod => Option_CheckedOp.some(value: checked_mod.CheckedOp.mod_)
+        case _ => Option_CheckedOp.none
+    }
+}
+
+function eq_dispatch_of(
+    builder: builder_mod.LowerCtx,
+    op: ast_ops.BinOp,
+    lhs_ty: ty_mod.TyId,
+) -> Option_EqTarget.Option {
+    let is_eq_family = match op {
+        case .eq => true
+        case .ne => true
+        case _ => false
+    }
+    if !is_eq_family {
+        return Option_EqTarget.none
+    }
+    return eqmap_mod.lookup_target(builder_mod.eq_targets(builder), lhs_ty)
+}
+
+function lower_nominal_eq_call(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    op: ast_ops.BinOp,
+    target: eqmap_mod.EqTarget,
+    lhs_op: take rvalue_mod.Operand,
+    rhs_op: take rvalue_mod.Operand,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let callee = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: target.fn_ty,
+            kind: rvalue_mod.ConstantKind.fn_ref(def: target.comparator),
+        },
+    )
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, take lhs_op, allocator)?
+    Vec_Operand.push(mutable args, take rhs_op, allocator)?
+    let result_ty = check_mod.type_of_node(types_out, call_node)
+    let eq_result = lower_call_with_operands(
+        mutable builder, call_node, callee, args, result_ty,
+        types_out, ty_interner, allocator,
+    )?
+    let is_ne = match op {
+        case .ne => true
+        case _ => false
+    }
+    if !is_ne {
+        return eq_result
+    }
+    return emit_rvalue_into_temp(
+        mutable builder,
+        rvalue_mod.Rvalue.unary(op: rvalue_mod.MUnOp.not_, operand: eq_result),
+        result_ty,
+        call_node,
+        allocator,
+    )?
+}
+
+function lower_binop(op: ast_ops.BinOp) -> rvalue_mod.MBinOp {
+    return match op {
+        case .add => rvalue_mod.MBinOp.add(mode: rvalue_mod.OverflowMode.trapping)
+        case .sub => rvalue_mod.MBinOp.sub(mode: rvalue_mod.OverflowMode.trapping)
+        case .mul => rvalue_mod.MBinOp.mul(mode: rvalue_mod.OverflowMode.trapping)
+        case .div => rvalue_mod.MBinOp.div(mode: rvalue_mod.OverflowMode.trapping, proven_nonzero: false, proven_no_overflow: false)
+        case .mod => rvalue_mod.MBinOp.mod_(mode: rvalue_mod.OverflowMode.trapping, proven_nonzero: false, proven_no_overflow: false)
+        case .wrap_add => rvalue_mod.MBinOp.add(mode: rvalue_mod.OverflowMode.wrapping_)
+        case .wrap_sub => rvalue_mod.MBinOp.sub(mode: rvalue_mod.OverflowMode.wrapping_)
+        case .wrap_mul => rvalue_mod.MBinOp.mul(mode: rvalue_mod.OverflowMode.wrapping_)
+        case .sat_add => rvalue_mod.MBinOp.add(mode: rvalue_mod.OverflowMode.saturating_)
+        case .sat_sub => rvalue_mod.MBinOp.sub(mode: rvalue_mod.OverflowMode.saturating_)
+        case .sat_mul => rvalue_mod.MBinOp.mul(mode: rvalue_mod.OverflowMode.saturating_)
+        case .check_add => rvalue_mod.MBinOp.add(mode: rvalue_mod.OverflowMode.checked_)
+        case .check_sub => rvalue_mod.MBinOp.sub(mode: rvalue_mod.OverflowMode.checked_)
+        case .check_mul => rvalue_mod.MBinOp.mul(mode: rvalue_mod.OverflowMode.checked_)
+        case .check_mod => rvalue_mod.MBinOp.mod_(mode: rvalue_mod.OverflowMode.checked_, proven_nonzero: false, proven_no_overflow: false)
+        case .eq => rvalue_mod.MBinOp.eq
+        case .ne => rvalue_mod.MBinOp.ne
+        case .lt => rvalue_mod.MBinOp.lt
+        case .le => rvalue_mod.MBinOp.le
+        case .gt => rvalue_mod.MBinOp.gt
+        case .ge => rvalue_mod.MBinOp.ge
+        case .and => rvalue_mod.MBinOp.logical_and
+        case .or => rvalue_mod.MBinOp.logical_or
+        case .bit_and => rvalue_mod.MBinOp.bit_and
+        case .bit_or => rvalue_mod.MBinOp.bit_or
+        case .bit_xor => rvalue_mod.MBinOp.bit_xor
+        case .shl => rvalue_mod.MBinOp.shl
+        case .shr => rvalue_mod.MBinOp.shr
+    }
+}
+
+function lower_unop(op: ast_ops.UnOp) -> rvalue_mod.MUnOp {
+    return match op {
+        case .neg => rvalue_mod.MUnOp.neg
+        case .not => rvalue_mod.MUnOp.not_
+        case .bit_not => rvalue_mod.MUnOp.bit_not
+    }
+}
+
+
+function lower_cast_mode(mode: ast_ops.CastMode) -> rvalue_mod.OverflowMode {
+    return match mode {
+        case .trap => rvalue_mod.OverflowMode.trapping
+        case .wrapping_ => rvalue_mod.OverflowMode.wrapping_
+        case .saturating_ => rvalue_mod.OverflowMode.saturating_
+        case .checked_ => rvalue_mod.OverflowMode.checked_
+    }
+}
+
+function cast_is_integer(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let kind) => match kind {
+            case .i8_ => true
+            case .i16_ => true
+            case .i32_ => true
+            case .i64_ => true
+            case .i128_ => true
+            case .u8_ => true
+            case .u16_ => true
+            case .u32_ => true
+            case .u64_ => true
+            case .u128_ => true
+            case .isize_ => true
+            case .usize_ => true
+            case .codepoint_ => true
+            case _ => false
+        }
+        case .refined(let base, _) => cast_is_integer(base, ty_interner)
+        case _ => false
+    }
+}
+
+function cast_is_floating(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let kind) => match kind {
+            case .f32_ => true
+            case .f64_ => true
+            case _ => false
+        }
+        case .refined(let base, _) => cast_is_floating(base, ty_interner)
+        case _ => false
+    }
+}
+
+function cast_is_bool(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return false
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let kind) => match kind {
+            case .bool_ => true
+            case _ => false
+        }
+        case .refined(let base, _) => cast_is_bool(base, ty_interner)
+        case _ => false
+    }
+}
+
+function derive_cast_kind(
+    from_ty: ty_mod.TyId,
+    to_ty: ty_mod.TyId,
+    mode: ast_ops.CastMode,
+    ty_interner: ty_interner_mod.Interner,
+) -> rvalue_mod.CastKind
+    with {panic, divergence}
+{
+    let from_is_int = cast_is_integer(from_ty, ty_interner)
+    let to_is_int = cast_is_integer(to_ty, ty_interner)
+    let from_is_float = cast_is_floating(from_ty, ty_interner)
+    let to_is_float = cast_is_floating(to_ty, ty_interner)
+    let from_is_bool = cast_is_bool(from_ty, ty_interner)
+    if from_is_int && to_is_int {
+        return rvalue_mod.CastKind.int_to_int(mode: lower_cast_mode(mode))
+    }
+    if from_is_int && to_is_float {
+        return rvalue_mod.CastKind.int_to_float
+    }
+    if from_is_float && to_is_int {
+        return rvalue_mod.CastKind.float_to_int(mode: lower_cast_mode(mode))
+    }
+    if from_is_float && to_is_float {
+        return rvalue_mod.CastKind.float_to_float
+    }
+    if from_is_bool && to_is_int {
+        return rvalue_mod.CastKind.bool_to_int
+    }
+    panic("walker.derive_cast_kind: unsupported cast combination — typecheck should have rejected the form before lowering")
+}
+
+
+function lower_cast_operand(
+    builder: mutable builder_mod.LowerCtx,
+    expr: hir_tree.HExpr,
+    inner_box: Box_HExpr,
+    cast_mode: ast_ops.CastMode,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let inner = Box_HExpr.get(inner_box)
+    let from_ty = check_mod.type_of_node(types_out, inner.node_id)
+    let to_ty = check_mod.type_of_node(types_out, expr.node_id)
+    let conv_def = conv_def_for_cast(from_ty, to_ty, cast_mode, ty_interner)
+    if def_mod.is_error(conv_def) {
+        return lower_via_rvalue(mutable builder, expr, result_ty, types_out, ty_interner, allocator)?
+    }
+    let inner_op = lower_expr_as_operand(mutable builder, inner, from_ty, types_out, ty_interner, allocator)?
+    let fw_from = float_width_of(from_ty, ty_interner)
+    let wk_to = wide_int_kind(to_ty, ty_interner)
+    var call_src = inner_op
+    if fw_from != 0 && wk_to != 0 {
+        match cast_mode {
+            case .checked_ => {
+                call_src = checked_mod.checked_float_to_wide_guard(
+                    mutable builder, expr.node_id, inner_op, from_ty, fw_from, wk_to, types_out, allocator,
+                )?
+            }
+            case .trap => {
+                call_src = checked_mod.trapping_float_to_wide_guard(
+                    mutable builder, expr.node_id, inner_op, from_ty, fw_from, wk_to, types_out, allocator,
+                )?
+            }
+            case _ => ()
+        }
+    }
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, take call_src, allocator)?
+    return emit_raw_bridge_call(mutable builder, expr.node_id, conv_def, args, to_ty, false, ty_mod.error(), types_out, allocator)?
+}
+
+
+function conv_def_for_cast(
+    from_ty: ty_mod.TyId,
+    to_ty: ty_mod.TyId,
+    cast_mode: ast_ops.CastMode,
+    ty_interner: ty_interner_mod.Interner,
+) -> def_mod.DefId
+    with {divergence}
+{
+    let fw_to = float_width_of(to_ty, ty_interner)
+    let wk_from = wide_int_kind(from_ty, ty_interner)
+    if fw_to != 0 && wk_from != 0 {
+        if wk_from == 1 {
+            return if fw_to == 2 { builtins_mod.floattidf_reserved() } else { builtins_mod.floattisf_reserved() }
+        }
+        return if fw_to == 2 { builtins_mod.floatuntidf_reserved() } else { builtins_mod.floatuntisf_reserved() }
+    }
+    let fw_from = float_width_of(from_ty, ty_interner)
+    let wk_to = wide_int_kind(to_ty, ty_interner)
+    if fw_from != 0 && wk_to != 0 {
+        return match cast_mode {
+            case .saturating_ => fix_def_for_cast(fw_from, wk_to)
+            case .checked_ => fix_def_for_cast(fw_from, wk_to)
+            case .trap => fix_def_for_cast(fw_from, wk_to)
+            case .wrapping_ => fixwrap_def_for_cast(fw_from)
+        }
+    }
+    return def_mod.error()
+}
+
+
+function fix_def_for_cast(fw_from: u8, wk_to: u8) -> def_mod.DefId {
+    if wk_to == 1 {
+        return if fw_from == 2 { builtins_mod.fixdfti_reserved() } else { builtins_mod.fixsfti_reserved() }
+    }
+    return if fw_from == 2 { builtins_mod.fixunsdfti_reserved() } else { builtins_mod.fixunssfti_reserved() }
+}
+
+
+function fixwrap_def_for_cast(fw_from: u8) -> def_mod.DefId {
+    return if fw_from == 2 { builtins_mod.fixwrapdfti_reserved() } else { builtins_mod.fixwrapsfti_reserved() }
+}
+
+
+function float_width_of(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> u8
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return 0
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let kind) => match kind {
+            case .f32_ => 1
+            case .f64_ => 2
+            case _ => 0
+        }
+        case .refined(let base, _) => float_width_of(base, ty_interner)
+        case _ => 0
+    }
+}
+
+
+function wide_int_kind(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> u8
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return 0
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .primitive(let kind) => match kind {
+            case .i128_ => 1
+            case .u128_ => 2
+            case _ => 0
+        }
+        case .refined(let base, _) => wide_int_kind(base, ty_interner)
+        case _ => 0
+    }
+}
+
+
+function callee_operand_for_def(
+    callee_def: def_mod.DefId,
+    types_out: check_mod.TypeOutput,
+) -> rvalue_mod.Operand {
+    let callee_ty = check_mod.fn_ref_type(types_out, callee_def)
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: callee_ty,
+            kind: rvalue_mod.ConstantKind.fn_ref(def: callee_def),
+        },
+    )
+}
+
+function lower_args(
+    builder: mutable builder_mod.LowerCtx,
+    args: Vec_HArg.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit operands: Vec_Operand.Vec
+    Vec_Operand.new(init operands, allocator)?
+    let n: usize = Vec_HArg.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_HArg.at(args, i)
+        let arg_ty = check_mod.type_of_node(types_out, arg.expr.node_id)
+        let arg_op = lower_expr_as_operand(mutable builder, arg.expr, arg_ty, types_out, ty_interner, allocator)?
+        Vec_Operand.push(mutable operands, take arg_op, allocator)?
+        i = i + 1
+    }
+    return operands
+}
+
+function lower_method_call_operand(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    name: symbol_mod.Symbol,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let recv = Vec_HArg.at(args, 0 as usize).expr
+    let recv_ty = check_mod.type_of_node(types_out, recv.node_id)
+    return match sig_mod.resolve_method_in_index(types_out.method_index, recv_ty, name) {
+        case .some(let def) => lower_call_expr(
+            mutable builder,
+            call_node,
+            callee_operand_for_def(def, types_out),
+            args,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .none => {
+            let b = types_out.builtins
+            let is_alloc_recv = recv_ty.raw == b.allocator.raw || recv_ty.raw == b.bounded_allocator.raw
+            if is_alloc_recv && sig_mod.is_slice_ty(result_ty, ty_interner) && Vec_HArg.len(args) >= 3 as usize {
+                lower_alloc_array_method(mutable builder, call_node, args, result_ty, types_out, ty_interner, allocator)?
+            } else if recv_ty.raw == b.string_.raw && sig_mod.is_slice_ty(result_ty, ty_interner) {
+                lower_expr_as_operand(mutable builder, recv, result_ty, types_out, ty_interner, allocator)?
+            } else {
+                lower_len_intrinsic(mutable builder, recv, result_ty, types_out, ty_interner, allocator)?
+            }
+        }
+    }
+}
+
+
+function lower_alloc_array_method(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let nargs = Vec_HArg.len(args)
+    let recv = Vec_HArg.at(args, 0 as usize).expr
+    let recv_ty = check_mod.type_of_node(types_out, recv.node_id)
+    let recv_op = lower_expr_as_operand(mutable builder, recv, recv_ty, types_out, ty_interner, allocator)?
+    let ef = builder_mod.effect_facts(builder)
+    uninit ops: Vec_Operand.Vec
+    Vec_Operand.new(init ops, allocator)?
+    if nargs >= 4 as usize {
+        let data = Vec_HArg.at(args, 2 as usize).expr
+        let data_ty = check_mod.type_of_node(types_out, data.node_id)
+        let data_op = lower_expr_as_operand(mutable builder, data, data_ty, types_out, ty_interner, allocator)?
+        let n = Vec_HArg.at(args, 3 as usize).expr
+        let n_ty = check_mod.type_of_node(types_out, n.node_id)
+        let n_op = lower_expr_as_operand(mutable builder, n, n_ty, types_out, ty_interner, allocator)?
+        Vec_Operand.push(mutable ops, data_op, allocator)?
+        Vec_Operand.push(mutable ops, n_op, allocator)?
+        Vec_Operand.push(mutable ops, recv_op, allocator)?
+        return build_realloc_array_bridge(mutable builder, call_node, ef, ops, result_ty, types_out, ty_interner, allocator)?
+    }
+    let n = Vec_HArg.at(args, 2 as usize).expr
+    let n_ty = check_mod.type_of_node(types_out, n.node_id)
+    let n_op = lower_expr_as_operand(mutable builder, n, n_ty, types_out, ty_interner, allocator)?
+    Vec_Operand.push(mutable ops, recv_op, allocator)?
+    Vec_Operand.push(mutable ops, n_op, allocator)?
+    return build_alloc_array_bridge(mutable builder, call_node, ef, ops, result_ty, types_out, ty_interner, allocator)?
+}
+
+
+function lower_len_intrinsic(
+    builder: mutable builder_mod.LowerCtx,
+    recv: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let recv_local = lower_expr_as_temp(mutable builder, recv, types_out, ty_interner, allocator)?
+    let recv_place = builder_mod.local_place(recv_local)
+    let len_rvalue = rvalue_mod.Rvalue.len(place: recv_place)
+    let temp_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: recv.node_id),
+        allocator,
+    )?
+    let dest_place = builder_mod.local_place(temp_local)
+    let assign_stmt = stmt_mod.Statement {
+        origin: recv.node_id,
+        kind: stmt_mod.MStmtKind.assign(dest: dest_place, value: len_rvalue),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    let return_place = builder_mod.local_place(temp_local)
+    return rvalue_mod.Operand.copy_(place: return_place, ty: result_ty)
+}
+
+
+function is_signed_int_ty(out: check_mod.TypeOutput, t: ty_mod.TyId) -> bool {
+    let b = out.builtins
+    return t.raw == b.i8_.raw
+        || t.raw == b.i16_.raw
+        || t.raw == b.i32_.raw
+        || t.raw == b.i64_.raw
+        || t.raw == b.i128_.raw
+        || t.raw == b.isize_.raw
+}
+
+function own_allocator_operand(builder: builder_mod.LowerCtx, types_out: check_mod.TypeOutput) -> Option_Operand.Option {
+    if !builder_mod.effect_facts(builder).raises {
+        return Option_Operand.none
+    }
+    return match builder_mod.own_allocator(builder) {
+        case .some(let local) => Option_Operand.some(
+            value: rvalue_mod.Operand.copy_(place: builder_mod.local_place(local), ty: types_out.builtins.allocator),
+        )
+        case .none => Option_Operand.none
+    }
+}
+
+function call_format_target(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    sentinel_def: def_mod.DefId,
+    real_def: def_mod.DefId,
+    arg_op: take rvalue_mod.Operand,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit ops: Vec_Operand.Vec
+    Vec_Operand.new(init ops, allocator)?
+    Vec_Operand.push(mutable ops, take arg_op, allocator)?
+    let target_def = match own_allocator_operand(builder, types_out) {
+        case .some(let alloc_op) => {
+            if def_mod.is_error(real_def) {
+                sentinel_def
+            } else {
+                Vec_Operand.push(mutable ops, alloc_op, allocator)?
+                real_def
+            }
+        }
+        case .none => sentinel_def
+    }
+    if def_mod.is_error(target_def) {
+        builder_mod.record_fmt_target_unresolved(mutable builder, call_node, allocator)?
+        return rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: result_ty,
+                kind: rvalue_mod.ConstantKind.unit_,
+            },
+        )
+    }
+    let callee_op = callee_operand_for_def(target_def, types_out)
+    return lower_call_with_operands(mutable builder, call_node, callee_op, ops, result_ty, types_out, ty_interner, allocator)?
+}
+
+function call_debug_format(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    target: eqmap_mod.EqTarget,
+    arg_op: take rvalue_mod.Operand,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let callee = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: target.fn_ty,
+            kind: rvalue_mod.ConstantKind.fn_ref(def: target.comparator),
+        },
+    )
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, take arg_op, allocator)?
+    return lower_call_with_operands(
+        mutable builder, call_node, callee, args, result_ty,
+        types_out, ty_interner, allocator,
+    )?
+}
+
+function lower_fstring_format(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let arg = Vec_HArg.at(args, 0 as usize).expr
+    let arg_ty = check_mod.type_of_node(types_out, arg.node_id)
+    let b = types_out.builtins
+    let ib = builtins_mod.seed(1 as u32).builtins
+    let ft = builder_mod.fmt_targets(builder)
+    match eqmap_mod.lookup_target(ft.debug, arg_ty) {
+        case .some(let target) => {
+            let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+            return call_debug_format(mutable builder, call_node, target, take op, result_ty, types_out, ty_interner, allocator)?
+        }
+        case .none => ()
+    }
+    if arg_ty.raw == b.bool_.raw {
+        let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+        return call_format_target(mutable builder, call_node, builtins_mod.format_bool(ib), ft.bool_to_string, take op, result_ty, types_out, ty_interner, allocator)?
+    }
+    if check_mod.is_floating(types_out, arg_ty) {
+        let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+        let f_op = if arg_ty.raw == b.f64_.raw {
+            op
+        } else {
+            let cast_rv = rvalue_mod.Rvalue.cast(operand: op, from: arg_ty, to: b.f64_, kind: rvalue_mod.CastKind.float_to_float)
+            emit_rvalue_into_temp(mutable builder, cast_rv, b.f64_, call_node, allocator)?
+        }
+        return call_format_target(mutable builder, call_node, builtins_mod.format_f64(ib), ft.f64_to_string, take f_op, result_ty, types_out, ty_interner, allocator)?
+    }
+    if check_mod.is_integer(types_out, arg_ty) {
+        if arg_ty.raw == b.i128_.raw {
+            let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+            return call_format_target(mutable builder, call_node, ft.format_i128, ft.i128_to_string, take op, result_ty, types_out, ty_interner, allocator)?
+        }
+        if arg_ty.raw == b.u128_.raw {
+            let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+            return call_format_target(mutable builder, call_node, ft.format_u128, ft.u128_to_string, take op, result_ty, types_out, ty_interner, allocator)?
+        }
+        if is_signed_int_ty(types_out, arg_ty) {
+            let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+            let w_op = if arg_ty.raw == b.i64_.raw {
+                op
+            } else {
+                let cast_rv = rvalue_mod.Rvalue.cast(operand: op, from: arg_ty, to: b.i64_, kind: rvalue_mod.CastKind.int_to_int(mode: rvalue_mod.OverflowMode.wrapping_))
+                emit_rvalue_into_temp(mutable builder, cast_rv, b.i64_, call_node, allocator)?
+            }
+            return call_format_target(mutable builder, call_node, builtins_mod.format_i64(ib), ft.i64_to_string, take w_op, result_ty, types_out, ty_interner, allocator)?
+        }
+        let op = lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+        let w_op = if arg_ty.raw == b.u64_.raw {
+            op
+        } else {
+            let cast_rv = rvalue_mod.Rvalue.cast(operand: op, from: arg_ty, to: b.u64_, kind: rvalue_mod.CastKind.int_to_int(mode: rvalue_mod.OverflowMode.wrapping_))
+            emit_rvalue_into_temp(mutable builder, cast_rv, b.u64_, call_node, allocator)?
+        }
+        return call_format_target(mutable builder, call_node, builtins_mod.format_u64(ib), ft.u64_to_string, take w_op, result_ty, types_out, ty_interner, allocator)?
+    }
+    return lower_expr_as_operand(mutable builder, arg, arg_ty, types_out, ty_interner, allocator)?
+}
+
+function lower_string_concat(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    var ops = lower_args(mutable builder, args, types_out, ty_interner, allocator)?
+    let ib = builtins_mod.seed(1 as u32).builtins
+    let ft = builder_mod.fmt_targets(builder)
+    let target_def = match own_allocator_operand(builder, types_out) {
+        case .some(let alloc_op) => {
+            if def_mod.is_error(ft.string_concat) {
+                builtins_mod.string_concat(ib)
+            } else {
+                Vec_Operand.push(mutable ops, alloc_op, allocator)?
+                ft.string_concat
+            }
+        }
+        case .none => builtins_mod.string_concat(ib)
+    }
+    let callee_op = callee_operand_for_def(target_def, types_out)
+    return lower_call_with_operands(mutable builder, call_node, callee_op, ops, result_ty, types_out, ty_interner, allocator)?
+}
+
+function lower_discriminant_of(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let arg = Vec_HArg.at(args, 0 as usize).expr
+    let value_place = lower_expr_as_place(mutable builder, arg, types_out, ty_interner, allocator)?
+    let disc_ty = check_mod.discriminant_ty(types_out)
+    let disc_op = emit_rvalue_into_temp(mutable builder, rvalue_mod.Rvalue.discriminant(place: value_place), disc_ty, call_node, allocator)?
+    return emit_rvalue_into_temp(
+        mutable builder,
+        rvalue_mod.Rvalue.cast(
+            operand: disc_op,
+            from: disc_ty,
+            to: result_ty,
+            kind: rvalue_mod.CastKind.int_to_int(mode: rvalue_mod.OverflowMode.wrapping_),
+        ),
+        result_ty,
+        call_node,
+        allocator,
+    )?
+}
+
+function lower_dyn_variant_ctor(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_expr: hir_tree.HExpr,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Operand.Option
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let callee_node_ty = check_mod.type_of_node(types_out, callee_expr.node_id)
+    if !ty_mod.is_error(callee_node_ty) {
+        let callee_cty = ty_interner_mod.lookup(ty_interner, callee_node_ty)
+        match callee_cty {
+            case .fn_(_, _, _) => return Option_Operand.none
+            case _ => ()
+        }
+    }
+    return match callee_expr.kind {
+        case .positional(let recv_box, let idx_box) => {
+            let recv_ty = check_mod.type_of_node(types_out, Box_HExpr.get(recv_box).node_id)
+            match check_mod.sum_def_of_ty(types_out, recv_ty) {
+                case .some(let sum_def) => {
+                    let variant_idx = positional_const_index(Box_HExpr.get(idx_box))
+                    let operands = lower_args(mutable builder, args, types_out, ty_interner, allocator)?
+                    let rv = rvalue_mod.Rvalue.aggregate(
+                        kind: rvalue_mod.AggregateKind.variant(def: sum_def, variant_idx: variant_idx),
+                        elems: operands,
+                        result_ty: result_ty,
+                    )
+                    Option_Operand.some(value: emit_rvalue_into_temp(mutable builder, rv, result_ty, call_node, allocator)?)
+                }
+                case .none => Option_Operand.none
+            }
+        }
+        case _ => Option_Operand.none
+    }
+}
+
+function lower_call_or_method(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_def: def_mod.DefId,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let ib = builtins_mod.seed(1 as u32).builtins
+    if callee_def.raw == builtins_mod.task_await(ib).raw {
+        return lower_task_await(mutable builder, call_node, callee_def, args, result_ty, types_out, ty_interner, allocator)?
+    }
+    if callee_def.raw == builtins_mod.fstring_format(ib).raw {
+        return lower_fstring_format(mutable builder, call_node, args, result_ty, types_out, ty_interner, allocator)?
+    }
+    if callee_def.raw == builtins_mod.string_concat(ib).raw {
+        return lower_string_concat(mutable builder, call_node, args, result_ty, types_out, ty_interner, allocator)?
+    }
+    if callee_def.raw == builtins_mod.discriminant_of(ib).raw {
+        return lower_discriminant_of(mutable builder, call_node, args, result_ty, types_out, ty_interner, allocator)?
+    }
+    let method_def = check_mod.call_method_of(types_out, call_node)
+    if check_mod.is_len_intrinsic(method_def) {
+        let recv = Vec_HArg.at(args, 0 as usize).expr
+        return lower_len_intrinsic(mutable builder, recv, result_ty, types_out, ty_interner, allocator)?
+    }
+    let callee_op = if def_mod.is_error(method_def) {
+        callee_operand_for_def(callee_def, types_out)
+    } else {
+        callee_operand_for_def(method_def, types_out)
+    }
+    return lower_call_expr(
+        mutable builder,
+        call_node,
+        callee_op,
+        args,
+        result_ty,
+        types_out,
+        ty_interner,
+        allocator,
+    )?
+}
+
+
+function lower_task_await(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_def: def_mod.DefId,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let handle_arg = Vec_HArg.at(args, 0 as usize)
+    let handle_ty = check_mod.type_of_node(types_out, handle_arg.expr.node_id)
+    let handle_op = lower_expr_as_operand(mutable builder, handle_arg.expr, handle_ty, types_out, ty_interner, allocator)?
+    let heap_ptr_ty = types_out.builtins.heap_ptr
+    match triple_mod.os(builder_mod.triple(builder)) {
+        case .browser => return lower_task_await_suspend(mutable builder, call_node, handle_op, heap_ptr_ty, result_ty, types_out, allocator)?
+        case _ => ()
+    }
+    uninit call_args: Vec_Operand.Vec
+    Vec_Operand.new(init call_args, allocator)?
+    Vec_Operand.push(mutable call_args, take handle_op, allocator)?
+    let callee_op = callee_operand_for_def(callee_def, types_out)
+    let raw_op = lower_call_with_operands(mutable builder, call_node, callee_op, call_args, heap_ptr_ty, types_out, ty_interner, allocator)?
+    if result_ty.raw == types_out.builtins.unit_.raw {
+        return rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: result_ty,
+                kind: rvalue_mod.ConstantKind.unit_,
+            },
+        )
+    }
+    let ptr_local = spill_value(mutable builder, raw_op, heap_ptr_ty, call_node, allocator)?
+    return deref_operand(ptr_local, result_ty, allocator)?
+}
+
+function lower_task_await_suspend(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    handle_op: rvalue_mod.Operand,
+    heap_ptr_ty: ty_mod.TyId,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        heap_ptr_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    let dest_place = builder_mod.local_place(dest_local)
+    let resume_block = builder_mod.alloc_block(mutable builder, call_node, Option_RegionId.none, allocator)?
+    let await_term = term_mod.Terminator {
+        origin: call_node,
+        kind: term_mod.TermKind.await_(
+            handle: handle_op,
+            dest: dest_place,
+            return_: resume_block,
+            unwind: term_mod.UnwindAction.propagate,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take await_term, allocator)?
+    builder_mod.switch_to(mutable builder, resume_block)
+    if result_ty.raw == types_out.builtins.unit_.raw {
+        return rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: result_ty,
+                kind: rvalue_mod.ConstantKind.unit_,
+            },
+        )
+    }
+    return deref_operand(dest_local, result_ty, allocator)?
+}
+
+
+public type ByRefSlot {
+    caller_local: local_mod.LocalId
+    addr_local: local_mod.LocalId
+    value_ty: ty_mod.TyId
+}
+
+function arg_is_by_ref(arg: hir_tree.HArg) -> bool {
+    return match arg.mode {
+        case .some(let m) => match m {
+            case .mutable_ => true
+            case .init_ => true
+            case _ => false
+        }
+        case .none => false
+    }
+}
+
+function arg_is_init(arg: hir_tree.HArg) -> bool {
+    return match arg.mode {
+        case .some(let m) => match m {
+            case .init_ => true
+            case _ => false
+        }
+        case .none => false
+    }
+}
+
+function addr_operand_local(addr_op: rvalue_mod.Operand) -> local_mod.LocalId {
+    return match addr_op {
+        case .copy_(let p, _) => p.local
+        case .move_(let p, _) => p.local
+        case _ => local_mod.LocalId { raw: 0 }
+    }
+}
+
+function expr_is_simple_use(expr: hir_tree.HExpr) -> bool {
+    return match expr.kind {
+        case .use_(_) => true
+        case _ => false
+    }
+}
+
+function place_is_sole_deref(p: place_mod.Place) -> bool {
+    if place_mod.proj_len(p) != (1 as usize) { return false }
+    return match place_mod.proj_at(p, 0 as usize).kind {
+        case .deref_ => true
+        case _ => false
+    }
+}
+
+function zero_value_constant(ty: ty_mod.TyId) -> Option_Operand.Option {
+    return Option_Operand.some(
+        value: rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: ty,
+                kind: rvalue_mod.ConstantKind.zero_init,
+            },
+        ),
+    )
+}
+
+
+function zero_value_op(
+    builder: mutable builder_mod.LowerCtx,
+    ty: ty_mod.TyId,
+    call_node: node_mod.NodeId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    fuel: u32,
+    allocator: Allocator,
+) -> Option_Operand.Option
+    with {allocator, err: alloc.AllocError, panic, divergence}
+    decreases fuel
+{
+    if fuel == (0 as u32) {
+        return Option_Operand.none
+    }
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .primitive(_) => zero_value_constant(ty)
+        case .refined(let base, _) => zero_value_op(mutable builder, base, call_node, types_out, ty_interner, fuel - (1 as u32), allocator)?
+        case .record(_) => zero_value_constant(ty)
+        case .slice(_) => zero_value_constant(ty)
+        case .string_ => zero_value_constant(ty)
+        case .sum_(_) => zero_value_constant(ty)
+        case .tuple_(_) => zero_value_constant(ty)
+        case .array(_, _) => zero_value_constant(ty)
+        case _ => Option_Operand.none
+    }
+}
+
+function any_type_meta_arg(args: Vec_HArg.Vec, types_out: check_mod.TypeOutput) -> bool {
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        if check_mod.type_of_node(types_out, a.expr.node_id).raw == types_out.builtins.type_meta.raw {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+function runtime_args_only(args: Vec_HArg.Vec, types_out: check_mod.TypeOutput, allocator: Allocator) -> Vec_HArg.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HArg.Vec
+    Vec_HArg.new(init out, allocator)?
+    let n = Vec_HArg.len(args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let a = Vec_HArg.at(args, i)
+        if check_mod.type_of_node(types_out, a.expr.node_id).raw != types_out.builtins.type_meta.raw {
+            Vec_HArg.push(mutable out, a, allocator)?
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+function lower_call_expr(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_op: rvalue_mod.Operand,
+    args: Vec_HArg.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    var call_args = args
+    if any_type_meta_arg(args, types_out) {
+        call_args = runtime_args_only(args, types_out, allocator)?
+    }
+    uninit operands: Vec_Operand.Vec
+    Vec_Operand.new(init operands, allocator)?
+    uninit byref_slots: Vec_ByRefSlot.Vec
+    Vec_ByRefSlot.new(init byref_slots, allocator)?
+    let n: usize = Vec_HArg.len(call_args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_HArg.at(call_args, i)
+        let arg_ty = check_mod.type_of_node(types_out, arg.expr.node_id)
+        var handled = false
+        if arg_is_by_ref(arg) && expr_is_simple_use(arg.expr) {
+            let caller_place = lower_expr_as_place(mutable builder, arg.expr, types_out, ty_interner, allocator)?
+            if place_mod.proj_len(caller_place) == (0 as usize) {
+                let slot_op = if arg_is_init(arg) {
+                    zero_value_op(mutable builder, arg_ty, call_node, types_out, ty_interner, 16 as u32, allocator)?
+                } else {
+                    Option_Operand.some(value: rvalue_mod.Operand.copy_(place: caller_place, ty: arg_ty))
+                }
+                match slot_op {
+                    case .some(let value_op) => {
+                        let slot = spill_value(mutable builder, value_op, arg_ty, call_node, allocator)?
+                        let addr_op = addr_of_local(mutable builder, slot, rvalue_mod.BorrowKind.mutable_, types_out, call_node, allocator)?
+                        let addr_local = addr_operand_local(addr_op)
+                        Vec_Operand.push(mutable operands, take addr_op, allocator)?
+                        Vec_ByRefSlot.push(
+                            mutable byref_slots,
+                            take ByRefSlot { caller_local: caller_place.local, addr_local: addr_local, value_ty: arg_ty },
+                            allocator,
+                        )?
+                        handled = true
+                    }
+                    case .none => ()
+                }
+            }
+            if place_is_sole_deref(caller_place) {
+                let fwd_op = rvalue_mod.Operand.copy_(
+                    place: builder_mod.local_place(caller_place.local),
+                    ty: types_out.builtins.heap_ptr,
+                )
+                Vec_Operand.push(mutable operands, take fwd_op, allocator)?
+                handled = true
+            }
+        }
+        if handled == false {
+            let arg_op = lower_expr_as_operand(mutable builder, arg.expr, arg_ty, types_out, ty_interner, allocator)?
+            Vec_Operand.push(mutable operands, take arg_op, allocator)?
+        }
+        i = i + 1
+    }
+    emit_call_preconditions(mutable builder, callee_op, call_args, types_out, ty_interner, allocator)?
+    let call_result = lower_call_with_operands(
+        mutable builder,
+        call_node,
+        callee_op,
+        operands,
+        result_ty,
+        types_out,
+        ty_interner,
+        allocator,
+    )?
+    let m: usize = Vec_ByRefSlot.len(byref_slots)
+    var j: usize = 0
+    loop
+        decreases (m - j)
+    {
+        if j >= m {
+            break
+        }
+        let slot = Vec_ByRefSlot.at(byref_slots, j)
+        var deref_place = builder_mod.local_place(slot.addr_local)
+        place_mod.push_projection(
+            mutable deref_place,
+            place_mod.Projection {
+                kind: place_mod.ProjectionKind.deref_,
+                result_ty: slot.value_ty,
+            },
+            allocator,
+        )?
+        let loadback = stmt_mod.Statement {
+            origin: call_node,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: builder_mod.local_place(slot.caller_local),
+                value: rvalue_mod.Rvalue.use_(operand: rvalue_mod.Operand.copy_(place: deref_place, ty: slot.value_ty)),
+            ),
+        }
+        builder_mod.push_stmt(mutable builder, take loadback, allocator)?
+        j = j + 1
+    }
+    return call_result
+}
+
+
+public function lower_call_with_operands(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_op: rvalue_mod.Operand,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    match bridge_kind_of(builder, callee_op) {
+        case .some(let kind) => {
+            match lower_alloc_bridge(mutable builder, call_node, kind, callee_op, arg_operands, result_ty, types_out, ty_interner, allocator)? {
+                case .some(let bridged) => return bridged
+                case .none => ()
+            }
+        }
+        case .none => ()
+    }
+    let call_args = reorder_call_args_for_extern(builder, callee_op, arg_operands, types_out, ty_interner, allocator)?
+    let err_facts = callee_raise_facts(callee_op, types_out)
+    let dest_ty = fallible_dest_ty(builder, callee_op, result_ty, err_facts, ty_interner, types_out)
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        dest_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    let dest_place = builder_mod.local_place(dest_local)
+    let success = builder_mod.alloc_block(
+        mutable builder,
+        call_node,
+        Option_RegionId.none,
+        allocator,
+    )?
+    let unwind = if err_facts.raises {
+        let err_bb = builder_mod.alloc_block(mutable builder, call_node, Option_RegionId.none, allocator)?
+        term_mod.UnwindAction.handler(block: err_bb)
+    } else {
+        term_mod.UnwindAction.propagate
+    }
+    let call_term = term_mod.Terminator {
+        origin: call_node,
+        kind: term_mod.TermKind.call_(
+            callee: callee_op,
+            args: call_args,
+            dest: dest_place,
+            return_: success,
+            unwind: unwind,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take call_term, allocator)?
+    match unwind {
+        case .handler(let err_bb) => fill_call_err_edge(mutable builder, call_node, err_bb, dest_local, err_facts.err_ty, allocator)?
+        case _ => ()
+    }
+    builder_mod.switch_to(mutable builder, success)
+    let return_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: return_place, ty: result_ty)
+}
+
+
+function reorder_call_args_for_extern(
+    builder: builder_mod.LowerCtx,
+    callee_op: rvalue_mod.Operand,
+    arg_operands: Vec_Operand.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    return match callee_op {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => {
+                if !builder_mod.is_extern_def(builder, def) {
+                    arg_operands
+                } else {
+                    match check_mod.signature_of(types_out, def) {
+                        case .some(let sig) => extern_reordered_args(arg_operands, sig, ty_interner, allocator)?
+                        case .none => arg_operands
+                    }
+                }
+            }
+            case _ => arg_operands
+        }
+        case _ => arg_operands
+    }
+}
+
+
+function is_capability_param_ty(ty: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> bool {
+    return match ty_interner_mod.lookup(ty_interner, ty) {
+        case .capability(_) => true
+        case _ => false
+    }
+}
+
+
+function extern_reordered_args(
+    arg_operands: Vec_Operand.Vec,
+    sig: sig_mod.FnSig,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_Operand.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Operand.len(arg_operands)
+    if n != Vec_TyId.len(sig.params) {
+        return arg_operands
+    }
+    uninit reordered: Vec_Operand.Vec
+    Vec_Operand.new(init reordered, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if is_capability_param_ty(Vec_TyId.at(sig.params, i), ty_interner) {
+            Vec_Operand.push(mutable reordered, Vec_Operand.at(arg_operands, i), allocator)?
+        }
+        i += 1
+    }
+    var j: usize = 0
+    loop decreases n - j {
+        if j >= n { break }
+        if !is_capability_param_ty(Vec_TyId.at(sig.params, j), ty_interner) {
+            Vec_Operand.push(mutable reordered, Vec_Operand.at(arg_operands, j), allocator)?
+        }
+        j += 1
+    }
+    return reordered
+}
+
+
+function bridge_kind_of(
+    builder: builder_mod.LowerCtx,
+    callee_op: rvalue_mod.Operand,
+) -> Option_BridgeKind.Option {
+    match callee_op {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => match builder_mod.bridge_ordinal_of(builder, def) {
+                case .some(let ord) => return bridge.from_ordinal(ord)
+                case .none => ()
+            }
+            case _ => ()
+        }
+        case _ => ()
+    }
+    return Option_BridgeKind.none
+}
+
+
+function lower_alloc_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    kind: bridge.BridgeKind,
+    callee_op: rvalue_mod.Operand,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Operand.Option
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return match kind {
+        case .alloc_ => Option_Operand.some(
+            value: build_box_new_bridge(mutable builder, call_node, callee_op, arg_operands, result_ty, types_out, ty_interner, allocator)?,
+        )
+        case .box_read => Option_Operand.some(
+            value: build_box_read_bridge(mutable builder, call_node, arg_operands, result_ty, types_out, ty_interner, allocator)?,
+        )
+        case .box_unbox => Option_Operand.some(
+            value: build_box_unbox_bridge(mutable builder, call_node, arg_operands, result_ty, types_out, ty_interner, allocator)?,
+        )
+        case .alloc_array => Option_Operand.some(
+            value: build_alloc_array_bridge(mutable builder, call_node, callee_raise_facts(callee_op, types_out), arg_operands, result_ty, types_out, ty_interner, allocator)?,
+        )
+        case .realloc_array => Option_Operand.some(
+            value: build_realloc_array_bridge(mutable builder, call_node, callee_raise_facts(callee_op, types_out), arg_operands, result_ty, types_out, ty_interner, allocator)?,
+        )
+        case .copy_array => Option_Operand.some(
+            value: build_copy_array_bridge(mutable builder, call_node, callee_op, arg_operands, types_out, ty_interner, allocator)?,
+        )
+        case .free_ => match callee_op {
+            case .constant(let c) => match c.kind {
+                case .fn_ref(let def) => match builder_mod.box_elem_ty_of(builder, def) {
+                    case .some(let t) => Option_Operand.some(
+                        value: build_box_free_bridge(mutable builder, call_node, callee_op, arg_operands, t, types_out, ty_interner, allocator)?,
+                    )
+                    case .none => Option_Operand.none
+                }
+                case _ => Option_Operand.none
+            }
+            case _ => Option_Operand.none
+        }
+    }
+}
+
+
+function build_box_free_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_op: rvalue_mod.Operand,
+    arg_operands: Vec_Operand.Vec,
+    t: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let b_op = Vec_Operand.at(arg_operands, 0)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, t, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, t, ty_interner, types_out, triple, 1)
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, b_op, allocator)?
+    let ef = callee_raise_facts(callee_op, types_out)
+    return emit_raw_bridge_call(mutable builder, call_node, builtins_mod.free_raw_reserved(), args, types_out.builtins.unit_, ef.raises, ef.err_ty, types_out, allocator)?
+}
+
+
+function build_copy_array_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_op: rvalue_mod.Operand,
+    arg_operands: Vec_Operand.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let dst_op = Vec_Operand.at(arg_operands, 0)
+    let src_op = Vec_Operand.at(arg_operands, 1)
+    let elem_ty = slice_elem_ty(operand_ty(dst_op), ty_interner)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, elem_ty, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, elem_ty, ty_interner, types_out, triple, 1)
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, dst_op, allocator)?
+    Vec_Operand.push(mutable args, src_op, allocator)?
+    let ef = callee_raise_facts(callee_op, types_out)
+    return emit_raw_bridge_call(mutable builder, call_node, builtins_mod.copy_array_raw_reserved(), args, types_out.builtins.unit_, ef.raises, ef.err_ty, types_out, allocator)?
+}
+
+
+function operand_ty(op: rvalue_mod.Operand) -> ty_mod.TyId {
+    return match op {
+        case .copy_(let p, let t) => t
+        case .move_(let p, let t) => t
+        case .constant(let c) => c.ty
+    }
+}
+
+
+function slice_elem_ty(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> ty_mod.TyId
+    with {divergence}
+{
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .slice(let elem) => elem
+        case _ => ty_mod.error()
+    }
+}
+
+
+function usize_const(value: u128, types_out: check_mod.TypeOutput) -> rvalue_mod.Operand {
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: types_out.builtins.usize_,
+            kind: rvalue_mod.ConstantKind.int_(bits: value),
+        },
+    )
+}
+
+
+function layout_op(
+    field: bridge.LayoutField,
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+    fallback: u128,
+) -> rvalue_mod.Operand
+    with {divergence}
+{
+    return match bridge.emit_layout_constant(field, t, ty_interner, types_out, triple) {
+        case .some(let op) => op
+        case .none => usize_const(fallback, types_out)
+    }
+}
+
+
+function type_layout_size(
+    t: ty_mod.TyId,
+    ty_interner: ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+    triple: triple_mod.TargetTriple,
+) -> usize
+    with {divergence}
+{
+    return match engine_mod.compute_layout(t, ty_interner, types_out, triple) {
+        case .ok(let layout) => layout.size
+        case .unsupported(_) => 0 as usize
+    }
+}
+
+
+function widest_err_ty_of(
+    builder: builder_mod.LowerCtx,
+    callee_op: rvalue_mod.Operand,
+    err_facts: effect_row_mod.EffectFacts,
+) -> ty_mod.TyId {
+    match callee_op {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => match builder_mod.err_wide_ty_of(builder, def) {
+                case .some(let t) => return t
+                case .none => ()
+            }
+            case _ => ()
+        }
+        case _ => ()
+    }
+    return err_facts.err_ty
+}
+
+
+function fallible_dest_ty(
+    builder: builder_mod.LowerCtx,
+    callee_op: rvalue_mod.Operand,
+    result_ty: ty_mod.TyId,
+    err_facts: effect_row_mod.EffectFacts,
+    ty_interner: ty_interner_mod.Interner,
+    types_out: check_mod.TypeOutput,
+) -> ty_mod.TyId
+    with {divergence}
+{
+    if !err_facts.raises {
+        return result_ty
+    }
+    let err_ty = widest_err_ty_of(builder, callee_op, err_facts)
+    let triple = builder_mod.triple(builder)
+    let result_size = type_layout_size(result_ty, ty_interner, types_out, triple)
+    let err_size = type_layout_size(err_ty, ty_interner, types_out, triple)
+    if err_size > result_size {
+        return err_ty
+    }
+    return result_ty
+}
+
+
+function addr_of_local(
+    builder: mutable builder_mod.LowerCtx,
+    target: local_mod.LocalId,
+    borrow: rvalue_mod.BorrowKind,
+    types_out: check_mod.TypeOutput,
+    call_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let ref_place = builder_mod.local_place(target)
+    let ref_rv = rvalue_mod.Rvalue.ref_(kind: borrow, place: ref_place)
+    return emit_rvalue_into_temp(mutable builder, ref_rv, types_out.builtins.heap_ptr, call_node, allocator)?
+}
+
+
+function spill_value(
+    builder: mutable builder_mod.LowerCtx,
+    value_op: rvalue_mod.Operand,
+    value_ty: ty_mod.TyId,
+    call_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let slot = builder_mod.alloc_local(
+        mutable builder,
+        value_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    let slot_place = builder_mod.local_place(slot)
+    let assign = stmt_mod.Statement {
+        origin: call_node,
+        kind: stmt_mod.MStmtKind.assign(dest: slot_place, value: rvalue_mod.Rvalue.use_(operand: value_op)),
+    }
+    builder_mod.push_stmt(mutable builder, take assign, allocator)?
+    return slot
+}
+
+
+function zero_slot(
+    builder: mutable builder_mod.LowerCtx,
+    slot_ty: ty_mod.TyId,
+    call_node: node_mod.NodeId,
+    allocator: Allocator,
+) -> local_mod.LocalId
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let zero_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: slot_ty,
+            kind: rvalue_mod.ConstantKind.zero_init,
+        },
+    )
+    return spill_value(mutable builder, zero_op, slot_ty, call_node, allocator)?
+}
+
+
+function emit_raw_bridge_call(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    raw_def: def_mod.DefId,
+    raw_args: Vec_Operand.Vec,
+    dest_ty: ty_mod.TyId,
+    raises: bool,
+    err_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let callee_op = callee_operand_for_def(raw_def, types_out)
+    if raises {
+        return emit_raising_bridge_call(mutable builder, call_node, callee_op, raw_args, dest_ty, err_ty, false, types_out, allocator)?
+    }
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        dest_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    let dest_place = builder_mod.local_place(dest_local)
+    let success = builder_mod.alloc_block(mutable builder, call_node, Option_RegionId.none, allocator)?
+    let call_term = term_mod.Terminator {
+        origin: call_node,
+        kind: term_mod.TermKind.call_(
+            callee: callee_op,
+            args: raw_args,
+            dest: dest_place,
+            return_: success,
+            unwind: term_mod.UnwindAction.propagate,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take call_term, allocator)?
+    builder_mod.switch_to(mutable builder, success)
+    let return_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: return_place, ty: dest_ty)
+}
+
+
+function emit_raising_bridge_call(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_op: rvalue_mod.Operand,
+    raw_args: Vec_Operand.Vec,
+    dest_ty: ty_mod.TyId,
+    err_ty: ty_mod.TyId,
+    trap_on_err: bool,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let buf_ty = builder_mod.outcome_buf_ty_of(builder)
+    let buf_local = builder_mod.alloc_local(
+        mutable builder,
+        buf_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    uninit zero_elems: Vec_Operand.Vec
+    Vec_Operand.new(init zero_elems, allocator)?
+    Vec_Operand.push(mutable zero_elems, zero_word_op(types_out), allocator)?
+    Vec_Operand.push(mutable zero_elems, zero_word_op(types_out), allocator)?
+    Vec_Operand.push(mutable zero_elems, zero_word_op(types_out), allocator)?
+    let buf_init = stmt_mod.Statement {
+        origin: call_node,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(buf_local),
+            value: rvalue_mod.Rvalue.aggregate(kind: rvalue_mod.AggregateKind.tuple, elems: zero_elems, result_ty: buf_ty),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take buf_init, allocator)?
+    let result_local = builder_mod.alloc_local(
+        mutable builder,
+        dest_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    let unit_dest = builder_mod.alloc_local(
+        mutable builder,
+        types_out.builtins.unit_,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: call_node),
+        allocator,
+    )?
+    let buf_ptr = addr_of_local(mutable builder, buf_local, rvalue_mod.BorrowKind.mutable_, types_out, call_node, allocator)?
+    let buf_ptr_local = addr_operand_local(buf_ptr)
+    uninit call_args: Vec_Operand.Vec
+    Vec_Operand.new(init call_args, allocator)?
+    Vec_Operand.push(mutable call_args, buf_ptr, allocator)?
+    let nra = Vec_Operand.len(raw_args)
+    var ai: usize = 0
+    loop decreases nra - ai {
+        if ai >= nra { break }
+        Vec_Operand.push(mutable call_args, Vec_Operand.at(raw_args, ai), allocator)?
+        ai += 1
+    }
+    let post_bb = builder_mod.alloc_block(mutable builder, call_node, Option_RegionId.none, allocator)?
+    let ok_bb = builder_mod.alloc_block(mutable builder, call_node, Option_RegionId.none, allocator)?
+    let err_bb = builder_mod.alloc_block(mutable builder, call_node, Option_RegionId.none, allocator)?
+
+    let call_term = term_mod.Terminator {
+        origin: call_node,
+        kind: term_mod.TermKind.call_(
+            callee: callee_op,
+            args: call_args,
+            dest: builder_mod.local_place(unit_dest),
+            return_: post_bb,
+            unwind: term_mod.UnwindAction.propagate,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take call_term, allocator)?
+
+    builder_mod.switch_to(mutable builder, post_bb)
+    let tag_op = outcome_field_operand(buf_ptr_local, buf_ty, 0, types_out.builtins.usize_, allocator)?
+    let zero_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: types_out.builtins.usize_,
+            kind: rvalue_mod.ConstantKind.int_(bits: 0),
+        },
+    )
+    let cond_op = build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.eq, lhs: tag_op, rhs: zero_op),
+        types_out.builtins.bool_,
+        call_node,
+        allocator,
+    )?
+    let branch_term = term_mod.Terminator {
+        origin: call_node,
+        kind: term_mod.TermKind.branch(cond: cond_op, true_: ok_bb, false_: err_bb),
+    }
+    builder_mod.seal_block_with(mutable builder, take branch_term, allocator)?
+
+    builder_mod.switch_to(mutable builder, err_bb)
+    if trap_on_err {
+        let trap_term = term_mod.Terminator {
+            origin: call_node,
+            kind: term_mod.TermKind.unreachable_,
+        }
+        builder_mod.seal_block_with(mutable builder, take trap_term, allocator)?
+    } else {
+        let err_local = builder_mod.alloc_local(
+            mutable builder,
+            err_ty,
+            body_mod.Mutability.immutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.none,
+            Option_NodeId.some(value: call_node),
+            allocator,
+        )?
+        let err_payload = outcome_field_operand(buf_ptr_local, buf_ty, 1, err_ty, allocator)?
+        let err_assign = stmt_mod.Statement {
+            origin: call_node,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: builder_mod.local_place(err_local),
+                value: rvalue_mod.Rvalue.use_(operand: err_payload),
+            ),
+        }
+        builder_mod.push_stmt(mutable builder, take err_assign, allocator)?
+        fill_call_err_edge(mutable builder, call_node, err_bb, err_local, err_ty, allocator)?
+    }
+
+    builder_mod.switch_to(mutable builder, ok_bb)
+    let ok_payload = outcome_field_operand(buf_ptr_local, buf_ty, 1, dest_ty, allocator)?
+    let ok_assign = stmt_mod.Statement {
+        origin: call_node,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: builder_mod.local_place(result_local),
+            value: rvalue_mod.Rvalue.use_(operand: ok_payload),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take ok_assign, allocator)?
+    let return_place = builder_mod.local_place(result_local)
+    return rvalue_mod.Operand.copy_(place: return_place, ty: dest_ty)
+}
+
+
+function zero_word_op(types_out: check_mod.TypeOutput) -> rvalue_mod.Operand {
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: types_out.builtins.usize_,
+            kind: rvalue_mod.ConstantKind.int_(bits: 0),
+        },
+    )
+}
+
+
+function outcome_field_operand(
+    buf_ptr_local: local_mod.LocalId,
+    buf_ty: ty_mod.TyId,
+    field_idx: u32,
+    result_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    var p = builder_mod.local_place(buf_ptr_local)
+    let deref_proj = place_mod.Projection {
+        kind: place_mod.ProjectionKind.deref_,
+        result_ty: buf_ty,
+    }
+    place_mod.push_projection(mutable p, take deref_proj, allocator)?
+    let field_proj = place_mod.Projection {
+        kind: place_mod.ProjectionKind.field(idx: field_idx),
+        result_ty: result_ty,
+    }
+    place_mod.push_projection(mutable p, take field_proj, allocator)?
+    return rvalue_mod.Operand.copy_(place: p, ty: result_ty)
+}
+
+
+function deref_operand(
+    ptr_local: local_mod.LocalId,
+    result_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    var p = builder_mod.local_place(ptr_local)
+    let deref_proj = place_mod.Projection {
+        kind: place_mod.ProjectionKind.deref_,
+        result_ty: result_ty,
+    }
+    place_mod.push_projection(mutable p, take deref_proj, allocator)?
+    return rvalue_mod.Operand.copy_(place: p, ty: result_ty)
+}
+
+
+function build_box_new_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    callee_op: rvalue_mod.Operand,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let value_op = Vec_Operand.at(arg_operands, 0)
+    let alloc_op = Vec_Operand.at(arg_operands, 1)
+    let t = operand_ty(value_op)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, t, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, t, ty_interner, types_out, triple, 1)
+    let slot = spill_value(mutable builder, value_op, t, call_node, allocator)?
+    let value_ptr = addr_of_local(mutable builder, slot, rvalue_mod.BorrowKind.shared, types_out, call_node, allocator)?
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, alloc_op, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, value_ptr, allocator)?
+    let ef = callee_raise_facts(callee_op, types_out)
+    return emit_raw_bridge_call(mutable builder, call_node, builtins_mod.alloc_raw_reserved(), args, result_ty, ef.raises, ef.err_ty, types_out, allocator)?
+}
+
+
+function build_box_read_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let b_op = Vec_Operand.at(arg_operands, 0)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, result_ty, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, result_ty, ty_interner, types_out, triple, 1)
+    let out_slot = zero_slot(mutable builder, result_ty, call_node, allocator)?
+    let out_ptr = addr_of_local(mutable builder, out_slot, rvalue_mod.BorrowKind.mutable_, types_out, call_node, allocator)?
+    let out_ptr_local = addr_operand_local(out_ptr)
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, b_op, allocator)?
+    Vec_Operand.push(mutable args, out_ptr, allocator)?
+    let _ = emit_raw_bridge_call(mutable builder, call_node, builtins_mod.box_read_raw_reserved(), args, types_out.builtins.unit_, false, ty_mod.error(), types_out, allocator)?
+    return deref_operand(out_ptr_local, result_ty, allocator)?
+}
+
+
+function build_box_unbox_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let b_op = Vec_Operand.at(arg_operands, 0)
+    let alloc_op = Vec_Operand.at(arg_operands, 1)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, result_ty, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, result_ty, ty_interner, types_out, triple, 1)
+    let out_slot = zero_slot(mutable builder, result_ty, call_node, allocator)?
+    let out_ptr = addr_of_local(mutable builder, out_slot, rvalue_mod.BorrowKind.mutable_, types_out, call_node, allocator)?
+    let out_ptr_local = addr_operand_local(out_ptr)
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, alloc_op, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, b_op, allocator)?
+    Vec_Operand.push(mutable args, out_ptr, allocator)?
+    let _ = emit_raw_bridge_call(mutable builder, call_node, builtins_mod.box_unbox_raw_reserved(), args, types_out.builtins.unit_, false, ty_mod.error(), types_out, allocator)?
+    return deref_operand(out_ptr_local, result_ty, allocator)?
+}
+
+
+function build_alloc_array_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    ef: effect_row_mod.EffectFacts,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let alloc_op = Vec_Operand.at(arg_operands, 0)
+    let n_op = Vec_Operand.at(arg_operands, 1)
+    let t = slice_elem_ty(result_ty, ty_interner)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, t, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, t, ty_interner, types_out, triple, 1)
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, alloc_op, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, n_op, allocator)?
+    return emit_raw_bridge_call(mutable builder, call_node, builtins_mod.alloc_array_reserved(), args, result_ty, ef.raises, ef.err_ty, types_out, allocator)?
+}
+
+
+function build_realloc_array_bridge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    ef: effect_row_mod.EffectFacts,
+    arg_operands: Vec_Operand.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let data_op = Vec_Operand.at(arg_operands, 0)
+    let n_op = Vec_Operand.at(arg_operands, 1)
+    let alloc_op = Vec_Operand.at(arg_operands, 2)
+    let t = slice_elem_ty(result_ty, ty_interner)
+    let triple = builder_mod.triple(builder)
+    let size_op = layout_op(bridge.LayoutField.size_, t, ty_interner, types_out, triple, 0)
+    let align_op = layout_op(bridge.LayoutField.align_, t, ty_interner, types_out, triple, 1)
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, alloc_op, allocator)?
+    Vec_Operand.push(mutable args, size_op, allocator)?
+    Vec_Operand.push(mutable args, align_op, allocator)?
+    Vec_Operand.push(mutable args, data_op, allocator)?
+    Vec_Operand.push(mutable args, n_op, allocator)?
+    return emit_raw_bridge_call(mutable builder, call_node, builtins_mod.realloc_array_raw_reserved(), args, result_ty, ef.raises, ef.err_ty, types_out, allocator)?
+}
+
+
+function emit_call_preconditions(
+    builder: mutable builder_mod.LowerCtx,
+    callee_op: rvalue_mod.Operand,
+    args: Vec_HArg.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match callee_op {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => {
+                let i = def_mod.index(def)
+                if i < Vec_FnSig.len(types_out.fn_signatures) {
+                    let sig = Vec_FnSig.at(types_out.fn_signatures, i)
+                    obligation_mod.emit_precondition_obligations(
+                        mutable builder,
+                        sig.param_names,
+                        sig.refinements,
+                        args,
+                        types_out,
+                        ty_interner,
+                        allocator,
+                    )?
+                }
+            }
+            case _ => ()
+        }
+        case _ => ()
+    }
+}
+
+
+function callee_raise_facts(
+    callee_op: rvalue_mod.Operand,
+    types_out: check_mod.TypeOutput,
+) -> effect_row_mod.EffectFacts {
+    match callee_op {
+        case .constant(let c) => match c.kind {
+            case .fn_ref(let def) => {
+                let i = def_mod.index(def)
+                if i < Vec_FnSig.len(types_out.fn_signatures) {
+                    return Vec_FnSig.at(types_out.fn_signatures, i).effect_facts
+                }
+            }
+            case _ => ()
+        }
+        case _ => ()
+    }
+    return effect_row_mod.pure_facts()
+}
+
+
+function fill_call_err_edge(
+    builder: mutable builder_mod.LowerCtx,
+    call_node: node_mod.NodeId,
+    err_bb: block_mod.BlockId,
+    dest_local: local_mod.LocalId,
+    caught_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    builder_mod.switch_to(mutable builder, err_bb)
+    let payload_place = builder_mod.local_place(dest_local)
+    let payload_op = rvalue_mod.Operand.copy_(place: payload_place, ty: caught_ty)
+    match builder_mod.innermost_matching_handler(builder, caught_ty) {
+        case .some(let frame) => {
+            let binder_place = builder_mod.local_place(frame.binder_local)
+            let assign_stmt = stmt_mod.Statement {
+                origin: call_node,
+                kind: stmt_mod.MStmtKind.assign(
+                    dest: binder_place,
+                    value: rvalue_mod.Rvalue.use_(operand: payload_op),
+                ),
+            }
+            builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+            let goto_handler = term_mod.Terminator {
+                origin: call_node,
+                kind: term_mod.TermKind.goto_(target: frame.handler_block),
+            }
+            builder_mod.seal_block_with(mutable builder, take goto_handler, allocator)?
+        }
+        case .none => {
+            let raise_term = term_mod.Terminator {
+                origin: call_node,
+                kind: term_mod.TermKind.raise_(
+                    value: payload_op,
+                    unwind: term_mod.UnwindAction.propagate,
+                ),
+            }
+            builder_mod.seal_block_with(mutable builder, take raise_term, allocator)?
+        }
+    }
+}
+
+
+function lower_raise_expr(
+    builder: mutable builder_mod.LowerCtx,
+    raise_node: node_mod.NodeId,
+    value_expr: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let value_ty = check_mod.type_of_node(types_out, value_expr.node_id)
+    let value_op = lower_expr_as_operand(mutable builder, value_expr, value_ty, types_out, ty_interner, allocator)?
+    match builder_mod.innermost_matching_handler(builder, value_ty) {
+        case .some(let frame) => {
+            let binder_place = builder_mod.local_place(frame.binder_local)
+            let assign_stmt = stmt_mod.Statement {
+                origin: raise_node,
+                kind: stmt_mod.MStmtKind.assign(
+                    dest: binder_place,
+                    value: rvalue_mod.Rvalue.use_(operand: value_op),
+                ),
+            }
+            builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+            let dead_block = builder_mod.alloc_block(mutable builder, raise_node, Option_RegionId.none, allocator)?
+            let goto_handler = term_mod.Terminator {
+                origin: raise_node,
+                kind: term_mod.TermKind.goto_(target: frame.handler_block),
+            }
+            builder_mod.seal_block_with(mutable builder, take goto_handler, allocator)?
+            builder_mod.switch_to(mutable builder, dead_block)
+        }
+        case .none => {
+            let dead_block = builder_mod.alloc_block(mutable builder, raise_node, Option_RegionId.none, allocator)?
+            let raise_term = term_mod.Terminator {
+                origin: raise_node,
+                kind: term_mod.TermKind.raise_(
+                    value: value_op,
+                    unwind: term_mod.UnwindAction.propagate,
+                ),
+            }
+            builder_mod.seal_block_with(mutable builder, take raise_term, allocator)?
+            builder_mod.switch_to(mutable builder, dead_block)
+        }
+    }
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.zero_init,
+        },
+    )
+}
+
+
+function lower_handle_expr(
+    builder: mutable builder_mod.LowerCtx,
+    handle_node: node_mod.NodeId,
+    binder: def_mod.DefId,
+    recovery: hir_tree.HExpr,
+    body: hir_tree.HBlock,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let caught_ty = check_mod.type_of_local(types_out, binder)
+    let binder_local = builder_mod.alloc_local(
+        mutable builder,
+        caught_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: handle_node),
+        allocator,
+    )?
+    builder_mod.bind_local(mutable builder, binder, binder_local, allocator)?
+
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: handle_node),
+        allocator,
+    )?
+    let handler_blk = builder_mod.alloc_block(mutable builder, handle_node, Option_RegionId.none, allocator)?
+    let join_blk = builder_mod.alloc_block(mutable builder, handle_node, Option_RegionId.none, allocator)?
+
+    let frame = builder_mod.HandlerFrame {
+        caught_ty: caught_ty,
+        handler_block: handler_blk,
+        binder_local: binder_local,
+    }
+    builder_mod.enter_handler(mutable builder, take frame, allocator)?
+    let body_op = lower_block(mutable builder, body, types_out, ty_interner, allocator)?
+    let _popped = builder_mod.exit_handler(mutable builder)
+    emit_assign_then_goto(mutable builder, handle_node, dest_local, body_op, join_blk, allocator)?
+
+    builder_mod.switch_to(mutable builder, handler_blk)
+    let rec_op = lower_expr_as_operand(mutable builder, recovery, result_ty, types_out, ty_interner, allocator)?
+    emit_assign_then_goto(mutable builder, handle_node, dest_local, rec_op, join_blk, allocator)?
+
+    builder_mod.switch_to(mutable builder, join_blk)
+    let read_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+
+function lower_panic_expr(
+    builder: mutable builder_mod.LowerCtx,
+    panic_node: node_mod.NodeId,
+    message_expr: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let message_ty = check_mod.type_of_node(types_out, message_expr.node_id)
+    let message_op = lower_expr_as_operand(mutable builder, message_expr, message_ty, types_out, ty_interner, allocator)?
+    let dead_block = builder_mod.alloc_block(
+        mutable builder,
+        panic_node,
+        Option_RegionId.none,
+        allocator,
+    )?
+    let panic_term = term_mod.Terminator {
+        origin: panic_node,
+        kind: term_mod.TermKind.panic_(message: message_op),
+    }
+    builder_mod.seal_block_with(mutable builder, take panic_term, allocator)?
+    builder_mod.switch_to(mutable builder, dead_block)
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.zero_init,
+        },
+    )
+}
+
+
+function ret_is_unit(builder: builder_mod.LowerCtx, ty_interner: ty_interner_mod.Interner) -> bool {
+    return match ty_interner_mod.lookup(ty_interner, builder_mod.return_value_ty(builder)) {
+        case .primitive(let prim) => match prim {
+            case .unit_ => true
+            case _ => false
+        }
+        case _ => false
+    }
+}
+
+function unit_zero_operand(ty: ty_mod.TyId) -> rvalue_mod.Operand {
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: ty,
+            kind: rvalue_mod.ConstantKind.int_(bits: 0 as u128),
+        },
+    )
+}
+
+function assign_return_place(
+    builder: mutable builder_mod.LowerCtx,
+    origin: node_mod.NodeId,
+    value_op: rvalue_mod.Operand,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let return_place = builder_mod.local_place(local_mod.LocalId { raw: 1 })
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: return_place,
+            value: rvalue_mod.Rvalue.use_(operand: value_op),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+}
+
+function lower_return_expr(
+    builder: mutable builder_mod.LowerCtx,
+    return_node: node_mod.NodeId,
+    value_opt: Option_Box_HExpr.Option,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let is_unit = ret_is_unit(builder, ty_interner)
+    match value_opt {
+        case .some(let boxed) => {
+            let value_expr = Box_HExpr.get(boxed)
+            let value_ty = check_mod.type_of_node(types_out, value_expr.node_id)
+            let value_op = lower_expr_as_operand(mutable builder, value_expr, value_ty, types_out, ty_interner, allocator)?
+            let assigned_op = if is_unit {
+                unit_zero_operand(builder_mod.return_value_ty(builder))
+            } else {
+                value_op
+            }
+            assign_return_place(mutable builder, return_node, assigned_op, allocator)?
+            let return_expr_opt = if is_unit { Option_Box_HExpr.none } else { Option_Box_HExpr.some(value: boxed) }
+            obligation_mod.record_return_exit(mutable builder, assigned_op, return_expr_opt, allocator)?
+        }
+        case .none => {
+            if is_unit {
+                let unit_op = unit_zero_operand(builder_mod.return_value_ty(builder))
+                assign_return_place(mutable builder, return_node, unit_op, allocator)?
+                obligation_mod.record_return_exit(mutable builder, unit_op, Option_Box_HExpr.none, allocator)?
+            }
+        }
+    }
+    let dead_block = builder_mod.alloc_block(
+        mutable builder,
+        return_node,
+        Option_RegionId.none,
+        allocator,
+    )?
+    let return_term = term_mod.Terminator {
+        origin: return_node,
+        kind: term_mod.TermKind.return_,
+    }
+    builder_mod.seal_block_with(mutable builder, take return_term, allocator)?
+    builder_mod.switch_to(mutable builder, dead_block)
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.zero_init,
+        },
+    )
+}
+
+
+public function lower_block(
+    builder: mutable builder_mod.LowerCtx,
+    block: hir_tree.HBlock,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return lower_block_impl(mutable builder, block, false, types_out, ty_interner, allocator)?
+}
+
+
+public function lower_fn_body_block(
+    builder: mutable builder_mod.LowerCtx,
+    block: hir_tree.HBlock,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return lower_block_impl(mutable builder, block, true, types_out, ty_interner, allocator)?
+}
+
+
+function lower_block_impl(
+    builder: mutable builder_mod.LowerCtx,
+    block: hir_tree.HBlock,
+    retain_exit_negations: bool,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let n: usize = Vec_HStmt.len(block.stmts)
+    var i: usize = 0
+    var pushed_negations: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let stmt = Vec_HStmt.at(block.stmts, i)
+        lower_stmt(mutable builder, stmt, types_out, ty_interner, allocator)?
+        match early_exit_negation(builder, stmt, types_out, ty_interner, allocator)? {
+            case .some(let neg) => {
+                builder_mod.push_guard_fact(mutable builder, take neg, allocator)?
+                pushed_negations = pushed_negations + 1
+            }
+            case .none => {}
+        }
+        i = i + 1
+    }
+    let out_op = match block.trailing {
+        case .some(let boxed) => {
+            let trailing_expr = Box_HExpr.get(boxed)
+            let trailing_ty = check_mod.type_of_node(types_out, trailing_expr.node_id)
+            lower_expr_as_operand(mutable builder, trailing_expr, trailing_ty, types_out, ty_interner, allocator)?
+        }
+        case .none => {
+            let block_ty = check_mod.type_of_node(types_out, block.node_id)
+            rvalue_mod.Operand.constant(
+                c: rvalue_mod.Constant {
+                    ty: block_ty,
+                    kind: rvalue_mod.ConstantKind.unit_,
+                },
+            )
+        }
+    }
+    if !retain_exit_negations {
+        loop
+            decreases (pushed_negations)
+        {
+            if pushed_negations == 0 as usize {
+                break
+            }
+            builder_mod.pop_guard_fact(mutable builder)
+            pushed_negations = pushed_negations - 1
+        }
+    }
+    return out_op
+}
+
+
+function early_exit_negation(
+    builder: builder_mod.LowerCtx,
+    stmt: hir_tree.HStmt,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Expr.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match stmt.kind {
+        case .let_(_, _, let bindings, _, let init_) => {
+            if Vec_HBinding.len(bindings) != 0 as usize {
+                return Option_Expr.none
+            }
+            match init_.kind {
+                case .if_(let cond_box, let then_block, let else_opt) => {
+                    let has_else = match else_opt {
+                        case .some(_) => true
+                        case .none => false
+                    }
+                    if has_else {
+                        return Option_Expr.none
+                    }
+                    if !block_always_exits(then_block) {
+                        return Option_Expr.none
+                    }
+                    match guard_mod.guard_fact_expr(builder, Box_HExpr.get(cond_box), types_out, ty_interner, allocator)? {
+                        case .some(let g) => Option_Expr.some(value: postcond_mod.negated_expr(take g, allocator)?)
+                        case .none => Option_Expr.none
+                    }
+                }
+                case _ => Option_Expr.none
+            }
+        }
+        case _ => Option_Expr.none
+    }
+}
+
+
+function block_always_exits(b: hir_tree.HBlock) -> bool {
+    return match b.trailing {
+        case .some(let boxed) => match Box_HExpr.get(boxed).kind {
+            case .return_(_) => true
+            case .raise_(_) => true
+            case .panic_(_) => true
+            case _ => false
+        }
+        case .none => false
+    }
+}
+
+public function lower_stmt(
+    builder: mutable builder_mod.LowerCtx,
+    stmt: hir_tree.HStmt,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    match stmt.kind {
+        case .assign(let target, let op, let rhs) => {
+            match op {
+                case .plain => {
+                    let target_place = lower_expr_as_place(mutable builder, target, types_out, ty_interner, allocator)?
+                    let rhs_ty = check_mod.type_of_node(types_out, rhs.node_id)
+                    let rhs_op = lower_expr_as_operand(mutable builder, rhs, rhs_ty, types_out, ty_interner, allocator)?
+                    let assign_stmt = stmt_mod.Statement {
+                        origin: stmt.node_id,
+                        kind: stmt_mod.MStmtKind.assign(
+                            dest: target_place,
+                            value: rvalue_mod.Rvalue.use_(operand: rhs_op),
+                        ),
+                    }
+                    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+                }
+                case _ => lower_compound_assign(mutable builder, stmt.node_id, target, op, rhs, types_out, ty_interner, allocator)?
+            }
+        }
+        case .let_(let binding, _, let bindings, _, let init_) => {
+            lower_let(mutable builder, stmt.node_id, binding, bindings, init_, types_out, ty_interner, allocator)?
+        }
+        case .uninit_(_, let bindings, _) => {
+            lower_uninit(mutable builder, stmt.node_id, bindings, types_out, ty_interner, allocator)?
+        }
+    }
+}
+
+
+function lower_let(
+    builder: mutable builder_mod.LowerCtx,
+    stmt_node: node_mod.NodeId,
+    binding: ast_ops.BindingMode,
+    bindings: Vec_HBinding.Vec,
+    init_: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let mutability = match binding {
+        case .mutable_ => body_mod.Mutability.mutable_
+        case _ => body_mod.Mutability.immutable_
+    }
+    let nb = Vec_HBinding.len(bindings)
+    if nb == 1 as usize {
+        let b = Vec_HBinding.at(bindings, 0 as usize)
+        let bty = check_mod.type_of_local(types_out, b.def_id)
+        let blocal = builder_mod.alloc_local(
+            mutable builder,
+            bty,
+            mutability,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: b.name),
+            Option_NodeId.some(value: stmt_node),
+            allocator,
+        )?
+        builder_mod.bind_local(mutable builder, b.def_id, blocal, allocator)?
+        let init_op = lower_expr_as_operand(mutable builder, init_, bty, types_out, ty_interner, allocator)?
+        let dest_place = builder_mod.local_place(blocal)
+        let assign_stmt = stmt_mod.Statement {
+            origin: stmt_node,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: dest_place,
+                value: rvalue_mod.Rvalue.use_(operand: init_op),
+            ),
+        }
+        builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+        return ()
+    }
+    let init_temp = lower_expr_as_temp(mutable builder, init_, types_out, ty_interner, allocator)?
+    var j: usize = 0
+    loop
+        decreases (nb - j)
+    {
+        if j >= nb {
+            break
+        }
+        let b = Vec_HBinding.at(bindings, j)
+        let bty = check_mod.type_of_local(types_out, b.def_id)
+        let blocal = builder_mod.alloc_local(
+            mutable builder,
+            bty,
+            mutability,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: b.name),
+            Option_NodeId.some(value: stmt_node),
+            allocator,
+        )?
+        builder_mod.bind_local(mutable builder, b.def_id, blocal, allocator)?
+        var src_place = builder_mod.local_place(init_temp)
+        place_mod.push_projection(
+            mutable src_place,
+            place_mod.Projection {
+                kind: place_mod.ProjectionKind.field(idx: j as u32),
+                result_ty: bty,
+            },
+            allocator,
+        )?
+        let dest_place = builder_mod.local_place(blocal)
+        let assign_stmt = stmt_mod.Statement {
+            origin: stmt_node,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: dest_place,
+                value: rvalue_mod.Rvalue.use_(
+                    operand: rvalue_mod.Operand.copy_(place: src_place, ty: bty),
+                ),
+            ),
+        }
+        builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+        j = j + 1
+    }
+}
+
+
+function lower_uninit(
+    builder: mutable builder_mod.LowerCtx,
+    stmt_node: node_mod.NodeId,
+    bindings: Vec_HBinding.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = Vec_HBinding.len(bindings)
+    var j: usize = 0
+    loop
+        decreases (nb - j)
+    {
+        if j >= nb {
+            break
+        }
+        let b = Vec_HBinding.at(bindings, j)
+        let bty = check_mod.type_of_local(types_out, b.def_id)
+        let blocal = builder_mod.alloc_local(
+            mutable builder,
+            bty,
+            body_mod.Mutability.mutable_,
+            body_mod.Consumption.copy_,
+            Option_Symbol.some(value: b.name),
+            Option_NodeId.some(value: stmt_node),
+            allocator,
+        )?
+        builder_mod.bind_local(mutable builder, b.def_id, blocal, allocator)?
+        let seed_stmt = stmt_mod.Statement {
+            origin: stmt_node,
+            kind: stmt_mod.MStmtKind.assign(
+                dest: builder_mod.local_place(blocal),
+                value: rvalue_mod.Rvalue.use_(
+                    operand: rvalue_mod.Operand.constant(
+                        c: rvalue_mod.Constant {
+                            ty: bty,
+                            kind: rvalue_mod.ConstantKind.zero_init,
+                        },
+                    ),
+                ),
+            ),
+        }
+        builder_mod.push_stmt(mutable builder, take seed_stmt, allocator)?
+        j = j + 1
+    }
+}
+
+
+function lower_compound_assign(
+    builder: mutable builder_mod.LowerCtx,
+    stmt_node: node_mod.NodeId,
+    target: hir_tree.HExpr,
+    op: ast_ops.AssignOp,
+    rhs: hir_tree.HExpr,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let target_place = lower_expr_as_place(mutable builder, target, types_out, ty_interner, allocator)?
+    let target_ty = check_mod.type_of_node(types_out, target.node_id)
+    let rhs_ty = check_mod.type_of_node(types_out, rhs.node_id)
+    let rhs_op = lower_expr_as_operand(mutable builder, rhs, rhs_ty, types_out, ty_interner, allocator)?
+    let cur_op = rvalue_mod.Operand.copy_(place: target_place, ty: target_ty)
+    let mbinop = assign_op_to_mbinop(op)
+    let value_rv = rvalue_mod.Rvalue.binary(op: mbinop, lhs: cur_op, rhs: rhs_op)
+    maybe_note_div_obligation(mutable builder, value_rv, allocator)?
+    maybe_note_overflow_obligation(mutable builder, value_rv, allocator)?
+    let assign_stmt = stmt_mod.Statement {
+        origin: stmt_node,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: target_place,
+            value: value_rv,
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+}
+
+
+function assign_op_to_mbinop(op: ast_ops.AssignOp) -> rvalue_mod.MBinOp
+    with {panic}
+{
+    return match op {
+        case .add => rvalue_mod.MBinOp.add(mode: rvalue_mod.OverflowMode.trapping)
+        case .sub => rvalue_mod.MBinOp.sub(mode: rvalue_mod.OverflowMode.trapping)
+        case .mul => rvalue_mod.MBinOp.mul(mode: rvalue_mod.OverflowMode.trapping)
+        case .div => rvalue_mod.MBinOp.div(mode: rvalue_mod.OverflowMode.trapping, proven_nonzero: false, proven_no_overflow: false)
+        case .mod => rvalue_mod.MBinOp.mod_(mode: rvalue_mod.OverflowMode.trapping, proven_nonzero: false, proven_no_overflow: false)
+        case .bit_and => rvalue_mod.MBinOp.bit_and
+        case .bit_or => rvalue_mod.MBinOp.bit_or
+        case .bit_xor => rvalue_mod.MBinOp.bit_xor
+        case .shl => rvalue_mod.MBinOp.shl
+        case .shr => rvalue_mod.MBinOp.shr
+        case .plain => panic("walker.assign_op_to_mbinop: plain assign handled in lower_stmt, not a compound op")
+    }
+}
+
+
+function lower_if_expr(
+    builder: mutable builder_mod.LowerCtx,
+    if_node: node_mod.NodeId,
+    cond_expr: hir_tree.HExpr,
+    then_block: hir_tree.HBlock,
+    else_opt: Option_HBlock.Option,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let cond_ty = check_mod.type_of_node(types_out, cond_expr.node_id)
+    let cond_op = lower_expr_as_operand(mutable builder, cond_expr, cond_ty, types_out, ty_interner, allocator)?
+
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: if_node),
+        allocator,
+    )?
+
+    let then_blk = builder_mod.alloc_block(mutable builder, then_block.node_id, Option_RegionId.none, allocator)?
+    let else_blk = builder_mod.alloc_block(mutable builder, if_node, Option_RegionId.none, allocator)?
+    let join_blk = builder_mod.alloc_block(mutable builder, if_node, Option_RegionId.none, allocator)?
+
+    let branch_term = term_mod.Terminator {
+        origin: if_node,
+        kind: term_mod.TermKind.branch(
+            cond: cond_op,
+            true_: then_blk,
+            false_: else_blk,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take branch_term, allocator)?
+
+    let guard_fact = guard_mod.guard_fact_expr(builder, cond_expr, types_out, ty_interner, allocator)?
+    let has_guard = match guard_fact {
+        case .some(_) => true
+        case .none => false
+    }
+
+    builder_mod.switch_to(mutable builder, then_blk)
+    match guard_fact {
+        case .some(let g) => builder_mod.push_guard_fact(mutable builder, take g, allocator)?
+        case .none => builder_mod.enter_opaque_guards(mutable builder)
+    }
+    let then_op = lower_block(mutable builder, then_block, types_out, ty_interner, allocator)?
+    if has_guard {
+        builder_mod.pop_guard_fact(mutable builder)
+    } else {
+        builder_mod.exit_opaque_guards(mutable builder)
+    }
+    emit_assign_then_goto(mutable builder, if_node, dest_local, then_op, join_blk, allocator)?
+
+    builder_mod.switch_to(mutable builder, else_blk)
+    match guard_fact {
+        case .some(let g) => {
+            let ng = postcond_mod.negated_expr(take g, allocator)?
+            builder_mod.push_guard_fact(mutable builder, take ng, allocator)?
+        }
+        case .none => builder_mod.enter_opaque_guards(mutable builder)
+    }
+    let else_op = match else_opt {
+        case .some(let eb) => lower_block(mutable builder, eb, types_out, ty_interner, allocator)?
+        case .none => rvalue_mod.Operand.constant(
+            c: rvalue_mod.Constant {
+                ty: result_ty,
+                kind: rvalue_mod.ConstantKind.unit_,
+            },
+        )
+    }
+    if has_guard {
+        builder_mod.pop_guard_fact(mutable builder)
+    } else {
+        builder_mod.exit_opaque_guards(mutable builder)
+    }
+    emit_assign_then_goto(mutable builder, if_node, dest_local, else_op, join_blk, allocator)?
+
+    builder_mod.switch_to(mutable builder, join_blk)
+    let read_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+function lower_short_circuit(
+    builder: mutable builder_mod.LowerCtx,
+    node_id: node_mod.NodeId,
+    is_and: bool,
+    lhs_expr: hir_tree.HExpr,
+    rhs_expr: hir_tree.HExpr,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let lhs_ty = check_mod.type_of_node(types_out, lhs_expr.node_id)
+    let lhs_op = lower_expr_as_operand(mutable builder, lhs_expr, lhs_ty, types_out, ty_interner, allocator)?
+
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: node_id),
+        allocator,
+    )?
+
+    let rhs_blk = builder_mod.alloc_block(mutable builder, rhs_expr.node_id, Option_RegionId.none, allocator)?
+    let skip_blk = builder_mod.alloc_block(mutable builder, node_id, Option_RegionId.none, allocator)?
+    let join_blk = builder_mod.alloc_block(mutable builder, node_id, Option_RegionId.none, allocator)?
+
+    let branch_term = term_mod.Terminator {
+        origin: node_id,
+        kind: if is_and {
+            term_mod.TermKind.branch(cond: lhs_op, true_: rhs_blk, false_: skip_blk)
+        } else {
+            term_mod.TermKind.branch(cond: lhs_op, true_: skip_blk, false_: rhs_blk)
+        },
+    }
+    builder_mod.seal_block_with(mutable builder, take branch_term, allocator)?
+
+    builder_mod.switch_to(mutable builder, rhs_blk)
+    let rhs_ty = check_mod.type_of_node(types_out, rhs_expr.node_id)
+    let rhs_op = lower_expr_as_operand(mutable builder, rhs_expr, rhs_ty, types_out, ty_interner, allocator)?
+    emit_assign_then_goto(mutable builder, node_id, dest_local, rhs_op, join_blk, allocator)?
+
+    builder_mod.switch_to(mutable builder, skip_blk)
+    let skip_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.bool_(value: !is_and),
+        },
+    )
+    emit_assign_then_goto(mutable builder, node_id, dest_local, skip_op, join_blk, allocator)?
+
+    builder_mod.switch_to(mutable builder, join_blk)
+    let read_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+
+function emit_assign_then_goto(
+    builder: mutable builder_mod.LowerCtx,
+    origin: node_mod.NodeId,
+    dest_local: local_mod.LocalId,
+    value_op: rvalue_mod.Operand,
+    join: block_mod.BlockId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let dest_place = builder_mod.local_place(dest_local)
+    let assign_stmt = stmt_mod.Statement {
+        origin: origin,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: dest_place,
+            value: rvalue_mod.Rvalue.use_(operand: value_op),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+    let goto_term = term_mod.Terminator {
+        origin: origin,
+        kind: term_mod.TermKind.goto_(target: join),
+    }
+    builder_mod.seal_block_with(mutable builder, take goto_term, allocator)?
+}
+
+
+function lower_loop_expr(
+    builder: mutable builder_mod.LowerCtx,
+    loop_node: node_mod.NodeId,
+    body: hir_tree.HBlock,
+    label: Option_Symbol.Option,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let break_dest = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: loop_node),
+        allocator,
+    )?
+    let header_block = builder_mod.alloc_block(mutable builder, body.node_id, Option_RegionId.none, allocator)?
+    let exit_block = builder_mod.alloc_block(mutable builder, loop_node, Option_RegionId.none, allocator)?
+
+    let frame = builder_mod.LoopFrame {
+        break_target: exit_block,
+        continue_target: header_block,
+        label: label,
+        break_dest: break_dest,
+    }
+    builder_mod.enter_loop(mutable builder, take frame, allocator)?
+
+    let goto_header = term_mod.Terminator {
+        origin: loop_node,
+        kind: term_mod.TermKind.goto_(target: header_block),
+    }
+    builder_mod.seal_block_with(mutable builder, take goto_header, allocator)?
+
+    builder_mod.switch_to(mutable builder, header_block)
+    let _body_op = lower_block(mutable builder, body, types_out, ty_interner, allocator)?
+    let loop_back = term_mod.Terminator {
+        origin: loop_node,
+        kind: term_mod.TermKind.goto_(target: header_block),
+    }
+    builder_mod.seal_block_with(mutable builder, take loop_back, allocator)?
+
+    let _popped = builder_mod.exit_loop(mutable builder)
+
+    builder_mod.switch_to(mutable builder, exit_block)
+    let read_place = builder_mod.local_place(break_dest)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+function lower_break_expr(
+    builder: mutable builder_mod.LowerCtx,
+    break_node: node_mod.NodeId,
+    label: Option_Symbol.Option,
+    value_opt: Option_Box_HExpr.Option,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let frame_opt = match label {
+        case .none => builder_mod.innermost_loop(builder)
+        case .some(let lbl) => builder_mod.find_loop_by_label(builder, lbl)
+    }
+    let frame = match frame_opt {
+        case .some(let f) => f
+        case .none => panic("walker.lower_break_expr: break outside of any loop — typecheck should have rejected before lowering")
+    }
+    match value_opt {
+        case .some(let boxed) => {
+            let value_expr = Box_HExpr.get(boxed)
+            let value_ty = check_mod.type_of_node(types_out, value_expr.node_id)
+            let value_op = lower_expr_as_operand(mutable builder, value_expr, value_ty, types_out, ty_interner, allocator)?
+            let dest_place = builder_mod.local_place(frame.break_dest)
+            let assign_stmt = stmt_mod.Statement {
+                origin: break_node,
+                kind: stmt_mod.MStmtKind.assign(
+                    dest: dest_place,
+                    value: rvalue_mod.Rvalue.use_(operand: value_op),
+                ),
+            }
+            builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+        }
+        case .none => {
+            let dest_ty = builder_mod.local_ty(builder, frame.break_dest)
+            let value_op = rvalue_mod.Operand.constant(
+                c: rvalue_mod.Constant {
+                    ty: dest_ty,
+                    kind: rvalue_mod.ConstantKind.unit_,
+                },
+            )
+            let dest_place = builder_mod.local_place(frame.break_dest)
+            let assign_stmt = stmt_mod.Statement {
+                origin: break_node,
+                kind: stmt_mod.MStmtKind.assign(
+                    dest: dest_place,
+                    value: rvalue_mod.Rvalue.use_(operand: value_op),
+                ),
+            }
+            builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+        }
+    }
+    let dead_block = builder_mod.alloc_block(mutable builder, break_node, Option_RegionId.none, allocator)?
+    let goto_exit = term_mod.Terminator {
+        origin: break_node,
+        kind: term_mod.TermKind.goto_(target: frame.break_target),
+    }
+    builder_mod.seal_block_with(mutable builder, take goto_exit, allocator)?
+    builder_mod.switch_to(mutable builder, dead_block)
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.zero_init,
+        },
+    )
+}
+
+function lower_scope_expr(
+    builder: mutable builder_mod.LowerCtx,
+    scope_node: node_mod.NodeId,
+    kind: ast_ops.ScopeKind,
+    body: hir_tree.HBlock,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return match kind {
+        case .coherence => lower_coherence_scope(
+            mutable builder,
+            scope_node,
+            body,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+        case .exec => lower_exec_scope(
+            mutable builder,
+            scope_node,
+            body,
+            result_ty,
+            types_out,
+            ty_interner,
+            allocator,
+        )?
+    }
+}
+
+
+function lower_exec_scope(
+    builder: mutable builder_mod.LowerCtx,
+    scope_node: node_mod.NodeId,
+    body: hir_tree.HBlock,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let group_local = builder_mod.alloc_local(
+        mutable builder,
+        builder_mod.task_group_ty_of(builder),
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: scope_node),
+        allocator,
+    )?
+    emit_task_group_call(mutable builder, scope_node, builtins_mod.task_group_open_reserved(), Option_LocalId.none, group_local, allocator)?
+    let prev = builder_mod.current_exec_group(builder)
+    builder_mod.set_exec_group(mutable builder, Option_LocalId.some(value: group_local))
+    let body_op = lower_block(mutable builder, body, types_out, ty_interner, allocator)?
+    builder_mod.set_exec_group(mutable builder, prev)
+    let join_dest = builder_mod.alloc_local(
+        mutable builder,
+        builder_mod.task_group_ty_of(builder),
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: scope_node),
+        allocator,
+    )?
+    emit_task_group_call(mutable builder, scope_node, builtins_mod.task_group_join_reserved(), Option_LocalId.some(value: group_local), join_dest, allocator)?
+    return body_op
+}
+
+
+function emit_task_group_call(
+    builder: mutable builder_mod.LowerCtx,
+    scope_node: node_mod.NodeId,
+    callee_def: def_mod.DefId,
+    group_arg: Option_LocalId.Option,
+    dest_local: local_mod.LocalId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let callee = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: ty_mod.error(),
+            kind: rvalue_mod.ConstantKind.fn_ref(def: callee_def),
+        },
+    )
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    match group_arg {
+        case .some(let g) => {
+            let group_op = rvalue_mod.Operand.move_(place: builder_mod.local_place(g), ty: builder_mod.task_group_ty_of(builder))
+            Vec_Operand.push(mutable args, take group_op, allocator)?
+        }
+        case .none => ()
+    }
+    let success = builder_mod.alloc_block(mutable builder, scope_node, Option_RegionId.none, allocator)?
+    let call_term = term_mod.Terminator {
+        origin: scope_node,
+        kind: term_mod.TermKind.call_(
+            callee: callee,
+            args: args,
+            dest: builder_mod.local_place(dest_local),
+            return_: success,
+            unwind: term_mod.UnwindAction.propagate,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take call_term, allocator)?
+    builder_mod.switch_to(mutable builder, success)
+}
+
+
+function lower_spawn_expr(
+    builder: mutable builder_mod.LowerCtx,
+    sp: hir_tree.HSpawn,
+    spawn_node: node_mod.NodeId,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let group_local = match builder_mod.current_exec_group(builder) {
+        case .some(let g) => g
+        case .none => panic("walker.lower_spawn_expr: group.spawn outside any scope(exec) — typecheck should have rejected before lowering")
+    }
+
+    let env_ty = builder_mod.closure_env_ty_of(builder, spawn_node)
+    if ty_mod.is_error(env_ty) {
+        builder_mod.record_unlowered(mutable builder, spawn_node, allocator)?
+        return unsupported_closure_operand(result_ty)
+    }
+    let cap_defs = match builder_mod.spawn_captures_of(builder, spawn_node) {
+        case .some(let defs) => defs
+        case .none => {
+            builder_mod.record_unlowered(mutable builder, spawn_node, allocator)?
+            return unsupported_closure_operand(result_ty)
+        }
+    }
+
+    let unit_ty = types_out.builtins.unit_
+    let body_ty = match sp.body.trailing {
+        case .some(let box) => check_mod.type_of_node(types_out, Box_HExpr.get(box).node_id)
+        case .none => unit_ty
+    }
+    let slot_ty = if body_ty.raw == unit_ty.raw { types_out.builtins.usize_ } else { body_ty }
+    let slot_local = zero_slot(mutable builder, slot_ty, spawn_node, allocator)?
+    let slot_ptr = addr_of_local(mutable builder, slot_local, rvalue_mod.BorrowKind.mutable_, types_out, spawn_node, allocator)?
+
+    uninit elems: Vec_Operand.Vec
+    Vec_Operand.new(init elems, allocator)?
+    Vec_Operand.push(mutable elems, slot_ptr, allocator)?
+    uninit captures: Vec_HCapture.Vec
+    Vec_HCapture.new(init captures, allocator)?
+
+    let nc = Vec_DefId.len(cap_defs)
+    var ci: usize = 0
+    loop decreases (nc - ci) {
+        if ci >= nc { break }
+        let cdef = Vec_DefId.at(cap_defs, ci)
+        let cty = check_mod.type_of_local(types_out, cdef)
+        let clocal = match builder_mod.lookup_local(builder, cdef) {
+            case .some(let l) => l
+            case .none => panic("walker.lower_spawn_expr: capture def lost between envscan collection and emission")
+        }
+        let cplace = builder_mod.local_place(clocal)
+        Vec_Operand.push(mutable elems, rvalue_mod.Operand.copy_(place: cplace, ty: cty), allocator)?
+        let cap = hir_tree.HCapture {
+            def_id: cdef,
+            name: symbol_mod.empty(),
+            mode: ast_ops.CaptureMode.take_,
+        }
+        Vec_HCapture.push(mutable captures, take cap, allocator)?
+        ci = ci + 1
+    }
+
+    let na = Vec_HSpawnArg.len(sp.args)
+    var pi: usize = 0
+    loop decreases (na - pi) {
+        if pi >= na { break }
+        let arg = Vec_HSpawnArg.at(sp.args, pi)
+        let init_ty = check_mod.type_of_node(types_out, arg.init_.node_id)
+        let init_op = lower_expr_as_operand(mutable builder, arg.init_, init_ty, types_out, ty_interner, allocator)?
+        Vec_Operand.push(mutable elems, init_op, allocator)?
+        let acap = hir_tree.HCapture {
+            def_id: arg.def_id,
+            name: arg.name,
+            mode: ast_ops.CaptureMode.take_,
+        }
+        Vec_HCapture.push(mutable captures, take acap, allocator)?
+        pi = pi + 1
+    }
+
+    let env_local = builder_mod.alloc_local(
+        mutable builder,
+        env_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: spawn_node),
+        allocator,
+    )?
+    let agg = rvalue_mod.Rvalue.aggregate(
+        kind: rvalue_mod.AggregateKind.tuple,
+        elems: elems,
+        result_ty: env_ty,
+    )
+    let agg_stmt = stmt_mod.Statement {
+        origin: spawn_node,
+        kind: stmt_mod.MStmtKind.assign(dest: builder_mod.local_place(env_local), value: agg),
+    }
+    builder_mod.push_stmt(mutable builder, take agg_stmt, allocator)?
+    let env_ptr = addr_of_local(mutable builder, env_local, rvalue_mod.BorrowKind.shared, types_out, spawn_node, allocator)?
+    let triple = builder_mod.triple(builder)
+    let env_size = layout_op(bridge.LayoutField.size_, env_ty, ty_interner, types_out, triple, 8)
+
+    uninit args_ops: Vec_Operand.Vec
+    Vec_Operand.new(init args_ops, allocator)?
+    Vec_Operand.push(mutable args_ops, env_ptr, allocator)?
+    Vec_Operand.push(mutable args_ops, env_size, allocator)?
+
+    let base = builder_mod.closure_base(builder)
+    let lifted_def = def_mod.DefId { raw: base +% spawn_node.raw }
+    uninit params: Vec_HClosureParam.Vec
+    Vec_HClosureParam.new(init params, allocator)?
+    let pc = builder_mod.PendingClosure {
+        def_id: lifted_def,
+        name: symbol_mod.empty(),
+        params: params,
+        body: sp.body,
+        return_ty: types_out.builtins.heap_ptr,
+        prepend_env: true,
+        has_capture: false,
+        capture_def: def_mod.error(),
+        capture_name: symbol_mod.empty(),
+        capture_ty: ty_mod.error(),
+        pointer_backed: true,
+        env_ty: env_ty,
+        captures: captures,
+        spawn_result_ty: body_ty,
+    }
+    builder_mod.record_closure(mutable builder, take pc, allocator)?
+
+    let handle_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: spawn_node),
+        allocator,
+    )?
+    let handle_place = builder_mod.local_place(handle_local)
+    let success = builder_mod.alloc_block(mutable builder, spawn_node, Option_RegionId.none, allocator)?
+    let spawn_term = term_mod.Terminator {
+        origin: spawn_node,
+        kind: term_mod.TermKind.spawn_(
+            child: lifted_def,
+            args: args_ops,
+            group_local: group_local,
+            handle_dest: handle_place,
+            return_: success,
+            unwind: term_mod.UnwindAction.propagate,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take spawn_term, allocator)?
+    builder_mod.switch_to(mutable builder, success)
+    let read_place = builder_mod.local_place(handle_local)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+
+function lower_coherence_scope(
+    builder: mutable builder_mod.LowerCtx,
+    scope_node: node_mod.NodeId,
+    body: hir_tree.HBlock,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let region = builder_mod.alloc_region(mutable builder)
+    let region_opt = Option_RegionId.some(value: region)
+
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: scope_node),
+        allocator,
+    )?
+
+    let body_blk = builder_mod.alloc_block(mutable builder, body.node_id, region_opt, allocator)?
+    let after_blk = builder_mod.alloc_block(mutable builder, scope_node, Option_RegionId.none, allocator)?
+
+    let enter_term = term_mod.Terminator {
+        origin: scope_node,
+        kind: term_mod.TermKind.coherence_enter(
+            body_entry: body_blk,
+            exit: after_blk,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take enter_term, allocator)?
+
+    builder_mod.switch_to(mutable builder, body_blk)
+    let outer_region = builder_mod.current_region(builder)
+    builder_mod.set_coherence_region(mutable builder, region_opt)
+    let body_op = lower_block(mutable builder, body, types_out, ty_interner, allocator)?
+    builder_mod.set_coherence_region(mutable builder, outer_region)
+
+    let dest_place = builder_mod.local_place(dest_local)
+    let assign_stmt = stmt_mod.Statement {
+        origin: scope_node,
+        kind: stmt_mod.MStmtKind.assign(
+            dest: dest_place,
+            value: rvalue_mod.Rvalue.use_(operand: body_op),
+        ),
+    }
+    builder_mod.push_stmt(mutable builder, take assign_stmt, allocator)?
+
+    let exit_term = term_mod.Terminator {
+        origin: scope_node,
+        kind: term_mod.TermKind.coherence_exit(target: after_blk),
+    }
+    builder_mod.seal_block_with(mutable builder, take exit_term, allocator)?
+
+    builder_mod.switch_to(mutable builder, after_blk)
+    let read_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+function lower_continue_expr(
+    builder: mutable builder_mod.LowerCtx,
+    cont_node: node_mod.NodeId,
+    label: Option_Symbol.Option,
+    result_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let frame_opt = match label {
+        case .none => builder_mod.innermost_loop(builder)
+        case .some(let lbl) => builder_mod.find_loop_by_label(builder, lbl)
+    }
+    let frame = match frame_opt {
+        case .some(let f) => f
+        case .none => panic("walker.lower_continue_expr: continue outside of any loop — typecheck should have rejected before lowering")
+    }
+    let dead_block = builder_mod.alloc_block(mutable builder, cont_node, Option_RegionId.none, allocator)?
+    let goto_cont = term_mod.Terminator {
+        origin: cont_node,
+        kind: term_mod.TermKind.goto_(target: frame.continue_target),
+    }
+    builder_mod.seal_block_with(mutable builder, take goto_cont, allocator)?
+    builder_mod.switch_to(mutable builder, dead_block)
+    return rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: result_ty,
+            kind: rvalue_mod.ConstantKind.zero_init,
+        },
+    )
+}
+
+
+function lower_match_expr(
+    builder: mutable builder_mod.LowerCtx,
+    match_node: node_mod.NodeId,
+    scrutinee: hir_tree.HExpr,
+    arms: Vec_HArm.Vec,
+    result_ty: ty_mod.TyId,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let scrut_ty = check_mod.type_of_node(types_out, scrutinee.node_id)
+    let scrut_local = lower_expr_as_temp(mutable builder, scrutinee, types_out, ty_interner, allocator)?
+
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        result_ty,
+        body_mod.Mutability.mutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: match_node),
+        allocator,
+    )?
+    let join_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+    let bool_ty = types_out.builtins.bool_
+
+    let n = Vec_HArm.len(arms)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arm = Vec_HArm.at(arms, i)
+        let next_blk = builder_mod.alloc_block(mutable builder, match_node, Option_RegionId.none, allocator)?
+        let matched_blk = builder_mod.alloc_block(mutable builder, arm.body.node_id, Option_RegionId.none, allocator)?
+
+        pattern_mod.emit_arm_match_and_bind(mutable builder, scrut_local, scrut_ty, bool_ty, arm.pat, arm.bindings, matched_blk, next_blk, types_out, ty_interner, match_node, allocator)?
+
+        builder_mod.switch_to(mutable builder, matched_blk)
+        match arm.guard {
+            case .some(let g) => {
+                let gop = lower_expr_as_operand(mutable builder, g, bool_ty, types_out, ty_interner, allocator)?
+                let body_blk = builder_mod.alloc_block(mutable builder, arm.body.node_id, Option_RegionId.none, allocator)?
+                let gterm = term_mod.Terminator {
+                    origin: match_node,
+                    kind: term_mod.TermKind.branch(cond: gop, true_: body_blk, false_: next_blk),
+                }
+                builder_mod.seal_block_with(mutable builder, take gterm, allocator)?
+                builder_mod.switch_to(mutable builder, body_blk)
+            }
+            case .none => ()
+        }
+
+        builder_mod.enter_opaque_guards(mutable builder)
+        let arm_op = lower_expr_as_operand(mutable builder, arm.body, result_ty, types_out, ty_interner, allocator)?
+        builder_mod.exit_opaque_guards(mutable builder)
+        emit_assign_then_goto(mutable builder, match_node, dest_local, arm_op, join_blk, allocator)?
+
+        builder_mod.switch_to(mutable builder, next_blk)
+        i = i + 1
+    }
+
+    let fallthrough_term = term_mod.Terminator {
+        origin: match_node,
+        kind: term_mod.TermKind.unreachable_,
+    }
+    builder_mod.seal_block_with(mutable builder, take fallthrough_term, allocator)?
+
+    builder_mod.switch_to(mutable builder, join_blk)
+    let read_place = builder_mod.local_place(dest_local)
+    return rvalue_mod.Operand.copy_(place: read_place, ty: result_ty)
+}
+
+

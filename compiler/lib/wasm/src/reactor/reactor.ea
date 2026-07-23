@@ -1,0 +1,262 @@
+
+module wasm.reactor.reactor
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.collections.slice
+import local.model as model_mod
+import local.fmt.encode as enc_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(model_mod.ValType)
+spec std.collections.hashmap.IntMap(u32)
+spec std.core.option.Option(u32)
+
+
+public function reactor_kind_for_name(name: String) -> Option_u32.Option {
+    let b = name.bytes()
+    if name_eq(b, "__edda_reactor_store".bytes()) { return Option_u32.some(value: 0 as u32) }
+    if name_eq(b, "__edda_reactor_load_ptr".bytes()) { return Option_u32.some(value: 1 as u32) }
+    if name_eq(b, "__edda_reactor_load_len".bytes()) { return Option_u32.some(value: 2 as u32) }
+    return Option_u32.none
+}
+
+
+function name_eq(b: [u8], lit: [u8]) -> bool {
+    if b.len() != lit.len() { return false }
+    return slice.starts_with_u8(b, lit)
+}
+
+
+function reactor_ptr_offset() -> u32 { return 8 }
+
+
+function reactor_len_offset() -> u32 { return 12 }
+
+
+public function assign_reactor_positions(
+    func_pos: mutable IntMap_u32.IntMap,
+    reactor_def_by_kind: IntMap_u32.IntMap,
+    num_bodies: u32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var slot: u32 = 0
+    var ki: u32 = 0
+    loop decreases (3 as u32) - ki {
+        if ki >= (3 as u32) { break }
+        match IntMap_u32.get(reactor_def_by_kind, ki as i64) {
+            case .some(let def_raw) => {
+                let _ = IntMap_u32.insert(mutable func_pos, def_raw as i64, num_bodies +% slot, allocator)?
+                slot += 1
+            }
+            case .none => ()
+        }
+        ki += 1
+    }
+}
+
+
+public function emit_reactor_intrinsics(
+    wmod: mutable model_mod.WasmModule,
+    reactor_def_by_kind: IntMap_u32.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var ki: u32 = 0
+    loop decreases (3 as u32) - ki {
+        if ki >= (3 as u32) { break }
+        match IntMap_u32.get(reactor_def_by_kind, ki as i64) {
+            case .some(_) => emit_reactor_intrinsic(mutable wmod, ki, allocator)?
+            case .none => ()
+        }
+        ki += 1
+    }
+}
+
+
+function emit_reactor_intrinsic(wmod: mutable model_mod.WasmModule, kind: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValType.Vec
+    Vec_ValType.new(init params, allocator)?
+    uninit results: Vec_ValType.Vec
+    Vec_ValType.new(init results, allocator)?
+    if kind == (0 as u32) {
+        Vec_ValType.push(mutable params, model_mod.ValType.i32_, allocator)?
+        Vec_ValType.push(mutable params, model_mod.ValType.i32_, allocator)?
+    } else {
+        Vec_ValType.push(mutable results, model_mod.ValType.i32_, allocator)?
+    }
+    let type_idx = model_mod.add_type(mutable wmod, take model_mod.FuncType { params: params, results: results }, allocator)?
+    uninit code: Vec_u8.Vec
+    Vec_u8.new(init code, allocator)?
+    emit_reactor_body(mutable code, kind, allocator)?
+    uninit locals: Vec_ValType.Vec
+    Vec_ValType.new(init locals, allocator)?
+    let _ = model_mod.add_func(mutable wmod, take model_mod.Func { type_idx: type_idx, locals: locals, body: code }, allocator)?
+}
+
+
+function emit_reactor_body(code: mutable Vec_u8.Vec, kind: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if kind == (0 as u32) {
+        emit_i32_const(mutable code, reactor_ptr_offset(), allocator)?
+        emit_local_get(mutable code, 0 as u32, allocator)?
+        emit_i32_store(mutable code, allocator)?
+        emit_i32_const(mutable code, reactor_len_offset(), allocator)?
+        emit_local_get(mutable code, 1 as u32, allocator)?
+        emit_i32_store(mutable code, allocator)?
+        return
+    }
+    let off = if kind == (1 as u32) { reactor_ptr_offset() } else { reactor_len_offset() }
+    emit_i32_const(mutable code, off, allocator)?
+    emit_i32_load(mutable code, allocator)?
+}
+
+
+function emit_i32_const(code: mutable Vec_u8.Vec, value: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x41, allocator)?
+    enc_mod.sleb(mutable code, value as i64, allocator)?
+}
+
+
+function emit_local_get(code: mutable Vec_u8.Vec, idx: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x20, allocator)?
+    enc_mod.uleb(mutable code, idx as u64, allocator)?
+}
+
+
+function emit_i32_store(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x36, allocator)?
+    enc_mod.uleb(mutable code, 2 as u64, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+}
+
+
+function emit_i32_load(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x28, allocator)?
+    enc_mod.uleb(mutable code, 2 as u64, allocator)?
+    enc_mod.uleb(mutable code, 0 as u64, allocator)?
+}
+
+
+function emit_i64_extend_u(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0xAD, allocator)?
+}
+
+
+function emit_i64_const(code: mutable Vec_u8.Vec, value: i64, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x42, allocator)?
+    enc_mod.sleb(mutable code, value, allocator)?
+}
+
+
+function emit_i64_shl(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x86, allocator)?
+}
+
+
+function emit_i64_or(code: mutable Vec_u8.Vec, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x84, allocator)?
+}
+
+
+function emit_call(code: mutable Vec_u8.Vec, idx: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    enc_mod.push_byte(mutable code, 0x10, allocator)?
+    enc_mod.uleb(mutable code, idx as u64, allocator)?
+}
+
+
+function emit_reactor_call_body(code: mutable Vec_u8.Vec, param_count: u32, callee_idx: u32, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    emit_i32_const(mutable code, reactor_ptr_offset(), allocator)?
+    emit_i32_load(mutable code, allocator)?
+    emit_i64_extend_u(mutable code, allocator)?
+    emit_i32_const(mutable code, reactor_len_offset(), allocator)?
+    emit_i32_load(mutable code, allocator)?
+    emit_i64_extend_u(mutable code, allocator)?
+    emit_i64_const(mutable code, 32 as i64, allocator)?
+    emit_i64_shl(mutable code, allocator)?
+    emit_i64_or(mutable code, allocator)?
+    var i: u32 = 0
+    loop decreases param_count - i {
+        if i >= param_count { break }
+        emit_local_get(mutable code, i, allocator)?
+        i += 1
+    }
+    emit_call(mutable code, callee_idx, allocator)?
+}
+
+
+public function emit_reactor_exports(
+    wmod: mutable model_mod.WasmModule,
+    num_imports: u32,
+    wake_idx: Option_u32.Option,
+    dispatch_idx: Option_u32.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    emit_reactor_export(mutable wmod, num_imports, "__edda_wake", 4 as u32, wake_idx, allocator)?
+    emit_reactor_export(mutable wmod, num_imports, "__edda_dispatch_event", 3 as u32, dispatch_idx, allocator)?
+}
+
+
+function emit_reactor_export(
+    wmod: mutable model_mod.WasmModule,
+    num_imports: u32,
+    name: String,
+    param_count: u32,
+    callee_idx: Option_u32.Option,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_ValType.Vec
+    Vec_ValType.new(init params, allocator)?
+    var i: u32 = 0
+    loop decreases param_count - i {
+        if i >= param_count { break }
+        Vec_ValType.push(mutable params, model_mod.ValType.i32_, allocator)?
+        i += 1
+    }
+    uninit results: Vec_ValType.Vec
+    Vec_ValType.new(init results, allocator)?
+    let type_idx = model_mod.add_type(mutable wmod, take model_mod.FuncType { params: params, results: results }, allocator)?
+    uninit locals: Vec_ValType.Vec
+    Vec_ValType.new(init locals, allocator)?
+    uninit code: Vec_u8.Vec
+    Vec_u8.new(init code, allocator)?
+    match callee_idx {
+        case .some(let idx) => emit_reactor_call_body(mutable code, param_count, idx, allocator)?
+        case .none => ()
+    }
+    let func_idx = model_mod.add_func(mutable wmod, take model_mod.Func { type_idx: type_idx, locals: locals, body: code }, allocator)?
+    model_mod.add_export(mutable wmod, take model_mod.Export { name: name, func_idx: num_imports +% func_idx }, allocator)?
+}

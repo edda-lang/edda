@@ -1,0 +1,79 @@
+module debug.codeview.files.files
+
+import std.mem.alloc
+import std.collections.vec
+
+import debug.codeview.cursor.cursor as cursor_mod
+import debug.model as model_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(String)
+
+
+public type FileTable {
+    offsets: Vec_u32.Vec
+    paths: Vec_String.Vec
+}
+
+
+public function empty(allocator: Allocator) -> FileTable
+    with {allocator, err: alloc.AllocError}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    uninit paths: Vec_String.Vec
+    Vec_String.new(init paths, allocator)?
+    return FileTable { offsets: offsets, paths: paths }
+}
+
+
+public function parse_filechecksums(
+    bytes: Vec_u8.Vec,
+    payload_lo: usize,
+    payload_hi: usize,
+    string_base: usize,
+    allocator: Allocator,
+) -> FileTable
+    with {allocator, err: model_mod.DebugError, err: alloc.AllocError}
+{
+    uninit offsets: Vec_u32.Vec
+    Vec_u32.new(init offsets, allocator)?
+    uninit paths: Vec_String.Vec
+    Vec_String.new(init paths, allocator)?
+
+    var cur = cursor_mod.Cursor { pos: payload_lo }
+    let span = if payload_hi > payload_lo { payload_hi - payload_lo } else { 0 as usize }
+    var step: usize = 0
+    loop decreases span - step {
+        if step >= span { break }
+        if cur.pos >= payload_hi { break }
+        let entry_off = cur.pos - payload_lo
+        let string_offset = cursor_mod.read_u32_le(bytes, mutable cur)?
+        let cb = cursor_mod.read_u8(bytes, mutable cur)?
+        let _kind = cursor_mod.read_u8(bytes, mutable cur)?
+        cursor_mod.seek(mutable cur, cur.pos + (cb as usize))
+        cursor_mod.align_to_4(mutable cur)
+
+        var path_cur = cursor_mod.Cursor { pos: string_base + (string_offset as usize) }
+        let path = cursor_mod.read_cstr(bytes, mutable path_cur, allocator)?
+
+        Vec_u32.push(mutable offsets, entry_off as u32 wrapping, allocator)?
+        Vec_String.push(mutable paths, path, allocator)?
+        step += 1
+    }
+    return FileTable { offsets: offsets, paths: paths }
+}
+
+
+public function lookup_path(ft: FileTable, file_id: u32) -> String {
+    let n = Vec_u32.len(ft.offsets)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_u32.at(ft.offsets, i) == file_id { return Vec_String.at(ft.paths, i) }
+        i += 1
+    }
+    return "unknown"
+}

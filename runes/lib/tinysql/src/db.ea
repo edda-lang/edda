@@ -1,0 +1,75 @@
+module tinysql.db
+
+import std.mem.alloc
+import std.os.fs as fsmod
+import std.text.string
+import tinysql.model.schema
+import tinysql.model.ast
+import tinysql.model.error
+import tinysql.parse.parse as parse_mod
+import tinysql.exec.exec
+import tinysql.store.write
+import tinysql.store.read
+
+public function open(rfs: ReadOnlyFilesystem, path: String, allocator: Allocator) -> schema.Database
+    with {rfs, allocator, err: error.SqlError}
+{
+    return handle err: alloc.AllocError -> { raise error.SqlError.allocation_failed } {
+        handle err: fsmod.FsError -> { raise error.SqlError.io_error } {
+            if !fsmod.path_exists(rfs, path) {
+                uninit db: schema.Database
+                schema.new_database(init db, allocator)?
+                db
+            } else {
+                let bytes = fsmod.read_bytes(rfs, path, allocator)?
+                read.deserialize(bytes, allocator)?
+            }
+        }
+    }
+}
+
+function _persist(db: schema.Database, fs: Filesystem, path: String, allocator: Allocator) -> ()
+    with {fs, allocator, err: error.SqlError}
+{
+    return handle err: alloc.AllocError -> { raise error.SqlError.allocation_failed } {
+        handle err: fsmod.FsError -> { raise error.SqlError.io_error } {
+            let bytes = write.serialize(db, allocator)?
+            let tmp = string.concat(path, ".tmp", allocator)?
+            fsmod.write_bytes(fs, tmp, bytes)?
+            fsmod.rename(fs, tmp, path)?
+            ()
+        }
+    }
+}
+
+function _is_mutating(stmt: ast.Statement) -> bool {
+    return match stmt {
+        case .select(_, _, _) => false
+        case _                => true
+    }
+}
+
+public function execute_sql(
+    db: mutable schema.Database,
+    fs: Filesystem,
+    path: String,
+    sql: String,
+    allocator: Allocator,
+) -> exec.ResultSet
+    with {fs, allocator, err: error.SqlError}
+{
+    let stmt = parse_mod.parse(sql, allocator)?
+    let mutating = _is_mutating(stmt)
+    let out_set = handle err: alloc.AllocError -> { raise error.SqlError.allocation_failed } {
+        exec.execute(mutable db, stmt, allocator)?
+    }
+    if mutating { _persist(db, fs, path, allocator)? }
+    return out_set
+}
+
+public function commit(db: schema.Database, fs: Filesystem, path: String, allocator: Allocator) -> ()
+    with {fs, allocator, err: error.SqlError}
+{
+    _persist(db, fs, path, allocator)?
+    return ()
+}

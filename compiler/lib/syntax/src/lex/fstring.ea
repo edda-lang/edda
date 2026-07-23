@@ -1,0 +1,197 @@
+
+module syntax.lex.fstring
+
+import std.mem.alloc
+import std.collections.vec
+import span.file as file_mod
+import span.loc.pos.span as span_mod
+import intern.interner as interner_mod
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.kind as kind_mod
+import syntax.tokens.lexed as lexed_mod
+import local.lex.scan as scan_mod
+import local.lex.util.util as util_mod
+
+spec std.collections.vec.Vec(lexed_mod.Lexed)
+
+
+public function emit_one(
+    bytes: [u8],
+    file: file_mod.FileId,
+    start: usize,
+    leading_newline: bool,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    out: mutable Vec_Lexed,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+    requires start < bytes.len()
+    ensures result > start
+{
+    let n = bytes.len()
+    let b = bytes[start]
+    if b == 0x66 && start + 1 < n && bytes[start + 1] == 0x22 {
+        return lex_fstring_stream(bytes, file, start, leading_newline, mutable interner, mutable diags, mutable out, allocator)?
+    }
+    let r = scan_mod.next_token(bytes, file, start, mutable interner, mutable diags, allocator)?
+    let span = util_mod.sp(file, start, r.1)
+    let lx = lexed_mod.Lexed { kind: r.0, span: span, leading_newline: leading_newline }
+    Vec_Lexed.push(mutable out, lx, allocator)?
+    return r.1
+}
+
+
+function lex_fstring_stream(
+    bytes: [u8],
+    file: file_mod.FileId,
+    start: usize,
+    leading_newline: bool,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    out: mutable Vec_Lexed,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+    requires start + 1 < bytes.len()
+    ensures result > start
+{
+    let n = bytes.len()
+    let begin = lexed_mod.Lexed {
+        kind: kind_mod.Token.fstr_begin,
+        span: util_mod.sp(file, start, start + 2),
+        leading_newline: leading_newline,
+    }
+    Vec_Lexed.push(mutable out, begin, allocator)?
+    var p = start + 2
+    var text_start = p
+    loop {
+        if p >= n {
+            flush_text(bytes, file, text_start, n, mutable interner, mutable out, allocator)?
+            util_mod.emit_error(mutable diags, util_mod.sp(file, start, n), "unterminated f-string", allocator)?
+            push_fstr(mutable out, kind_mod.Token.fstr_end, util_mod.sp(file, n, n), allocator)?
+            return n
+        }
+        let b = bytes[p]
+        if b == 0x22 {
+            flush_text(bytes, file, text_start, p, mutable interner, mutable out, allocator)?
+            push_fstr(mutable out, kind_mod.Token.fstr_end, util_mod.sp(file, p, p + 1), allocator)?
+            return p + 1
+        }
+        if b == 0x0A {
+            flush_text(bytes, file, text_start, p, mutable interner, mutable out, allocator)?
+            util_mod.emit_error(mutable diags, util_mod.sp(file, start, p), "unterminated f-string at end of line", allocator)?
+            push_fstr(mutable out, kind_mod.Token.fstr_end, util_mod.sp(file, p, p), allocator)?
+            return p
+        }
+        if b == 0x5C {
+            p = p + 1
+            if p < n {
+                p = p + util_mod.utf8_width(bytes[p])
+                if p > n { p = n }
+            }
+            continue
+        }
+        if b == 0x7B && p + 1 < n && bytes[p + 1] == 0x7B {
+            p = p + 2
+            continue
+        }
+        if b == 0x7D && p + 1 < n && bytes[p + 1] == 0x7D {
+            p = p + 2
+            continue
+        }
+        if b == 0x7B {
+            flush_text(bytes, file, text_start, p, mutable interner, mutable out, allocator)?
+            push_fstr(mutable out, kind_mod.Token.fstr_expr_begin, util_mod.sp(file, p, p + 1), allocator)?
+            p = lex_fstring_slot(bytes, file, p + 1, mutable interner, mutable diags, mutable out, allocator)?
+            text_start = p
+            continue
+        }
+        p = p + util_mod.utf8_width(b)
+        if p > n { p = n }
+    }
+}
+
+
+function lex_fstring_slot(
+    bytes: [u8],
+    file: file_mod.FileId,
+    start: usize,
+    interner: mutable interner_mod.Interner,
+    diags: mutable diags_mod.Diagnostics,
+    out: mutable Vec_Lexed,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: alloc.AllocError, divergence}
+    requires start <= bytes.len()
+    ensures result >= start
+{
+    let n = bytes.len()
+    var p = start
+    var depth: u32 = 0
+    loop {
+        let triv = scan_mod.skip_trivia(bytes, p)
+        p = triv.0
+        let nl = triv.1
+        if p >= n {
+            push_fstr(mutable out, kind_mod.Token.fstr_expr_end, util_mod.sp(file, n, n), allocator)?
+            util_mod.emit_error(mutable diags, util_mod.sp(file, start, n), "unterminated f-string interpolation", allocator)?
+            return n
+        }
+        let b = bytes[p]
+        if b == 0x7D && depth == 0 {
+            push_fstr(mutable out, kind_mod.Token.fstr_expr_end, util_mod.sp(file, p, p + 1), allocator)?
+            return p + 1
+        }
+        let before = Vec_Lexed.len(out)
+        let np = emit_one(bytes, file, p, nl, mutable interner, mutable diags, mutable out, allocator)?
+        let after = Vec_Lexed.len(out)
+        if after > before {
+            let last = Vec_Lexed.at(out, after - 1)
+            match last.kind {
+                case .l_brace => { depth = depth + 1 }
+                case .r_brace => { if depth > 0 { depth = depth - 1 } }
+                case _ => ()
+            }
+        }
+        p = np
+    }
+}
+
+
+function flush_text(
+    bytes: [u8],
+    file: file_mod.FileId,
+    text_start: usize,
+    text_end: usize,
+    interner: mutable interner_mod.Interner,
+    out: mutable Vec_Lexed,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires text_start <= text_end
+    requires text_end <= bytes.len()
+{
+    if text_end > text_start {
+        let sym = interner_mod.intern_bytes(mutable interner, bytes[text_start..<text_end], allocator)?
+        let lx = lexed_mod.Lexed {
+            kind: kind_mod.Token.fstr_text(sym: sym),
+            span: util_mod.sp(file, text_start, text_end),
+            leading_newline: false,
+        }
+        Vec_Lexed.push(mutable out, lx, allocator)?
+    }
+}
+
+
+function push_fstr(
+    out: mutable Vec_Lexed,
+    tok: kind_mod.Token,
+    span: span_mod.Span,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let lx = lexed_mod.Lexed { kind: tok, span: span, leading_newline: false }
+    Vec_Lexed.push(mutable out, lx, allocator)?
+}

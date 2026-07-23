@@ -1,0 +1,120 @@
+
+module std.compress.zstd.bits.stream
+
+
+public type Back {
+    remaining: usize
+    debt: usize
+    overrun: bool
+}
+
+public function open_back(data: [u8]) -> Back {
+    if data.len() == 0 { return Back { remaining: 0, debt: 0, overrun: true } }
+    let last: u8 = data[data.len() - 1]
+    if last == 0x00 { return Back { remaining: 0, debt: 0, overrun: true } }
+    var high: usize = 0
+    var probe: u8 = last
+    loop
+        decreases probe
+    {
+        if probe <= 1 { break }
+        probe = probe >> 1
+        high += 1
+    }
+    return Back { remaining: ((data.len() - 1) *| 8) +| high, debt: 0, overrun: false }
+}
+
+public function read_back(data: [u8], s: mutable Back, n: usize where n <= 32) -> usize {
+    if s.overrun { return 0 }
+    if n > s.remaining {
+        s.overrun = true
+        return 0
+    }
+    let base: usize = s.remaining - n
+    var v: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let bit_idx: usize = base +| i
+        let byte_idx: usize = bit_idx / 8
+        if byte_idx >= data.len() {
+            s.overrun = true
+            return 0
+        }
+        let sh: usize = bit_idx % 8
+        let bit: usize = ((data[byte_idx] as usize) >> sh) & 1
+        v = v | (bit << i)
+        i += 1
+    }
+    s.remaining = base
+    return v
+}
+
+public function back_exhausted(s: Back) -> bool {
+    return s.remaining == 0 && !s.overrun
+}
+
+public function read_back_padded(data: [u8], s: mutable Back, n: usize where n <= 32) -> usize {
+    if s.overrun { return 0 }
+    if n <= s.remaining { return read_back(data, mutable s, n) }
+    let avail: usize = s.remaining
+    let missing: usize = n - avail
+    let v: usize = read_back(data, mutable s, avail)
+    s.debt = s.debt +| missing
+    if s.debt > 32 {
+        s.overrun = true
+        return 0
+    }
+    return v << missing
+}
+
+
+public type Fwd {
+    pos: usize
+    overrun: bool
+}
+
+public function open_fwd() -> Fwd {
+    return Fwd { pos: 0, overrun: false }
+}
+
+public function peek_fwd(data: [u8], s: Fwd, n: usize where n <= 32) -> usize {
+    if s.overrun { return 0 }
+    var v: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let bit_idx: usize = s.pos +| i
+        let byte_idx: usize = bit_idx / 8
+        if byte_idx >= data.len() { break }
+        let sh: usize = bit_idx % 8
+        let bit: usize = ((data[byte_idx] as usize) >> sh) & 1
+        v = v | (bit << i)
+        i += 1
+    }
+    return v
+}
+
+public function skip_fwd(data: [u8], s: mutable Fwd, n: usize where n <= 32) -> () {
+    if s.overrun { return }
+    let end: usize = s.pos +| n
+    if end > data.len() *| 8 {
+        s.overrun = true
+        return
+    }
+    s.pos = end
+}
+
+public function read_fwd(data: [u8], s: mutable Fwd, n: usize where n <= 32) -> usize {
+    let v: usize = peek_fwd(data, s, n)
+    skip_fwd(data, mutable s, n)
+    return v
+}
+
+public function fwd_bytes_consumed(s: Fwd) -> usize {
+    return (s.pos +| 7) / 8
+}

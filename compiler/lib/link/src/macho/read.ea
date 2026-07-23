@@ -1,0 +1,292 @@
+
+module link.macho.read
+
+import std.mem.alloc
+import std.collections.vec
+import object.fmt.macho as macho_mod
+import local.coff.cursor as cursor_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(macho_mod.MachoSection64)
+spec std.collections.vec.Vec(macho_mod.MachoSectionBundle)
+spec std.collections.vec.Vec(macho_mod.MachoNlist64)
+spec std.collections.vec.Vec(macho_mod.MachoRelocationInfo)
+
+
+function cpu_from_i32(raw: i32) -> macho_mod.MachoCpu {
+    if raw == (0x01000007 as i32) { return macho_mod.MachoCpu.x86_64 }
+    if raw == (0x0100000C as i32) { return macho_mod.MachoCpu.arm64 }
+    return macho_mod.MachoCpu.any
+}
+
+function file_from_u32(raw: u32) -> macho_mod.MachoKind {
+    if raw == (0x2 as u32) { return macho_mod.MachoKind.execute }
+    if raw == (0x6 as u32) { return macho_mod.MachoKind.dylib }
+    if raw == (0x8 as u32) { return macho_mod.MachoKind.bundle }
+    return macho_mod.MachoKind.object
+}
+
+
+function parse_name_16(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoName16
+    with {err: cursor_mod.ReadError}
+{
+    let lo = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let hi = cursor_mod.read_u64_le(bytes, mutable cur)?
+    return macho_mod.MachoName16 { lo: lo, hi: hi }
+}
+
+
+function parse_header(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoHeader
+    with {err: cursor_mod.ReadError}
+{
+    let magic = cursor_mod.read_u32_le(bytes, mutable cur)?
+    if magic != macho_mod.magic_64_native() { raise cursor_mod.ReadError.bad_archive_magic }
+    let cputype_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let cpusubtype_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let filetype_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let ncmds = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let sizeofcmds = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let flags = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let reserved = cursor_mod.read_u32_le(bytes, mutable cur)?
+    return macho_mod.MachoHeader {
+        magic: magic,
+        cputype: cpu_from_i32(cputype_raw as i32 wrapping),
+        cpusubtype: cpusubtype_raw as i32 wrapping,
+        filetype: file_from_u32(filetype_raw),
+        ncmds: ncmds,
+        sizeofcmds: sizeofcmds,
+        flags: flags,
+        reserved: reserved,
+    }
+}
+
+
+function parse_segment_command_64(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoSegmentCommand64
+    with {err: cursor_mod.ReadError}
+{
+    let _cmd = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let cmdsize = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let segname = parse_name_16(bytes, mutable cur)?
+    let vmaddr = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let vmsize = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let fileoff = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let filesize = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let maxprot_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let initprot_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let nsects = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let flags = cursor_mod.read_u32_le(bytes, mutable cur)?
+    return macho_mod.MachoSegmentCommand64 {
+        cmd: macho_mod.MachoLoadCommandKind.segment_64,
+        cmdsize: cmdsize,
+        segname: segname,
+        vmaddr: vmaddr,
+        vmsize: vmsize,
+        fileoff: fileoff,
+        filesize: filesize,
+        maxprot: maxprot_raw as i32 wrapping,
+        initprot: initprot_raw as i32 wrapping,
+        nsects: nsects,
+        flags: flags,
+    }
+}
+
+
+function parse_section_64(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoSection64
+    with {err: cursor_mod.ReadError}
+{
+    let sectname = parse_name_16(bytes, mutable cur)?
+    let segname = parse_name_16(bytes, mutable cur)?
+    let addr = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let size = cursor_mod.read_u64_le(bytes, mutable cur)?
+    let offset = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let align = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let reloff = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let nreloc = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let flags = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let reserved1 = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let reserved2 = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let reserved3 = cursor_mod.read_u32_le(bytes, mutable cur)?
+    return macho_mod.MachoSection64 {
+        sectname: sectname,
+        segname: segname,
+        addr: addr,
+        size: size,
+        offset: offset,
+        align: align,
+        reloff: reloff,
+        nreloc: nreloc,
+        flags: flags,
+        reserved1: reserved1,
+        reserved2: reserved2,
+        reserved3: reserved3,
+    }
+}
+
+
+function parse_symtab_command(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoSymtabCommand
+    with {err: cursor_mod.ReadError}
+{
+    let _cmd = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let cmdsize = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let symoff = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let nsyms = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let stroff = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let strsize = cursor_mod.read_u32_le(bytes, mutable cur)?
+    return macho_mod.MachoSymtabCommand {
+        cmd: macho_mod.MachoLoadCommandKind.symtab,
+        cmdsize: cmdsize,
+        symoff: symoff,
+        nsyms: nsyms,
+        stroff: stroff,
+        strsize: strsize,
+    }
+}
+
+
+function parse_nlist_64(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoNlist64
+    with {err: cursor_mod.ReadError}
+{
+    let n_strx = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let n_type = cursor_mod.read_u8(bytes, mutable cur)?
+    let n_sect = cursor_mod.read_u8(bytes, mutable cur)?
+    let n_desc = cursor_mod.read_u16_le(bytes, mutable cur)?
+    let n_value = cursor_mod.read_u64_le(bytes, mutable cur)?
+    return macho_mod.MachoNlist64 {
+        n_strx: n_strx,
+        n_type: n_type,
+        n_sect: n_sect,
+        n_desc: n_desc,
+        n_value: n_value,
+    }
+}
+
+
+function parse_relocation_info(bytes: Vec_u8.Vec, cur: mutable cursor_mod.Cursor) -> macho_mod.MachoRelocationInfo
+    with {err: cursor_mod.ReadError}
+{
+    let r_address_raw = cursor_mod.read_u32_le(bytes, mutable cur)?
+    let r_info = cursor_mod.read_u32_le(bytes, mutable cur)?
+    return macho_mod.MachoRelocationInfo {
+        r_address: r_address_raw as i32 wrapping,
+        r_info: r_info,
+    }
+}
+
+
+function read_bytes_at(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    offset: u64,
+    size: u64,
+    allocator: Allocator,
+) -> Vec_u8.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    uninit out_bytes: Vec_u8.Vec
+    Vec_u8.new(init out_bytes, allocator)?
+    let count = size as usize
+    if count == (0 as usize) { return out_bytes }
+    cursor_mod.seek(mutable cur, offset as usize)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let b = cursor_mod.read_u8(bytes, mutable cur)?
+        Vec_u8.push(mutable out_bytes, take b, allocator)?
+        i = i + 1
+    }
+    return out_bytes
+}
+
+
+function read_relocs_at(
+    bytes: Vec_u8.Vec,
+    cur: mutable cursor_mod.Cursor,
+    offset: u32,
+    count: usize,
+    allocator: Allocator,
+) -> Vec_MachoRelocationInfo.Vec
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    uninit out_relocs: Vec_MachoRelocationInfo.Vec
+    Vec_MachoRelocationInfo.new(init out_relocs, allocator)?
+    if count == (0 as usize) { return out_relocs }
+    cursor_mod.seek(mutable cur, offset as usize)
+    var i: usize = 0
+    loop decreases (count - i) {
+        if i >= count { break }
+        let r = parse_relocation_info(bytes, mutable cur)?
+        Vec_MachoRelocationInfo.push(mutable out_relocs, take r, allocator)?
+        i = i + 1
+    }
+    return out_relocs
+}
+
+
+public function parse_file(bytes: Vec_u8.Vec, allocator: Allocator) -> macho_mod.MachoFile
+    with {allocator, err: cursor_mod.ReadError, err: alloc.AllocError}
+{
+    var cur: cursor_mod.Cursor = cursor_mod.at_start()
+    let header = parse_header(bytes, mutable cur)?
+    let segment = parse_segment_command_64(bytes, mutable cur)?
+    let n_sections = segment.nsects as usize
+
+    uninit sect_headers: Vec_MachoSection64.Vec
+    Vec_MachoSection64.new(init sect_headers, allocator)?
+    var i: usize = 0
+    loop decreases (n_sections - i) {
+        if i >= n_sections { break }
+        let sh = parse_section_64(bytes, mutable cur)?
+        Vec_MachoSection64.push(mutable sect_headers, take sh, allocator)?
+        i = i + 1
+    }
+
+    let symtab = parse_symtab_command(bytes, mutable cur)?
+
+    uninit sections: Vec_MachoSectionBundle.Vec
+    Vec_MachoSectionBundle.new(init sections, allocator)?
+    var k: usize = 0
+    loop decreases (n_sections - k) {
+        if k >= n_sections { break }
+        let sh = Vec_MachoSection64.at(sect_headers, k)
+        let zerofill = (sh.flags & 0xFF) == 1
+        let data = if zerofill {
+            uninit empty_data: Vec_u8.Vec
+            Vec_u8.new(init empty_data, allocator)?
+            empty_data
+        } else {
+            read_bytes_at(bytes, mutable cur, sh.offset as u64, sh.size, allocator)?
+        }
+        let relocations = read_relocs_at(bytes, mutable cur, sh.reloff, sh.nreloc as usize, allocator)?
+        let bundle = macho_mod.MachoSectionBundle {
+            header: sh,
+            data: data,
+            relocations: relocations,
+        }
+        Vec_MachoSectionBundle.push(mutable sections, take bundle, allocator)?
+        k = k + 1
+    }
+
+    let n_symbols = symtab.nsyms as usize
+    cursor_mod.seek(mutable cur, symtab.symoff as usize)
+    uninit symbols: Vec_MachoNlist64.Vec
+    Vec_MachoNlist64.new(init symbols, allocator)?
+    var s: usize = 0
+    loop decreases (n_symbols - s) {
+        if s >= n_symbols { break }
+        let sym = parse_nlist_64(bytes, mutable cur)?
+        Vec_MachoNlist64.push(mutable symbols, take sym, allocator)?
+        s = s + 1
+    }
+
+    let string_table_bytes = read_bytes_at(bytes, mutable cur, symtab.stroff as u64, symtab.strsize as u64, allocator)?
+
+    return macho_mod.MachoFile {
+        header: header,
+        segment: segment,
+        sections: sections,
+        symtab: symtab,
+        symbols: symbols,
+        string_table: macho_mod.MachoStringTable { bytes: string_table_bytes },
+    }
+}

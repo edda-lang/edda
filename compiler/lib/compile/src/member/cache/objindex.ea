@@ -1,0 +1,105 @@
+
+module compile.member.cache.objindex
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.os.env
+import cache.addr.hash as hash_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import intern.interner as interner_mod
+import resolve.paths.modules as mt_mod
+import mir.file.store as mir_file_mod
+import hir.build.file as origin_file_mod
+
+import local.member.cache.key.interface.hash as ifacehash_mod
+
+
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(hash_mod.ArtifactHash)
+spec std.collections.vec.Vec(origin_file_mod.HirFile)
+spec std.collections.vec.Vec(u8)
+spec std.collections.hashmap.StringMap(hash_mod.ArtifactHash)
+spec std.core.option.Option(hash_mod.ArtifactHash)
+
+
+public function build_object_index(
+    files: Vec_File.Vec,
+    map: source_map_mod.SourceMap,
+    module_tree: mt_mod.ModuleTree,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> StringMap_ArtifactHash.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    let hashes = ifacehash_mod.module_interface_hashes_of(files, map, module_tree, interner, allocator)?
+    var index = StringMap_ArtifactHash.new(allocator)?
+    let n = Vec_File.len(files)
+    let fc = source_map_mod.file_count(map)
+    for i in 0..<n {
+        let f = Vec_File.at(files, i)
+        let fid = f.span.file
+        if (fid.raw as usize) < fc {
+            let name = source_map_mod.file_name_of(map, fid)
+            let h = Vec_ArtifactHash.at(hashes, i)
+            let _ = StringMap_ArtifactHash.insert(mutable index, name, h, allocator)?
+        }
+    }
+    return index
+}
+
+
+public function empty_object_index(
+    allocator: Allocator,
+) -> StringMap_ArtifactHash.StringMap
+    with {allocator, err: alloc.AllocError}
+{
+    return StringMap_ArtifactHash.new(allocator)?
+}
+
+
+public function object_cache_key(
+    file: mir_file_mod.MirFile,
+    source_map: source_map_mod.SourceMap,
+    index: StringMap_ArtifactHash.StringMap,
+    allocator: Allocator,
+) -> Option_ArtifactHash.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_HirFile.len(file.hir_files)
+    let fc = source_map_mod.file_count(source_map)
+    uninit acc: Vec_u8.Vec
+    Vec_u8.new(init acc, allocator)?
+    let exe = env.self_exe_path(allocator)
+    let epoch = match env.read_optional("EDDA_CACHE_EPOCH", allocator) {
+        case .some(let v) => v
+        case .none => ""
+    }
+    Vec_u8.extend_from_slice(mutable acc, exe.bytes(), allocator)?
+    Vec_u8.push(mutable acc, 0, allocator)?
+    Vec_u8.extend_from_slice(mutable acc, epoch.bytes(), allocator)?
+    Vec_u8.push(mutable acc, 0, allocator)?
+    var resolved: usize = 0
+    for i in 0..<n {
+        let hf = Vec_HirFile.at(file.hir_files, i)
+        let fid = hf.source.span.file
+        if (fid.raw as usize) < fc {
+            let name = source_map_mod.file_name_of(source_map, fid)
+            match StringMap_ArtifactHash.get(index, name) {
+                case .some(let h) => {
+                    let hex = hash_mod.to_hex_string(h, allocator)?
+                    Vec_u8.extend_from_slice(mutable acc, hex.bytes(), allocator)?
+                    Vec_u8.push(mutable acc, 0, allocator)?
+                    resolved += 1
+                }
+                case .none => return Option_ArtifactHash.none
+            }
+        }
+    }
+    if resolved == 0 as usize { return Option_ArtifactHash.none }
+    let owned = Vec_u8.into_array(take acc, allocator)?
+    let key = hash_mod.hash_bytes(owned, allocator)?
+    return Option_ArtifactHash.some(value: key)
+}

@@ -1,0 +1,136 @@
+module std.os.fs.watch
+import std.text.string
+
+import std.io.stream
+import std.os.raw
+import std.os.pages
+import std.mem.alloc
+import std.text.utf8
+
+public linear type WatchHandle {
+    fd: i32
+    buf: u64
+    filled: u32
+    pos: u32
+}
+
+public type WatchEvent {
+    case created(path: String)
+    case modified(path: String)
+    case removed(path: String)
+    case renamed(from_path: String, to_path: String)
+    case overflowed
+}
+
+
+function event_mask() -> u64 {
+    return 0x7CA
+}
+
+function copy_cstr(pg: u64, path: String) -> () {
+    let b: [u8] = path.bytes()
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        raw.store_u8(pg +% (i as u64), b[i])
+        i = i + 1
+    }
+    raw.store_u8(pg +% (b.len() as u64), 0)
+}
+
+function release_page(pg: u64) -> () {
+    if pg == 0 || pg % 4096 != 0 { return }
+    handle err: pages.PageError as _e -> () {
+        pages.unmap(pg, 4096)?
+    }
+}
+
+function name_at(base: u64, cap: u32, allocator: Allocator) -> String
+    with {allocator, err: stream.IoError}
+{
+    var n: u32 = 0
+    loop
+        decreases cap - n
+    {
+        if n >= cap { break }
+        if raw.load_u8(base +% (n as u64)) == 0 { break }
+        n = n + 1
+    }
+    if n == 0 { return "" }
+    let out: [u8] = handle err: alloc.AllocError as _e -> (raise stream.IoError.other) {
+        allocator.alloc_array(u8, n as usize)?
+    }
+    var i: usize = 0
+    loop
+        decreases (n as usize) - i
+    {
+        if i >= n as usize { break }
+        out[i] = raw.load_u8(base +% (i as u64))
+        i = i + 1
+    }
+    if !utf8.validate(out) { raise stream.IoError.other }
+    return string.from_owned_utf8(take out)
+}
+
+
+public function watch(rfs: ReadOnlyFilesystem, path: String, allocator: Allocator) -> WatchHandle
+    with {rfs, allocator, err: stream.IoError}
+{
+    if path.bytes().len() + 1 > 4096 { raise stream.IoError.other }
+    let ifd: i64 = raw.syscall6(294, 0, 0, 0, 0, 0, 0)
+    if ifd < 0 { raise stream.IoError.os_error(code: ifd as i32 wrapping) }
+    let pg: u64 = handle err: pages.PageError as _e -> {
+        let _ = raw.syscall6(3, ifd as u64, 0, 0, 0, 0, 0)
+        raise stream.IoError.other
+    } { pages.map(4096)? }
+    copy_cstr(pg, path)
+    let wd: i64 = raw.syscall6(254, ifd as u64, pg, event_mask(), 0, 0, 0)
+    if wd < 0 {
+        let _ = raw.syscall6(3, ifd as u64, 0, 0, 0, 0, 0)
+        release_page(pg)
+        raise stream.IoError.os_error(code: wd as i32 wrapping)
+    }
+    return WatchHandle { fd: ifd as i32 wrapping, buf: pg, filled: 0, pos: 0 }
+}
+
+public function next(h: mutable WatchHandle, allocator: Allocator) -> WatchEvent
+    with {allocator, err: stream.IoError, cancellation}
+{
+    var fuel: u32 = 1024
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { raise stream.IoError.other }
+        fuel = fuel - 1
+        if h.pos +% 16 > h.filled {
+            let r: i64 = raw.syscall6(0, h.fd as u64, h.buf, 4096, 0, 0, 0)
+            if r == 0 { raise stream.IoError.unexpected_eof }
+            if r < 0 { raise stream.IoError.os_error(code: r as i32 wrapping) }
+            if r as u64 > 4096 { raise stream.IoError.other }
+            h.filled = r as u32 wrapping
+            h.pos = 0
+        }
+        let base: u64 = h.buf +% (h.pos as u64)
+        let mask: u32 = raw.load_u32(base +% 4)
+        let name_len: u32 = raw.load_u32(base +% 12)
+        if h.pos +% 16 +% name_len > h.filled { raise stream.IoError.other }
+        h.pos = h.pos +% 16 +% name_len
+        if (mask & 0x4000) != 0 { return WatchEvent.overflowed }
+        if (mask & 0x180) != 0 {
+            return WatchEvent.created(path: name_at(base +% 16, name_len, allocator)?)
+        }
+        if (mask & 0xA) != 0 {
+            return WatchEvent.modified(path: name_at(base +% 16, name_len, allocator)?)
+        }
+        if (mask & 0x640) != 0 {
+            return WatchEvent.removed(path: name_at(base +% 16, name_len, allocator)?)
+        }
+    }
+}
+
+public function close(h: take WatchHandle) -> () {
+    let _ = raw.syscall6(3, h.fd as u64, 0, 0, 0, 0, 0)
+    release_page(h.buf)
+}

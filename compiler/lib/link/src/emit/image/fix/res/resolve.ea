@@ -1,0 +1,372 @@
+
+module link.emit.image.fix.res.resolve
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+import object.coff as coff_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(coff_mod.CoffFile)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(coff_mod.CoffSymbol)
+spec std.core.option.Option(Definition)
+spec std.collections.hashmap.StringMap(Definition)
+spec std.collections.hashmap.StringMap(bool)
+
+
+public type ComdatSelection {
+    case no_duplicates
+    case any
+    case same_size
+    case exact_match
+    case associative
+    case largest
+}
+
+
+public type SymbolClass {
+    case defined
+    case undefined
+    case common
+    case absolute
+    case debug_
+}
+
+
+public type Definition {
+    name: String
+    object_index: usize
+    symbol_index: usize
+    section_number: i16
+    value: u32
+    is_comdat: bool
+    selection: ComdatSelection
+    size: u32
+    is_weak: bool
+}
+
+
+public type ResolveResult {
+    table: StringMap_Definition.StringMap
+    unresolved: Vec_String.Vec
+    duplicates: Vec_String.Vec
+}
+
+
+function is_external(sc: u8) -> bool {
+    return sc == (2 as u8)
+}
+
+
+function is_weak(sc: u8) -> bool {
+    return sc == (105 as u8)
+}
+
+
+function classify(section_number: i16, value: u32) -> SymbolClass {
+    if section_number > (0 as i16) { return SymbolClass.defined }
+    if section_number == (0 as i16) {
+        if value != (0 as u32) { return SymbolClass.common }
+        return SymbolClass.undefined
+    }
+    if section_number == ((0 as i16) - (1 as i16)) { return SymbolClass.absolute }
+    return SymbolClass.debug_
+}
+
+
+function is_definition(c: SymbolClass) -> bool {
+    return match c {
+        case .defined => true
+        case .common  => true
+        case _        => false
+    }
+}
+
+
+function is_undefined(c: SymbolClass) -> bool {
+    return match c {
+        case .undefined => true
+        case _          => false
+    }
+}
+
+
+function comdat_flag() -> u32 {
+    return 0x00001000 as u32
+}
+
+
+function section_is_comdat(file: coff_mod.CoffFile, section_number: i16) -> bool {
+    if section_number <= (0 as i16) { return false }
+    let idx = (section_number as usize) - (1 as usize)
+    let nsec = Vec_CoffSection.len(file.sections)
+    if idx >= nsec { return false }
+    let sec = Vec_CoffSection.at(file.sections, idx)
+    return (sec.header.characteristics & comdat_flag()) != (0 as u32)
+}
+
+
+function section_size(file: coff_mod.CoffFile, section_number: i16) -> u32 {
+    if section_number <= (0 as i16) { return 0 as u32 }
+    let idx = (section_number as usize) - (1 as usize)
+    let nsec = Vec_CoffSection.len(file.sections)
+    if idx >= nsec { return 0 as u32 }
+    let sec = Vec_CoffSection.at(file.sections, idx)
+    return sec.header.size_of_raw_data
+}
+
+
+function inline_name(packed: u64, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var n: usize = 0
+    loop decreases ((8 as usize) - n) {
+        if n >= (8 as usize) { break }
+        let shift = (8 as u64) * (n as u64)
+        let b = ((packed >> shift) & (0xFF as u64)) as u8
+        if b == (0 as u8) { break }
+        n = n + 1
+    }
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases ((8 as usize) - i) {
+        if i >= (8 as usize) { break }
+        if i >= n { break }
+        let shift = (8 as u64) * (i as u64)
+        buf[i] = ((packed >> shift) & (0xFF as u64)) as u8
+        i = i + 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function strtab_name(table: coff_mod.CoffStringTable, offset: u32, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = table.bytes
+    let len = Vec_u8.len(bytes)
+    if offset < (4 as u32) {
+        let empty: [u8] = allocator.alloc_array(u8, 0 as usize)?
+        return string.from_owned_utf8(take empty)
+    }
+    let start = (offset - (4 as u32)) as usize
+    var end: usize = start
+    loop decreases (len - end) {
+        if end >= len { break }
+        if Vec_u8.at(bytes, end) == (0 as u8) { break }
+        end = end + 1
+    }
+    let n = end - start
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        buf[i] = Vec_u8.at(bytes, start + i)
+        i = i + 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+public function symbol_name(name: coff_mod.CoffSymbolName, table: coff_mod.CoffStringTable, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match name {
+        case .inline_(let packed)          => inline_name(packed, allocator)?
+        case .string_table_ref(let offset) => strtab_name(table, offset, allocator)?
+    }
+}
+
+
+function make_definition(
+    file: coff_mod.CoffFile,
+    name: take String,
+    object_index: usize,
+    symbol_index: usize,
+    sym: coff_mod.CoffSymbol,
+) -> Definition {
+    return Definition {
+        name: name,
+        object_index: object_index,
+        symbol_index: symbol_index,
+        section_number: sym.section_number,
+        value: sym.value,
+        is_comdat: section_is_comdat(file, sym.section_number),
+        selection: ComdatSelection.any,
+        size: section_size(file, sym.section_number),
+        is_weak: is_weak(sym.storage_class),
+    }
+}
+
+
+function selection_is_largest(s: ComdatSelection) -> bool {
+    return match s {
+        case .largest => true
+        case _        => false
+    }
+}
+
+
+function is_foldable(existing: Definition, candidate: Definition) -> bool {
+    return existing.is_comdat || candidate.is_comdat
+}
+
+
+function should_replace(existing: Definition, candidate: Definition) -> bool {
+    if !is_foldable(existing, candidate) { return false }
+    if !selection_is_largest(existing.selection) { return false }
+    return candidate.size > existing.size
+}
+
+
+function insert_definition(
+    table: mutable StringMap_Definition.StringMap,
+    duplicates: mutable Vec_String.Vec,
+    def: take Definition,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let key = def.name
+    let existing_opt = StringMap_Definition.get(table, key)
+    match existing_opt {
+        case .none => {
+            let _ = StringMap_Definition.insert(mutable table, key, take def, allocator)?
+        }
+        case .some(let existing) => {
+            if existing.is_weak && !def.is_weak {
+                let _ = StringMap_Definition.insert(mutable table, key, take def, allocator)?
+            } else if def.is_weak {
+            } else if should_replace(existing, def) {
+                let _ = StringMap_Definition.insert(mutable table, key, take def, allocator)?
+            } else if !is_foldable(existing, def) {
+                Vec_String.push(mutable duplicates, take key, allocator)?
+            }
+        }
+    }
+}
+
+
+function collect_definitions(
+    file: coff_mod.CoffFile,
+    object_index: usize,
+    table: mutable StringMap_Definition.StringMap,
+    duplicates: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_CoffSymbol.len(file.symbols)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sym = Vec_CoffSymbol.at(file.symbols, i)
+        let sc = classify(sym.section_number, sym.value)
+        if is_definition(sc) && is_external(sym.storage_class) {
+            let name = symbol_name(sym.name, file.string_table, allocator)?
+            let def = make_definition(file, take name, object_index, i, sym)
+            insert_definition(mutable table, mutable duplicates, take def, allocator)?
+        } else if is_weak(sym.storage_class) && sym.section_number == (0 as i16) {
+            if i + (1 as usize) < n {
+                let aux = Vec_CoffSymbol.at(file.symbols, i + (1 as usize))
+                let default_index = aux.value as usize
+                if default_index < n {
+                    let default_sym = Vec_CoffSymbol.at(file.symbols, default_index)
+                    let default_class = classify(default_sym.section_number, default_sym.value)
+                    if is_definition(default_class) {
+                        let name = symbol_name(sym.name, file.string_table, allocator)?
+                        let def = Definition {
+                            name: name,
+                            object_index: object_index,
+                            symbol_index: default_index,
+                            section_number: default_sym.section_number,
+                            value: default_sym.value,
+                            is_comdat: section_is_comdat(file, default_sym.section_number),
+                            selection: ComdatSelection.any,
+                            size: section_size(file, default_sym.section_number),
+                            is_weak: true,
+                        }
+                        insert_definition(mutable table, mutable duplicates, take def, allocator)?
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+function resolve_references(
+    file: coff_mod.CoffFile,
+    table: StringMap_Definition.StringMap,
+    provided: StringMap_bool.StringMap,
+    unresolved: mutable Vec_String.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_CoffSymbol.len(file.symbols)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let sym = Vec_CoffSymbol.at(file.symbols, i)
+        let sc = classify(sym.section_number, sym.value)
+        if is_undefined(sc) && is_external(sym.storage_class) {
+            let name = symbol_name(sym.name, file.string_table, allocator)?
+            let known = StringMap_Definition.contains(table, name) || StringMap_bool.contains(provided, name)
+            if !known {
+                Vec_String.push(mutable unresolved, take name, allocator)?
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+public function has_errors(res: ResolveResult) -> bool {
+    return Vec_String.len(res.unresolved) > (0 as usize)
+        || Vec_String.len(res.duplicates) > (0 as usize)
+}
+
+
+public function resolve(
+    objects: Vec_CoffFile.Vec,
+    provided: StringMap_bool.StringMap,
+    allocator: Allocator,
+) -> ResolveResult
+    with {allocator, err: alloc.AllocError}
+{
+    var table = StringMap_Definition.new(allocator)?
+    uninit duplicates: Vec_String.Vec
+    Vec_String.new(init duplicates, allocator)?
+    uninit unresolved: Vec_String.Vec
+    Vec_String.new(init unresolved, allocator)?
+
+    let n_obj = Vec_CoffFile.len(objects)
+    var oi: usize = 0
+    loop decreases (n_obj - oi) {
+        if oi >= n_obj { break }
+        let file = Vec_CoffFile.at(objects, oi)
+        collect_definitions(file, oi, mutable table, mutable duplicates, allocator)?
+        oi = oi + 1
+    }
+
+    var oj: usize = 0
+    loop decreases (n_obj - oj) {
+        if oj >= n_obj { break }
+        let file = Vec_CoffFile.at(objects, oj)
+        resolve_references(file, table, provided, mutable unresolved, allocator)?
+        oj = oj + 1
+    }
+
+    return ResolveResult {
+        table: table,
+        unresolved: unresolved,
+        duplicates: duplicates,
+    }
+}

@@ -1,0 +1,359 @@
+
+module std.os.process.capture
+
+import std.mem.alloc
+import std.os.raw
+import std.text.string
+import local.process
+import local.spawn.spawn
+import local.spawn.quote
+import local.spawn.posix as spawn_posix
+import local.spawn.error as spawn_error
+
+function create_pipe(read_out: u64, write_out: u64, attrs: u64, size: u32) -> i32
+    extern "CreatePipe" from "kernel32.dll"
+
+function set_handle_information(handle: u64, mask: u32, flags: u32) -> i32
+    extern "SetHandleInformation" from "kernel32.dll"
+
+function write_file(handle: u64, buf: u64, n: u32, written_out: u64, overlapped: u64) -> i32
+    extern "WriteFile" from "kernel32.dll"
+
+function create_process_w(
+    app_name: u64,
+    cmd_line: u64,
+    proc_attrs: u64,
+    thread_attrs: u64,
+    inherit_handles: i32,
+    creation_flags: u64,
+    environment: u64,
+    current_dir: u64,
+    startup_info: u64,
+    proc_info: u64,
+) -> i32
+    extern "CreateProcessW" from "kernel32.dll"
+
+function close_handle(handle: u64) -> i32
+    extern "CloseHandle" from "kernel32.dll"
+
+type Pipes {
+    in_read: u64
+    in_write: u64
+    out_read: u64
+    out_write: u64
+    err_read: u64
+    err_write: u64
+}
+
+function make_pipes_windows(allocator: Allocator) -> Pipes
+    with {allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let hbuf: [u8] = allocator.alloc_array(u8, 48)?
+    let hb: u64 = raw.slice_addr(hbuf)
+    let sa: [u8] = allocator.alloc_array(u8, 24)?
+    let sab: u64 = raw.slice_addr(sa)
+    spawn.zero_bytes(sab, 24)
+    raw.store_u32(sab, 24)
+    raw.store_u32(sab +% 16, 1)
+    if create_pipe(hb, hb +% 8, sab, 65536) == 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "CreatePipe failed")
+    }
+    if create_pipe(hb +% 16, hb +% 24, sab, 65536) == 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "CreatePipe failed")
+    }
+    if create_pipe(hb +% 32, hb +% 40, sab, 65536) == 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "CreatePipe failed")
+    }
+    let in_write: u64 = raw.load_u64(hb +% 8)
+    let out_read: u64 = raw.load_u64(hb +% 16)
+    let err_read: u64 = raw.load_u64(hb +% 32)
+    let _ = set_handle_information(in_write, 1, 0)
+    let _ = set_handle_information(out_read, 1, 0)
+    let _ = set_handle_information(err_read, 1, 0)
+    return Pipes {
+        in_read: raw.load_u64(hb),
+        in_write: in_write,
+        out_read: out_read,
+        out_write: raw.load_u64(hb +% 24),
+        err_read: err_read,
+        err_write: raw.load_u64(hb +% 40),
+    }
+}
+
+function make_pipes_posix(allocator: Allocator) -> Pipes
+    with {allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let b: [u8] = allocator.alloc_array(u8, 24)?
+    let base: u64 = raw.slice_addr(b)
+    let cloexec: u64 = 524288
+    if raw.syscall6(293, base, cloexec, 0, 0, 0, 0) < 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "pipe2 failed")
+    }
+    if raw.syscall6(293, base +% 8, cloexec, 0, 0, 0, 0) < 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "pipe2 failed")
+    }
+    if raw.syscall6(293, base +% 16, cloexec, 0, 0, 0, 0) < 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "pipe2 failed")
+    }
+    return Pipes {
+        in_read: raw.load_u32(base) as u64,
+        in_write: raw.load_u32(base +% 4) as u64,
+        out_read: raw.load_u32(base +% 8) as u64,
+        out_write: raw.load_u32(base +% 12) as u64,
+        err_read: raw.load_u32(base +% 16) as u64,
+        err_write: raw.load_u32(base +% 20) as u64,
+    }
+}
+
+function command_line_of(exe: String, args: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let qexe: String = quote.win_quoted(exe, allocator)?
+    let eb: [u8] = qexe.bytes()
+    let ab: [u8] = args.bytes()
+    let total: usize = eb.len() + 1 + ab.len()
+    let buf: [u8] = allocator.alloc_array(u8, total + 1)?
+    var w: usize = 0
+    var k: usize = 0
+    loop
+        decreases eb.len() - k
+    {
+        if k >= eb.len() { break }
+        buf[w] = eb[k]
+        w = w + 1
+        k = k + 1
+    }
+    buf[w] = 0x20
+    w = w + 1
+    var m: usize = 0
+    loop
+        decreases ab.len() - m
+    {
+        if m >= ab.len() { break }
+        buf[w] = ab[m]
+        w = w + 1
+        m = m + 1
+    }
+    buf[w] = 0
+    return string.from_owned_utf8(take buf)
+}
+
+function count_tokens(b: [u8]) -> usize {
+    var count: usize = 0
+    var in_tok: bool = false
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        if b[i] == 0x20 {
+            in_tok = false
+        } else {
+            if !in_tok {
+                count = count + 1
+                in_tok = true
+            }
+        }
+        i = i + 1
+    }
+    return count
+}
+
+function slice_to_string(base: u64, lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if hi <= lo { return "" }
+    let n: usize = hi - lo
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var k: usize = 0
+    loop
+        decreases n - k
+    {
+        if k >= n { break }
+        buf[k] = raw.load_u8(base +% ((lo + k) as u64))
+        k = k + 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function split_ws(s: String, allocator: Allocator) -> [String]
+    with {allocator, err: alloc.AllocError}
+{
+    let b: [u8] = s.bytes()
+    let base: u64 = raw.slice_addr(b)
+    let n: usize = count_tokens(b)
+    var out: [String] = allocator.alloc_array(String, n)?
+    var idx: usize = 0
+    var start: usize = 0
+    var in_tok: bool = false
+    var i: usize = 0
+    loop
+        decreases b.len() - i
+    {
+        if i >= b.len() { break }
+        if b[i] == 0x20 {
+            if in_tok {
+                if idx < out.len() {
+                    out[idx] = slice_to_string(base, start, i, allocator)?
+                    idx = idx + 1
+                }
+                in_tok = false
+            }
+        } else {
+            if !in_tok {
+                start = i
+                in_tok = true
+            }
+        }
+        i = i + 1
+    }
+    if in_tok {
+        if idx < out.len() {
+            out[idx] = slice_to_string(base, start, b.len(), allocator)?
+        }
+    }
+    return out
+}
+
+function feed_input_posix(fd: u64, input: [u8]) -> () {
+    let n: usize = if input.len() > 65536 { 65536 } else { input.len() }
+    let base: u64 = raw.slice_addr(input)
+    var off: usize = 0
+    var fuel: u64 = 65537
+    loop
+        decreases fuel
+    {
+        if fuel == 0 { break }
+        if off >= n { break }
+        fuel = fuel - 1
+        let r: i64 = raw.syscall6(1, fd, base +% (off as u64), (n - off) as u64, 0, 0, 0)
+        if r <= 0 { break }
+        let got: usize = r as usize
+        let adv: usize = if got > (n - off) { n - off } else { got }
+        off = off + adv
+    }
+}
+
+function spawn_captured_windows(
+    exe: String,
+    args: String,
+    input: [u8],
+    allocator: Allocator,
+) -> process.ChildHandle
+    with {allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let pipes: Pipes = make_pipes_windows(allocator)?
+    let cmd: String = command_line_of(exe, args, allocator)?
+    let cmd_w: u64 = spawn.utf8_to_wide(cmd, allocator)?
+
+    let si: [u8] = allocator.alloc_array(u8, 104)?
+    let sib: u64 = raw.slice_addr(si)
+    spawn.zero_bytes(sib, 104)
+    raw.store_u32(sib, 104)
+    raw.store_u32(sib +% 60, 0x00000100)
+    raw.store_u64(sib +% 80, pipes.in_read)
+    raw.store_u64(sib +% 88, pipes.out_write)
+    raw.store_u64(sib +% 96, pipes.err_write)
+
+    let pi: [u8] = allocator.alloc_array(u8, 24)?
+    let pib: u64 = raw.slice_addr(pi)
+    spawn.zero_bytes(pib, 24)
+
+    let ok: i32 = create_process_w(0, cmd_w, 0, 0, 1, 0, 0, 0, sib, pib)
+    if ok == 0 {
+        let _ = close_handle(pipes.in_read)
+        let _ = close_handle(pipes.in_write)
+        let _ = close_handle(pipes.out_read)
+        let _ = close_handle(pipes.out_write)
+        let _ = close_handle(pipes.err_read)
+        let _ = close_handle(pipes.err_write)
+        raise spawn_error.SpawnError.spawn_failed(reason: "CreateProcessW failed")
+    }
+    let h_process: u64 = raw.load_u64(pib)
+    let _ = close_handle(raw.load_u64(pib +% 8))
+    let _ = close_handle(pipes.in_read)
+    let _ = close_handle(pipes.out_write)
+    let _ = close_handle(pipes.err_write)
+
+    let nin: usize = if input.len() > 65536 { 65536 } else { input.len() }
+    if nin > 0 {
+        let wr: [u8] = allocator.alloc_array(u8, 4)?
+        let _ = write_file(pipes.in_write, raw.slice_addr(input), nin as u32 wrapping, raw.slice_addr(wr), 0)
+    }
+    let _ = close_handle(pipes.in_write)
+    return process.ChildHandle {
+        raw: h_process,
+        out_fd: pipes.out_read,
+        err_fd: pipes.err_read,
+    }
+}
+
+function spawn_captured_posix(
+    exe: String,
+    args: String,
+    input: [u8],
+    allocator: Allocator,
+) -> process.ChildHandle
+    with {allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let pipes: Pipes = make_pipes_posix(allocator)?
+    let eb: [u8] = exe.bytes()
+    let ec: [u8] = allocator.alloc_array(u8, eb.len() + 1)?
+    var k: usize = 0
+    loop
+        decreases eb.len() - k
+    {
+        if k >= eb.len() { break }
+        ec[k] = eb[k]
+        k = k + 1
+    }
+    ec[eb.len()] = 0
+    let exe_ptr: u64 = raw.slice_addr(ec)
+    let parts: [String] = split_ws(args, allocator)?
+    let argv: u64 = spawn_posix.build_argv(exe, parts, allocator)?
+
+    let envp: u64 = spawn_posix.build_envp_inherit_posix(allocator)?
+
+    let pid: i64 = raw.syscall6(57, 0, 0, 0, 0, 0, 0)
+    if pid < 0 {
+        raise spawn_error.SpawnError.spawn_failed(reason: "fork failed")
+    }
+    if pid == 0 {
+        let _ = raw.syscall6(33, pipes.in_read, 0, 0, 0, 0, 0)
+        let _ = raw.syscall6(33, pipes.out_write, 1, 0, 0, 0, 0)
+        let _ = raw.syscall6(33, pipes.err_write, 2, 0, 0, 0, 0)
+        let _ = raw.syscall6(59, exe_ptr, argv, envp, 0, 0, 0)
+        let _ = raw.syscall6(60, 127, 0, 0, 0, 0, 0)
+        raise spawn_error.SpawnError.spawn_failed(reason: "execve failed")
+    }
+    let _ = raw.syscall6(3, pipes.in_read, 0, 0, 0, 0, 0)
+    let _ = raw.syscall6(3, pipes.out_write, 0, 0, 0, 0, 0)
+    let _ = raw.syscall6(3, pipes.err_write, 0, 0, 0, 0, 0)
+    feed_input_posix(pipes.in_write, input)
+    let _ = raw.syscall6(3, pipes.in_write, 0, 0, 0, 0, 0)
+    return process.ChildHandle {
+        raw: pid as u64,
+        out_fd: pipes.out_read,
+        err_fd: pipes.err_read,
+    }
+}
+
+public function spawn_captured(
+    p: Subprocess,
+    exe: String,
+    args: String,
+    input: [u8],
+    allocator: Allocator,
+) -> process.ChildHandle
+    with {p, allocator, err: spawn_error.SpawnError, err: alloc.AllocError}
+{
+    let verdict: i32 = spawn.check(p, exe, "")
+    if verdict == -1 {
+        raise spawn_error.SpawnError.not_in_allowlist(exe: exe)
+    }
+    comptime if target_has("windows") {
+        return spawn_captured_windows(exe, args, input, allocator)?
+    } else {
+        return spawn_captured_posix(exe, args, input, allocator)?
+    }
+}

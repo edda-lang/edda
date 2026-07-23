@@ -1,0 +1,152 @@
+
+module lower.flow.suspend.suspend
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import mir.body.model as mir_body_mod
+import mir.term as mir_term_mod
+import mir.id.block as mir_block_mod
+import mir.id.local as mir_local_mod
+import target.triple as triple_mod
+import types.ty.interner as ty_interner_mod
+import cteval.builtin.target.layout.compute.engine as layout_mod
+
+import local.flow.cfg.cfg as cfg_mod
+import local.flow.live.live as live_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(FrameEntry)
+spec std.core.option.Option(SuspendSite)
+spec std.core.option.Option(FrameLayout)
+
+
+public type SuspendSite {
+    suspend_block: usize
+    resume_block: usize
+    dest_local: usize
+}
+
+
+public type FrameEntry {
+    local: usize
+    size: usize
+    align: usize
+    offset: usize
+}
+
+
+public type FrameLayout {
+    entries: Vec_FrameEntry.Vec
+    total_size: usize
+}
+
+
+public function find_suspend_site(body: mir_body_mod.MirBody) -> Option_SuspendSite.Option {
+    let nb = Vec_BasicBlock.len(body.blocks)
+    var i: usize = 0
+    loop decreases nb - i {
+        if i >= nb { break }
+        let blk = Vec_BasicBlock.at(body.blocks, i)
+        let site = suspend_site_of(blk.terminator, i)
+        match site {
+            case .some(_) => return site
+            case .none => {}
+        }
+        i += 1
+    }
+    return Option_SuspendSite.none
+}
+
+
+function suspend_site_of(term: mir_term_mod.Terminator, block: usize) -> Option_SuspendSite.Option {
+    return match term.kind {
+        case .await_(_, let dest, let return_, _) => Option_SuspendSite.some(value: SuspendSite {
+            suspend_block: block,
+            resume_block: mir_block_mod.index(return_),
+            dest_local: mir_local_mod.index(dest.local),
+        })
+        case _ => Option_SuspendSite.none
+    }
+}
+
+
+public function analyze_suspend(
+    body: mir_body_mod.MirBody,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> Option_FrameLayout.Option
+    with {allocator, err: alloc.AllocError}
+{
+    return match find_suspend_site(body) {
+        case .none => Option_FrameLayout.none
+        case .some(let site) => Option_FrameLayout.some(
+            value: build_frame_layout(body, site, ty_interner, triple, allocator)?,
+        )
+    }
+}
+
+
+function build_frame_layout(
+    body: mir_body_mod.MirBody,
+    site: SuspendSite,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> FrameLayout
+    with {allocator, err: alloc.AllocError}
+{
+    uninit cfg: cfg_mod.Cfg
+    cfg_mod.build(init cfg, body, allocator)?
+    uninit liveness: live_mod.Liveness
+    live_mod.compute(init liveness, body, cfg, allocator)?
+
+    uninit entries: Vec_FrameEntry.Vec
+    Vec_FrameEntry.new(init entries, allocator)?
+
+    let n_locals = Vec_Local.len(body.locals)
+    var offset: usize = 0
+    var max_align: usize = 1
+    var i: usize = 0
+    loop decreases n_locals - i {
+        if i >= n_locals { break }
+        if i != site.dest_local && live_mod.is_live_in(liveness, site.resume_block, i) {
+            let lc = Vec_Local.at(body.locals, i)
+            let layout = local_layout(lc, ty_interner, triple)
+            if layout.size > (0 as usize) {
+                let aligned = layout_mod.align_up_to(offset, layout.align)
+                Vec_FrameEntry.push(
+                    mutable entries,
+                    FrameEntry { local: i, size: layout.size, align: layout.align, offset: aligned },
+                    allocator,
+                )?
+                offset = aligned + layout.size
+                if layout.align > max_align { max_align = layout.align }
+            }
+        }
+        i += 1
+    }
+
+    let total = layout_mod.align_up_to(offset, max_align)
+    return FrameLayout { entries: entries, total_size: total }
+}
+
+
+function local_layout(
+    lc: mir_body_mod.Local,
+    ty_interner: ty_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+) -> layout_mod.Layout {
+    let cty = ty_interner_mod.lookup(ty_interner, lc.ty)
+    return match cty {
+        case .primitive(let kind) => match layout_mod.prim_layout(kind) {
+            case .ok(let l) => l
+            case .unsupported(_) => layout_mod.thin_pointer_layout(triple)
+        }
+        case _ => layout_mod.thin_pointer_layout(triple)
+    }
+}

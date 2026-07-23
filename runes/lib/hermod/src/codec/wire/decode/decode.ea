@@ -1,0 +1,341 @@
+
+module hermod.codec.wire.decode.decode
+
+import std.mem.alloc
+import local.error
+import local.proto.method as method_mod
+import local.proto.status as status_mod
+import local.proto.headers as headers_mod
+import local.message.body as body_mod
+import local.uri.types as uri_mod
+import local.message.request as request_mod
+import local.message.response as response_mod
+import local.codec.transfer.chunked as chunked_mod
+
+function _alloc_u8_slots(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _b_sp() -> u8     { return 32 as u8 }
+function _b_cr() -> u8     { return 13 as u8 }
+function _b_lf() -> u8     { return 10 as u8 }
+function _b_colon() -> u8  { return 58 as u8 }
+function _b_zero() -> u8   { return 48 as u8 }
+function _b_nine() -> u8   { return 57 as u8 }
+function _b_tab() -> u8    { return 9  as u8 }
+
+function _parse_decimal_usize(src: [u8], lo: usize, hi: usize) -> usize
+    with {err: error.CodecError}
+{
+    if lo >= hi { raise error.CodecError.invalid_status_code }
+    var acc: usize = 0 as usize
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        let b = src[i]
+        if b < _b_zero() || b > _b_nine() {
+            raise error.CodecError.invalid_status_code
+        }
+        acc = acc * (10 as usize) + ((b - _b_zero()) as usize)
+        i += 1
+    }
+    return acc
+}
+
+function _index_of(src: [u8], lo: usize, hi: usize, target: u8) -> usize {
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if src[i] == target { return i }
+        i += 1
+    }
+    return hi
+}
+
+function _find_eol(src: [u8], lo: usize, hi: usize) -> usize {
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if src[i] == _b_lf() { return i }
+        i += 1
+    }
+    return hi
+}
+
+function _consume_eol(src: [u8], pos: usize) -> usize
+    with {err: error.CodecError}
+{
+    if pos >= src.len() { raise error.CodecError.missing_crlf }
+    if src[pos] == _b_cr() {
+        if pos + (1 as usize) >= src.len() {
+            raise error.CodecError.missing_crlf
+        }
+        if src[pos + (1 as usize)] != _b_lf() {
+            raise error.CodecError.missing_crlf
+        }
+        return pos + (2 as usize)
+    }
+    if src[pos] == _b_lf() {
+        return pos + (1 as usize)
+    }
+    raise error.CodecError.missing_crlf
+}
+
+function _trim_ows_left(src: [u8], lo: usize, hi: usize) -> usize {
+    var i: usize = lo
+    loop decreases hi - i {
+        if i >= hi { break }
+        if src[i] != _b_sp() && src[i] != _b_tab() { return i }
+        i += 1
+    }
+    return hi
+}
+
+function _trim_ows_right(src: [u8], lo: usize, hi: usize) -> usize {
+    var j: usize = hi
+    loop decreases j + (1 as usize) {
+        if j <= lo { break }
+        let prev = j - (1 as usize)
+        if src[prev] != _b_sp() && src[prev] != _b_tab() {
+            return j
+        }
+        j = prev
+    }
+    return lo
+}
+
+function _slice_eq(src: [u8], lo: usize, hi: usize, target: [u8]) -> bool {
+    let want = target.len()
+    if hi - lo != want { return false }
+    var i: usize = 0
+    loop decreases want - i {
+        if i >= want { break }
+        if src[lo + i] != target[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function _parse_method(src: [u8], lo: usize, hi: usize) -> method_mod.Method
+    with {err: error.CodecError}
+{
+    if _slice_eq(src, lo, hi, "GET".bytes())     { return method_mod.Method.method_get }
+    if _slice_eq(src, lo, hi, "POST".bytes())    { return method_mod.Method.method_post }
+    if _slice_eq(src, lo, hi, "PUT".bytes())     { return method_mod.Method.method_put }
+    if _slice_eq(src, lo, hi, "PATCH".bytes())   { return method_mod.Method.method_patch }
+    if _slice_eq(src, lo, hi, "DELETE".bytes())  { return method_mod.Method.method_delete }
+    if _slice_eq(src, lo, hi, "HEAD".bytes())    { return method_mod.Method.method_head }
+    if _slice_eq(src, lo, hi, "OPTIONS".bytes()) { return method_mod.Method.method_options }
+    if _slice_eq(src, lo, hi, "CONNECT".bytes()) { return method_mod.Method.method_connect }
+    if _slice_eq(src, lo, hi, "TRACE".bytes())   { return method_mod.Method.method_trace }
+    raise error.CodecError.unknown_method
+}
+
+function _alloc_slice_copy(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let n = hi - lo
+    let out = _alloc_u8_slots(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        out[i] = src[lo + i]
+        i += 1
+    }
+    return out
+}
+
+function _slice_copy(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    allocator: Allocator,
+) -> [u8]
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        _alloc_slice_copy(src, lo, hi, allocator)?
+    }
+}
+
+function _max_header_count() -> usize { return 64 as usize }
+
+function _content_length(h: headers_mod.Headers) -> usize
+    with {err: error.CodecError}
+{
+    let idx = headers_mod.headers_find(h, "Content-Length".bytes())
+    if idx >= headers_mod.headers_len(h) {
+        return 0 as usize
+    }
+    let entry = headers_mod.headers_at(h, idx)
+    let view = headers_mod.header_value(entry)
+    return _parse_decimal_usize(view, 0 as usize, view.len())?
+}
+
+function _ascii_lower(b: u8) -> u8 {
+    if b >= (65 as u8) && b <= (90 as u8) { return b + (32 as u8) }
+    return b
+}
+
+function _bytes_eq_ci(a: [u8], b: [u8]) -> bool {
+    let n = a.len()
+    if n != b.len() { return false }
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if _ascii_lower(a[i]) != _ascii_lower(b[i]) { return false }
+        i += 1
+    }
+    return true
+}
+
+function _is_chunked_transfer_encoding(h: headers_mod.Headers) -> bool {
+    let idx = headers_mod.headers_find(h, "Transfer-Encoding".bytes())
+    if idx >= headers_mod.headers_len(h) { return false }
+    let entry = headers_mod.headers_at(h, idx)
+    let view = headers_mod.header_value(entry)
+    return _bytes_eq_ci(view, "chunked".bytes())
+}
+
+function _parse_one_header(
+    src: [u8],
+    lo: usize,
+    hi: usize,
+    h: mutable headers_mod.Headers,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: error.CodecError}
+{
+    let colon = _index_of(src, lo, hi, _b_colon())
+    if colon >= hi { raise error.CodecError.malformed_header_line }
+    let name = _slice_copy(src, lo, colon, allocator)?
+    let v_lo = _trim_ows_left(src, colon + (1 as usize), hi)
+    let v_hi = _trim_ows_right(src, v_lo, hi)
+    let value = _slice_copy(src, v_lo, v_hi, allocator)?
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        headers_mod.headers_append(mutable h, name, value)
+    }
+}
+
+function _parse_header_block(
+    src: [u8],
+    pos: usize,
+    h: mutable headers_mod.Headers,
+    allocator: Allocator,
+) -> usize
+    with {allocator, err: error.CodecError}
+{
+    var p: usize = pos
+    var count: usize = 0
+    let limit = _max_header_count()
+    loop decreases limit + (1 as usize) - count {
+        if count >= limit { raise error.CodecError.header_too_large }
+        if p < src.len() && src[p] == _b_cr() {
+            return _consume_eol(src, p)?
+        }
+        if p < src.len() && src[p] == _b_lf() {
+            return _consume_eol(src, p)?
+        }
+        let eol = _find_eol(src, p, src.len())
+        if eol >= src.len() { raise error.CodecError.missing_crlf }
+        var content_hi: usize = eol
+        if eol > p && src[eol - (1 as usize)] == _b_cr() {
+            content_hi = eol - (1 as usize)
+        }
+        _parse_one_header(src, p, content_hi, mutable h, allocator)?
+        p = _consume_eol(src, eol)?
+        count += 1
+    }
+    return p
+}
+
+function _alloc_headers(allocator: mutable Allocator) -> headers_mod.Headers
+    with {allocator, err: error.CodecError}
+{
+    return handle err: alloc.AllocError -> (raise error.CodecError.out_of_memory) {
+        headers_mod.headers_with_capacity(_max_header_count(), mutable allocator)?
+    }
+}
+
+public function decode_request(
+    src: [u8],
+    allocator: mutable Allocator,
+) -> request_mod.Request
+    with {allocator, err: error.CodecError}
+{
+    let n_total = src.len()
+    let eol = _find_eol(src, 0 as usize, n_total)
+    if eol >= n_total { raise error.CodecError.malformed_request_line }
+    var content_hi: usize = eol
+    if eol > (0 as usize) && src[eol - (1 as usize)] == _b_cr() {
+        content_hi = eol - (1 as usize)
+    }
+    let sp1 = _index_of(src, 0 as usize, content_hi, _b_sp())
+    if sp1 >= content_hi { raise error.CodecError.malformed_request_line }
+    let sp2 = _index_of(src, sp1 + (1 as usize), content_hi, _b_sp())
+    if sp2 >= content_hi { raise error.CodecError.malformed_request_line }
+    let m = _parse_method(src, 0 as usize, sp1)?
+    let target = _slice_copy(src, sp1 + (1 as usize), sp2, allocator)?
+    let after_line = _consume_eol(src, eol)?
+    var h = _alloc_headers(mutable allocator)?
+    let body_start = _parse_header_block(src, after_line, mutable h, allocator)?
+    var bdy: body_mod.Body = body_mod.body_empty()
+    if _is_chunked_transfer_encoding(h) {
+        let body_bytes_slice = chunked_mod.decode_chunked(src[body_start..<n_total], mutable allocator)?
+        bdy = body_mod.body_from(body_bytes_slice)
+    } else {
+        let body_len = _content_length(h)?
+        if body_start + body_len > n_total {
+            raise error.CodecError.unexpected_eof
+        }
+        let body_bytes_slice = _slice_copy(src, body_start, body_start + body_len, allocator)?
+        bdy = body_mod.body_from(body_bytes_slice)
+    }
+    let u = uri_mod.uri_http("".bytes(), 0 as u16, target)
+    return request_mod.request_new(m, u, h, bdy)
+}
+
+public function decode_response(
+    src: [u8],
+    allocator: mutable Allocator,
+) -> response_mod.Response
+    with {allocator, err: error.CodecError}
+{
+    let n_total = src.len()
+    let eol = _find_eol(src, 0 as usize, n_total)
+    if eol >= n_total { raise error.CodecError.malformed_status_line }
+    var content_hi: usize = eol
+    if eol > (0 as usize) && src[eol - (1 as usize)] == _b_cr() {
+        content_hi = eol - (1 as usize)
+    }
+    let sp1 = _index_of(src, 0 as usize, content_hi, _b_sp())
+    if sp1 >= content_hi { raise error.CodecError.malformed_status_line }
+    let sp2 = _index_of(src, sp1 + (1 as usize), content_hi, _b_sp())
+    let code_hi: usize = if sp2 < content_hi { sp2 } else { content_hi }
+    let code_val = _parse_decimal_usize(src, sp1 + (1 as usize), code_hi)?
+    if code_val < (100 as usize) || code_val >= (600 as usize) {
+        raise error.CodecError.invalid_status_code
+    }
+    let s = status_mod.status_from(code_val as u16)
+    let after_line = _consume_eol(src, eol)?
+    var h = _alloc_headers(mutable allocator)?
+    let body_start = _parse_header_block(src, after_line, mutable h, allocator)?
+    var bdy: body_mod.Body = body_mod.body_empty()
+    if _is_chunked_transfer_encoding(h) {
+        let body_bytes_slice = chunked_mod.decode_chunked(src[body_start..<n_total], mutable allocator)?
+        bdy = body_mod.body_from(body_bytes_slice)
+    } else {
+        let body_len = _content_length(h)?
+        if body_start + body_len > n_total {
+            raise error.CodecError.unexpected_eof
+        }
+        let body_bytes_slice = _slice_copy(src, body_start, body_start + body_len, allocator)?
+        bdy = body_mod.body_from(body_bytes_slice)
+    }
+    return response_mod.response_new(s, h, bdy)
+}

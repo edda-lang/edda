@@ -1,0 +1,115 @@
+
+module compile.phase.pipeline.mir
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import diagnostics.emit.collection as diags_mod
+import hir.build.file as hir_file_mod
+import intern.interner as interner_mod
+import mir.body.model as mir_body_mod
+import mir.file.store as mir_file_mod
+import mir.layout.table as mir_layout_mod
+import mir.lower.driver as mir_lower_mod
+import mir.lower.eqmap.targets as eqmap_mod
+import mir.lower.fmt.targets as fmt_targets_mod
+import cteval.res.output as cteval_output_mod
+import types.check as types_check_mod
+import types.effect.interner as effect_interner_mod
+import types.ty.interner as ty_interner_mod
+import target.triple as triple_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(mir_body_mod.MirBody)
+spec std.collections.vec.Vec(types_check_mod.TypeOutput)
+spec std.collections.vec.Vec(cteval_output_mod.ComptimeOutput)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public function lower_to_mir(
+    hir_files: take Vec_HirFile.Vec,
+    type_outputs: Vec_TypeOutput.Vec,
+    comptime_outs: Vec_ComptimeOutput.Vec,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    skip_templates: bool,
+    interner: interner_mod.Interner,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    layout_cache: mutable mir_layout_mod.LayoutCache,
+    diags: mutable diags_mod.Diagnostics,
+    meta_alloc: Allocator,
+    allocator: Allocator,
+) -> Vec_MirFile.Vec
+    with {meta_alloc, allocator, err: alloc.AllocError, panic, divergence}
+{
+    uninit mir_files: Vec_MirFile.Vec
+    Vec_MirFile.new(init mir_files, allocator)?
+    var i: usize = 0
+    loop decreases (Vec_HirFile.len(hir_files) + 1) as usize {
+        if Vec_HirFile.is_empty(hir_files) {
+            break
+        }
+        let hir = Vec_HirFile.remove(mutable hir_files, 0 as usize)
+        let types_out = Vec_TypeOutput.at(type_outputs, i)
+        let comptime_out = Vec_ComptimeOutput.at(comptime_outs, i)
+        let mir = mir_lower_mod.lower_file(take hir, types_out, comptime_out, mutable ty_interner, effect_interner, triple, skip_templates, interner, bridge_map, extern_defs, box_elem_ty_map, fmt_targets, eq_targets, mutable layout_cache, mutable diags, meta_alloc, allocator)?
+        Vec_MirFile.push(mutable mir_files, take mir, allocator)?
+        i = i + 1 as usize
+    }
+    return mir_files
+}
+
+
+public function lower_one_to_mir(
+    hir: take hir_file_mod.HirFile,
+    types_out: types_check_mod.TypeOutput,
+    comptime_out: cteval_output_mod.ComptimeOutput,
+    ty_interner: mutable ty_interner_mod.Interner,
+    effect_interner: effect_interner_mod.Interner,
+    triple: triple_mod.TargetTriple,
+    skip_templates: bool,
+    interner: interner_mod.Interner,
+    bridge_map: IntMap_u32.IntMap,
+    extern_defs: IntMap_u32.IntMap,
+    box_elem_ty_map: IntMap_u32.IntMap,
+    fmt_targets: fmt_targets_mod.FmtTargets,
+    eq_targets: eqmap_mod.EqTargets,
+    layout_cache: mutable mir_layout_mod.LayoutCache,
+    diags: mutable diags_mod.Diagnostics,
+    meta_alloc: Allocator,
+    allocator: Allocator,
+) -> mir_file_mod.MirFile
+    with {meta_alloc, allocator, err: alloc.AllocError, panic, divergence}
+{
+    return mir_lower_mod.lower_file(take hir, types_out, comptime_out, mutable ty_interner, effect_interner, triple, skip_templates, interner, bridge_map, extern_defs, box_elem_ty_map, fmt_targets, eq_targets, mutable layout_cache, mutable diags, meta_alloc, allocator)?
+}
+
+
+public function finalize_agg_layouts(
+    files: mutable Vec_MirFile.Vec,
+    table: mir_layout_mod.LayoutTable,
+) -> () {
+    let nf = Vec_MirFile.len(files)
+    var i: usize = 0
+    loop decreases nf - i {
+        if i >= nf { break }
+        var mf = Vec_MirFile.at(files, i)
+        let nb = Vec_MirBody.len(mf.bodies)
+        var j: usize = 0
+        loop decreases nb - j {
+            if j >= nb { break }
+            let b = Vec_MirBody.at(mf.bodies, j)
+            Vec_MirBody.set_at(mutable mf.bodies, j, take mir_body_mod.set_agg_layouts(take b, table))
+            j += 1
+        }
+        Vec_MirFile.set_at(mutable files, i, take mf)
+        i += 1
+    }
+}

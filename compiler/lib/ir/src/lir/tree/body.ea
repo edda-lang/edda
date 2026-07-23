@@ -1,0 +1,361 @@
+
+module ir.lir.tree.body
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import types.pass.ty as ty_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import mir.id.hir as hir_file_mod
+import mir.layout.table as mir_layout_mod
+import local.lir.id.vreg as vreg_mod
+import local.lir.id.op as op_mod
+import local.lir.id.block as block_id_mod
+import local.lir.id.region as region_mod
+import local.lir.tree.reg as reg_mod
+import local.lir.op as lir_op_mod
+import local.lir.term as term_mod
+import local.lir.attrs as attrs_mod
+import local.hlir.op as hlir_op_mod
+
+
+spec std.collections.vec.Vec(vreg_mod.LirVRegId)
+spec std.collections.vec.Vec(op_mod.LirOpId)
+spec std.collections.vec.Vec(reg_mod.LirVReg)
+spec std.collections.vec.Vec(LirBlock)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+spec std.collections.vec.Vec(LirDebugLocal)
+spec std.collections.vec.Vec(LirDebugSlot)
+spec std.collections.vec.Vec(LirCalleeSave)
+
+
+spec std.core.option.Option(region_mod.LirRegionId)
+spec std.core.option.Option(reg_mod.PReg)
+
+
+derive eq, hash, debug for LirBlock
+derive eq, hash, debug for LirDebugLocal
+derive eq, hash, debug for LirDebugSlot
+derive eq, hash, debug for LirCalleeSave
+derive eq, hash, debug for LirBody
+
+
+public type LirDebugLocal {
+    vreg_raw: u32
+    name: symbol_mod.Symbol
+    ty: ty_mod.TyId
+}
+
+
+public type LirDebugSlot {
+    vreg_raw: u32
+    frame_disp: i32
+}
+
+
+public type LirCalleeSave {
+    preg_raw: u32
+    frame_disp: i32
+}
+
+
+public type LirBlock {
+    node_id_origin: node_mod.NodeId
+    params: Vec_LirVRegId.Vec
+    ops: Vec_LirOpId.Vec
+    terminator: term_mod.LirTerminator
+    coherence_region: Option_LirRegionId.Option
+}
+
+
+public type LirBody {
+    def_id: def_mod.DefId
+    origin_file: hir_file_mod.HirFileId
+    blocks: Vec_LirBlock.Vec
+    ops: Vec_LirOp.Vec
+    vregs: Vec_LirVReg.Vec
+    n_params: u32
+    frame_size: u32
+    fn_attrs: attrs_mod.LirFnAttrs
+    symbol: symbol_mod.Symbol
+    debug_locals: Vec_LirDebugLocal.Vec
+    debug_slots: Vec_LirDebugSlot.Vec
+    callee_saved: Vec_LirCalleeSave.Vec
+    agg_layouts: mir_layout_mod.LayoutTable
+}
+
+
+public function new_body(
+    out: init LirBody,
+    def_id: def_mod.DefId,
+    origin_file: hir_file_mod.HirFileId,
+    body_node_origin: node_mod.NodeId,
+    fn_attrs: attrs_mod.LirFnAttrs,
+    symbol: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit blocks: Vec_LirBlock.Vec
+    Vec_LirBlock.new(init blocks, allocator)?
+    Vec_LirBlock.push(mutable blocks, take sentinel_block(allocator)?, allocator)?
+    Vec_LirBlock.push(mutable blocks, take entry_block(body_node_origin, allocator)?, allocator)?
+
+    uninit ops: Vec_LirOp.Vec
+    Vec_LirOp.new(init ops, allocator)?
+    Vec_LirOp.push(mutable ops, take sentinel_op(), allocator)?
+
+    uninit vregs: Vec_LirVReg.Vec
+    Vec_LirVReg.new(init vregs, allocator)?
+    Vec_LirVReg.push(mutable vregs, take sentinel_vreg(), allocator)?
+
+    uninit debug_locals: Vec_LirDebugLocal.Vec
+    Vec_LirDebugLocal.new(init debug_locals, allocator)?
+    uninit debug_slots: Vec_LirDebugSlot.Vec
+    Vec_LirDebugSlot.new(init debug_slots, allocator)?
+    uninit callee_saved: Vec_LirCalleeSave.Vec
+    Vec_LirCalleeSave.new(init callee_saved, allocator)?
+
+    out = LirBody {
+        def_id: def_id,
+        origin_file: origin_file,
+        blocks: blocks,
+        ops: ops,
+        vregs: vregs,
+        n_params: 0,
+        frame_size: 0,
+        fn_attrs: fn_attrs,
+        symbol: symbol,
+        debug_locals: debug_locals,
+        debug_slots: debug_slots,
+        callee_saved: callee_saved,
+        agg_layouts: mir_layout_mod.new_table(allocator)?,
+    }
+}
+
+
+public function set_agg_layouts(
+    body: take LirBody,
+    agg_layouts: mir_layout_mod.LayoutTable,
+) -> LirBody {
+    return LirBody {
+        def_id: body.def_id,
+        origin_file: body.origin_file,
+        blocks: body.blocks,
+        ops: body.ops,
+        vregs: body.vregs,
+        n_params: body.n_params,
+        frame_size: body.frame_size,
+        fn_attrs: body.fn_attrs,
+        symbol: body.symbol,
+        debug_locals: body.debug_locals,
+        debug_slots: body.debug_slots,
+        callee_saved: body.callee_saved,
+        agg_layouts: agg_layouts,
+    }
+}
+
+
+public function push_callee_save(
+    body: mutable LirBody,
+    preg_raw: u32,
+    frame_disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_LirCalleeSave.push(
+        mutable body.callee_saved,
+        take LirCalleeSave { preg_raw: preg_raw, frame_disp: frame_disp },
+        allocator,
+    )?
+}
+
+
+public function has_callee_save(body: LirBody, preg_raw: u32) -> bool {
+    let n = Vec_LirCalleeSave.len(body.callee_saved)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_LirCalleeSave.at(body.callee_saved, i).preg_raw == preg_raw { return true }
+        i += 1
+    }
+    return false
+}
+
+
+public function push_debug_slot(
+    body: mutable LirBody,
+    vreg_raw: u32,
+    frame_disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_LirDebugSlot.push(
+        mutable body.debug_slots,
+        take LirDebugSlot { vreg_raw: vreg_raw, frame_disp: frame_disp },
+        allocator,
+    )?
+}
+
+
+public function push_debug_local(
+    body: mutable LirBody,
+    vreg_raw: u32,
+    name: symbol_mod.Symbol,
+    ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    Vec_LirDebugLocal.push(
+        mutable body.debug_locals,
+        take LirDebugLocal { vreg_raw: vreg_raw, name: name, ty: ty },
+        allocator,
+    )?
+}
+
+
+function sentinel_block(allocator: Allocator) -> LirBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init params, allocator)?
+    uninit ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ops, allocator)?
+    return LirBlock {
+        node_id_origin: node_mod.error(),
+        params: params,
+        ops: ops,
+        terminator: term_mod.LirTerminator {
+            origin: node_mod.error(),
+            kind: term_mod.LirTermKind.unreachable_,
+        },
+        coherence_region: Option_LirRegionId.none,
+    }
+}
+
+function entry_block(body_node_origin: node_mod.NodeId, allocator: Allocator) -> LirBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit params: Vec_LirVRegId.Vec
+    Vec_LirVRegId.new(init params, allocator)?
+    uninit ops: Vec_LirOpId.Vec
+    Vec_LirOpId.new(init ops, allocator)?
+    return LirBlock {
+        node_id_origin: body_node_origin,
+        params: params,
+        ops: ops,
+        terminator: term_mod.LirTerminator {
+            origin: body_node_origin,
+            kind: term_mod.LirTermKind.unreachable_,
+        },
+        coherence_region: Option_LirRegionId.none,
+    }
+}
+
+function sentinel_op() -> lir_op_mod.LirOp {
+    return lir_op_mod.LirOp {
+        origin: node_mod.error(),
+        kind: lir_op_mod.LirOpKind.constant_(
+            c: lir_op_mod.LConstant.unit_,
+            dst: vreg_mod.error(),
+        ),
+        flags: hlir_op_mod.OpFlags {
+            overflow_safe: false,
+            in_bounds: false,
+            nonzero_divisor: false,
+            range_safe: false,
+            intrinsic: hlir_op_mod.Intrinsic.none,
+            div_overflow: hlir_op_mod.DivOverflow.trap,
+            div_overflow_safe: false,
+            extern_call: false,
+            extern_ret_size: 0 as u32,
+        },
+    }
+}
+
+function sentinel_vreg() -> reg_mod.LirVReg {
+    return reg_mod.LirVReg {
+        class_: reg_mod.RegClass.gp,
+        pin: Option_PReg.none,
+        ty: ty_mod.error(),
+        size: reg_mod.register_width(),
+        int_width: reg_mod.register_width(),
+        int_signed: false,
+        is_ref: false,
+    }
+}
+
+
+public function push_block(
+    body: mutable LirBody,
+    block: take LirBlock,
+    allocator: Allocator,
+) -> block_id_mod.LirBlockId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_LirBlock.len(body.blocks) < 4294967295
+{
+    let id = block_id_mod.LirBlockId { raw: Vec_LirBlock.len(body.blocks) as u32 }
+    Vec_LirBlock.push(mutable body.blocks, take block, allocator)?
+    return id
+}
+
+public function push_op(
+    body: mutable LirBody,
+    op: take lir_op_mod.LirOp,
+    allocator: Allocator,
+) -> op_mod.LirOpId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_LirOp.len(body.ops) < 4294967295
+{
+    let id = op_mod.LirOpId { raw: Vec_LirOp.len(body.ops) as u32 }
+    Vec_LirOp.push(mutable body.ops, take op, allocator)?
+    return id
+}
+
+public function push_vreg(
+    body: mutable LirBody,
+    vreg: take reg_mod.LirVReg,
+    allocator: Allocator,
+) -> vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_LirVReg.len(body.vregs) < 4294967295
+{
+    let id = vreg_mod.LirVRegId { raw: Vec_LirVReg.len(body.vregs) as u32 }
+    Vec_LirVReg.push(mutable body.vregs, take vreg, allocator)?
+    return id
+}
+
+public function mint_param_vreg(
+    body: mutable LirBody,
+    class_: reg_mod.RegClass,
+    pin: Option_PReg.Option,
+    ty: ty_mod.TyId,
+    size: u32,
+    int_width: u32,
+    int_signed: bool,
+    is_ref: bool,
+    allocator: Allocator,
+) -> vreg_mod.LirVRegId
+    with {allocator, err: alloc.AllocError}
+    requires Vec_LirVReg.len(body.vregs) < 4294967295
+    requires Vec_LirVReg.len(body.vregs) == (body.n_params as usize) + 1
+{
+    let id = vreg_mod.LirVRegId { raw: Vec_LirVReg.len(body.vregs) as u32 }
+    let vreg = reg_mod.LirVReg {
+        class_: class_,
+        pin: pin,
+        ty: ty,
+        size: size,
+        int_width: int_width,
+        int_signed: int_signed,
+        is_ref: is_ref,
+    }
+    Vec_LirVReg.push(mutable body.vregs, take vreg, allocator)?
+    body.n_params = body.n_params + 1
+    return id
+}

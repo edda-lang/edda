@@ -1,0 +1,222 @@
+
+module uri.syntax.scan
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import uri.error
+
+spec option.Option(String)
+spec option.Option(u16)
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+function _is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+
+function _bytes_copy(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError}
+{
+    let n = hi - lo
+    let buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[i] = src[lo + i]
+        i = i + 1 as usize
+    }
+    return buf
+}
+
+function _substring(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = _bytes_copy(src, lo, hi, allocator)?
+    return string.from_owned_utf8(take bytes)
+}
+
+
+function _scan_authority_end(src: [u8], lo: usize) -> usize {
+    let n = src.len()
+    var i: usize = lo
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = src[i]
+        if c == 47 as u8 || c == 63 as u8 || c == 35 as u8 { break }
+        i = i + 1 as usize
+    }
+    return i
+}
+
+function _rfind_at(src: [u8], lo: usize, hi: usize) -> (usize, bool) {
+    var i: usize = hi
+    loop decreases i + 1 as usize {
+        if i <= lo { break }
+        i = i - 1 as usize
+        if src[i] == 64 as u8 { return (i, true) }
+    }
+    return (0 as usize, false)
+}
+
+function _find_port_colon(src: [u8], lo: usize, hi: usize) -> (usize, bool)
+    with {err: error.ParseError}
+{
+    var i: usize = lo
+    var in_brackets: bool = false
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        let c = src[i]
+        if c == 91 as u8 {
+            in_brackets = true
+        } else if c == 93 as u8 {
+            in_brackets = false
+        } else if c == 58 as u8 && !in_brackets {
+            return (i, true)
+        }
+        i = i + 1 as usize
+    }
+    return (0 as usize, false)
+}
+
+function _parse_port(
+    src: [u8], lo: usize, hi: usize,
+) -> Option_u16
+    with {err: error.ParseError}
+{
+    if lo >= hi { return Option_u16.none }
+    var acc: u32 = 0 as u32
+    var i: usize = lo
+    loop decreases hi - i + 1 as usize {
+        if i >= hi { break }
+        let c = src[i]
+        if !_is_digit(c) {
+            raise error.ParseError.bad_port(at: i)
+        }
+        acc = acc *% (10 as u32) +% ((c - 48 as u8) as u32)
+        if acc > (65535 as u32) {
+            raise error.ParseError.port_out_of_range(at: lo)
+        }
+        i = i + 1 as usize
+    }
+    return Option_u16.some(value: (acc & (0xFFFF as u32)) as u16)
+}
+
+function _scan_ip_literal(src: [u8], lo: usize, hi: usize) -> usize
+    with {err: error.ParseError}
+{
+    var i: usize = lo + 1 as usize
+    loop decreases hi - i + 1 as usize {
+        if i >= hi {
+            raise error.ParseError.unclosed_ip_literal(at: lo)
+        }
+        if src[i] == 93 as u8 { return i }
+        i = i + 1 as usize
+    }
+    raise error.ParseError.unclosed_ip_literal(at: lo)
+}
+
+
+function _parse_authority(
+    src: [u8], cursor: usize, allocator: Allocator,
+) -> (Option_String, Option_String, Option_u16, usize)
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let auth_end = _scan_authority_end(src, cursor)
+    let auth_start = cursor
+
+    var userinfo: Option_String = Option_String.none
+    var host_start: usize = auth_start
+    let (at_pos, has_at) = _rfind_at(src, auth_start, auth_end)
+    if has_at {
+        let ui_str = _substring(src, auth_start, at_pos, allocator)?
+        userinfo = Option_String.some(value: ui_str)
+        host_start = at_pos + 1 as usize
+    }
+
+    var host_end: usize = auth_end
+    if host_start < auth_end && src[host_start] == 91 as u8 {
+        let close = _scan_ip_literal(src, host_start, auth_end)?
+        host_end = close + 1 as usize
+    } else {
+        let (colon_pos, has_colon) = _find_port_colon(src, host_start, auth_end)?
+        if has_colon { host_end = colon_pos }
+    }
+    if host_end <= host_start {
+        raise error.ParseError.empty_host(at: host_start)
+    }
+    let host_str = _substring(src, host_start, host_end, allocator)?
+    let host = Option_String.some(value: host_str)
+
+    var port: Option_u16 = Option_u16.none
+    if host_end < auth_end {
+        if src[host_end] != 58 as u8 {
+            raise error.ParseError.bad_host(at: host_end)
+        }
+        port = _parse_port(src, host_end + 1 as usize, auth_end)?
+    }
+
+    return (userinfo, host, port, auth_end)
+}
+
+public function parse_body(
+    src: [u8], cursor: usize, allocator: Allocator,
+) -> (Option_String, Option_String, Option_u16, String, Option_String, Option_String)
+    with {allocator, err: error.ParseError, err: alloc.AllocError}
+{
+    let n = src.len()
+    var c: usize = cursor
+
+    var userinfo: Option_String = Option_String.none
+    var host: Option_String = Option_String.none
+    var port: Option_u16 = Option_u16.none
+    if c + 2 as usize <= n
+        && src[c] == 47 as u8
+        && src[c + 1 as usize] == 47 as u8 {
+        c = c + 2 as usize
+        let (ui, h, p, ae) = _parse_authority(src, c, allocator)?
+        userinfo = ui
+        host = h
+        port = p
+        c = ae
+    }
+
+    var path_end: usize = n
+    var i: usize = c
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let ch = src[i]
+        if ch == 63 as u8 || ch == 35 as u8 { path_end = i; break }
+        i = i + 1 as usize
+    }
+    let path = _substring(src, c, path_end, allocator)?
+    c = path_end
+
+    var query: Option_String = Option_String.none
+    if c < n && src[c] == 63 as u8 {
+        let q_start = c + 1 as usize
+        var q_end: usize = n
+        var j: usize = q_start
+        loop decreases n - j + 1 as usize {
+            if j >= n { break }
+            if src[j] == 35 as u8 { q_end = j; break }
+            j = j + 1 as usize
+        }
+        let q_str = _substring(src, q_start, q_end, allocator)?
+        query = Option_String.some(value: q_str)
+        c = q_end
+    }
+
+    var fragment: Option_String = Option_String.none
+    if c < n && src[c] == 35 as u8 {
+        let f_str = _substring(src, c + 1 as usize, n, allocator)?
+        fragment = Option_String.some(value: f_str)
+    }
+
+    return (userinfo, host, port, path, query, fragment)
+}

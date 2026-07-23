@@ -1,0 +1,520 @@
+
+module structmap.aggregate.workspace
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string as string
+import local.data.model as model
+import local.render.toon as toon
+import local.render.doc.emit as emit_mod
+import local.walk.count.children as childsort_mod
+
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(usize)
+spec std.collections.hashmap.StringMap(u32)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(String)
+spec std.collections.vec.Vec(model.ChildIndex)
+spec std.collections.vec.Vec(MemberSummary)
+spec std.collections.vec.Vec(DirBody)
+
+public type MemberSummary {
+    dir: String
+    types: u32
+    functions: u32
+    public_names: String
+}
+
+public type DirBody {
+    rel: String
+    body: String
+}
+
+public function emit_workspace_aggregator(
+    project_name: String,
+    compiler_version: String,
+    workspace_root: String,
+    members: Vec_MemberSummary.Vec,
+    allocator: Allocator,
+) -> emit_mod.RenderedFiles
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit rendered: emit_mod.RenderedFiles
+    emit_mod.new_rendered(init rendered, allocator)?
+    let agg_dirs = collect_aggregate_dirs(workspace_root, members, allocator)?
+    let agg_n: usize = Vec_String.len(agg_dirs)
+    var i: usize = 0
+    loop
+        decreases agg_n - i
+    {
+        if i >= agg_n { break }
+        let agg = Vec_String.at(agg_dirs, i)
+        let text = render_aggregate_dir(
+            project_name, compiler_version, workspace_root, agg, agg_dirs, members, allocator,
+        )?
+        let with_sep = string.concat(agg, "/", allocator)?
+        let full_path = string.concat(with_sep, model.index_filename(), allocator)?
+        Vec_String.push(mutable rendered.paths, full_path, allocator)?
+        Vec_String.push(mutable rendered.texts, text, allocator)?
+        i += 1
+    }
+    return rendered
+}
+
+public function emit_workspace_descendant_tree(
+    project_name: String,
+    compiler_version: String,
+    workspace_root: String,
+    members: Vec_MemberSummary.Vec,
+    member_bodies: emit_mod.RenderedFiles,
+    allocator: Allocator,
+) -> emit_mod.RenderedFiles
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit rendered: emit_mod.RenderedFiles
+    emit_mod.new_rendered(init rendered, allocator)?
+    let agg_dirs = collect_aggregate_dirs(workspace_root, members, allocator)?
+    let agg_n: usize = Vec_String.len(agg_dirs)
+    var i: usize = 0
+    loop
+        decreases agg_n - i
+    {
+        if i >= agg_n { break }
+        let agg = Vec_String.at(agg_dirs, i)
+        let text = if string.equals(agg, workspace_root) {
+            render_workspace_root_tree(
+                project_name, compiler_version, workspace_root, agg_dirs, members, member_bodies, allocator,
+            )?
+        } else {
+            render_aggregate_dir(
+                project_name, compiler_version, workspace_root, agg, agg_dirs, members, allocator,
+            )?
+        }
+        let with_sep = string.concat(agg, "/", allocator)?
+        let full_path = string.concat(with_sep, model.index_filename(), allocator)?
+        Vec_String.push(mutable rendered.paths, full_path, allocator)?
+        Vec_String.push(mutable rendered.texts, text, allocator)?
+        i += 1
+    }
+    return rendered
+}
+
+function render_workspace_root_tree(
+    project_name: String,
+    compiler_version: String,
+    workspace_root: String,
+    agg_dirs: Vec_String.Vec,
+    members: Vec_MemberSummary.Vec,
+    member_bodies: emit_mod.RenderedFiles,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    toon.push_str(mutable buf, "project: ", allocator)?
+    toon.push_quoted(mutable buf, project_name, allocator)?
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    toon.push_str(mutable buf, "compiler_version: ", allocator)?
+    toon.push_quoted(mutable buf, compiler_version, allocator)?
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    toon.push_str(mutable buf, "schema_version: ", allocator)?
+    toon.push_u32_decimal(mutable buf, model.schema_version(), allocator)?
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    toon.push_str(mutable buf, "descendant_tree: true\n", allocator)?
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    let root_rows = children_rows_of(workspace_root, agg_dirs, members, allocator)?
+    render_children_rows(mutable buf, root_rows, allocator)?
+    let sections = collect_descendant_sections(workspace_root, agg_dirs, members, member_bodies, allocator)?
+    let sec_n: usize = Vec_DirBody.len(sections)
+    var i: usize = 0
+    loop
+        decreases sec_n - i
+    {
+        if i >= sec_n { break }
+        let s = Vec_DirBody.at(sections, i)
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_str(mutable buf, "# directory: ", allocator)?
+        toon.push_str(mutable buf, s.rel, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_str(mutable buf, s.body, allocator)?
+        i += 1
+    }
+    return toon.finish_string(take buf, allocator)?
+}
+
+function collect_descendant_sections(
+    workspace_root: String,
+    agg_dirs: Vec_String.Vec,
+    members: Vec_MemberSummary.Vec,
+    member_bodies: emit_mod.RenderedFiles,
+    allocator: Allocator,
+) -> Vec_DirBody.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_DirBody.Vec
+    Vec_DirBody.new(init out, allocator)?
+    let agg_n: usize = Vec_String.len(agg_dirs)
+    var i: usize = 0
+    loop
+        decreases agg_n - i
+    {
+        if i >= agg_n { break }
+        let agg = Vec_String.at(agg_dirs, i)
+        if !string.equals(agg, workspace_root) {
+            let rel = relative_to_root(agg, workspace_root, allocator)?
+            let rows = children_rows_of(agg, agg_dirs, members, allocator)?
+            uninit body_buf: Vec_u8.Vec
+            Vec_u8.new(init body_buf, allocator)?
+            render_children_rows(mutable body_buf, rows, allocator)?
+            let body = toon.finish_string(take body_buf, allocator)?
+            Vec_DirBody.push(mutable out, DirBody { rel: rel, body: body }, allocator)?
+        }
+        i += 1
+    }
+    let mem_n: usize = Vec_String.len(member_bodies.paths)
+    var j: usize = 0
+    loop
+        decreases mem_n - j
+    {
+        if j >= mem_n { break }
+        let dir = Vec_String.at(member_bodies.paths, j)
+        let body = Vec_String.at(member_bodies.texts, j)
+        let rel = relative_to_root(dir, workspace_root, allocator)?
+        Vec_DirBody.push(mutable out, DirBody { rel: rel, body: string.clone(body, allocator)? }, allocator)?
+        j += 1
+    }
+    sort_dir_bodies(mutable out)
+    return out
+}
+
+function sort_dir_bodies(items: mutable Vec_DirBody.Vec) -> () {
+    let n: usize = Vec_DirBody.len(items)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        var min: usize = i
+        var j: usize = i + 1
+        loop
+            decreases n - j
+        {
+            if j >= n { break }
+            if rel_less(Vec_DirBody.at(items, j).rel, Vec_DirBody.at(items, min).rel) {
+                min = j
+            }
+            j += 1
+        }
+        if min != i {
+            Vec_DirBody.swap(mutable items, i, min)
+        }
+        i += 1
+    }
+}
+
+function rel_less(a: String, b: String) -> bool {
+    let ab = a.bytes()
+    let bb = b.bytes()
+    let an: usize = ab.len()
+    let bn: usize = bb.len()
+    let m: usize = if an < bn { an } else { bn }
+    var i: usize = 0
+    loop
+        decreases m - i
+    {
+        if i >= m { break }
+        if ab[i] != bb[i] {
+            return ab[i] < bb[i]
+        }
+        i += 1
+    }
+    return an < bn
+}
+
+function collect_aggregate_dirs(
+    workspace_root: String,
+    members: Vec_MemberSummary.Vec,
+    allocator: Allocator,
+) -> Vec_String.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit dirs: Vec_String.Vec
+    Vec_String.new(init dirs, allocator)?
+    var seen = StringMap_u32.new(allocator)?
+    let n: usize = Vec_MemberSummary.len(members)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        var cur = string.clone(Vec_MemberSummary.at(members, i).dir, allocator)?
+        loop {
+            let parent_opt = parent_dir(cur, allocator)?
+            let parent = match parent_opt {
+                case .some(let p) => p
+                case .none => break
+            }
+            if !starts_with_str(parent, workspace_root) { break }
+            match StringMap_u32.get(seen, parent) {
+                case .some(_) => ()
+                case .none => {
+                    let copy = string.clone(parent, allocator)?
+                    Vec_String.push(mutable dirs, copy, allocator)?
+                    let key = string.clone(parent, allocator)?
+                    let _ = StringMap_u32.insert(mutable seen, key, 1 as u32, allocator)?
+                }
+            }
+            if string.equals(parent, workspace_root) { break }
+            cur = parent
+        }
+        i += 1
+    }
+    return dirs
+}
+
+function render_aggregate_dir(
+    project_name: String,
+    compiler_version: String,
+    workspace_root: String,
+    agg: String,
+    agg_dirs: Vec_String.Vec,
+    members: Vec_MemberSummary.Vec,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    if string.equals(agg, workspace_root) {
+        toon.push_str(mutable buf, "project: ", allocator)?
+        toon.push_quoted(mutable buf, project_name, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_str(mutable buf, "compiler_version: ", allocator)?
+        toon.push_quoted(mutable buf, compiler_version, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        toon.push_str(mutable buf, "schema_version: ", allocator)?
+        toon.push_u32_decimal(mutable buf, model.schema_version(), allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+    } else {
+        toon.push_str(mutable buf, "loc: ", allocator)?
+        toon.push_str(mutable buf, relative_to_root(agg, workspace_root, allocator)?, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+    }
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+    let rows = children_rows_of(agg, agg_dirs, members, allocator)?
+    render_children_rows(mutable buf, rows, allocator)?
+    return toon.finish_string(take buf, allocator)?
+}
+
+function children_rows_of(
+    agg: String,
+    agg_dirs: Vec_String.Vec,
+    members: Vec_MemberSummary.Vec,
+    allocator: Allocator,
+) -> Vec_ChildIndex.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit rows: Vec_ChildIndex.Vec
+    Vec_ChildIndex.new(init rows, allocator)?
+    var seen = StringMap_u32.new(allocator)?
+    let agg_n: usize = Vec_String.len(agg_dirs)
+    var i: usize = 0
+    loop
+        decreases agg_n - i
+    {
+        if i >= agg_n { break }
+        push_child_row(mutable rows, mutable seen, agg, Vec_String.at(agg_dirs, i), members, allocator)?
+        i += 1
+    }
+    let mem_n: usize = Vec_MemberSummary.len(members)
+    var j: usize = 0
+    loop
+        decreases mem_n - j
+    {
+        if j >= mem_n { break }
+        push_child_row(mutable rows, mutable seen, agg, Vec_MemberSummary.at(members, j).dir, members, allocator)?
+        j += 1
+    }
+    childsort_mod.sort_children(mutable rows)
+    return rows
+}
+
+function push_child_row(
+    rows: mutable Vec_ChildIndex.Vec,
+    seen: mutable StringMap_u32.StringMap,
+    agg: String,
+    cand: String,
+    members: Vec_MemberSummary.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if string.equals(cand, agg) { return }
+    let parent_opt = parent_dir(cand, allocator)?
+    let parent = match parent_opt {
+        case .some(let p) => p
+        case .none => return
+    }
+    if !string.equals(parent, agg) { return }
+    let rel = relative_to_root(cand, agg, allocator)?
+    match StringMap_u32.get(seen, rel) {
+        case .some(_) => return
+        case .none => ()
+    }
+    let key = string.clone(rel, allocator)?
+    let _ = StringMap_u32.insert(mutable seen, key, 1 as u32, allocator)?
+    let prefix = string.concat(cand, "/", allocator)?
+    var types_total: u32 = 0
+    var functions_total: u32 = 0
+    var headline = ""
+    let n: usize = Vec_MemberSummary.len(members)
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let m = Vec_MemberSummary.at(members, i)
+        if string.equals(m.dir, cand) || starts_with_str(m.dir, prefix) {
+            types_total = types_total +| m.types
+            functions_total = functions_total +| m.functions
+        }
+        if string.equals(m.dir, cand) {
+            headline = m.public_names
+        }
+        i += 1
+    }
+    Vec_ChildIndex.push(
+        mutable rows,
+        model.ChildIndex {
+            dir_idx: 0,
+            path: rel,
+            types: types_total,
+            functions: functions_total,
+            public_names: headline,
+        },
+        allocator,
+    )?
+}
+
+function render_children_rows(
+    buf: mutable Vec_u8.Vec,
+    rows: Vec_ChildIndex.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n: usize = Vec_ChildIndex.len(rows)
+    if n == 0 { return }
+    toon.push_str(mutable buf, "children[", allocator)?
+    toon.push_usize_decimal(mutable buf, n, allocator)?
+    toon.push_str(mutable buf, "]{path,types,functions,public}:\n", allocator)?
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let r = Vec_ChildIndex.at(rows, i)
+        toon.push_str(mutable buf, "  ", allocator)?
+        toon.push_quoted(mutable buf, r.path, allocator)?
+        toon.push_byte(mutable buf, 0x2C, allocator)?
+        toon.push_u32_decimal(mutable buf, r.types, allocator)?
+        toon.push_byte(mutable buf, 0x2C, allocator)?
+        toon.push_u32_decimal(mutable buf, r.functions, allocator)?
+        toon.push_byte(mutable buf, 0x2C, allocator)?
+        toon.push_quoted(mutable buf, r.public_names, allocator)?
+        toon.push_byte(mutable buf, 0x0A, allocator)?
+        i += 1
+    }
+    toon.push_byte(mutable buf, 0x0A, allocator)?
+}
+
+function relative_to_root(dir: String, root: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if !string.starts_with(dir, root) {
+        return string.clone(dir, allocator)?
+    }
+    let d_bytes = dir.bytes()
+    let r_bytes = root.bytes()
+    let dn: usize = d_bytes.len()
+    let rn: usize = r_bytes.len()
+    if dn == rn {
+        return string.clone(".", allocator)?
+    }
+    var start: usize = rn
+    if start < dn && (d_bytes[start] == 0x2F || d_bytes[start] == 0x5C) {
+        start += 1
+    }
+    let rest_len: usize = dn - start
+    let out: [u8] = allocator.alloc_array(u8, rest_len)?
+    var i: usize = 0
+    loop
+        decreases rest_len - i
+    {
+        if i >= rest_len { break }
+        let b = d_bytes[start + i]
+        if b == 0x5C {
+            out[i] = 0x2F
+        } else {
+            out[i] = b
+        }
+        i += 1
+    }
+    return string.from_owned_utf8(take out)
+}
+
+function parent_dir(path: String, allocator: Allocator) -> Option_String.Option
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = path.bytes()
+    let n: usize = bytes.len()
+    var last: usize = 0
+    var found = false
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        if bytes[i] == 0x2F || bytes[i] == 0x5C {
+            last = i
+            found = true
+        }
+        i += 1
+    }
+    if !found { return Option_String.none }
+    if last == 0 { return Option_String.none }
+    let out: [u8] = allocator.alloc_array(u8, last)?
+    var k: usize = 0
+    loop
+        decreases last - k
+    {
+        if k >= last { break }
+        out[k] = bytes[k]
+        k += 1
+    }
+    return Option_String.some(value: string.from_owned_utf8(take out))
+}
+
+function starts_with_str(s: String, prefix: String) -> bool {
+    let sb = s.bytes()
+    let pb = prefix.bytes()
+    let sn: usize = sb.len()
+    let pn: usize = pb.len()
+    if pn > sn { return false }
+    var i: usize = 0
+    loop
+        decreases pn - i
+    {
+        if i >= pn { break }
+        if sb[i] != pb[i] { return false }
+        i += 1
+    }
+    return true
+}

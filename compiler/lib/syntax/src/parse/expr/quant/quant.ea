@@ -1,0 +1,116 @@
+
+module syntax.parse.expr.quant.quant
+
+import std.mem.alloc
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import local.parse.util as util_mod
+
+spec std.mem.alloc.Box(tree_mod.Expr)
+
+
+public function parse_forall(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let parts_r = parse_quantifier_parts(tokens, pos, mutable diags, allocator, parse_expr_fn, depth)?
+    let p = parts_r.0
+    let bound = parts_r.1
+    let iter_box = parts_r.2
+    let body_box = parts_r.3
+    let kw_span = util_mod.span_at(tokens, pos)
+    let body_span = parts_r.4
+    let expr = tree_mod.Expr {
+        span: merge_spans(kw_span, body_span),
+        kind: tree_mod.ExprKind.forall_(bound: bound, iter: iter_box, body: body_box),
+    }
+    return (expr, p)
+}
+
+public function parse_exists(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (tree_mod.Expr, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let parts_r = parse_quantifier_parts(tokens, pos, mutable diags, allocator, parse_expr_fn, depth)?
+    let p = parts_r.0
+    let bound = parts_r.1
+    let iter_box = parts_r.2
+    let body_box = parts_r.3
+    let kw_span = util_mod.span_at(tokens, pos)
+    let body_span = parts_r.4
+    let expr = tree_mod.Expr {
+        span: merge_spans(kw_span, body_span),
+        kind: tree_mod.ExprKind.exists_(bound: bound, iter: iter_box, body: body_box),
+    }
+    return (expr, p)
+}
+
+
+function parse_quantifier_parts(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (usize, ident_mod.Ident, Box_Expr, Box_Expr, span_mod.Span)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var p = pos + 1
+    let bound = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected bound variable name", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: util_mod.span_at(tokens, p) }
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .kw_in => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `in` between bound variable and iterator", allocator)?
+        }
+    }
+    let iter_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+    p = iter_r.1
+    match util_mod.peek(tokens, p) {
+        case .colon => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `:` between iterator and predicate body", allocator)?
+        }
+    }
+    let body_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+    let body_span = body_r.0.span
+    let iter_box = Box_Expr.new(take iter_r.0, allocator)?
+    let body_box = Box_Expr.new(take body_r.0, allocator)?
+    return (body_r.1, bound, iter_box, body_box, body_span)
+}
+
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

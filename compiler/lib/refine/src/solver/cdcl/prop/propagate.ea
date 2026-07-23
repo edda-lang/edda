@@ -1,0 +1,179 @@
+
+module refine.solver.cdcl.prop.propagate
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import local.solver.lit.lit as lit_mod
+import local.solver.cdcl.core.trail as trail_mod
+import local.solver.cdcl.prop.clause as clause_mod
+import local.solver.cdcl.prop.watch as watch_mod
+import local.solver.cdcl.core.state as state_mod
+
+
+spec std.collections.vec.Vec(usize)
+spec std.core.option.Option(usize)
+
+
+type WatchOutcome {
+    case handled
+    case conflict_
+}
+
+
+public function run(s: mutable state_mod.Solver, allocator: Allocator) -> Option_usize.Option
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var has_conflict: bool = false
+    var conflict_ci: usize = 0
+    loop {
+        if has_conflict {
+            break
+        }
+        if s.qhead >= trail_mod.stack_len(s.trail) {
+            break
+        }
+        let p = trail_mod.stack_at(s.trail, s.qhead)
+        s.qhead = s.qhead + 1
+        let neg = lit_mod.lit_negate(p)
+        let code = lit_mod.lit_code(neg)
+        let snap = snapshot_list(s.watches, code, allocator)?
+        watch_mod.clear(mutable s.watches, code, allocator)?
+        let m = Vec_usize.len(snap)
+        var j: usize = 0
+        loop
+            decreases (m - j)
+        {
+            if j >= m {
+                break
+            }
+            let ci = Vec_usize.at(snap, j)
+            j = j + 1
+            if has_conflict {
+                watch_mod.add(mutable s.watches, code, ci, allocator)?
+            } else {
+                match process_watch(mutable s, ci, code, allocator)? {
+                    case .conflict_ => {
+                        has_conflict = true
+                        conflict_ci = ci
+                    }
+                    case .handled => {}
+                }
+            }
+        }
+    }
+    return if has_conflict {
+        Option_usize.some(value: conflict_ci)
+    } else {
+        Option_usize.none
+    }
+}
+
+
+function process_watch(
+    s: mutable state_mod.Solver,
+    ci: usize,
+    code: usize,
+    allocator: Allocator,
+) -> WatchOutcome
+    with {allocator, err: alloc.AllocError}
+{
+    let wp = clause_mod.wpos_of(s.db, ci)
+    let lit_a = clause_mod.clause_lit(s.db, ci, wp.a)
+    var falsi_idx: usize = wp.b
+    var other_idx: usize = wp.a
+    if lit_mod.lit_code(lit_a) == code {
+        falsi_idx = wp.a
+        other_idx = wp.b
+    }
+    let other = clause_mod.clause_lit(s.db, ci, other_idx)
+    if state_mod.lit_true(s, other) {
+        watch_mod.add(mutable s.watches, code, ci, allocator)?
+        return WatchOutcome.handled
+    }
+    let n = clause_mod.clause_len(s.db, ci)
+    var found = Option_usize.none
+    var k: usize = 0
+    loop
+        decreases (n - k)
+    {
+        if k >= n {
+            break
+        }
+        if k != wp.a {
+            if k != wp.b {
+                let lk = clause_mod.clause_lit(s.db, ci, k)
+                if !state_mod.lit_false(s, lk) {
+                    found = Option_usize.some(value: k)
+                    break
+                }
+            }
+        }
+        k = k + 1
+    }
+    return match found {
+        case .some(let kk) => relocate_watch(mutable s, ci, wp, falsi_idx, kk, allocator)?
+        case .none => finalize_watch(mutable s, ci, code, other, allocator)?
+    }
+}
+
+
+function relocate_watch(
+    s: mutable state_mod.Solver,
+    ci: usize,
+    wp: clause_mod.WatchPos,
+    falsi_idx: usize,
+    kk: usize,
+    allocator: Allocator,
+) -> WatchOutcome
+    with {allocator, err: alloc.AllocError}
+{
+    let new_lit = clause_mod.clause_lit(s.db, ci, kk)
+    let new_wp = if falsi_idx == wp.a {
+        clause_mod.WatchPos { a: kk, b: wp.b }
+    } else {
+        clause_mod.WatchPos { a: wp.a, b: kk }
+    }
+    clause_mod.set_wpos(mutable s.db, ci, new_wp)
+    watch_mod.add(mutable s.watches, lit_mod.lit_code(new_lit), ci, allocator)?
+    return WatchOutcome.handled
+}
+
+
+function finalize_watch(
+    s: mutable state_mod.Solver,
+    ci: usize,
+    code: usize,
+    other: lit_mod.Lit,
+    allocator: Allocator,
+) -> WatchOutcome
+    with {allocator, err: alloc.AllocError}
+{
+    watch_mod.add(mutable s.watches, code, ci, allocator)?
+    if state_mod.lit_false(s, other) {
+        return WatchOutcome.conflict_
+    }
+    trail_mod.assign(mutable s.trail, other, trail_mod.Reason.propagated(clause: ci), allocator)?
+    return WatchOutcome.handled
+}
+
+
+function snapshot_list(w: watch_mod.Watches, code: usize, allocator: Allocator) -> Vec_usize.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_usize.Vec
+    Vec_usize.new(init out, allocator)?
+    let n = watch_mod.list_len(w, code)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let ci = watch_mod.list_at(w, code, i)
+        Vec_usize.push(mutable out, take ci, allocator)?
+        i = i + 1
+    }
+    return out
+}

@@ -1,0 +1,145 @@
+module resolve.build.drive.instances
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import intern.interner as interner_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item
+import syntax.ast.ident as ast_ident
+import hir.def as def_mod
+import local.ctx as ctx_mod
+import local.bind.bindings as bindings_mod
+import local.bind.lookup.lookup as lookup_mod
+import local.paths.modules as mt_mod
+import local.build.drive.surface.walk.catalogue.specsurface as specsurface_mod
+import local.bind.lookup.env.walk.uses as uses_mod
+
+
+spec std.mem.alloc.Box(ast_item.FnDecl)
+spec std.mem.alloc.Box(ast_item.TypeDecl)
+spec std.mem.alloc.Box(ast_item.Spec)
+spec std.mem.alloc.Box(ast_item.LetDecl)
+
+spec std.collections.vec.Vec(ast_file.File)
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.core.option.Option(def_mod.DefId)
+
+
+public function resolve_instance_files(
+    ctx: mutable ctx_mod.ResolveCtx,
+    cat: specsurface_mod.SpecCatalogue,
+    files: Vec_File.Vec,
+    interner: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    ctx_mod.set_instance_mode(mutable ctx, true)
+    specsurface_mod.register_invocations(mutable ctx, cat, files, mutable interner, allocator)?
+    bind_item_defs(mutable ctx, files, allocator)?
+    uses_mod.walk_uses(mutable ctx, files, interner, allocator)?
+    ctx_mod.set_instance_mode(mutable ctx, false)
+}
+
+
+function bind_item_defs(
+    ctx: mutable ctx_mod.ResolveCtx,
+    files: Vec_File.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_File.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_File.at(files, i)
+        bind_file_item_defs(mutable ctx, f, allocator)?
+        i = i + 1
+    }
+}
+
+
+function bind_file_item_defs(
+    ctx: mutable ctx_mod.ResolveCtx,
+    file: ast_file.File,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let mp = lookup_mod.module_path_of(file.items, allocator)?
+    var mod_id = ctx_mod.module_id_of(ctx, mp)
+    if mod_id.raw == 0 {
+        mod_id = register_instance_module(mutable ctx, file, allocator)?
+    }
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        bind_one_item(mutable ctx, mod_id, Vec_Item.at(file.items, i), allocator)?
+        i = i + 1
+    }
+}
+
+
+function register_instance_module(
+    ctx: mutable ctx_mod.ResolveCtx,
+    file: ast_file.File,
+    allocator: Allocator,
+) -> mt_mod.ModuleId
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let mod_id = ctx_mod.alloc_module_id(mutable ctx)
+    uninit table: bindings_mod.SymbolTable
+    table = bindings_mod.new_table(allocator)?
+    let n = Vec_Item.len(file.items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        match item_name(Vec_Item.at(file.items, i)) {
+            case .some(let id) => {
+                let def = ctx_mod.alloc_def(mutable ctx)
+                let _ = bindings_mod.insert(mutable table, id.name, def, allocator)?
+            }
+            case .none => ()
+        }
+        i = i + 1
+    }
+    let mp = lookup_mod.module_path_of(file.items, allocator)?
+    ctx_mod.register_module_path(mutable ctx, take mp, mod_id, allocator)?
+    ctx_mod.register_module(mutable ctx, mod_id, take table, allocator)?
+    return mod_id
+}
+
+
+function bind_one_item(
+    ctx: mutable ctx_mod.ResolveCtx,
+    mod_id: mt_mod.ModuleId,
+    item: ast_item.Item,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match item_name(item) {
+        case .some(let id) => {
+            let def = ctx_mod.lookup_in_module(ctx, mod_id, id.name)
+            if !def_mod.is_error(def) {
+                ctx_mod.record_use(mutable ctx, id.span, def, allocator)?
+            }
+        }
+        case .none => ()
+    }
+}
+
+
+function item_name(item: ast_item.Item) -> Option_Ident.Option {
+    return match item.kind {
+        case .function_(let d) => Option_Ident.some(value: Box_FnDecl.get(d).name)
+        case .type_decl(let d) => Option_Ident.some(value: Box_TypeDecl.get(d).name)
+        case .spec_(let d) => Option_Ident.some(value: Box_Spec.get(d).name)
+        case .let_(let d) => Option_Ident.some(value: Box_LetDecl.get(d).name)
+        case _ => Option_Ident.none
+    }
+}

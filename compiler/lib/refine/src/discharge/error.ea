@@ -1,0 +1,262 @@
+
+module refine.discharge.error
+
+import std.core.fmt
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.core.option.Option(String)
+
+
+derive eq, hash, debug for UnsupportedFragment
+derive eq, debug for RefineError
+
+
+public type UnsupportedFragment {
+    case nla
+
+    case bitvector
+
+    case floating_point
+
+    case string_content
+
+    case other(message: String)
+}
+
+public type RefineError {
+    case failed(
+        at: span_mod.Span,
+        predicate: String,
+        counterexample: Option_String.Option,
+    )
+
+    case timeout(
+        at: span_mod.Span,
+        predicate: String,
+        elapsed_ms: u32,
+        configured_ms: u32,
+    )
+
+    case unknown(
+        at: span_mod.Span,
+        predicate: String,
+        reason: Option_String.Option,
+    )
+
+    case solver_internal(
+        at: span_mod.Span,
+        message: String,
+    )
+
+    case encoding_unsupported(
+        at: span_mod.Span,
+        predicate: String,
+        fragment: UnsupportedFragment,
+    )
+
+    case skipped_undecidable(
+        at: span_mod.Span,
+        predicate: String,
+        reason: Option_String.Option,
+    )
+
+    case trivially_true(
+        at: span_mod.Span,
+        predicate: String,
+    )
+}
+
+
+public function to_diagnostic(e: RefineError, allocator: Allocator) -> diag_mod.Diagnostic
+    with {allocator, err: alloc.AllocError}
+{
+    let at = span_of(e)
+    let msg = format_message(e, allocator)?
+    return match e {
+        case .failed(_, _, _) =>
+            diag_mod.error_at(code_mod.refine_failed(), at, msg)
+        case .timeout(_, _, _, _) =>
+            diag_mod.error_at(code_mod.refine_timeout(), at, msg)
+        case .unknown(_, _, _) =>
+            diag_mod.error_at(code_mod.refine_unknown(), at, msg)
+        case .solver_internal(_, _) =>
+            diag_mod.fatal_at(code_mod.refine_solver_internal(), at, msg)
+        case .encoding_unsupported(_, _, _) =>
+            diag_mod.error_at(code_mod.refine_encoding_unsupported(), at, msg)
+        case .skipped_undecidable(_, _, _) =>
+            diag_mod.warn_at(code_mod.refine_skipped_undecidable(), at, msg)
+        case .trivially_true(_, _) =>
+            diag_mod.warn_at(code_mod.refinement_trivially_true(), at, msg)
+    }
+}
+
+
+public stable function span_of(e: RefineError) -> span_mod.Span {
+    return match e {
+        case .failed(let at, _, _) => at
+        case .timeout(let at, _, _, _) => at
+        case .unknown(let at, _, _) => at
+        case .solver_internal(let at, _) => at
+        case .encoding_unsupported(let at, _, _) => at
+        case .skipped_undecidable(let at, _, _) => at
+        case .trivially_true(let at, _) => at
+    }
+}
+
+
+function format_message(e: RefineError, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return match e {
+        case .failed(_, let predicate, let counterexample) =>
+            fmt_failed(predicate, counterexample, allocator)?
+        case .timeout(_, let predicate, let elapsed, let configured) =>
+            fmt_timeout(predicate, elapsed, configured, allocator)?
+        case .unknown(_, let predicate, let reason) =>
+            fmt_unknown(predicate, reason, allocator)?
+        case .solver_internal(_, let message) =>
+            fmt_solver_internal(message, allocator)?
+        case .encoding_unsupported(_, let predicate, let fragment) =>
+            fmt_encoding_unsupported(predicate, fragment, allocator)?
+        case .skipped_undecidable(_, let predicate, let reason) =>
+            fmt_skipped_undecidable(predicate, reason, allocator)?
+        case .trivially_true(_, let predicate) =>
+            fmt_trivially_true(predicate, allocator)?
+    }
+}
+
+function fmt_failed(
+    predicate: String,
+    counterexample: Option_String.Option,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat("predicate does not hold: ", predicate, allocator)?
+    return match counterexample {
+        case .some(let cex) => {
+            let p2 = string.concat(p1, " — counterexample: ", allocator)?
+            string.concat(p2, cex, allocator)?
+        }
+        case .none => p1
+    }
+}
+
+function fmt_timeout(
+    predicate: String,
+    elapsed_ms: u32,
+    configured_ms: u32,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat("solver timed out on: ", predicate, allocator)?
+    let p2 = string.concat(p1, " — elapsed ", allocator)?
+    let elapsed_str = fmt.u32_to_string(elapsed_ms, allocator)?
+    let p3 = string.concat(p2, elapsed_str, allocator)?
+    let p4 = string.concat(p3, "ms, budget ", allocator)?
+    let budget_str = fmt.u32_to_string(configured_ms, allocator)?
+    let p5 = string.concat(p4, budget_str, allocator)?
+    return string.concat(p5, "ms", allocator)?
+}
+
+function fmt_unknown(
+    predicate: String,
+    reason: Option_String.Option,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat("solver returned `unknown` on: ", predicate, allocator)?
+    return match reason {
+        case .some(let r) => {
+            let p2 = string.concat(p1, " — solver reason: ", allocator)?
+            string.concat(p2, r, allocator)?
+        }
+        case .none => p1
+    }
+}
+
+function fmt_solver_internal(message: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.concat("solver pipeline failed: ", message, allocator)?
+}
+
+function fmt_skipped_undecidable(
+    predicate: String,
+    reason: Option_String.Option,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(
+        "obligation skipped — not proven and not refuted: ",
+        predicate,
+        allocator,
+    )?
+    let p2 = match reason {
+        case .some(let r) => {
+            let s = string.concat(p1, " — ", allocator)?
+            string.concat(s, r, allocator)?
+        }
+        case .none => p1
+    }
+    return string.concat(
+        p2,
+        " (add `@trust(reason: \"...\")` at the site if the predicate holds by argument)",
+        allocator,
+    )?
+}
+
+function fmt_trivially_true(predicate: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(
+        "predicate discharges without using any context premise: ",
+        predicate,
+        allocator,
+    )?
+    return string.concat(
+        p1,
+        " (this clause is a tautology — consider simplifying or removing it)",
+        allocator,
+    )?
+}
+
+function fmt_encoding_unsupported(
+    predicate: String,
+    fragment: UnsupportedFragment,
+    allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat(
+        "predicate uses a form outside the V1.0 decidable fragment: ",
+        predicate,
+        allocator,
+    )?
+    let p2 = string.concat(p1, " — ", allocator)?
+    let p3 = string.concat(p2, fmt_unsupported_fragment(fragment), allocator)?
+    return string.concat(
+        p3,
+        " (consider `@trust(reason: \"...\")` at the site if the predicate holds by argument outside the decidable fragment)",
+        allocator,
+    )?
+}
+
+public function fmt_unsupported_fragment(fragment: UnsupportedFragment) -> String {
+    return match fragment {
+        case .nla => "nonlinear arithmetic (multiplication / division by a non-constant value)"
+        case .bitvector => "bitwise operators (`&`, `|`, `^`, `~`, `<<`, `>>`) — reserved for post-V1.0"
+        case .floating_point => "float arithmetic predicate beyond comparison — reserved for post-V1.0"
+        case .string_content => "string content predicate (substring / prefix / content-equality) — reserved for post-V1.0"
+        case .other(let message) => message
+    }
+}

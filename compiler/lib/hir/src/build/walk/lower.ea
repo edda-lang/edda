@@ -1,0 +1,1756 @@
+
+module hir.build.walk.lower
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.symbol
+import intern.interner as intern_mod
+import std.text.str
+import std.text.string
+import resolve.build.builtins as resolve_builtins_mod
+import resolve.cteval.builtins as cbi_builtins_mod
+import resolve.ctx as resolve_ctx_mod
+import resolve.paths.path as resolve_path_mod
+import span.loc.pos.span as span_mod
+import syntax.ast.file as ast_file
+import syntax.ast.item as ast_item_mod
+import syntax.ast.tree as ast_tree
+import syntax.ast.ident as ast_ident
+import syntax.ast.literal as ast_literal
+import syntax.ast.ops as ast_ops
+import syntax.tokens.kind as kind_mod
+import local.def as def_mod
+import local.node as node_mod
+import local.build.file as hir_file_mod
+import local.build.walk.path.path as vpath_mod
+import local.tree as hir_tree
+import local.item as hir_item
+
+
+spec std.mem.alloc.Box(ast_tree.Expr)
+spec std.mem.alloc.Box(ast_tree.Pat)
+spec std.mem.alloc.Box(ast_tree.Ty)
+spec std.mem.alloc.Box(ast_tree.Closure)
+spec std.mem.alloc.Box(hir_tree.HClosure)
+spec std.mem.alloc.Box(ast_tree.SpawnExpr)
+spec std.mem.alloc.Box(hir_tree.HSpawn)
+spec std.mem.alloc.Box(ast_item_mod.FnDecl)
+spec std.mem.alloc.Box(ast_item_mod.TypeDecl)
+spec std.mem.alloc.Box(ast_item_mod.Spec)
+spec std.mem.alloc.Box(ast_item_mod.SpecInvocation)
+spec std.mem.alloc.Box(ast_item_mod.LetDecl)
+spec std.mem.alloc.Box(ast_item_mod.Derive)
+spec std.mem.alloc.Box(hir_tree.HExpr)
+spec std.mem.alloc.Box(hir_item.HFnSignature)
+spec std.mem.alloc.Box(hir_item.HTypeSignature)
+spec std.mem.alloc.Box(hir_item.HSpecSignature)
+
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.collections.vec.Vec(def_mod.DefId)
+spec std.collections.vec.Vec(hir_item.HItem)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.collections.vec.Vec(hir_tree.HExpr)
+spec std.collections.vec.Vec(hir_tree.HStmt)
+spec std.collections.vec.Vec(hir_tree.HArm)
+spec std.collections.vec.Vec(hir_tree.HArg)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.collections.vec.Vec(ast_item_mod.GenericParam)
+spec std.collections.vec.Vec(ast_item_mod.TypeField)
+spec std.collections.vec.Vec(ast_item_mod.Variant)
+spec std.collections.vec.Vec(ast_tree.RefinementClause)
+spec std.collections.vec.Vec(ast_tree.Param)
+spec std.collections.vec.Vec(ast_tree.Capture)
+spec std.collections.vec.Vec(hir_tree.HClosureParam)
+spec std.collections.vec.Vec(hir_tree.HCapture)
+spec std.collections.vec.Vec(ast_tree.SpawnArg)
+spec std.collections.vec.Vec(hir_tree.HSpawnArg)
+spec std.collections.vec.Vec(ast_tree.MatchArm)
+spec std.collections.vec.Vec(ast_tree.CallArg)
+spec std.collections.vec.Vec(ast_tree.Expr)
+spec std.collections.vec.Vec(ast_tree.FStringSeg)
+spec std.collections.vec.Vec(ast_tree.Stmt)
+spec std.collections.vec.Vec(ast_tree.StructLitField)
+spec std.collections.vec.Vec(ast_tree.StructPatField)
+spec std.collections.vec.Vec(ast_tree.Pat)
+spec std.collections.vec.Vec(hir_tree.HBinding)
+spec std.collections.vec.Vec(u8)
+
+spec std.core.option.Option(Box_Expr)
+spec std.core.option.Option(Box_HExpr)
+spec std.core.option.Option(hir_tree.HBlock)
+spec std.core.option.Option(hir_tree.HExpr)
+spec std.core.option.Option(symbol.Symbol)
+spec std.core.option.Option(ast_ops.CallMode)
+spec std.core.option.Option(ast_tree.Ty)
+spec std.core.option.Option(ast_tree.Expr)
+spec std.core.option.Option(ast_ident.Ident)
+spec std.core.option.Option(def_mod.DefId)
+spec std.core.option.Option(ast_item_mod.Stability)
+spec std.core.option.Option(ast_item_mod.Linearity)
+spec std.core.option.Option(ast_tree.EffectRow)
+spec std.core.option.Option(ast_tree.SliceRest)
+spec std.core.option.Option(Vec_Capture)
+
+
+public function lower_file(source: take ast_file.File, output: resolve_ctx_mod.ResolveOutput, start_def_id: u32, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_file_mod.HirFile
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let item_count = Vec_Item.len(source.items)
+    uninit out: hir_file_mod.HirFile
+    hir_file_mod.new_hir_file(init out, take source, start_def_id, item_count, allocator)?
+    var i: usize = 0
+    loop decreases item_count - i + 1 as usize {
+        if i >= item_count { break }
+        let ast_item = Vec_Item.at(out.source.items, i)
+        let h_item = lower_item(mutable out, take ast_item, output, mutable interner, sym_alloc, allocator)?
+        Vec_HItem.push(mutable out.items, take h_item, allocator)?
+        i = i + 1 as usize
+    }
+    return out
+}
+
+
+function lower_item(file: mutable hir_file_mod.HirFile, ast_item: take ast_item_mod.Item, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_item.HItem
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, ast_item.span, hir_file_mod.NodeKind.item, allocator)?
+    let name_span = match ast_item.kind {
+        case .function_(let decl) => Box_FnDecl.get(decl).name.span
+        case .type_decl(let decl) => Box_TypeDecl.get(decl).name.span
+        case .spec_(let decl) => Box_Spec.get(decl).name.span
+        case .let_(let decl) => Box_LetDecl.get(decl).name.span
+        case _ => span_mod.dummy()
+    }
+    file.saw_comptime = false
+    let kind = match ast_item.kind {
+        case .function_(let decl) => lower_function_item(mutable file, decl, output, mutable interner, sym_alloc, allocator)?
+        case .type_decl(let decl) => lower_type_item(decl, allocator)?
+        case .spec_(let decl) => lower_spec_item(mutable file, decl, output, mutable interner, sym_alloc, allocator)?
+        case .spec_invocation(let inv) => lower_spec_invocation_item(mutable file, inv, output, mutable interner, sym_alloc, allocator)?
+        case .let_(let decl) => lower_let_item(mutable file, decl, output, mutable interner, sym_alloc, allocator)?
+        case .import_(_) => hir_item.HItemKind.import_decl
+        case .module_(_) => hir_item.HItemKind.module_decl
+        case .derive_(let decl) => lower_derive_item(decl, output, allocator)?
+    }
+    return hir_item.HItem { node_id: node_id, def_id: resolve_ctx_mod.lookup_use(output, name_span), ast_item: ast_item, kind: kind, has_comptime: file.saw_comptime }
+}
+
+function lower_function_item(file: mutable hir_file_mod.HirFile, decl: Box_FnDecl, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_item.HItemKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let d = Box_FnDecl.get(decl)
+    let sig = lower_fn_signature(mutable file, d, output, mutable interner, sym_alloc, allocator)?
+    let boxed_sig = Box_HFnSignature.new(take sig, allocator)?
+    return match d.body {
+        case .block_(let body) => hir_item.HItemKind.function_(sig: boxed_sig, body: lower_block(mutable file, body, output, mutable interner, sym_alloc, allocator)?)
+        case .extern_(let sp, let name_sp, let name, let dll) => hir_item.HItemKind.function_extern(sig: boxed_sig, extern_name: name, extern_span: sp, extern_dll: dll)
+    }
+}
+
+function lower_type_item(decl: Box_TypeDecl, allocator: Allocator) -> hir_item.HItemKind
+    with {allocator, err: alloc.AllocError}
+{
+    let d = Box_TypeDecl.get(decl)
+    let sig = lower_type_signature(d)
+    let boxed = Box_HTypeSignature.new(take sig, allocator)?
+    return hir_item.HItemKind.type_decl(sig: boxed)
+}
+
+function lower_spec_item(file: mutable hir_file_mod.HirFile, decl: Box_Spec, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_item.HItemKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let d = Box_Spec.get(decl)
+    let sig = lower_spec_signature(mutable file, d, output, mutable interner, sym_alloc, allocator)?
+    let boxed = Box_HSpecSignature.new(take sig, allocator)?
+    uninit body_items: Vec_HItem.Vec
+    Vec_HItem.new(init body_items, allocator)?
+    let nested_count = Vec_Item.len(d.body)
+    var i: usize = 0
+    loop decreases nested_count - i + 1 as usize {
+        if i >= nested_count { break }
+        let nested = Vec_Item.at(d.body, i)
+        let h_nested = lower_item(mutable file, take nested, output, mutable interner, sym_alloc, allocator)?
+        Vec_HItem.push(mutable body_items, take h_nested, allocator)?
+        i = i + 1 as usize
+    }
+    return hir_item.HItemKind.spec_decl(sig: boxed, items: body_items)
+}
+
+function lower_spec_invocation_item(file: mutable hir_file_mod.HirFile, inv: Box_SpecInvocation, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_item.HItemKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let v = Box_SpecInvocation.get(inv)
+    uninit args: Vec_HExpr.Vec
+    Vec_HExpr.new(init args, allocator)?
+    let n = Vec_Expr.len(v.args)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let a = Vec_Expr.at(v.args, i)
+        let lowered = lower_expr(mutable file, a, output, mutable interner, sym_alloc, allocator)?
+        Vec_HExpr.push(mutable args, take lowered, allocator)?
+        i = i + 1 as usize
+    }
+    return hir_item.HItemKind.spec_invocation(path: v.path, args: args)
+}
+
+function lower_let_item(file: mutable hir_file_mod.HirFile, decl: Box_LetDecl, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_item.HItemKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let d = Box_LetDecl.get(decl)
+    let init_expr = lower_expr(mutable file, d.init_, output, mutable interner, sym_alloc, allocator)?
+    return hir_item.HItemKind.let_decl(name: d.name.name, ty: d.ty, init_: init_expr)
+}
+
+function lower_derive_item(decl: Box_Derive, output: resolve_ctx_mod.ResolveOutput, allocator: Allocator) -> hir_item.HItemKind
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let d = Box_Derive.get(decl)
+    uninit items_syms: Vec_Symbol.Vec
+    Vec_Symbol.new(init items_syms, allocator)?
+    let n = Vec_Ident.len(d.items)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let id = Vec_Ident.at(d.items, i)
+        Vec_Symbol.push(mutable items_syms, id.name, allocator)?
+        i = i + 1 as usize
+    }
+    return hir_item.HItemKind.derive_decl(items_to_derive: items_syms, target_def: resolve_ctx_mod.lookup_use(output, d.target.span))
+}
+
+
+function lower_fn_signature(file: mutable hir_file_mod.HirFile, d: ast_item_mod.FnDecl, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_item.HFnSignature
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    uninit params: Vec_HParam.Vec
+    Vec_HParam.new(init params, allocator)?
+    let n = Vec_Param.len(d.params)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let p = Vec_Param.at(d.params, i)
+        let hp = lower_param(mutable file, p, output, allocator)?
+        Vec_HParam.push(mutable params, take hp, allocator)?
+        i = i + 1 as usize
+    }
+    let return_ty = match d.return_ty {
+        case .some(let t) => t
+        case .none => synthetic_unit_ty(d.span)
+    }
+    let refinements_hir = lower_refinement_preds(mutable file, d.refinements, output, mutable interner, sym_alloc, allocator)?
+    uninit comptime_param_defs: Vec_DefId.Vec
+    Vec_DefId.new(init comptime_param_defs, allocator)?
+    collect_generic_defs(mutable comptime_param_defs, d.outbound_generics, output, allocator)?
+    collect_generic_defs(mutable comptime_param_defs, d.generics, output, allocator)?
+    return hir_item.HFnSignature {
+        name: d.name.name,
+        stability: d.stability,
+        visibility: d.visibility,
+        refinement_stable: d.refinement_stable,
+        outbound_generics: d.outbound_generics,
+        generics: d.generics,
+        comptime_param_defs: comptime_param_defs,
+        params: params,
+        return_mode: d.return_mode,
+        return_ty: return_ty,
+        effects: d.effects,
+        refinements: d.refinements,
+        refinements_hir: refinements_hir,
+    }
+}
+
+function collect_generic_defs(
+    out: mutable Vec_DefId.Vec,
+    src: Vec_GenericParam.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_GenericParam.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let g = Vec_GenericParam.at(src, i)
+        Vec_DefId.push(mutable out, resolve_ctx_mod.lookup_use(output, g.name.span), allocator)?
+        i = i + 1
+    }
+}
+
+function lower_refinement_preds(
+    file: mutable hir_file_mod.HirFile,
+    src: Vec_RefinementClause.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> Vec_HExpr.Vec
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HExpr.Vec
+    Vec_HExpr.new(init out, allocator)?
+    let n = Vec_RefinementClause.len(src)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let clause = Vec_RefinementClause.at(src, i)
+        let h = lower_expr(mutable file, clause.pred, output, mutable interner, sym_alloc, allocator)?
+        Vec_HExpr.push(mutable out, take h, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+function lower_type_signature(d: ast_item_mod.TypeDecl) -> hir_item.HTypeSignature {
+    let kind = match d.kind {
+        case .product(let fields) => hir_item.HTypeDeclKind.product(fields: fields)
+        case .sum(let variants) => hir_item.HTypeDeclKind.sum_(variants: variants)
+    }
+    return hir_item.HTypeSignature {
+        name: d.name.name,
+        stability: d.stability,
+        visibility: d.visibility,
+        linearity: d.linearity,
+        generics: d.generics,
+        kind: kind,
+        synthesize_box_ptr: d.synthesize_box_ptr,
+    }
+}
+
+function lower_spec_signature(
+    file: mutable hir_file_mod.HirFile,
+    d: ast_item_mod.Spec,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_item.HSpecSignature
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let where_clauses_hir = lower_refinement_preds(mutable file, d.where_clauses, output, mutable interner, sym_alloc, allocator)?
+    return hir_item.HSpecSignature {
+        name: d.name.name,
+        stability: d.stability,
+        visibility: d.visibility,
+        generics: d.generics,
+        where_clauses: d.where_clauses,
+        where_clauses_hir: where_clauses_hir,
+    }
+}
+
+function lower_param(file: mutable hir_file_mod.HirFile, p: ast_tree.Param, output: resolve_ctx_mod.ResolveOutput, allocator: Allocator) -> hir_item.HParam
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_def_id < 4294967295
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, p.span, hir_file_mod.NodeKind.param, allocator)?
+    let resolved = resolve_ctx_mod.lookup_use(output, p.name.span)
+    let def_id = if def_mod.is_error(resolved) {
+        hir_file_mod.alloc_def_id(mutable file)
+    } else {
+        resolved
+    }
+    return hir_item.HParam { node_id: node_id, def_id: def_id, name: p.name.name, mode: p.mode, ty: p.ty }
+}
+
+
+function lower_block(file: mutable hir_file_mod.HirFile, b: ast_tree.Block, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_tree.HBlock
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, b.span, hir_file_mod.NodeKind.block, allocator)?
+    uninit stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init stmts, allocator)?
+    let n = Vec_Stmt.len(b.stmts)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let s = Vec_Stmt.at(b.stmts, i)
+        let h = lower_stmt(mutable file, s, output, mutable interner, sym_alloc, allocator)?
+        Vec_HStmt.push(mutable stmts, take h, allocator)?
+        i = i + 1 as usize
+    }
+    let trailing = match b.trailing {
+        case .some(let boxed) => {
+            let e = Box_Expr.get(boxed)
+            let h_e = lower_expr(mutable file, e, output, mutable interner, sym_alloc, allocator)?
+            let boxed_h = Box_HExpr.new(take h_e, allocator)?
+            Option_Box_HExpr.some(value: boxed_h)
+        }
+        case .none => Option_Box_HExpr.none
+    }
+    return hir_tree.HBlock { node_id: node_id, stmts: stmts, trailing: trailing }
+}
+
+function lower_stmt(file: mutable hir_file_mod.HirFile, s: ast_tree.Stmt, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_tree.HStmt
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, s.span, hir_file_mod.NodeKind.stmt, allocator)?
+    let kind = match s.kind {
+        case .let_(let binding, let pat, let ty, let init_opt) => {
+            let bindings = lower_pat_bindings(mutable file, pat, output, allocator)?
+            match init_opt {
+                case .some(let e) => hir_tree.HStmtKind.let_(binding: binding, pat: pat, bindings: bindings, ty: ty, init_: lower_expr(mutable file, take e, output, mutable interner, sym_alloc, allocator)?)
+                case .none => match ty {
+                    case .some(let t) => hir_tree.HStmtKind.uninit_(pat: pat, bindings: bindings, ty: t)
+                    case .none => hir_tree.HStmtKind.let_(binding: binding, pat: pat, bindings: bindings, ty: ty, init_: synthetic_error_expr(mutable file, s.span, allocator)?)
+                }
+            }
+        }
+        case .assign(let target, let op, let rhs) => hir_tree.HStmtKind.assign(target: lower_expr(mutable file, take target, output, mutable interner, sym_alloc, allocator)?, op: op, rhs: lower_expr(mutable file, take rhs, output, mutable interner, sym_alloc, allocator)?)
+        case .expr(let v) => {
+            uninit empty_bindings: Vec_HBinding.Vec
+            Vec_HBinding.new(init empty_bindings, allocator)?
+            hir_tree.HStmtKind.let_(binding: ast_ops.BindingMode.immutable, pat: wildcard_pat(v.span), bindings: empty_bindings, ty: Option_Ty.none, init_: lower_expr(mutable file, take v, output, mutable interner, sym_alloc, allocator)?)
+        }
+    }
+    return hir_tree.HStmt { node_id: node_id, kind: kind }
+}
+
+function lower_expr(file: mutable hir_file_mod.HirFile, e: ast_tree.Expr, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_tree.HExpr
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, e.span, hir_file_mod.NodeKind.expr, allocator)?
+    let kind = match e.kind {
+        case .literal(let v) => convert_literal(v, interner)
+        case .fstring(let segs) => lower_fstring_kind(mutable file, segs, e.span, output, mutable interner, sym_alloc, allocator)?
+        case .path(let p) => vpath_mod.lower_value_path(mutable file, p, output, interner, allocator)?
+        case .binary(let op, let l, let r) => hir_tree.HExprKind.binary(op: op, lhs: lower_boxed_expr(mutable file, l, output, mutable interner, sym_alloc, allocator)?, rhs: lower_boxed_expr(mutable file, r, output, mutable interner, sym_alloc, allocator)?)
+        case .unary(let op, let x) => hir_tree.HExprKind.unary(op: op, expr: lower_boxed_expr(mutable file, x, output, mutable interner, sym_alloc, allocator)?)
+        case .call(let callee, let args) => lower_call_kind(mutable file, node_id, callee, args, output, mutable interner, sym_alloc, allocator)?
+        case .method_call(let recv_box, let name, let args) => lower_method_call_kind(mutable file, recv_box, name, args, output, mutable interner, sym_alloc, allocator)?
+        case .field(let r, let name) => hir_tree.HExprKind.field(receiver: lower_boxed_expr(mutable file, r, output, mutable interner, sym_alloc, allocator)?, accessor: hir_tree.FieldAccessor.named(name: name.name))
+        case .tuple_index(let r, let i) => hir_tree.HExprKind.field(receiver: lower_boxed_expr(mutable file, r, output, mutable interner, sym_alloc, allocator)?, accessor: hir_tree.FieldAccessor.indexed(index: i))
+        case .positional(let pr, let pix) => hir_tree.HExprKind.positional(receiver: lower_boxed_expr(mutable file, pr, output, mutable interner, sym_alloc, allocator)?, index: lower_boxed_expr(mutable file, pix, output, mutable interner, sym_alloc, allocator)?)
+        case .index(let r, let ix) => lower_index_kind(mutable file, r, ix, output, mutable interner, sym_alloc, allocator)?
+        case .if_(let c, let t, let e_opt) => {
+            let cond = lower_boxed_expr(mutable file, c, output, mutable interner, sym_alloc, allocator)?
+            let then_block = lower_block(mutable file, t, output, mutable interner, sym_alloc, allocator)?
+            let else_block = match e_opt {
+                case .some(let eb) => Option_HBlock.some(value: lower_block(mutable file, synthesize_block_from_expr(eb, allocator)?, output, mutable interner, sym_alloc, allocator)?)
+                case .none => Option_HBlock.none
+            }
+            hir_tree.HExprKind.if_(cond: cond, then_block: then_block, else_block: else_block)
+        }
+        case .match_(let scrut, let arms) => hir_tree.HExprKind.match_(scrutinee: lower_boxed_expr(mutable file, scrut, output, mutable interner, sym_alloc, allocator)?, arms: lower_arms(mutable file, arms, output, mutable interner, sym_alloc, allocator)?)
+        case .block(let body) => hir_tree.HExprKind.block_(body: lower_block(mutable file, body, output, mutable interner, sym_alloc, allocator)?)
+        case .cast(let x, let t, let mode) => hir_tree.HExprKind.cast(expr: lower_boxed_expr(mutable file, x, output, mutable interner, sym_alloc, allocator)?, ty: Box_Ty.get(t), mode: mode)
+        case .range(let lo_opt, let hi_opt, let rkind) => match lo_opt {
+            case .some(let lo_b) => match hi_opt {
+                case .some(let hi_b) => hir_tree.HExprKind.range(
+                    lo: lower_boxed_expr(mutable file, lo_b, output, mutable interner, sym_alloc, allocator)?,
+                    hi: lower_boxed_expr(mutable file, hi_b, output, mutable interner, sym_alloc, allocator)?,
+                    inclusive: range_kind_inclusive(rkind),
+                )
+                case .none => hir_tree.HExprKind.error
+            }
+            case .none => hir_tree.HExprKind.error
+        }
+        case .tuple(let elems) => hir_tree.HExprKind.tuple(elements: lower_exprs(mutable file, elems, output, mutable interner, sym_alloc, allocator)?)
+        case .struct_lit(let lit_path, let fields) => hir_tree.HExprKind.struct_lit(def: resolve_ctx_mod.lookup_use(output, lit_path.span), fields: lower_struct_lit_fields(mutable file, fields, output, mutable interner, sym_alloc, allocator)?)
+        case .loop_(let body, let label, let dec) => hir_tree.HExprKind.loop_(
+            body: lower_block(mutable file, body, output, mutable interner, sym_alloc, allocator)?,
+            label: lower_opt_label(label),
+            decreases_: lower_opt_box(mutable file, dec, output, mutable interner, sym_alloc, allocator)?,
+        )
+        case .for_(let pat_box, let iter_box, let body_blk, _) => lower_for_kind(mutable file, pat_box, iter_box, body_blk, e.span, output, mutable interner, sym_alloc, allocator)?
+        case .try_(let expr_box) => lower_try_kind(mutable file, node_id, expr_box, output, mutable interner, sym_alloc, allocator)?
+        case .await_(let expr_box) => lower_await_kind(mutable file, expr_box, output, mutable interner, sym_alloc, allocator)?
+        case .raise_(let x) => hir_tree.HExprKind.raise_(expr: lower_boxed_expr(mutable file, x, output, mutable interner, sym_alloc, allocator)?)
+        case .panic_(let x) => hir_tree.HExprKind.panic_(expr: lower_boxed_expr(mutable file, x, output, mutable interner, sym_alloc, allocator)?)
+        case .return_(let v_opt) => hir_tree.HExprKind.return_(value: lower_opt_box(mutable file, v_opt, output, mutable interner, sym_alloc, allocator)?)
+        case .break_(let lbl, let v_opt) => hir_tree.HExprKind.break_(label: lower_opt_label(lbl), value: lower_opt_box(mutable file, v_opt, output, mutable interner, sym_alloc, allocator)?)
+        case .continue_(let lbl) => hir_tree.HExprKind.continue_(label: lower_opt_label(lbl))
+        case .comptime_(let x) => lower_comptime_kind(mutable file, x, output, mutable interner, sym_alloc, allocator)?
+        case .comptime_block(let body) => {
+            let comptime_body = lower_block(mutable file, body, output, mutable interner, sym_alloc, allocator)?
+            file.saw_comptime = true
+            hir_tree.HExprKind.comptime_block(body: comptime_body)
+        }
+        case .scope_(let kind, let name_opt, let body) => hir_tree.HExprKind.scope_(kind: kind, name: lower_opt_ident(name_opt), body: lower_block(mutable file, body, output, mutable interner, sym_alloc, allocator)?)
+        case .effect_row(_) => hir_tree.HExprKind.error
+        case .handle_(let _eff, let ty, let binder, let recovery, let body) => hir_tree.HExprKind.handle_(caught_ty: Box_Ty.get(ty), binder: resolve_ctx_mod.lookup_use(output, binder.span), recovery: lower_boxed_expr(mutable file, recovery, output, mutable interner, sym_alloc, allocator)?, body: lower_block(mutable file, body, output, mutable interner, sym_alloc, allocator)?)
+        case .closure(let c) => lower_closure_kind(mutable file, c, output, mutable interner, sym_alloc, allocator)?
+        case .spawn(let sp) => lower_spawn_kind(mutable file, sp, output, mutable interner, sym_alloc, allocator)?
+        case .forall_(let bound, let iter, let body) => hir_tree.HExprKind.forall_(bound: bound.name, iter: lower_boxed_expr(mutable file, iter, output, mutable interner, sym_alloc, allocator)?, body: lower_boxed_expr(mutable file, body, output, mutable interner, sym_alloc, allocator)?)
+        case .exists_(let bound, let iter, let body) => hir_tree.HExprKind.exists_(bound: bound.name, iter: lower_boxed_expr(mutable file, iter, output, mutable interner, sym_alloc, allocator)?, body: lower_boxed_expr(mutable file, body, output, mutable interner, sym_alloc, allocator)?)
+        case .error => hir_tree.HExprKind.error
+    }
+    return hir_tree.HExpr { node_id: node_id, kind: kind }
+}
+
+function lower_arm(file: mutable hir_file_mod.HirFile, a: ast_tree.MatchArm, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_tree.HArm
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, a.span, hir_file_mod.NodeKind.arm, allocator)?
+    let bindings = lower_pat_bindings(mutable file, a.pat, output, allocator)?
+    let guard = match a.guard {
+        case .some(let g) => Option_HExpr.some(value: lower_expr(mutable file, take g, output, mutable interner, sym_alloc, allocator)?)
+        case .none => Option_HExpr.none
+    }
+    let body = lower_expr(mutable file, a.body, output, mutable interner, sym_alloc, allocator)?
+    return hir_tree.HArm { node_id: node_id, pat: a.pat, bindings: bindings, guard: guard, body: body }
+}
+
+function lower_arg(file: mutable hir_file_mod.HirFile, a: ast_tree.CallArg, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> hir_tree.HArg
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let name_sym = match a.name {
+        case .some(let id) => Option_Symbol.some(value: id.name)
+        case .none => Option_Symbol.none
+    }
+    return hir_tree.HArg { mode: a.mode, name: name_sym, expr: lower_expr(mutable file, a.expr, output, mutable interner, sym_alloc, allocator)? }
+}
+
+
+function lower_call_kind(
+    file: mutable hir_file_mod.HirFile,
+    call_node: node_mod.NodeId,
+    callee: Box_Expr,
+    args: Vec_CallArg.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let callee_def = callee_to_def(callee, output, interner)
+    let callee_expr = Box_Expr.get(callee)
+    match callee_expr.kind {
+        case .path(let mp) => {
+            if Vec_Ident.len(mp.segments) >= 2 as usize && call_head_is_local(mp, output) {
+                return reencode_method_call(mutable file, call_node, mp, args, output, mutable interner, sym_alloc, allocator)?
+            }
+        }
+        case _ => ()
+    }
+    if is_fn_value_callee(callee, output) {
+        let callee_ast = Box_Expr.get(callee)
+        let callee_h = lower_expr(mutable file, callee_ast, output, mutable interner, sym_alloc, allocator)?
+        let callee_box = Box_HExpr.new(take callee_h, allocator)?
+        return hir_tree.HExprKind.dyn_call(callee: callee_box, args: lower_args(mutable file, args, callee_def, output, mutable interner, sym_alloc, allocator)?)
+    }
+    if def_mod.is_error(callee_def) {
+        let c = Box_Expr.get(callee)
+        match c.kind {
+            case .path(let p) => {
+                match variant_ctor_target(p, output) {
+                    case .some(let target) => {
+                        let nseg = Vec_Ident.len(p.segments)
+                        let leaf = Vec_Ident.at(p.segments, nseg - 1)
+                        return hir_tree.HExprKind.variant_ctor(
+                            def: target,
+                            variant: leaf.name,
+                            args: lower_args(mutable file, args, target, output, mutable interner, sym_alloc, allocator)?,
+                        )
+                    }
+                    case .none => ()
+                }
+            }
+            case _ => ()
+        }
+    }
+    return hir_tree.HExprKind.call(callee: callee_def, args: lower_args(mutable file, args, callee_def, output, mutable interner, sym_alloc, allocator)?)
+}
+
+
+function call_head_is_local(p: ast_ident.Path, output: resolve_ctx_mod.ResolveOutput) -> bool {
+    return match resolve_path_mod.first_seg_ident(p) {
+        case .some(let h) => def_mod.is_error(resolve_ctx_mod.lookup_local_use(output, h.span)) == false
+        case .none => false
+    }
+}
+
+
+function build_prefix_path(p: ast_ident.Path, count: usize, allocator: Allocator) -> ast_ident.Path
+    with {allocator, err: alloc.AllocError}
+{
+    uninit segs: Vec_Ident.Vec
+    Vec_Ident.new(init segs, allocator)?
+    let total = Vec_Ident.len(p.segments)
+    var i: usize = 0
+    loop decreases count - i + 1 as usize {
+        if i >= count { break }
+        if i >= total { break }
+        Vec_Ident.push(mutable segs, Vec_Ident.at(p.segments, i), allocator)?
+        i = i + 1 as usize
+    }
+    let sp = if total > 0 as usize { Vec_Ident.at(p.segments, 0 as usize).span } else { p.span }
+    return ast_ident.Path { span: sp, segments: segs }
+}
+
+
+function reencode_method_call(
+    file: mutable hir_file_mod.HirFile,
+    call_node: node_mod.NodeId,
+    p: ast_ident.Path,
+    args: Vec_CallArg.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+    requires Vec_Ident.len(p.segments) >= 2 as usize
+{
+    let nseg = Vec_Ident.len(p.segments)
+    let method_ident = Vec_Ident.at(p.segments, nseg - 1 as usize)
+    let prefix = build_prefix_path(p, nseg - 1 as usize, allocator)?
+    let recv_kind = vpath_mod.lower_value_path(mutable file, prefix, output, interner, allocator)?
+    let recv_node = hir_file_mod.alloc_node(mutable file, method_ident.span, hir_file_mod.NodeKind.expr, allocator)?
+    let recv_expr = hir_tree.HExpr { node_id: recv_node, kind: recv_kind }
+    let recv_arg = hir_tree.HArg {
+        mode: Option_CallMode.none,
+        name: Option_Symbol.none,
+        expr: recv_expr,
+    }
+    uninit out_args: Vec_HArg.Vec
+    Vec_HArg.new(init out_args, allocator)?
+    Vec_HArg.push(mutable out_args, take recv_arg, allocator)?
+    let n = Vec_CallArg.len(args)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let a = Vec_CallArg.at(args, i)
+        let h = lower_arg(mutable file, a, output, mutable interner, sym_alloc, allocator)?
+        Vec_HArg.push(mutable out_args, take h, allocator)?
+        i = i + 1 as usize
+    }
+    hir_file_mod.set_method_name(mutable file, call_node.raw, method_ident.name, recv_node.raw)
+    return hir_tree.HExprKind.method_call(name: method_ident.name, args: out_args)
+}
+
+
+function variant_ctor_target(p: ast_ident.Path, output: resolve_ctx_mod.ResolveOutput) -> Option_DefId.Option {
+    let nseg = Vec_Ident.len(p.segments)
+    if nseg < 2 as usize {
+        return Option_DefId.none
+    }
+    let leaf = Vec_Ident.at(p.segments, nseg - 1)
+    let target = resolve_ctx_mod.lookup_use(output, leaf.span)
+    if def_mod.is_error(target) {
+        return Option_DefId.none
+    }
+    return Option_DefId.some(value: target)
+}
+
+
+function callee_to_def(callee: Box_Expr, output: resolve_ctx_mod.ResolveOutput, interner: intern_mod.Interner) -> def_mod.DefId {
+    let c = Box_Expr.get(callee)
+    return match c.kind {
+        case .path(let p) => vpath_mod.resolve_single_segment_path(p, output, interner)
+        case _ => def_mod.error()
+    }
+}
+
+function is_fn_value_callee(callee: Box_Expr, output: resolve_ctx_mod.ResolveOutput) -> bool {
+    let c = Box_Expr.get(callee)
+    return match c.kind {
+        case .path(let p) => def_mod.is_error(resolve_ctx_mod.lookup_local_use(output, p.span)) == false
+        case _ => true
+    }
+}
+
+function lower_boxed_expr(file: mutable hir_file_mod.HirFile, boxed: Box_Expr, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> Box_HExpr
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let e = Box_Expr.get(boxed)
+    let h = lower_expr(mutable file, e, output, mutable interner, sym_alloc, allocator)?
+    return Box_HExpr.new(take h, allocator)?
+}
+
+function lower_opt_box(file: mutable hir_file_mod.HirFile, opt: Option_Box_Expr, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> Option_Box_HExpr
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    return match opt {
+        case .some(let boxed) => Option_Box_HExpr.some(value: lower_boxed_expr(mutable file, boxed, output, mutable interner, sym_alloc, allocator)?)
+        case .none => Option_Box_HExpr.none
+    }
+}
+
+function lower_exprs(file: mutable hir_file_mod.HirFile, src: Vec_Expr.Vec, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> Vec_HExpr.Vec
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HExpr.Vec
+    Vec_HExpr.new(init out, allocator)?
+    let n = Vec_Expr.len(src)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let e = Vec_Expr.at(src, i)
+        let h = lower_expr(mutable file, e, output, mutable interner, sym_alloc, allocator)?
+        Vec_HExpr.push(mutable out, take h, allocator)?
+        i = i + 1 as usize
+    }
+    return out
+}
+
+function lower_args(file: mutable hir_file_mod.HirFile, src: Vec_CallArg.Vec, callee_def: def_mod.DefId, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> Vec_HArg.Vec
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HArg.Vec
+    Vec_HArg.new(init out, allocator)?
+    let n = Vec_CallArg.len(src)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let a = Vec_CallArg.at(src, i)
+        let h = if is_ident_literal_arg(callee_def, output, i) {
+            lower_ident_literal_arg(mutable file, a, allocator)?
+        } else {
+            lower_arg(mutable file, a, output, mutable interner, sym_alloc, allocator)?
+        }
+        Vec_HArg.push(mutable out, take h, allocator)?
+        i = i + 1 as usize
+    }
+    return out
+}
+
+function is_ident_literal_arg(callee_def: def_mod.DefId, output: resolve_ctx_mod.ResolveOutput, i: usize) -> bool {
+    if i != (1 as usize) {
+        return false
+    }
+    let cbi = resolve_ctx_mod.output_comptime_builtins(output)
+    return callee_def.raw == cbi_builtins_mod.offset_of(cbi).raw
+}
+
+function lower_ident_literal_arg(file: mutable hir_file_mod.HirFile, a: ast_tree.CallArg, allocator: Allocator) -> hir_tree.HArg
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, a.expr.span, hir_file_mod.NodeKind.expr, allocator)?
+    let kind = match a.expr.kind {
+        case .path(let p) => if resolve_path_mod.path_len(p) == (1 as usize) {
+            hir_tree.HExprKind.ident_literal(name: resolve_path_mod.leaf(p))
+        } else {
+            hir_tree.HExprKind.error
+        }
+        case _ => hir_tree.HExprKind.error
+    }
+    let name_sym = match a.name {
+        case .some(let id) => Option_Symbol.some(value: id.name)
+        case .none => Option_Symbol.none
+    }
+    return hir_tree.HArg { mode: a.mode, name: name_sym, expr: hir_tree.HExpr { node_id: node_id, kind: kind } }
+}
+
+function lower_arms(file: mutable hir_file_mod.HirFile, src: Vec_MatchArm.Vec, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> Vec_HArm.Vec
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HArm.Vec
+    Vec_HArm.new(init out, allocator)?
+    let n = Vec_MatchArm.len(src)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let a = Vec_MatchArm.at(src, i)
+        let h = lower_arm(mutable file, a, output, mutable interner, sym_alloc, allocator)?
+        Vec_HArm.push(mutable out, take h, allocator)?
+        i = i + 1 as usize
+    }
+    return out
+}
+
+function lower_struct_lit_fields(file: mutable hir_file_mod.HirFile, src: Vec_StructLitField.Vec, output: resolve_ctx_mod.ResolveOutput, interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> Vec_HArg.Vec
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    uninit out: Vec_HArg.Vec
+    Vec_HArg.new(init out, allocator)?
+    let n = Vec_StructLitField.len(src)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let f = Vec_StructLitField.at(src, i)
+        let value = lower_expr(mutable file, f.value, output, mutable interner, sym_alloc, allocator)?
+        let h = hir_tree.HArg { mode: f.mode, name: Option_Symbol.some(value: f.name.name), expr: value }
+        Vec_HArg.push(mutable out, take h, allocator)?
+        i = i + 1 as usize
+    }
+    return out
+}
+
+function lower_opt_label(opt: Option_Ident) -> Option_Symbol {
+    return match opt {
+        case .some(let id) => Option_Symbol.some(value: id.name)
+        case .none => Option_Symbol.none
+    }
+}
+
+function lower_opt_ident(opt: Option_Ident) -> Option_Symbol {
+    return lower_opt_label(opt)
+}
+
+function convert_literal(lit: ast_literal.Literal, interner: intern_mod.Interner) -> hir_tree.HExprKind {
+    return match lit {
+        case .int(let v, let b) => hir_tree.HExprKind.literal(value: hir_tree.HLiteral.int(value: v, base: b))
+        case .float(let s) => {
+            let bytes = intern_mod.lookup(interner, s)
+            let v = handle err: str.ParseFloatError as _pe -> 0.0 {
+                str.parse_f64(bytes)?
+            }
+            hir_tree.HExprKind.literal(value: hir_tree.HLiteral.float(sym: s, value: v))
+        }
+        case .str(let s) => hir_tree.HExprKind.literal(value: hir_tree.HLiteral.str(sym: s))
+        case .bool(let v) => hir_tree.HExprKind.literal(value: hir_tree.HLiteral.bool(value: v))
+        case .unit => hir_tree.HExprKind.literal(value: hir_tree.HLiteral.unit)
+    }
+}
+function synthetic_unit_ty(sp: span_mod.Span) -> ast_tree.Ty {
+    return ast_tree.Ty { span: sp, kind: ast_tree.TyKind.unit }
+}
+
+function synthetic_error_expr(file: mutable hir_file_mod.HirFile, sp: span_mod.Span, allocator: Allocator) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_node_id < 4294967295
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    return hir_tree.HExpr { node_id: node_id, kind: hir_tree.HExprKind.error }
+}
+
+function synthesize_block_from_expr(boxed: Box_Expr, allocator: Allocator) -> ast_tree.Block
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let e = Box_Expr.get(boxed)
+    let sp = e.span
+    let boxed_e = Box_Expr.new(take e, allocator)?
+    uninit stmts: Vec_Stmt.Vec
+    Vec_Stmt.new(init stmts, allocator)?
+    return ast_tree.Block { span: sp, stmts: stmts, trailing: Option_Box_Expr.some(value: boxed_e) }
+}
+
+function wildcard_pat(sp: span_mod.Span) -> ast_tree.Pat {
+    return ast_tree.Pat { span: sp, kind: ast_tree.PatKind.wildcard }
+}
+
+
+function lower_method_call_kind(
+    file: mutable hir_file_mod.HirFile,
+    recv_box: Box_Expr,
+    name: ast_ident.Ident,
+    args: Vec_CallArg.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let recv_ast = Box_Expr.get(recv_box)
+    let recv_h = lower_expr(mutable file, recv_ast, output, mutable interner, sym_alloc, allocator)?
+    let recv_arg = hir_tree.HArg {
+        mode: Option_CallMode.none,
+        name: Option_Symbol.none,
+        expr: recv_h,
+    }
+    uninit out_args: Vec_HArg.Vec
+    Vec_HArg.new(init out_args, allocator)?
+    Vec_HArg.push(mutable out_args, take recv_arg, allocator)?
+    let n = Vec_CallArg.len(args)
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let a = Vec_CallArg.at(args, i)
+        let h = lower_arg(mutable file, a, output, mutable interner, sym_alloc, allocator)?
+        Vec_HArg.push(mutable out_args, take h, allocator)?
+        i = i + 1 as usize
+    }
+    return hir_tree.HExprKind.method_call(name: name.name, args: out_args)
+}
+
+function lower_index_kind(
+    file: mutable hir_file_mod.HirFile,
+    r: Box_Expr,
+    ix: Box_Expr,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let idx_ast = Box_Expr.get(ix)
+    return match idx_ast.kind {
+        case .range(let lo, let hi, let kind) => {
+            let receiver = lower_boxed_expr(mutable file, r, output, mutable interner, sym_alloc, allocator)?
+            let lo_h = lower_opt_box(mutable file, lo, output, mutable interner, sym_alloc, allocator)?
+            let hi_h = lower_opt_box(mutable file, hi, output, mutable interner, sym_alloc, allocator)?
+            let inclusive = match kind {
+                case .closed => true
+                case .half_open => false
+            }
+            hir_tree.HExprKind.subrange(receiver: receiver, lo: lo_h, hi: hi_h, inclusive: inclusive)
+        }
+        case _ => hir_tree.HExprKind.index(
+            receiver: lower_boxed_expr(mutable file, r, output, mutable interner, sym_alloc, allocator)?,
+            idx: lower_boxed_expr(mutable file, ix, output, mutable interner, sym_alloc, allocator)?,
+        )
+    }
+}
+
+function lower_await_kind(
+    file: mutable hir_file_mod.HirFile,
+    expr_box: Box_Expr,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let inner_ast = Box_Expr.get(expr_box)
+    let inner_h = lower_expr(mutable file, inner_ast, output, mutable interner, sym_alloc, allocator)?
+    let inner_arg = hir_tree.HArg {
+        mode: Option_CallMode.none,
+        name: Option_Symbol.none,
+        expr: inner_h,
+    }
+    uninit out_args: Vec_HArg.Vec
+    Vec_HArg.new(init out_args, allocator)?
+    Vec_HArg.push(mutable out_args, take inner_arg, allocator)?
+    let builtins = resolve_ctx_mod.output_builtins(output)
+    let await_def = resolve_builtins_mod.task_await(builtins)
+    return hir_tree.HExprKind.call(callee: await_def, args: out_args)
+}
+
+function lower_spawn_kind(
+    file: mutable hir_file_mod.HirFile,
+    sp_box: Box_SpawnExpr,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let sp = Box_SpawnExpr.get(sp_box)
+    uninit args: Vec_HSpawnArg.Vec
+    Vec_HSpawnArg.new(init args, allocator)?
+    let n = Vec_SpawnArg.len(sp.args)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arg = Vec_SpawnArg.at(sp.args, i)
+        let init_ast = arg.init_
+        let init_h = lower_expr(mutable file, init_ast, output, mutable interner, sym_alloc, allocator)?
+        let hsa = hir_tree.HSpawnArg {
+            def_id: resolve_ctx_mod.lookup_use(output, arg.name.span),
+            name: arg.name.name,
+            init_: init_h,
+        }
+        Vec_HSpawnArg.push(mutable args, take hsa, allocator)?
+        i = i + 1
+    }
+    let body = lower_block(mutable file, sp.body, output, mutable interner, sym_alloc, allocator)?
+    let hspawn = hir_tree.HSpawn {
+        scope_name: Option_Symbol.some(value: sp.scope_name.name),
+        args: args,
+        body: body,
+    }
+    let boxed = Box_HSpawn.new(take hspawn, allocator)?
+    return hir_tree.HExprKind.spawn_(spawn: boxed)
+}
+
+function lower_try_kind(
+    file: mutable hir_file_mod.HirFile,
+    try_node: node_mod.NodeId,
+    expr_box: Box_Expr,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let inner_ast = Box_Expr.get(expr_box)
+    let inner_h = lower_expr(mutable file, inner_ast, output, mutable interner, sym_alloc, allocator)?
+    hir_file_mod.set_try_flag(mutable file, try_node.raw)
+    return inner_h.kind
+}
+
+function lower_closure_kind(
+    file: mutable hir_file_mod.HirFile,
+    c_box: Box_Closure,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let c = Box_Closure.get(c_box)
+    uninit params: Vec_HClosureParam.Vec
+    Vec_HClosureParam.new(init params, allocator)?
+    let pn = Vec_Param.len(c.params)
+    var pi: usize = 0
+    loop decreases (pn - pi) {
+        if pi >= pn { break }
+        let p = Vec_Param.at(c.params, pi)
+        let p_def = resolve_ctx_mod.lookup_use(output, p.name.span)
+        let hp = hir_tree.HClosureParam { def_id: p_def, name: p.name.name, mode: p.mode, ty: p.ty }
+        Vec_HClosureParam.push(mutable params, take hp, allocator)?
+        pi = pi + 1
+    }
+    uninit captures: Vec_HCapture.Vec
+    Vec_HCapture.new(init captures, allocator)?
+    match c.captures_ {
+        case .some(let caps) => {
+            let cn = Vec_Capture.len(caps)
+            var ci: usize = 0
+            loop decreases (cn - ci) {
+                if ci >= cn { break }
+                let cap = Vec_Capture.at(caps, ci)
+                let c_def = resolve_ctx_mod.lookup_use(output, cap.name.span)
+                let hc = hir_tree.HCapture { def_id: c_def, name: cap.name.name, mode: cap.mode }
+                Vec_HCapture.push(mutable captures, take hc, allocator)?
+                ci = ci + 1
+            }
+        }
+        case .none => ()
+    }
+    let body = lower_block(mutable file, c.body, output, mutable interner, sym_alloc, allocator)?
+    let hclosure = hir_tree.HClosure {
+        params: params,
+        captures: captures,
+        ret: c.ret,
+        effects: c.effects,
+        body: body,
+    }
+    let boxed = Box_HClosure.new(take hclosure, allocator)?
+    return hir_tree.HExprKind.closure(closure: boxed)
+}
+
+function synthetic_use_expr(
+    file: mutable hir_file_mod.HirFile,
+    def: def_mod.DefId,
+    sp: span_mod.Span,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    return hir_tree.HExpr { node_id: node_id, kind: hir_tree.HExprKind.use_(def: def) }
+}
+
+function lower_for_kind(
+    file: mutable hir_file_mod.HirFile,
+    pat_box: Box_Pat,
+    iter_box: Box_Expr,
+    body_blk: ast_tree.Block,
+    sp: span_mod.Span,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    match Box_Expr.get(iter_box).kind {
+        case .range(let lo_opt, let hi_opt, let rkind) => {
+            match lo_opt {
+                case .some(let lo_b) => {
+                    match hi_opt {
+                        case .some(let hi_b) => return lower_range_for_kind(mutable file, pat_box, lo_b, hi_b, rkind, body_blk, sp, output, mutable interner, sym_alloc, allocator)?
+                        case .none => return hir_tree.HExprKind.error
+                    }
+                }
+                case .none => return hir_tree.HExprKind.error
+            }
+        }
+        case _ => return lower_slice_for_kind(mutable file, pat_box, iter_box, body_blk, sp, output, mutable interner, sym_alloc, allocator)?
+    }
+}
+
+function mk_expr(file: mutable hir_file_mod.HirFile, kind: take hir_tree.HExprKind, sp: span_mod.Span, allocator: Allocator) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    return hir_tree.HExpr { node_id: node_id, kind: kind }
+}
+
+function expr_stmt(file: mutable hir_file_mod.HirFile, e: hir_tree.HExpr, sp: span_mod.Span, allocator: Allocator) -> hir_tree.HStmt
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    uninit empty_bindings: Vec_HBinding.Vec
+    Vec_HBinding.new(init empty_bindings, allocator)?
+    return hir_tree.HStmt {
+        node_id: node_id,
+        kind: hir_tree.HStmtKind.let_(
+            binding: ast_ops.BindingMode.immutable,
+            pat: wildcard_pat(sp),
+            bindings: empty_bindings,
+            ty: Option_Ty.none,
+            init_: e,
+        ),
+    }
+}
+
+function lower_range_for_kind(
+    file: mutable hir_file_mod.HirFile,
+    pat_box: Box_Pat,
+    lo_box: Box_Expr,
+    hi_box: Box_Expr,
+    rkind: ast_ops.RangeKind,
+    body_blk: ast_tree.Block,
+    sp: span_mod.Span,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let user_pat = Box_Pat.get(pat_box)
+    let lo_h = lower_expr(mutable file, Box_Expr.get(lo_box), output, mutable interner, sym_alloc, allocator)?
+    let hi_h = lower_expr(mutable file, Box_Expr.get(hi_box), output, mutable interner, sym_alloc, allocator)?
+
+    let s_hi = intern_mod.intern(mutable interner, "hi", sym_alloc)?
+    let hi_pat = ast_tree.Pat { span: sp, kind: ast_tree.PatKind.binding(name: ast_ident.Ident { span: sp, name: s_hi }) }
+    let hi_bindings = lower_pat_bindings(mutable file, hi_pat, output, allocator)?
+    let hi_def = if Vec_HBinding.len(hi_bindings) > 0 as usize { Vec_HBinding.at(hi_bindings, 0 as usize).def_id } else { def_mod.error() }
+    let let_hi_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let let_hi_stmt = hir_tree.HStmt {
+        node_id: let_hi_node,
+        kind: hir_tree.HStmtKind.let_(
+            binding: ast_ops.BindingMode.immutable,
+            pat: hi_pat,
+            bindings: hi_bindings,
+            ty: Option_Ty.none,
+            init_: hi_h,
+        ),
+    }
+
+    let i_bindings = lower_pat_bindings(mutable file, user_pat, output, allocator)?
+    let i_def = if Vec_HBinding.len(i_bindings) > 0 as usize { Vec_HBinding.at(i_bindings, 0 as usize).def_id } else { def_mod.error() }
+    let let_i_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let let_i_stmt = hir_tree.HStmt {
+        node_id: let_i_node,
+        kind: hir_tree.HStmtKind.let_(
+            binding: ast_ops.BindingMode.mutable_,
+            pat: user_pat,
+            bindings: i_bindings,
+            ty: Option_Ty.none,
+            init_: lo_h,
+        ),
+    }
+    hir_file_mod.set_for_hint(mutable file, let_i_node.raw, hi_def.raw)
+
+    let cmp_op = match rkind {
+        case .closed => ast_ops.BinOp.gt
+        case .half_open => ast_ops.BinOp.ge
+    }
+    let guard_i = synthetic_use_expr(mutable file, i_def, sp, allocator)?
+    let guard_hi = synthetic_use_expr(mutable file, hi_def, sp, allocator)?
+    let guard_cond = mk_expr(mutable file, take hir_tree.HExprKind.binary(op: cmp_op, lhs: Box_HExpr.new(take guard_i, allocator)?, rhs: Box_HExpr.new(take guard_hi, allocator)?), sp, allocator)?
+    let break_expr = mk_expr(mutable file, take hir_tree.HExprKind.break_(label: Option_Symbol.none, value: Option_Box_HExpr.none), sp, allocator)?
+    let break_block_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    uninit break_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init break_stmts, allocator)?
+    let break_block = hir_tree.HBlock {
+        node_id: break_block_node,
+        stmts: break_stmts,
+        trailing: Option_Box_HExpr.some(value: Box_HExpr.new(take break_expr, allocator)?),
+    }
+    let guard_if = mk_expr(mutable file, take hir_tree.HExprKind.if_(cond: Box_HExpr.new(take guard_cond, allocator)?, then_block: break_block, else_block: Option_HBlock.none), sp, allocator)?
+    let guard_stmt = expr_stmt(mutable file, guard_if, sp, allocator)?
+
+    let user_body_hblock = lower_block(mutable file, body_blk, output, mutable interner, sym_alloc, allocator)?
+    let body_expr = mk_expr(mutable file, take hir_tree.HExprKind.block_(body: user_body_hblock), sp, allocator)?
+    let body_stmt = expr_stmt(mutable file, body_expr, sp, allocator)?
+
+    let incr_lhs = synthetic_use_expr(mutable file, i_def, sp, allocator)?
+    let one_lit = mk_expr(mutable file, take hir_tree.HExprKind.literal(value: hir_tree.HLiteral.int(value: 1 as u128, base: kind_mod.IntBase.dec)), sp, allocator)?
+    let incr_rhs = mk_expr(mutable file, take hir_tree.HExprKind.binary(op: ast_ops.BinOp.add, lhs: Box_HExpr.new(take incr_lhs, allocator)?, rhs: Box_HExpr.new(take one_lit, allocator)?), sp, allocator)?
+    let incr_target = synthetic_use_expr(mutable file, i_def, sp, allocator)?
+    let incr_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let incr_stmt = hir_tree.HStmt {
+        node_id: incr_node,
+        kind: hir_tree.HStmtKind.assign(target: incr_target, op: ast_ops.AssignOp.plain, rhs: incr_rhs),
+    }
+
+    uninit loop_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init loop_stmts, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take guard_stmt, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take body_stmt, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take incr_stmt, allocator)?
+    let loop_body_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    let loop_body = hir_tree.HBlock {
+        node_id: loop_body_node,
+        stmts: loop_stmts,
+        trailing: Option_Box_HExpr.none,
+    }
+    let loop_expr = mk_expr(mutable file, take hir_tree.HExprKind.loop_(body: loop_body, label: Option_Symbol.none, decreases_: Option_Box_HExpr.none), sp, allocator)?
+
+    uninit outer_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init outer_stmts, allocator)?
+    Vec_HStmt.push(mutable outer_stmts, take let_hi_stmt, allocator)?
+    Vec_HStmt.push(mutable outer_stmts, take let_i_stmt, allocator)?
+    let outer_block_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    let outer_block = hir_tree.HBlock {
+        node_id: outer_block_node,
+        stmts: outer_stmts,
+        trailing: Option_Box_HExpr.some(value: Box_HExpr.new(take loop_expr, allocator)?),
+    }
+    return hir_tree.HExprKind.block_(body: outer_block)
+}
+
+function lower_slice_for_kind(
+    file: mutable hir_file_mod.HirFile,
+    pat_box: Box_Pat,
+    iter_box: Box_Expr,
+    body_blk: ast_tree.Block,
+    sp: span_mod.Span,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let iter_h = lower_expr(mutable file, Box_Expr.get(iter_box), output, mutable interner, sym_alloc, allocator)?
+    let s_slice = intern_mod.intern(mutable interner, "slice", sym_alloc)?
+    let s_idx = intern_mod.intern(mutable interner, "idx", sym_alloc)?
+    let s_len = intern_mod.intern(mutable interner, "len", sym_alloc)?
+
+    let slice_pat = ast_tree.Pat { span: sp, kind: ast_tree.PatKind.binding(name: ast_ident.Ident { span: sp, name: s_slice }) }
+    let slice_bindings = lower_pat_bindings(mutable file, slice_pat, output, allocator)?
+    let slice_def = if Vec_HBinding.len(slice_bindings) > 0 as usize { Vec_HBinding.at(slice_bindings, 0 as usize).def_id } else { def_mod.error() }
+    let let_slice_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let let_slice_stmt = hir_tree.HStmt {
+        node_id: let_slice_node,
+        kind: hir_tree.HStmtKind.let_(
+            binding: ast_ops.BindingMode.immutable,
+            pat: slice_pat,
+            bindings: slice_bindings,
+            ty: Option_Ty.none,
+            init_: iter_h,
+        ),
+    }
+
+    let idx_pat = ast_tree.Pat { span: sp, kind: ast_tree.PatKind.binding(name: ast_ident.Ident { span: sp, name: s_idx }) }
+    let idx_bindings = lower_pat_bindings(mutable file, idx_pat, output, allocator)?
+    let idx_def = if Vec_HBinding.len(idx_bindings) > 0 as usize { Vec_HBinding.at(idx_bindings, 0 as usize).def_id } else { def_mod.error() }
+    let zero_lit = mk_expr(mutable file, take hir_tree.HExprKind.literal(value: hir_tree.HLiteral.int(value: 0 as u128, base: kind_mod.IntBase.dec)), sp, allocator)?
+    let let_idx_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let let_idx_stmt = hir_tree.HStmt {
+        node_id: let_idx_node,
+        kind: hir_tree.HStmtKind.let_(
+            binding: ast_ops.BindingMode.mutable_,
+            pat: idx_pat,
+            bindings: idx_bindings,
+            ty: Option_Ty.none,
+            init_: zero_lit,
+        ),
+    }
+
+    let guard_idx_use = synthetic_use_expr(mutable file, idx_def, sp, allocator)?
+    let slice_use_for_len = synthetic_use_expr(mutable file, slice_def, sp, allocator)?
+    uninit len_args: Vec_HArg.Vec
+    Vec_HArg.new(init len_args, allocator)?
+    let len_recv_arg = hir_tree.HArg { mode: Option_CallMode.none, name: Option_Symbol.none, expr: slice_use_for_len }
+    Vec_HArg.push(mutable len_args, take len_recv_arg, allocator)?
+    let len_call = mk_expr(mutable file, take hir_tree.HExprKind.method_call(name: s_len, args: len_args), sp, allocator)?
+    let guard_cond = mk_expr(mutable file, take hir_tree.HExprKind.binary(op: ast_ops.BinOp.ge, lhs: Box_HExpr.new(take guard_idx_use, allocator)?, rhs: Box_HExpr.new(take len_call, allocator)?), sp, allocator)?
+    let break_expr = mk_expr(mutable file, take hir_tree.HExprKind.break_(label: Option_Symbol.none, value: Option_Box_HExpr.none), sp, allocator)?
+    uninit break_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init break_stmts, allocator)?
+    let break_block_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    let break_block = hir_tree.HBlock {
+        node_id: break_block_node,
+        stmts: break_stmts,
+        trailing: Option_Box_HExpr.some(value: Box_HExpr.new(take break_expr, allocator)?),
+    }
+    let guard_if = mk_expr(mutable file, take hir_tree.HExprKind.if_(cond: Box_HExpr.new(take guard_cond, allocator)?, then_block: break_block, else_block: Option_HBlock.none), sp, allocator)?
+    let guard_stmt = expr_stmt(mutable file, guard_if, sp, allocator)?
+
+    let user_pat = Box_Pat.get(pat_box)
+    let user_pat_bindings = lower_pat_bindings(mutable file, user_pat, output, allocator)?
+    let slice_use_for_idx = synthetic_use_expr(mutable file, slice_def, sp, allocator)?
+    let idx_use_for_idx = synthetic_use_expr(mutable file, idx_def, sp, allocator)?
+    let index_expr = mk_expr(mutable file, take hir_tree.HExprKind.index(receiver: Box_HExpr.new(take slice_use_for_idx, allocator)?, idx: Box_HExpr.new(take idx_use_for_idx, allocator)?), sp, allocator)?
+    let user_let_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let user_let_stmt = hir_tree.HStmt {
+        node_id: user_let_node,
+        kind: hir_tree.HStmtKind.let_(
+            binding: ast_ops.BindingMode.immutable,
+            pat: user_pat,
+            bindings: user_pat_bindings,
+            ty: Option_Ty.none,
+            init_: index_expr,
+        ),
+    }
+
+    let user_body_hblock = lower_block(mutable file, body_blk, output, mutable interner, sym_alloc, allocator)?
+    let body_expr = mk_expr(mutable file, take hir_tree.HExprKind.block_(body: user_body_hblock), sp, allocator)?
+    let body_stmt = expr_stmt(mutable file, body_expr, sp, allocator)?
+
+    let incr_lhs = synthetic_use_expr(mutable file, idx_def, sp, allocator)?
+    let one_lit = mk_expr(mutable file, take hir_tree.HExprKind.literal(value: hir_tree.HLiteral.int(value: 1 as u128, base: kind_mod.IntBase.dec)), sp, allocator)?
+    let incr_rhs = mk_expr(mutable file, take hir_tree.HExprKind.binary(op: ast_ops.BinOp.add, lhs: Box_HExpr.new(take incr_lhs, allocator)?, rhs: Box_HExpr.new(take one_lit, allocator)?), sp, allocator)?
+    let incr_target = synthetic_use_expr(mutable file, idx_def, sp, allocator)?
+    let incr_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.stmt, allocator)?
+    let incr_stmt = hir_tree.HStmt {
+        node_id: incr_node,
+        kind: hir_tree.HStmtKind.assign(target: incr_target, op: ast_ops.AssignOp.plain, rhs: incr_rhs),
+    }
+
+    uninit loop_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init loop_stmts, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take guard_stmt, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take user_let_stmt, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take body_stmt, allocator)?
+    Vec_HStmt.push(mutable loop_stmts, take incr_stmt, allocator)?
+    let loop_body_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    let loop_body = hir_tree.HBlock {
+        node_id: loop_body_node,
+        stmts: loop_stmts,
+        trailing: Option_Box_HExpr.none,
+    }
+    let loop_expr = mk_expr(mutable file, take hir_tree.HExprKind.loop_(body: loop_body, label: Option_Symbol.none, decreases_: Option_Box_HExpr.none), sp, allocator)?
+
+    uninit outer_stmts: Vec_HStmt.Vec
+    Vec_HStmt.new(init outer_stmts, allocator)?
+    Vec_HStmt.push(mutable outer_stmts, take let_slice_stmt, allocator)?
+    Vec_HStmt.push(mutable outer_stmts, take let_idx_stmt, allocator)?
+    let outer_block_node = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.block, allocator)?
+    let outer_block = hir_tree.HBlock {
+        node_id: outer_block_node,
+        stmts: outer_stmts,
+        trailing: Option_Box_HExpr.some(value: Box_HExpr.new(take loop_expr, allocator)?),
+    }
+    return hir_tree.HExprKind.block_(body: outer_block)
+}
+
+function lower_comptime_kind(
+    file: mutable hir_file_mod.HirFile,
+    x: Box_Expr,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let inner = Box_Expr.get(x)
+    return match inner.kind {
+        case .for_(let pat_box, let iter_box, let body_blk, _) => {
+            let iter = Box_Expr.get(iter_box)
+            match iter.kind {
+                case .range(let lo_opt, let hi_opt, let rkind) => match lo_opt {
+                    case .some(let lb) => match hi_opt {
+                        case .some(let hb) => lower_comptime_for(mutable file, pat_box, lb, hb, range_kind_inclusive(rkind), body_blk, inner.span, output, mutable interner, sym_alloc, allocator)?
+                        case .none => default_comptime(mutable file, x, output, mutable interner, sym_alloc, allocator)?
+                    }
+                    case .none => default_comptime(mutable file, x, output, mutable interner, sym_alloc, allocator)?
+                }
+                case _ => default_comptime(mutable file, x, output, mutable interner, sym_alloc, allocator)?
+            }
+        }
+        case _ => default_comptime(mutable file, x, output, mutable interner, sym_alloc, allocator)?
+    }
+}
+
+function default_comptime(
+    file: mutable hir_file_mod.HirFile,
+    x: Box_Expr,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let inner_expr = lower_boxed_expr(mutable file, x, output, mutable interner, sym_alloc, allocator)?
+    file.saw_comptime = true
+    return hir_tree.HExprKind.comptime_(expr: inner_expr)
+}
+
+function range_kind_inclusive(rkind: ast_ops.RangeKind) -> bool {
+    return match rkind {
+        case .closed => true
+        case .half_open => false
+    }
+}
+
+function lower_comptime_for(
+    file: mutable hir_file_mod.HirFile,
+    pat_box: Box_Pat,
+    lo_box: Box_Expr,
+    hi_box: Box_Expr,
+    inclusive: bool,
+    body_blk: ast_tree.Block,
+    sp: span_mod.Span,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let _ = sp
+    let user_pat = Box_Pat.get(pat_box)
+    let binding_vec = lower_pat_bindings(mutable file, user_pat, output, allocator)?
+    let binding_def = if Vec_HBinding.len(binding_vec) > 0 as usize {
+        Vec_HBinding.at(binding_vec, 0 as usize).def_id
+    } else {
+        def_mod.error()
+    }
+    let lo_h = lower_expr(mutable file, Box_Expr.get(lo_box), output, mutable interner, sym_alloc, allocator)?
+    let hi_h = lower_expr(mutable file, Box_Expr.get(hi_box), output, mutable interner, sym_alloc, allocator)?
+    let body_h = lower_block(mutable file, body_blk, output, mutable interner, sym_alloc, allocator)?
+    file.saw_comptime = true
+    return hir_tree.HExprKind.comptime_for(
+        binding: binding_def,
+        lo: Box_HExpr.new(take lo_h, allocator)?,
+        hi: Box_HExpr.new(take hi_h, allocator)?,
+        inclusive: inclusive,
+        body: body_h,
+    )
+}
+
+function lower_fstring_kind(
+    file: mutable hir_file_mod.HirFile,
+    segs: Vec_FStringSeg.Vec,
+    sp: span_mod.Span,
+    output: resolve_ctx_mod.ResolveOutput,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExprKind
+    with {sym_alloc, allocator, err: alloc.AllocError, divergence}
+{
+    let builtins = resolve_ctx_mod.output_builtins(output)
+    let concat_def = resolve_builtins_mod.string_concat(builtins)
+
+    uninit segments: Vec_HExpr.Vec
+    Vec_HExpr.new(init segments, allocator)?
+
+    let seg_count = Vec_FStringSeg.len(segs)
+    var i: usize = 0
+    loop decreases (seg_count - i) {
+        if i >= seg_count { break }
+        let seg = Vec_FStringSeg.at(segs, i)
+        match seg {
+            case .text(let tsym) => {
+                let text_expr = materialize_fstring_text(mutable file, tsym, sp, mutable interner, sym_alloc, allocator)?
+                Vec_HExpr.push(mutable segments, take text_expr, allocator)?
+            }
+            case .interp(let boxed) => {
+                let e = Box_Expr.get(boxed)
+                let lowered = lower_expr(mutable file, e, output, mutable interner, sym_alloc, allocator)?
+                let formatted = wrap_fstring_format(mutable file, take lowered, output, sp, allocator)?
+                Vec_HExpr.push(mutable segments, take formatted, allocator)?
+            }
+        }
+        i = i + 1
+    }
+
+    let count = Vec_HExpr.len(segments)
+    if count == 0 {
+        let empty_sym = intern_empty_string(mutable interner, sym_alloc, allocator)?
+        return hir_tree.HExprKind.literal(value: hir_tree.HLiteral.str(sym: empty_sym))
+    }
+    if count == 1 {
+        let single = Vec_HExpr.at(segments, 0)
+        return single.kind
+    }
+    let seed = Vec_HExpr.at(segments, count - 1)
+    let folded = right_fold_concat(mutable file, segments, take seed, count - 1, concat_def, sp, allocator)?
+    return folded.kind
+}
+
+function materialize_fstring_text(
+    file: mutable hir_file_mod.HirFile,
+    sym: symbol.Symbol,
+    sp: span_mod.Span,
+    interner: mutable intern_mod.Interner, sym_alloc: Allocator,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {sym_alloc, allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let body = intern_mod.lookup(interner, sym)
+    let n = body.len()
+    let s = unescape_text_segment(body, 0, n, allocator)?
+    let str_sym = intern_mod.intern(mutable interner, s, sym_alloc)?
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    return hir_tree.HExpr {
+        node_id: node_id,
+        kind: hir_tree.HExprKind.literal(value: hir_tree.HLiteral.str(sym: str_sym)),
+    }
+}
+
+function intern_empty_string(interner: mutable intern_mod.Interner, sym_alloc: Allocator, allocator: Allocator) -> symbol.Symbol
+    with {sym_alloc, allocator, err: alloc.AllocError}
+{
+    let buf: [u8] = allocator.alloc_array(u8, 0)?
+    let s = string.from_owned_utf8(take buf)
+    return intern_mod.intern(mutable interner, s, sym_alloc)?
+}
+
+function right_fold_concat(
+    file: mutable hir_file_mod.HirFile,
+    segments: Vec_HExpr.Vec,
+    acc: take hir_tree.HExpr,
+    i: usize,
+    concat_def: def_mod.DefId,
+    sp: span_mod.Span,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError}
+    decreases i
+{
+    if i == 0 {
+        return acc
+    }
+    let next_i = i - 1
+    let left = Vec_HExpr.at(segments, next_i)
+    let next_acc = build_concat_call(mutable file, take left, take acc, concat_def, sp, allocator)?
+    return right_fold_concat(mutable file, segments, take next_acc, i - 1, concat_def, sp, allocator)?
+}
+
+function build_concat_call(
+    file: mutable hir_file_mod.HirFile,
+    left: take hir_tree.HExpr,
+    right: take hir_tree.HExpr,
+    concat_def: def_mod.DefId,
+    sp: span_mod.Span,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let left_arg = hir_tree.HArg {
+        mode: Option_CallMode.none,
+        name: Option_Symbol.none,
+        expr: left,
+    }
+    let right_arg = hir_tree.HArg {
+        mode: Option_CallMode.none,
+        name: Option_Symbol.none,
+        expr: right,
+    }
+    uninit args: Vec_HArg.Vec
+    Vec_HArg.new(init args, allocator)?
+    Vec_HArg.push(mutable args, take left_arg, allocator)?
+    Vec_HArg.push(mutable args, take right_arg, allocator)?
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    hir_file_mod.set_try_flag(mutable file, node_id.raw)
+    return hir_tree.HExpr {
+        node_id: node_id,
+        kind: hir_tree.HExprKind.call(callee: concat_def, args: args),
+    }
+}
+
+function wrap_fstring_format(
+    file: mutable hir_file_mod.HirFile,
+    inner: take hir_tree.HExpr,
+    output: resolve_ctx_mod.ResolveOutput,
+    sp: span_mod.Span,
+    allocator: Allocator,
+) -> hir_tree.HExpr
+    with {allocator, err: alloc.AllocError}
+    requires file.next_node_id < 4294967295
+{
+    let builtins = resolve_ctx_mod.output_builtins(output)
+    let fmt_def = resolve_builtins_mod.fstring_format(builtins)
+    let arg = hir_tree.HArg {
+        mode: Option_CallMode.none,
+        name: Option_Symbol.none,
+        expr: inner,
+    }
+    uninit args: Vec_HArg.Vec
+    Vec_HArg.new(init args, allocator)?
+    Vec_HArg.push(mutable args, take arg, allocator)?
+    let node_id = hir_file_mod.alloc_node(mutable file, sp, hir_file_mod.NodeKind.expr, allocator)?
+    hir_file_mod.set_try_flag(mutable file, node_id.raw)
+    return hir_tree.HExpr {
+        node_id: node_id,
+        kind: hir_tree.HExprKind.call(callee: fmt_def, args: args),
+    }
+}
+
+function unescape_text_segment(body: [u8], start: usize, end: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires start <= end
+    requires end <= body.len()
+{
+    let n = end - start
+    var out_len: usize = 0
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let b = body[start + i]
+        if b == 0x5C && i + 1 < n {
+            out_len = out_len + 1
+            i = i + 2
+        } else if (b == 0x7B || b == 0x7D) && i + 1 < n && body[start + i + 1] == b {
+            out_len = out_len + 1
+            i = i + 2
+        } else {
+            out_len = out_len + 1
+            i = i + 1
+        }
+    }
+    let buf: [u8] = allocator.alloc_array(u8, out_len)?
+    var src_i: usize = 0
+    var dst_i: usize = 0
+    loop decreases (n - src_i) {
+        if src_i >= n { break }
+        let b = body[start + src_i]
+        if b == 0x5C && src_i + 1 < n {
+            let esc = body[start + src_i + 1]
+            let decoded: u8 = match esc {
+                case 0x6E => 0x0A as u8
+                case 0x74 => 0x09 as u8
+                case 0x72 => 0x0D as u8
+                case 0x5C => 0x5C as u8
+                case 0x22 => 0x22 as u8
+                case 0x7B => 0x7B as u8
+                case 0x7D => 0x7D as u8
+                case 0x30 => 0x00 as u8
+                case _    => esc
+            }
+            buf[dst_i] = decoded
+            src_i = src_i + 2
+            dst_i = dst_i + 1
+        } else if (b == 0x7B || b == 0x7D) && src_i + 1 < n && body[start + src_i + 1] == b {
+            buf[dst_i] = b
+            src_i = src_i + 2
+            dst_i = dst_i + 1
+        } else {
+            buf[dst_i] = b
+            src_i = src_i + 1
+            dst_i = dst_i + 1
+        }
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function lower_pat_bindings(file: mutable hir_file_mod.HirFile, pat: ast_tree.Pat, output: resolve_ctx_mod.ResolveOutput, allocator: Allocator) -> Vec_HBinding.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_def_id < 4294967295
+{
+    uninit bindings: Vec_HBinding.Vec
+    Vec_HBinding.new(init bindings, allocator)?
+    collect_pat_bindings(mutable file, pat, output, mutable bindings, allocator)?
+    return bindings
+}
+
+function collect_pat_bindings(
+    file: mutable hir_file_mod.HirFile,
+    pat: ast_tree.Pat,
+    output: resolve_ctx_mod.ResolveOutput,
+    bindings: mutable Vec_HBinding.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_def_id < 4294967295
+{
+    match pat.kind {
+        case .binding(let id) => {
+            let resolved = resolve_ctx_mod.lookup_use(output, id.span)
+            let def_id = if def_mod.is_error(resolved) {
+                hir_file_mod.alloc_def_id(mutable file)
+            } else {
+                resolved
+            }
+            Vec_HBinding.push(mutable bindings, hir_tree.HBinding { name: id.name, def_id: def_id }, allocator)?
+        }
+        case .tuple(let elements) => {
+            let n = Vec_Pat.len(elements)
+            var i: usize = 0
+            loop decreases (n - i) {
+                if i >= n { break }
+                let sub = Vec_Pat.at(elements, i)
+                collect_pat_bindings(mutable file, sub, output, mutable bindings, allocator)?
+                i = i + 1
+            }
+        }
+        case .struct_(_, let fields, _) => {
+            collect_struct_pat_field_bindings(mutable file, fields, output, mutable bindings, allocator)?
+        }
+        case .slice(let prefix, let rest, let suffix) => {
+            collect_pats_bindings(mutable file, prefix, output, mutable bindings, allocator)?
+            match rest {
+                case .some(let sr) => {
+                    match sr.binding {
+                        case .some(let id) => {
+                            let resolved = resolve_ctx_mod.lookup_use(output, id.span)
+                            let def_id = if def_mod.is_error(resolved) {
+                                hir_file_mod.alloc_def_id(mutable file)
+                            } else {
+                                resolved
+                            }
+                            Vec_HBinding.push(mutable bindings, hir_tree.HBinding { name: id.name, def_id: def_id }, allocator)?
+                        }
+                        case .none => ()
+                    }
+                }
+                case .none => ()
+            }
+            collect_pats_bindings(mutable file, suffix, output, mutable bindings, allocator)?
+        }
+        case .variant(_, let payload) => {
+            match payload {
+                case .none => ()
+                case .tuple(let elements) => {
+                    let n = Vec_Pat.len(elements)
+                    var i: usize = 0
+                    loop decreases (n - i) {
+                        if i >= n { break }
+                        let sub = Vec_Pat.at(elements, i)
+                        collect_pat_bindings(mutable file, sub, output, mutable bindings, allocator)?
+                        i = i + 1
+                    }
+                }
+                case .struct_(let fields) => {
+                    collect_struct_pat_field_bindings(mutable file, fields, output, mutable bindings, allocator)?
+                }
+            }
+        }
+        case .or_(let alternatives) => {
+            if Vec_Pat.len(alternatives) > 0 {
+                collect_pat_bindings(mutable file, Vec_Pat.at(alternatives, 0), output, mutable bindings, allocator)?
+            }
+        }
+        case .at_binding(let id, let sub) => {
+            collect_pat_bindings(mutable file, Box_Pat.get(sub), output, mutable bindings, allocator)?
+            let resolved = resolve_ctx_mod.lookup_use(output, id.span)
+            let def_id = if def_mod.is_error(resolved) {
+                hir_file_mod.alloc_def_id(mutable file)
+            } else {
+                resolved
+            }
+            Vec_HBinding.push(mutable bindings, hir_tree.HBinding { name: id.name, def_id: def_id }, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+function collect_struct_pat_field_bindings(
+    file: mutable hir_file_mod.HirFile,
+    fields: Vec_StructPatField.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    bindings: mutable Vec_HBinding.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_def_id < 4294967295
+{
+    let n = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let f = Vec_StructPatField.at(fields, i)
+        collect_pat_bindings(mutable file, f.pat, output, mutable bindings, allocator)?
+        i = i + 1
+    }
+}
+
+function collect_pats_bindings(
+    file: mutable hir_file_mod.HirFile,
+    pats: Vec_Pat.Vec,
+    output: resolve_ctx_mod.ResolveOutput,
+    bindings: mutable Vec_HBinding.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+    requires file.next_def_id < 4294967295
+{
+    let n = Vec_Pat.len(pats)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        collect_pat_bindings(mutable file, Vec_Pat.at(pats, i), output, mutable bindings, allocator)?
+        i = i + 1
+    }
+}

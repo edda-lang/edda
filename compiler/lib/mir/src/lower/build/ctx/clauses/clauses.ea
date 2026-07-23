@@ -1,0 +1,177 @@
+
+module mir.lower.build.ctx.clauses.clauses
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import std.core.copy
+import hir.item as hir_item
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ident as ident_mod
+import span.loc.pos.span as span_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import local.lower.build.ctx.subst.subst as subst_mod
+
+
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(ast_tree_mod.RefinementClause)
+spec std.collections.vec.Vec(hir_item.HParam)
+spec std.mem.alloc.Box(ast_tree_mod.Ty)
+spec std.mem.alloc.Box(ast_tree_mod.Expr)
+spec std.core.option.Option(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(subst_mod.SubEntry)
+spec std.core.copy.clone(ast_tree_mod.Expr)
+
+
+public function collect_requires_clauses(
+    clause_list: Vec_RefinementClause.Vec,
+    allocator: Allocator,
+) -> Vec_Expr.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    uninit out: Vec_Expr.Vec
+    Vec_Expr.new(init out, allocator)?
+    let n: usize = Vec_RefinementClause.len(clause_list)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let clause = Vec_RefinementClause.at(clause_list, i)
+        match clause.kind {
+            case .requires_ => Vec_Expr.push(mutable out, take clause.pred, allocator)?
+            case _ => {}
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+public function collect_requires_context(
+    clause_list: Vec_RefinementClause.Vec,
+    params: Vec_HParam.Vec,
+    allocator: Allocator,
+) -> Vec_Expr.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    var out = collect_requires_clauses(clause_list, allocator)?
+    let n_params: usize = Vec_HParam.len(params)
+    var i: usize = 0
+    loop
+        decreases (n_params - i)
+    {
+        if i >= n_params {
+            break
+        }
+        let param = Vec_HParam.at(params, i)
+        push_ty_refinement(mutable out, param.ty, allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function push_ty_refinement(
+    out: mutable Vec_Expr.Vec,
+    t: ast_tree_mod.Ty,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match t.kind {
+        case .refined(_, let pred) => Vec_Expr.push(mutable out, take pred, allocator)?
+        case .slice(let elem) => push_ty_refinement(mutable out, Box_Ty.get(elem), allocator)?
+        case _ => {}
+    }
+}
+
+
+public function record_def_of_ty(ty_interner: ty_interner_mod.Interner, t: ty_mod.TyId) -> def_mod.DefId {
+    if (t.raw as usize) >= ty_interner_mod.slot_count(ty_interner) {
+        return def_mod.error()
+    }
+    return match ty_interner_mod.lookup(ty_interner, t) {
+        case .record(let d) => d
+        case .spec_instance(let d, _) => d
+        case _ => def_mod.error()
+    }
+}
+
+
+public function fold_field_refinement(
+    out: mutable Vec_Expr.Vec,
+    owner_def: def_mod.DefId,
+    field_idx: u32,
+    base_expr: ast_tree_mod.Expr,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    match check_mod.field_refinement_at(types_out, owner_def, field_idx as usize) {
+        case .none => {}
+        case .some(let pred) => {
+            let subs = sibling_field_subs(owner_def, base_expr, types_out, allocator)?
+            let instantiated = subst_mod.subst_expr(pred, subs, allocator)?
+            Vec_Expr.push(mutable out, take instantiated, allocator)?
+        }
+    }
+}
+
+
+function sibling_field_subs(
+    owner_def: def_mod.DefId,
+    base_expr: ast_tree_mod.Expr,
+    types_out: check_mod.TypeOutput,
+    allocator: Allocator,
+) -> Vec_SubEntry.Vec
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit subs: Vec_SubEntry.Vec
+    Vec_SubEntry.new(init subs, allocator)?
+    let n = check_mod.field_ty_count(types_out, owner_def)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        match check_mod.field_name_at(types_out, owner_def, 0 as u32, i) {
+            case .none => {}
+            case .some(let sib_name) => {
+                let sib_expr = field_projection_expr(base_expr, sib_name, allocator)?
+                let entry = subst_mod.SubEntry { name: sib_name, expr: sib_expr }
+                Vec_SubEntry.push(mutable subs, take entry, allocator)?
+            }
+        }
+        i = i + 1
+    }
+    return subs
+}
+
+
+function field_projection_expr(
+    base_expr: ast_tree_mod.Expr,
+    field_name: symbol_mod.Symbol,
+    allocator: Allocator,
+) -> ast_tree_mod.Expr
+    with {allocator, err: alloc.AllocError}
+{
+    let base_clone = clone_Expr.clone(base_expr)
+    let base_box = Box_Expr.new(take base_clone, allocator)?
+    return ast_tree_mod.Expr {
+        span: span_mod.dummy(),
+        kind: ast_tree_mod.ExprKind.field(
+            receiver: base_box,
+            name: ident_mod.Ident { name: field_name, span: span_mod.dummy() },
+        ),
+    }
+}

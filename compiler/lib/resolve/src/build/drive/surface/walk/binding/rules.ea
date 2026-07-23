@@ -1,0 +1,207 @@
+
+module resolve.build.drive.surface.walk.binding.rules
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import diagnostics.code as code_mod
+import diagnostics.emit.diagnostic as diag_mod
+import intern.interner as intern_mod
+import intern.symbol
+import span.loc.pos.span as span_mod
+import syntax.ast.item as ast_item
+import syntax.ast.ident as ast_ident
+import manifest.lex.toml.val.values as values_mod
+import local.ctx as ctx_mod
+
+spec std.collections.vec.Vec(ast_item.Item)
+spec std.collections.vec.Vec(ast_ident.Ident)
+spec std.mem.alloc.Box(ast_item.TypeDecl)
+spec std.mem.alloc.Box(ast_item.Derive)
+
+
+public function check_derive_rules(
+    ctx: mutable ctx_mod.ResolveCtx,
+    items: Vec_Item.Vec,
+    eq_sym: symbol.Symbol,
+    ord_sym: symbol.Symbol,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .derive_(let decl) => check_one_derive(mutable ctx, items, Box_Derive.get(decl), eq_sym, ord_sym, interner, allocator)?
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+function check_one_derive(
+    ctx: mutable ctx_mod.ResolveCtx,
+    items: Vec_Item.Vec,
+    d: ast_item.Derive,
+    eq_sym: symbol.Symbol,
+    ord_sym: symbol.Symbol,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let nsegs = Vec_Ident.len(d.target.segments)
+    if nsegs == 0 { return }
+    let leaf = Vec_Ident.at(d.target.segments, nsegs - 1)
+    if derive_target_is_private(items, leaf.name) {
+        emit_derive_target_not_public(mutable ctx, leaf.span, leaf.name, items, interner, allocator)?
+    }
+    if derive_lists_item(d.items, ord_sym) {
+        if !module_derives_eq_for(items, leaf.name, eq_sym) {
+            emit_derive_ord_without_eq(mutable ctx, derive_item_span(d.items, ord_sym, d.span), allocator)?
+        }
+    }
+}
+
+function derive_target_is_private(items: Vec_Item.Vec, name: symbol.Symbol) -> bool {
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .type_decl(let decl) => {
+                let td = Box_TypeDecl.get(decl)
+                if td.name.name.raw == name.raw {
+                    return match td.visibility {
+                        case .public_ => false
+                        case .module_ => true
+                    }
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return false
+}
+
+function derive_lists_item(items: Vec_Ident.Vec, name: symbol.Symbol) -> bool {
+    let n = Vec_Ident.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(items, i)
+        if id.name.raw == name.raw { return true }
+        i = i + 1
+    }
+    return false
+}
+
+function derive_item_span(items: Vec_Ident.Vec, name: symbol.Symbol, fallback: span_mod.Span) -> span_mod.Span {
+    let n = Vec_Ident.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let id = Vec_Ident.at(items, i)
+        if id.name.raw == name.raw { return id.span }
+        i = i + 1
+    }
+    return fallback
+}
+
+function module_derives_eq_for(items: Vec_Item.Vec, target: symbol.Symbol, eq_sym: symbol.Symbol) -> bool {
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .derive_(let decl) => {
+                let d = Box_Derive.get(decl)
+                let nsegs = Vec_Ident.len(d.target.segments)
+                if nsegs > 0 {
+                    let leaf = Vec_Ident.at(d.target.segments, nsegs - 1)
+                    if leaf.name.raw == target.raw {
+                        if derive_lists_item(d.items, eq_sym) { return true }
+                    }
+                }
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return false
+}
+
+function module_path_string(items: Vec_Item.Vec, interner: intern_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_Item.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_Item.at(items, i)
+        match item.kind {
+            case .module_(let decl) => {
+                var out: String = ""
+                let nsegs = Vec_Ident.len(decl.path.segments)
+                var j: usize = 0
+                loop decreases (nsegs - j) {
+                    if j >= nsegs { break }
+                    let seg = Vec_Ident.at(decl.path.segments, j)
+                    let bytes = intern_mod.lookup(interner, seg.name)
+                    let seg_str = values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+                    if j > 0 { out = string.concat(out, ".", allocator)? }
+                    out = string.concat(out, seg_str, allocator)?
+                    j = j + 1
+                }
+                return out
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+function emit_derive_target_not_public(
+    ctx: mutable ctx_mod.ResolveCtx,
+    at: span_mod.Span,
+    name: symbol.Symbol,
+    items: Vec_Item.Vec,
+    interner: intern_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = intern_mod.lookup(interner, name)
+    let n = values_mod.bytes_to_string(bytes, 0, bytes.len(), allocator)?
+    let mp = module_path_string(items, interner, allocator)?
+    let p1 = string.concat("item `", n, allocator)?
+    let p2 = string.concat(p1, "` in module `", allocator)?
+    let p3 = string.concat(p2, mp, allocator)?
+    let msg = string.concat(p3, "` is not `public`", allocator)?
+    let d = diag_mod.error_at(code_mod.import_resolution_error(), at, msg)
+    ctx_mod.emit_diagnostic(mutable ctx, d, allocator)?
+}
+
+function emit_derive_ord_without_eq(
+    ctx: mutable ctx_mod.ResolveCtx,
+    at: span_mod.Span,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let msg = string.concat(
+        "`derive ord` requires `derive eq` in the same module",
+        " per corpus/edda-codex/language/04-specs-comptime.md §5.3",
+        allocator,
+    )?
+    let d = diag_mod.error_at(code_mod.import_resolution_error(), at, msg)
+    ctx_mod.emit_diagnostic(mutable ctx, d, allocator)?
+}

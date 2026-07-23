@@ -1,0 +1,133 @@
+
+module query.graph.idx.node
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import cache.addr.hash as hash_mod
+import local.graph.idx.key as key_mod
+import local.memo.revision as rev_mod
+
+spec std.collections.vec.Vec(NodeId)
+spec std.core.option.Option(NodeId)
+
+derive clone, debug for NodeId
+derive clone, debug for NodeState
+
+
+public type NodeId {
+    value: usize
+}
+
+public type NodeState {
+    case unevaluated
+    case in_progress
+    case valid
+}
+
+public type QueryNode {
+    key: key_mod.QueryKey
+    value_hash: hash_mod.ArtifactHash
+    state: NodeState
+    verified_at: rev_mod.Revision
+    changed_at: rev_mod.Revision
+    deps: Vec_NodeId.Vec
+}
+
+
+public function node_id(value: usize) -> NodeId {
+    return NodeId { value: value }
+}
+
+public function new_node(key: key_mod.QueryKey, allocator: Allocator) -> QueryNode
+    with {allocator, err: alloc.AllocError}
+{
+    uninit deps: Vec_NodeId.Vec
+    Vec_NodeId.new(init deps, allocator)?
+    return QueryNode {
+        key: key,
+        value_hash: hash_mod.zero(),
+        state: NodeState.unevaluated,
+        verified_at: rev_mod.zero(),
+        changed_at: rev_mod.zero(),
+        deps: deps,
+    }
+}
+
+
+public function from_parts(
+    key: key_mod.QueryKey,
+    value_hash: hash_mod.ArtifactHash,
+    state: NodeState,
+    verified_at: rev_mod.Revision,
+    changed_at: rev_mod.Revision,
+    deps: take Vec_NodeId.Vec,
+) -> QueryNode {
+    return QueryNode {
+        key: key,
+        value_hash: value_hash,
+        state: state,
+        verified_at: verified_at,
+        changed_at: changed_at,
+        deps: deps,
+    }
+}
+
+public function state_to_u8(s: NodeState) -> u8 {
+    return match s {
+        case .unevaluated => 0
+        case .in_progress => 1
+        case .valid       => 2
+    }
+}
+
+public function u8_to_state(b: u8) -> NodeState {
+    if b == 1 { return NodeState.in_progress }
+    if b == 2 { return NodeState.valid }
+    return NodeState.unevaluated
+}
+
+public function set_in_progress(n: mutable QueryNode) -> () {
+    n.state = NodeState.in_progress
+}
+
+public function finalize(n: mutable QueryNode, value_hash: hash_mod.ArtifactHash, rev: rev_mod.Revision) -> () {
+    if !key_mod.hash_equals(n.value_hash, value_hash) {
+        n.changed_at = rev
+    }
+    n.value_hash = value_hash
+    n.state = NodeState.valid
+    n.verified_at = rev
+}
+
+public function add_dep(n: mutable QueryNode, dep: NodeId, allocator: Allocator) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    if contains_dep(n, dep) { return () }
+    Vec_NodeId.push(mutable n.deps, take dep, allocator)?
+}
+
+public function clear_deps(n: mutable QueryNode) -> () {
+    Vec_NodeId.clear(mutable n.deps)
+}
+
+public function dep_count(n: QueryNode) -> usize {
+    return Vec_NodeId.len(n.deps)
+}
+
+public function dep_get(n: QueryNode, i: usize) -> Option_NodeId {
+    return Vec_NodeId.get(n.deps, i)
+}
+
+
+function contains_dep(n: QueryNode, dep: NodeId) -> bool {
+    let m = Vec_NodeId.len(n.deps)
+    var i: usize = 0
+    loop decreases m - i {
+        if i >= m { break }
+        let d = Vec_NodeId.at(n.deps, i)
+        if d.value == dep.value { return true }
+        i += 1
+    }
+    return false
+}

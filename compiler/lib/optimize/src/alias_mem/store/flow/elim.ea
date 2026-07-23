@@ -1,0 +1,107 @@
+module optimize.alias_mem.store.flow.elim
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.stmt as mir_stmt_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.store.borrow as borrow_mod
+import local.alias_mem.store.flow.reads as reads_mod
+import local.alias_mem.store.flow.dead as dead_mod
+import local.alias_mem.store.flow.suffix as suffix_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_stmt_mod.Statement)
+
+
+public function run(
+    body: mutable mir_body_mod.MirBody,
+    info: escape_mod.EscapeInfo,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if escape_mod.is_opaque(info) {
+        return
+    }
+    if borrow_mod.body_has_borrow_surface(body) {
+        return
+    }
+
+    let n_locals: usize = Vec_Local.len(body.locals)
+    uninit read_flags: Vec_bool.Vec
+    Vec_bool.new(init read_flags, allocator)?
+    var ri: usize = 0
+    loop decreases n_locals - ri {
+        if ri >= n_locals { break }
+        let is_ret: bool = ri == 1
+        Vec_bool.push(mutable read_flags, is_ret, allocator)?
+        ri += 1
+    }
+
+    let n_blocks: usize = Vec_BasicBlock.len(body.blocks)
+    var bi: usize = 0
+    loop decreases n_blocks - bi {
+        if bi >= n_blocks { break }
+        let block = Vec_BasicBlock.at(body.blocks, bi)
+        reads_mod.mark_block_reads(mutable read_flags, block)
+        bi += 1
+    }
+
+    let unrem = dead_mod.compute_unremovable_writes(body, read_flags, info, allocator)?
+
+    uninit sweep: suffix_mod.SuffixEvents
+    suffix_mod.new_events(init sweep, n_locals, allocator)?
+
+    var bj: usize = 1
+    loop decreases n_blocks - bj {
+        if bj >= n_blocks { break }
+        rewrite_block(mutable body, read_flags, info, bj, unrem, mutable sweep, allocator)?
+        bj += 1
+    }
+}
+
+
+function rewrite_block(
+    body: mutable mir_body_mod.MirBody,
+    read_flags: Vec_bool.Vec,
+    info: escape_mod.EscapeInfo,
+    slot: usize,
+    unrem: Vec_bool.Vec,
+    sweep: mutable suffix_mod.SuffixEvents,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires slot < Vec_BasicBlock.len(body.blocks)
+{
+    let block = Vec_BasicBlock.at(body.blocks, slot)
+    let n_stmts: usize = Vec_Statement.len(block.statements)
+
+    let flags = dead_mod.assign_dead_flags(block, read_flags, info, body, mutable sweep, allocator)?
+
+    uninit kept: Vec_Statement.Vec
+    Vec_Statement.new(init kept, allocator)?
+
+    var si: usize = 0
+    loop decreases n_stmts - si {
+        if si >= n_stmts { break }
+        let stmt = Vec_Statement.at(block.statements, si)
+        if dead_mod.stmt_is_removable(stmt, flags, si, read_flags, info, body, unrem) == false {
+            Vec_Statement.push(mutable kept, take stmt, allocator)?
+        }
+        si += 1
+    }
+
+    let new_block = mir_body_mod.BasicBlock {
+        node_id_origin: block.node_id_origin,
+        statements: kept,
+        terminator: block.terminator,
+        coherence_region: block.coherence_region,
+    }
+    Vec_BasicBlock.set_at(mutable body.blocks, slot, take new_block)
+}

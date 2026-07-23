@@ -1,0 +1,301 @@
+
+module mir.body.model
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import types.pass.ty as ty_mod
+import types.effect.row as effect_facts_mod
+import hir.node as node_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+import syntax.ast.tree as ast_tree_mod
+import local.id.block as block_mod
+import local.id.hir as hir_file_mod
+import local.stmt as stmt_mod
+import local.term as term_mod
+import local.layout.table as layout_mod
+
+
+spec std.collections.vec.Vec(Local)
+spec std.collections.vec.Vec(stmt_mod.Statement)
+spec std.collections.vec.Vec(BasicBlock)
+spec std.collections.vec.Vec(ast_tree_mod.Expr)
+spec std.collections.vec.Vec(Obligation)
+
+
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(RegionId)
+
+
+derive eq, hash, debug for Local
+derive eq, hash, debug for Mutability
+derive eq, hash, debug for Consumption
+derive eq, hash, debug for RegionId
+derive eq, hash, debug for BasicBlock
+derive eq, hash, debug for MirBody
+derive eq, hash, debug for Obligation
+derive eq, hash, debug for ObligationKind
+derive eq, hash, debug for TrustAnnotation
+
+
+public type Local {
+    ty: ty_mod.TyId
+    mutability: Mutability
+    consumption: Consumption
+    name: Option_Symbol.Option
+    origin: Option_NodeId.Option
+}
+
+public type Mutability {
+    case immutable_
+    case mutable_
+}
+
+public type Consumption {
+    case copy_
+    case move_
+    case linear_
+    case affine_
+}
+
+
+public type RegionId {
+    raw: u32
+}
+
+
+public type BasicBlock {
+    node_id_origin: node_mod.NodeId
+    statements: Vec_Statement.Vec
+    terminator: term_mod.Terminator
+    coherence_region: Option_RegionId.Option
+}
+
+
+public type Obligation {
+    block: block_mod.BlockId
+    stmt_index: u32
+    kind: ObligationKind
+    predicate: ast_tree_mod.Expr
+    context: Vec_Expr.Vec
+    trust: TrustAnnotation
+}
+
+public type ObligationKind {
+    case int_overflow
+    case div_by_zero
+    case div_overflow
+    case index_in_bounds
+    case slice_subrange_in_bounds
+    case narrowing_cast_range
+    case precondition
+    case postcondition
+    case decreases_decreasing
+}
+
+public type TrustAnnotation {
+    case discharged
+    case unverified(reason: symbol_mod.Symbol)
+    case site_trusted(reason: symbol_mod.Symbol)
+}
+
+
+public type MirBody {
+    def_id: def_mod.DefId
+    name: symbol_mod.Symbol
+    origin_file: hir_file_mod.HirFileId
+    locals: Vec_Local.Vec
+    n_params: u32
+    blocks: Vec_BasicBlock.Vec
+    obligations: Vec_Obligation.Vec
+    function_trust: TrustAnnotation
+    effect_facts: effect_facts_mod.EffectFacts
+    agg_layouts: layout_mod.LayoutTable
+    requires_assumptions: Vec_Expr.Vec
+    err_bymem: bool
+}
+
+
+public function new_body(
+    out: init MirBody,
+    def_id: def_mod.DefId,
+    name: symbol_mod.Symbol,
+    origin_file: hir_file_mod.HirFileId,
+    body_node_origin: node_mod.NodeId,
+    return_ty: ty_mod.TyId,
+    function_trust: TrustAnnotation,
+    effect_facts: effect_facts_mod.EffectFacts,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit locals: Vec_Local.Vec
+    Vec_Local.new(init locals, allocator)?
+    Vec_Local.push(mutable locals, take sentinel_local(), allocator)?
+    Vec_Local.push(mutable locals, take return_value_local(return_ty, body_node_origin), allocator)?
+
+    uninit blocks: Vec_BasicBlock.Vec
+    Vec_BasicBlock.new(init blocks, allocator)?
+    Vec_BasicBlock.push(mutable blocks, take sentinel_block(allocator)?, allocator)?
+    Vec_BasicBlock.push(mutable blocks, take entry_block(body_node_origin, allocator)?, allocator)?
+
+    uninit obligations: Vec_Obligation.Vec
+    Vec_Obligation.new(init obligations, allocator)?
+
+    uninit requires_assumptions: Vec_Expr.Vec
+    Vec_Expr.new(init requires_assumptions, allocator)?
+
+    out = MirBody {
+        def_id: def_id,
+        name: name,
+        origin_file: origin_file,
+        locals: locals,
+        n_params: 0,
+        blocks: blocks,
+        obligations: obligations,
+        function_trust: function_trust,
+        effect_facts: effect_facts,
+        agg_layouts: layout_mod.new_table(allocator)?,
+        requires_assumptions: requires_assumptions,
+        err_bymem: false,
+    }
+}
+
+
+public function set_agg_layouts(
+    body: take MirBody,
+    agg_layouts: layout_mod.LayoutTable,
+) -> MirBody {
+    return MirBody {
+        def_id: body.def_id,
+        name: body.name,
+        origin_file: body.origin_file,
+        locals: body.locals,
+        n_params: body.n_params,
+        blocks: body.blocks,
+        obligations: body.obligations,
+        function_trust: body.function_trust,
+        effect_facts: body.effect_facts,
+        agg_layouts: agg_layouts,
+        requires_assumptions: body.requires_assumptions,
+        err_bymem: body.err_bymem,
+    }
+}
+
+
+public function set_err_bymem(
+    body: take MirBody,
+    err_bymem: bool,
+) -> MirBody {
+    return MirBody {
+        def_id: body.def_id,
+        name: body.name,
+        origin_file: body.origin_file,
+        locals: body.locals,
+        n_params: body.n_params,
+        blocks: body.blocks,
+        obligations: body.obligations,
+        function_trust: body.function_trust,
+        effect_facts: body.effect_facts,
+        agg_layouts: body.agg_layouts,
+        requires_assumptions: body.requires_assumptions,
+        err_bymem: err_bymem,
+    }
+}
+
+
+public function set_name(
+    body: take MirBody,
+    name: symbol_mod.Symbol,
+) -> MirBody {
+    return MirBody {
+        def_id: body.def_id,
+        name: name,
+        origin_file: body.origin_file,
+        locals: body.locals,
+        n_params: body.n_params,
+        blocks: body.blocks,
+        obligations: body.obligations,
+        function_trust: body.function_trust,
+        effect_facts: body.effect_facts,
+        agg_layouts: body.agg_layouts,
+        requires_assumptions: body.requires_assumptions,
+        err_bymem: body.err_bymem,
+    }
+}
+
+
+public function set_origin_file(
+    body: take MirBody,
+    origin_file: hir_file_mod.HirFileId,
+) -> MirBody {
+    return MirBody {
+        def_id: body.def_id,
+        name: body.name,
+        origin_file: origin_file,
+        locals: body.locals,
+        n_params: body.n_params,
+        blocks: body.blocks,
+        obligations: body.obligations,
+        function_trust: body.function_trust,
+        effect_facts: body.effect_facts,
+        agg_layouts: body.agg_layouts,
+        requires_assumptions: body.requires_assumptions,
+        err_bymem: body.err_bymem,
+    }
+}
+
+
+function sentinel_local() -> Local {
+    return Local {
+        ty: ty_mod.error(),
+        mutability: Mutability.immutable_,
+        consumption: Consumption.copy_,
+        name: Option_Symbol.none,
+        origin: Option_NodeId.none,
+    }
+}
+
+function return_value_local(return_ty: ty_mod.TyId, body_node_origin: node_mod.NodeId) -> Local {
+    return Local {
+        ty: return_ty,
+        mutability: Mutability.immutable_,
+        consumption: Consumption.move_,
+        name: Option_Symbol.some(value: symbol_mod.from_raw(symbol_mod.result_raw())),
+        origin: Option_NodeId.some(value: body_node_origin),
+    }
+}
+
+function sentinel_block(allocator: Allocator) -> BasicBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit stmts: Vec_Statement.Vec
+    Vec_Statement.new(init stmts, allocator)?
+    return BasicBlock {
+        node_id_origin: node_mod.error(),
+        statements: stmts,
+        terminator: term_mod.Terminator {
+            origin: node_mod.error(),
+            kind: term_mod.TermKind.unreachable_,
+        },
+        coherence_region: Option_RegionId.none,
+    }
+}
+
+function entry_block(body_node_origin: node_mod.NodeId, allocator: Allocator) -> BasicBlock
+    with {allocator, err: alloc.AllocError}
+{
+    uninit stmts: Vec_Statement.Vec
+    Vec_Statement.new(init stmts, allocator)?
+    return BasicBlock {
+        node_id_origin: body_node_origin,
+        statements: stmts,
+        terminator: term_mod.Terminator {
+            origin: body_node_origin,
+            kind: term_mod.TermKind.unreachable_,
+        },
+        coherence_region: Option_RegionId.none,
+    }
+}

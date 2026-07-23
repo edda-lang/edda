@@ -1,0 +1,203 @@
+
+module regex.api
+
+import std.mem.alloc
+import std.core.option
+import regex.syntax.grammar.ast
+import regex.syntax.errors
+import regex.engine.exec.program
+import regex.engine.exec.vm
+
+spec std.core.option.Option(SpanPair)
+spec std.core.option.Option(usize)
+spec std.core.option.Option(u32)
+spec std.core.option.Option(vm.Match)
+
+
+public type Regex {
+    prog: program.Program
+    names: [ast.NamedCapture]
+}
+
+public type SpanPair {
+    start: usize
+    end: usize
+}
+
+public type RegexError {
+    case compile_failed(err: errors.CompileError)
+    case exec_failed(err: vm.ExecError)
+}
+
+
+
+public function whole_match(m: vm.Match) -> SpanPair {
+    return SpanPair { start: m.start, end: m.end }
+}
+
+public function group_span(m: vm.Match, idx: u32) -> Option_SpanPair {
+    let n = m.captures.len()
+    let start_slot = (idx as usize) * 2 as usize
+    let end_slot = start_slot + 1 as usize
+    if end_slot >= n { return Option_SpanPair.none }
+    let s = m.captures[start_slot]
+    let e = m.captures[end_slot]
+    if s == vm.unset_slot() || e == vm.unset_slot() {
+        return Option_SpanPair.none
+    }
+    return Option_SpanPair.some(value: SpanPair { start: s, end: e })
+}
+
+public function group_count(m: vm.Match) -> u32 {
+    return (m.captures.len() / 2 as usize) as u32
+}
+
+public function group_bytes(m: vm.Match, idx: u32, input: [u8]) -> Option_SpanPair {
+    return group_span(m, idx)
+}
+
+public function group_index_by_name(re: Regex, name: String) -> Option_u32 {
+    let target = name.bytes()
+    let n = re.names.len()
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if _bytes_eq(re.names[i].name.bytes(), target) {
+            return Option_u32.some(value: re.names[i].index)
+        }
+        i = i + 1 as usize
+    }
+    return Option_u32.none
+}
+
+public function group_span_named(re: Regex, m: vm.Match, name: String) -> Option_SpanPair {
+    let idx_opt = group_index_by_name(re, name)
+    return match idx_opt {
+        case .none => Option_SpanPair.none
+        case .some(let idx) => group_span(m, idx)
+    }
+}
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+
+public function find_all(
+    re: Regex,
+    input: [u8],
+    allocator: mutable Allocator,
+) -> [vm.Match]
+    with {allocator, err: RegexError, divergence}
+{
+    return handle err: vm.ExecError -> { raise RegexError.exec_failed(err: vm.ExecError.allocation_failed) } {
+        _find_all_inner(re, input, mutable allocator)?
+    }
+}
+
+function _find_all_inner(
+    re: Regex,
+    input: [u8],
+    allocator: mutable Allocator,
+) -> [vm.Match]
+    with {allocator, err: vm.ExecError, divergence}
+{
+    let n = input.len()
+    let cap = n + 1 as usize
+    let slots = _alloc_match_slots(allocator, cap)?
+    var count: usize = 0 as usize
+    var pos: usize = 0 as usize
+    loop decreases n - pos + 2 as usize {
+        if pos > n { break }
+        let m_opt = vm.exec(re.prog, input, pos, mutable allocator)?
+        let m = match m_opt {
+            case .some(let mm) => mm
+            case .none         => break
+        }
+        slots[count] = m
+        count = count + 1 as usize
+        if m.end == m.start {
+            pos = pos + 1 as usize
+        } else {
+            pos = m.end
+        }
+    }
+    return slots[0 as usize..<count]
+}
+
+function _raw_match_slots(allocator: Allocator, n: usize) -> [vm.Match]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_match_slots(allocator: Allocator, n: usize) -> [vm.Match]
+    with {allocator, err: vm.ExecError}
+{
+    return handle err: alloc.AllocError -> { raise vm.ExecError.allocation_failed } {
+        _raw_match_slots(allocator, n)?
+    }
+}
+
+function _raw_byteslice_slots(allocator: Allocator, n: usize) -> [[u8]]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_byteslice_slots(allocator: Allocator, n: usize) -> [[u8]]
+    with {allocator, err: vm.ExecError}
+{
+    return handle err: alloc.AllocError -> { raise vm.ExecError.allocation_failed } {
+        _raw_byteslice_slots(allocator, n)?
+    }
+}
+
+
+
+public type FindIter {
+    re: Regex
+    input: [u8]
+    state: [usize]
+    done: [u8]
+}
+
+
+public function split(
+    re: Regex,
+    input: [u8],
+    allocator: mutable Allocator,
+) -> [[u8]]
+    with {allocator, err: RegexError, divergence}
+{
+    return handle err: vm.ExecError -> { raise RegexError.exec_failed(err: vm.ExecError.allocation_failed) } {
+        _split_inner(re, input, mutable allocator)?
+    }
+}
+
+function _split_inner(
+    re: Regex,
+    input: [u8],
+    allocator: mutable Allocator,
+) -> [[u8]]
+    with {allocator, err: vm.ExecError, divergence}
+{
+    let matches_raw = _find_all_inner(re, input, mutable allocator)?
+    let nm = matches_raw.len()
+    let out = _alloc_byteslice_slots(allocator, nm + 1 as usize)?
+    var prev_end: usize = 0 as usize
+    var k: usize = 0 as usize
+    loop decreases nm - k + 1 as usize {
+        if k >= nm { break }
+        let m = matches_raw[k]
+        out[k] = input[prev_end..<m.start]
+        prev_end = m.end
+        k = k + 1 as usize
+    }
+    out[nm] = input[prev_end..<input.len()]
+    return out
+}

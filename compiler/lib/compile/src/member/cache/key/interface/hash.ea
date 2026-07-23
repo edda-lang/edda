@@ -1,0 +1,161 @@
+
+module compile.member.cache.key.interface.hash
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc
+import cache.addr.hash as hash_mod
+import source.map as source_map_mod
+import syntax.ast.file as ast_file_mod
+import syntax.ast.item as ast_item_mod
+import intern.symbol
+import intern.interner as interner_mod
+import resolve.paths.modules as mt_mod
+import resolve.paths.imports as imports_mod
+import resolve.bind.lookup.lookup as lookup_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(symbol.Symbol)
+spec std.collections.vec.Vec(hash_mod.ArtifactHash)
+spec std.collections.vec.Vec(ast_file_mod.File)
+spec std.collections.vec.Vec(ast_item_mod.Item)
+spec std.core.option.Option(usize)
+
+
+public function module_interface_hashes_of(
+    files: Vec_File.Vec,
+    map: source_map_mod.SourceMap,
+    module_tree: mt_mod.ModuleTree,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> Vec_ArtifactHash.Vec
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_File.len(files)
+
+    uninit mp_keys: Vec_ArtifactHash.Vec
+    Vec_ArtifactHash.new(init mp_keys, allocator)?
+    for i in 0..<n {
+        let f = Vec_File.at(files, i)
+        let mp = lookup_mod.module_path_of(f.items, allocator)?
+        let key = path_key_of(mp, interner, allocator)?
+        Vec_ArtifactHash.push(mutable mp_keys, key, allocator)?
+    }
+
+    uninit own: Vec_ArtifactHash.Vec
+    Vec_ArtifactHash.new(init own, allocator)?
+    for i in 0..<n {
+        let f = Vec_File.at(files, i)
+        let content = source_map_mod.file_content_of(map, f.span.file)
+        let h = hash_mod.hash_bytes(content.bytes(), allocator)?
+        Vec_ArtifactHash.push(mutable own, h, allocator)?
+    }
+
+    uninit edge_start: Vec_usize.Vec
+    Vec_usize.new(init edge_start, allocator)?
+    uninit edge_to: Vec_usize.Vec
+    Vec_usize.new(init edge_to, allocator)?
+    for i in 0..<n {
+        Vec_usize.push(mutable edge_start, Vec_usize.len(edge_to), allocator)?
+        let f = Vec_File.at(files, i)
+        let mp = lookup_mod.module_path_of(f.items, allocator)?
+        let item_count = Vec_Item.len(f.items)
+        for k in 0..<item_count {
+            let it = Vec_Item.at(f.items, k)
+            match it.kind {
+                case .import_(let imp) => {
+                    let target = imports_mod.translate_path(imp.path, mp, module_tree, interner, allocator)?
+                    let target_key = path_key_of(target, interner, allocator)?
+                    match find_index(mp_keys, target_key) {
+                        case .some(let j) => Vec_usize.push(mutable edge_to, j, allocator)?
+                        case .none => ()
+                    }
+                }
+                case _ => ()
+            }
+        }
+    }
+    Vec_usize.push(mutable edge_start, Vec_usize.len(edge_to), allocator)?
+
+    uninit acc: Vec_ArtifactHash.Vec
+    Vec_ArtifactHash.new(init acc, allocator)?
+    for i in 0..<n {
+        Vec_ArtifactHash.push(mutable acc, Vec_ArtifactHash.at(own, i), allocator)?
+    }
+    for round in 0..<n {
+        for i in 0..<n {
+            let start = Vec_usize.at(edge_start, i)
+            let stop = Vec_usize.at(edge_start, i + 1 as usize)
+            let combined = combine_hash(Vec_ArtifactHash.at(own, i), acc, edge_to, start, stop, allocator)?
+            Vec_ArtifactHash.set_at(mutable acc, i, combined)
+        }
+    }
+    return acc
+}
+
+
+function path_key_of(
+    segs: Vec_Symbol.Vec,
+    interner: interner_mod.Interner,
+    allocator: Allocator,
+) -> hash_mod.ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    let n = Vec_Symbol.len(segs)
+    for i in 0..<n {
+        let sym = Vec_Symbol.at(segs, i)
+        let bytes = interner_mod.lookup(interner, sym)
+        Vec_u8.extend_from_slice(mutable v, bytes, allocator)?
+        Vec_u8.push(mutable v, 0, allocator)?
+    }
+    let owned = Vec_u8.into_array(take v, allocator)?
+    return hash_mod.hash_bytes(owned, allocator)?
+}
+
+
+function find_index(mp_keys: Vec_ArtifactHash.Vec, key: hash_mod.ArtifactHash) -> Option_usize.Option {
+    let n = Vec_ArtifactHash.len(mp_keys)
+    for i in 0..<n {
+        let cand = Vec_ArtifactHash.at(mp_keys, i)
+        if cand.w0 == key.w0 && cand.w1 == key.w1 && cand.w2 == key.w2 && cand.w3 == key.w3 {
+            return Option_usize.some(value: i)
+        }
+    }
+    return Option_usize.none
+}
+
+
+function combine_hash(
+    own_i: hash_mod.ArtifactHash,
+    acc: Vec_ArtifactHash.Vec,
+    edge_to: Vec_usize.Vec,
+    start: usize,
+    stop: usize,
+    allocator: Allocator,
+) -> hash_mod.ArtifactHash
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_u8.Vec
+    Vec_u8.new(init v, allocator)?
+    push_hash(mutable v, own_i, allocator)?
+    for k in start..<stop {
+        let j = Vec_usize.at(edge_to, k)
+        let dep = Vec_ArtifactHash.at(acc, j)
+        push_hash(mutable v, dep, allocator)?
+    }
+    let owned = Vec_u8.into_array(take v, allocator)?
+    return hash_mod.hash_bytes(owned, allocator)?
+}
+
+
+function push_hash(v: mutable Vec_u8.Vec, h: hash_mod.ArtifactHash, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let hex = hash_mod.to_hex_string(h, allocator)?
+    Vec_u8.extend_from_slice(mutable v, hex.bytes(), allocator)?
+    return ()
+}

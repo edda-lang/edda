@@ -1,0 +1,343 @@
+
+module syntax.parse.item.simple.simple
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import span.loc.pos.span as span_mod
+import intern.symbol
+import diagnostics.emit.collection as diags_mod
+import syntax.tokens.kind as kind_mod
+import syntax.tokens.lexed as lexed_mod
+import syntax.ast.tree as tree_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.item as item_ast
+import local.parse.util as util_mod
+import local.parse.ty.core.core as ty_mod
+
+spec std.collections.vec.Vec(ident_mod.Ident)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.core.option.Option(Vec_Ident)
+spec std.core.option.Option(symbol.Symbol)
+
+
+public function parse_import(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (item_ast.Import, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    let path_r = parse_path(tokens, pos + 1, allocator)?
+    var p = path_r.1
+    var alias: Option_Ident.Option = Option_Ident.none
+    var selection: Option_Vec_Ident.Option = Option_Vec_Ident.none
+    var end_span: span_mod.Span = path_r.0.span
+    match util_mod.peek(tokens, p) {
+        case .dot => {
+            match util_mod.peek_at(tokens, p, 1) {
+                case .l_brace => {
+                    let sel_r = parse_import_selection(tokens, p + 1, mutable diags, allocator)?
+                    selection = Option_Vec_Ident.some(value: sel_r.0)
+                    end_span = util_mod.span_at(tokens, sel_r.1 - 1)
+                    p = sel_r.1
+                }
+                case _ => ()
+            }
+        }
+        case _ => ()
+    }
+    match util_mod.peek(tokens, p) {
+        case .kw_as => {
+            match util_mod.peek_at(tokens, p, 1) {
+                case .ident(let sym) => {
+                    let id_span = util_mod.span_at(tokens, p + 1)
+                    let id = ident_mod.Ident { name: sym, span: id_span }
+                    match selection {
+                        case .some(_) => {
+                            util_mod.emit_error(mutable diags, id_span, "`as <alias>` and `.{...}` selection are mutually exclusive on the same `import`", allocator)?
+                        }
+                        case .none => ()
+                    }
+                    alias = Option_Ident.some(value: id)
+                    end_span = id_span
+                    p = p + 2
+                }
+                case _ => {
+                    util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p + 1), "expected alias name after `as`", allocator)?
+                    p = p + 1
+                }
+            }
+        }
+        case _ => ()
+    }
+    let full_span = merge_spans(kw_span, end_span)
+    let imp = item_ast.Import {
+        span: full_span,
+        path: path_r.0,
+        alias: alias,
+        selection: selection,
+    }
+    return (imp, p)
+}
+
+function parse_import_selection(
+    tokens: [lexed_mod.Lexed],
+    pos_at_lbrace: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (Vec_Ident.Vec, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit names: Vec_Ident.Vec
+    Vec_Ident.new(init names, allocator)?
+    var p = pos_at_lbrace + 1
+    match util_mod.peek(tokens, p) {
+        case .r_brace => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "selected-name import must name at least one entry between `{` and `}`", allocator)?
+            return (names, p + 1)
+        }
+        case _ => ()
+    }
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .ident(let sym) => {
+                let id_span = util_mod.span_at(tokens, p)
+                let id = ident_mod.Ident { name: sym, span: id_span }
+                Vec_Ident.push(mutable names, id, allocator)?
+                p = p + 1
+            }
+            case _ => {
+                util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected identifier in selected-name import", allocator)?
+                break
+            }
+        }
+        match util_mod.peek(tokens, p) {
+            case .comma => {
+                p = p + 1
+                match util_mod.peek(tokens, p) {
+                    case .r_brace => { break }
+                    case .eof => { break }
+                    case _ => ()
+                }
+            }
+            case _ => break
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .r_brace => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `}` to close selected-name import", allocator)?
+        }
+    }
+    return (names, p)
+}
+
+
+public function parse_module(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    allocator: Allocator,
+) -> (item_ast.ModuleDecl, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    let path_r = parse_path(tokens, pos + 1, allocator)?
+    let full_span = merge_spans(kw_span, path_r.0.span)
+    let decl = item_ast.ModuleDecl {
+        span: full_span,
+        path: path_r.0,
+    }
+    return (decl, path_r.1)
+}
+
+
+public function parse_let_item(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    visibility: item_ast.Visibility,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    parse_expr_fn: function(tokens: [lexed_mod.Lexed], pos: usize, diags: mutable diags_mod.Diagnostics, allocator: Allocator, depth: usize) -> (tree_mod.Expr, usize) with {allocator, err: alloc.AllocError, divergence},
+    depth: usize,
+) -> (item_ast.LetDecl, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    let name = match util_mod.peek(tokens, p) {
+        case .ident(let sym) => {
+            let id_span = util_mod.span_at(tokens, p)
+            p = p + 1
+            ident_mod.Ident { name: sym, span: id_span }
+        }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected binding name after `let`", allocator)?
+            ident_mod.Ident { name: symbol.empty(), span: kw_span }
+        }
+    }
+    match util_mod.peek(tokens, p) {
+        case .colon => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `:` — module-level `let` requires a type annotation", allocator)?
+        }
+    }
+    let ty_r = ty_mod.parse_ty(tokens, p, mutable diags, allocator, parse_expr_fn, depth)?
+    p = ty_r.1
+    match util_mod.peek(tokens, p) {
+        case .eq => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `=` — module-level `let` requires an initialiser", allocator)?
+        }
+    }
+    let init_r = parse_expr_fn(tokens, p, mutable diags, allocator, depth + 1)?
+    let full_span = merge_spans(kw_span, init_r.0.span)
+    let decl = item_ast.LetDecl {
+        span: full_span,
+        visibility: visibility,
+        name: name,
+        ty: ty_r.0,
+        init_: init_r.0,
+    }
+    return (decl, init_r.1)
+}
+
+
+public function parse_derive(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> (item_ast.Derive, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let kw_span = util_mod.span_at(tokens, pos)
+    var p = pos + 1
+    uninit items: Vec_Ident.Vec
+    Vec_Ident.new(init items, allocator)?
+    let first_r = expect_derive_item(tokens, p, mutable diags, allocator, "expected derive item name (e.g. `eq`, `hash`, `properties`)")?
+    Vec_Ident.push(mutable items, first_r.0, allocator)?
+    p = first_r.1
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .comma => { p = p + 1 }
+            case _ => break
+        }
+        match util_mod.peek(tokens, p) {
+            case .kw_for => { break }
+            case _ => ()
+        }
+        let next_r = expect_derive_item(tokens, p, mutable diags, allocator, "expected derive item name after `,`")?
+        Vec_Ident.push(mutable items, next_r.0, allocator)?
+        p = next_r.1
+    }
+    match util_mod.peek(tokens, p) {
+        case .kw_for => { p = p + 1 }
+        case _ => {
+            util_mod.emit_error(mutable diags, util_mod.span_at(tokens, p), "expected `for` between derive item list and target type", allocator)?
+            let target = synth_dummy_path(util_mod.span_at(tokens, p), allocator)?
+            let full_span = merge_spans(kw_span, target.span)
+            let decl = item_ast.Derive {
+                span: full_span,
+                items: items,
+                target: target,
+            }
+            return (decl, p)
+        }
+    }
+    let target_r = parse_path(tokens, p, allocator)?
+    let full_span = merge_spans(kw_span, target_r.0.span)
+    let decl = item_ast.Derive {
+        span: full_span,
+        items: items,
+        target: target_r.0,
+    }
+    return (decl, target_r.1)
+}
+
+function expect_derive_item(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+    message: String,
+) -> (ident_mod.Ident, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let span = util_mod.span_at(tokens, pos)
+    return match util_mod.peek(tokens, pos) {
+        case .ident(let sym) => (ident_mod.Ident { name: sym, span: span }, pos + 1)
+        case _ => {
+            util_mod.emit_error(mutable diags, span, message, allocator)?
+            (ident_mod.Ident { name: symbol.empty(), span: span }, pos)
+        }
+    }
+}
+
+function synth_dummy_path(span: span_mod.Span, allocator: Allocator) -> ident_mod.Path
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    let dummy = ident_mod.Ident { name: symbol.empty(), span: span }
+    Vec_Ident.push(mutable segments, dummy, allocator)?
+    return ident_mod.Path { segments: segments, span: span }
+}
+
+
+function parse_path(
+    tokens: [lexed_mod.Lexed],
+    pos: usize,
+    allocator: Allocator,
+) -> (ident_mod.Path, usize)
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit segments: Vec_Ident.Vec
+    Vec_Ident.new(init segments, allocator)?
+    var p = pos
+    let start_span = util_mod.span_at(tokens, p)
+    var last_span = start_span
+    let first_name = match path_segment_symbol(util_mod.peek(tokens, p)) {
+        case .some(let sym) => sym
+        case .none => symbol.empty()
+    }
+    let first = ident_mod.Ident { name: first_name, span: start_span }
+    Vec_Ident.push(mutable segments, first, allocator)?
+    p = p + 1
+    loop decreases (tokens.len() - p) {
+        match util_mod.peek(tokens, p) {
+            case .dot => ()
+            case _ => break
+        }
+        match path_segment_symbol(util_mod.peek_at(tokens, p, 1)) {
+            case .some(let sym) => {
+                let seg_span = util_mod.span_at(tokens, p + 1)
+                let seg = ident_mod.Ident { name: sym, span: seg_span }
+                Vec_Ident.push(mutable segments, seg, allocator)?
+                last_span = seg_span
+                p = p + 2
+            }
+            case .none => break
+        }
+    }
+    let path_span = merge_spans(start_span, last_span)
+    return (ident_mod.Path { segments: segments, span: path_span }, p)
+}
+
+function path_segment_symbol(tok: kind_mod.Token) -> Option_Symbol.Option {
+    return match tok {
+        case .ident(let sym) => Option_Symbol.some(value: sym)
+        case _ => Option_Symbol.none
+    }
+}
+
+function merge_spans(start: span_mod.Span, end: span_mod.Span) -> span_mod.Span {
+    if span_mod.is_dummy(end) { return start }
+    if span_mod.is_dummy(start) { return end }
+    if start.file == end.file {
+        return span_mod.merge(start, end)
+    }
+    return start
+}

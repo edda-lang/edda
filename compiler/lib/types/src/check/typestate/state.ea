@@ -1,0 +1,396 @@
+
+module types.check.typestate.state
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.def as def_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import target.capability as cap_mod
+import local.check.typestate.typestate as surface_mod
+
+
+spec std.collections.vec.Vec(TsSlot)
+spec std.collections.vec.Vec(ty_mod.TyId)
+spec std.core.option.Option(cap_mod.Capability)
+spec std.core.option.Option(surface_mod.Automaton)
+
+
+derive clone, debug for TsSlot
+
+
+public type TsSlot {
+    tracked: bool
+    state: surface_mod.TypeState
+}
+
+
+public type TsTable {
+    base: usize
+    slots: Vec_TsSlot.Vec
+}
+
+
+function default_slot() -> TsSlot {
+    return TsSlot { tracked: false, state: surface_mod.TypeState.alloc_open }
+}
+
+
+public function new_table(out: init TsTable, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit slots: Vec_TsSlot.Vec
+    Vec_TsSlot.new(init slots, allocator)?
+    out = TsTable { base: 0, slots: slots }
+}
+
+
+function align_down(t: mutable TsTable, new_base: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if new_base >= t.base {
+        return
+    }
+    let delta = t.base - new_base
+    let n = Vec_TsSlot.len(t.slots)
+    uninit fresh: Vec_TsSlot.Vec
+    Vec_TsSlot.with_capacity(init fresh, n + delta, allocator)?
+    var i: usize = 0 as usize
+    loop decreases (delta - i) {
+        if i >= delta { break }
+        Vec_TsSlot.push(mutable fresh, default_slot(), allocator)?
+        i = i + 1 as usize
+    }
+    var j: usize = 0 as usize
+    loop decreases (n - j) {
+        if j >= n { break }
+        Vec_TsSlot.push(mutable fresh, Vec_TsSlot.at(t.slots, j), allocator)?
+        j = j + 1 as usize
+    }
+    t.slots = fresh
+    t.base = new_base
+}
+
+
+function ensure_covers(t: mutable TsTable, target: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if Vec_TsSlot.len(t.slots) == 0 as usize {
+        t.base = target
+        Vec_TsSlot.push(mutable t.slots, default_slot(), allocator)?
+        return
+    }
+    if target < t.base {
+        align_down(mutable t, target, allocator)?
+        return
+    }
+    grow_to(mutable t.slots, target - t.base, allocator)?
+}
+
+
+function grow_to(
+    states: mutable Vec_TsSlot.Vec,
+    target: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    loop {
+        let len = Vec_TsSlot.len(states)
+        if len > target { break }
+        Vec_TsSlot.push(mutable states, default_slot(), allocator)?
+    }
+}
+
+
+public function seed(
+    states: mutable TsTable,
+    def: def_mod.DefId,
+    st: surface_mod.TypeState,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let target = def_mod.index(def)
+    ensure_covers(mutable states, target, allocator)?
+    let pos = target - states.base
+    Vec_TsSlot.set_at(mutable states.slots, pos, TsSlot { tracked: true, state: st })
+}
+
+
+public function set_state(
+    states: mutable TsTable,
+    def: def_mod.DefId,
+    st: surface_mod.TypeState,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if def_mod.is_error(def) {
+        return
+    }
+    let target = def_mod.index(def)
+    ensure_covers(mutable states, target, allocator)?
+    let pos = target - states.base
+    let cur = Vec_TsSlot.at(states.slots, pos)
+    Vec_TsSlot.set_at(mutable states.slots, pos, TsSlot { tracked: cur.tracked, state: st })
+}
+
+
+public function get(states: TsTable, def: def_mod.DefId) -> TsSlot {
+    if def_mod.is_error(def) {
+        return default_slot()
+    }
+    let i = def_mod.index(def)
+    if i < states.base {
+        return default_slot()
+    }
+    let pos = i - states.base
+    if pos >= Vec_TsSlot.len(states.slots) {
+        return default_slot()
+    }
+    return Vec_TsSlot.at(states.slots, pos)
+}
+
+
+public function type_of_local(local_types: Vec_TyId.Vec, def: def_mod.DefId) -> ty_mod.TyId {
+    if def_mod.is_error(def) {
+        return ty_mod.error()
+    }
+    let i = def_mod.index(def)
+    if i >= Vec_TyId.len(local_types) {
+        return ty_mod.error()
+    }
+    return Vec_TyId.at(local_types, i)
+}
+
+
+public function tracked_automaton(ty: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> Option_Automaton.Option
+    with {divergence}
+{
+    return match cap_of(ty, ty_interner) {
+        case .some(let cap) => match cap {
+            case .allocator => Option_Automaton.some(value: surface_mod.Automaton.allocator)
+            case .bounded_allocator => Option_Automaton.some(value: surface_mod.Automaton.allocator)
+            case _ => Option_Automaton.none
+        }
+        case .none => Option_Automaton.none
+    }
+}
+
+
+function cap_of(t: ty_mod.TyId, ty_interner: ty_interner_mod.Interner) -> Option_Capability.Option
+    with {divergence}
+{
+    if ty_mod.is_error(t) {
+        return Option_Capability.none
+    }
+    let cty = ty_interner_mod.lookup(ty_interner, t)
+    return match cty {
+        case .capability(let cap) => Option_Capability.some(value: cap)
+        case .refined(let base, _) => cap_of(base, ty_interner)
+        case _ => Option_Capability.none
+    }
+}
+
+
+public function clone_slots(src: TsTable, allocator: Allocator) -> TsTable
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let n = Vec_TsSlot.len(src.slots)
+    uninit out: Vec_TsSlot.Vec
+    Vec_TsSlot.with_capacity(init out, n, allocator)?
+    var i: usize = 0 as usize
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_TsSlot.push(mutable out, Vec_TsSlot.at(src.slots, i), allocator)?
+        i = i + 1 as usize
+    }
+    return TsTable { base: src.base, slots: out }
+}
+
+
+function src_slot_abs(src: TsTable, abs: usize) -> TsSlot {
+    if abs < src.base {
+        return default_slot()
+    }
+    let pos = abs - src.base
+    if pos >= Vec_TsSlot.len(src.slots) {
+        return default_slot()
+    }
+    return Vec_TsSlot.at(src.slots, pos)
+}
+
+
+public function overwrite_slots(
+    dst: mutable TsTable,
+    src: TsTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let sn = Vec_TsSlot.len(src.slots)
+    if sn == 0 as usize {
+        let dn0 = Vec_TsSlot.len(dst.slots)
+        var k: usize = 0 as usize
+        loop decreases (dn0 - k) {
+            if k >= dn0 { break }
+            let cur = Vec_TsSlot.at(dst.slots, k)
+            Vec_TsSlot.set_at(mutable dst.slots, k, TsSlot { tracked: cur.tracked, state: surface_mod.TypeState.alloc_open })
+            k = k + 1 as usize
+        }
+        return
+    }
+    let src_end = src.base + sn
+    if Vec_TsSlot.len(dst.slots) == 0 as usize {
+        dst.base = src.base
+    }
+    if src.base < dst.base {
+        align_down(mutable dst, src.base, allocator)?
+    }
+    ensure_covers(mutable dst, src_end - 1 as usize, allocator)?
+    let copy_n = src_end - dst.base
+    var i: usize = 0 as usize
+    loop decreases (copy_n - i) {
+        if i >= copy_n { break }
+        Vec_TsSlot.set_at(mutable dst.slots, i, src_slot_abs(src, dst.base + i))
+        i = i + 1 as usize
+    }
+    let dn = Vec_TsSlot.len(dst.slots)
+    var j: usize = copy_n
+    loop decreases (dn - j) {
+        if j >= dn { break }
+        let cur = Vec_TsSlot.at(dst.slots, j)
+        Vec_TsSlot.set_at(mutable dst.slots, j, TsSlot { tracked: cur.tracked, state: surface_mod.TypeState.alloc_open })
+        j = j + 1 as usize
+    }
+}
+
+
+public function merge_into(
+    dst: mutable TsTable,
+    a: TsTable,
+    a_ft: bool,
+    b: TsTable,
+    b_ft: bool,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if a_ft && !b_ft {
+        overwrite_slots(mutable dst, a, allocator)?
+        return
+    }
+    if b_ft && !a_ft {
+        overwrite_slots(mutable dst, b, allocator)?
+        return
+    }
+    if !a_ft && !b_ft {
+        overwrite_slots(mutable dst, a, allocator)?
+        return
+    }
+    merge_overwrite(mutable dst, a, b, allocator)?
+}
+
+
+function merge_overwrite(
+    dst: mutable TsTable,
+    a: TsTable,
+    b: TsTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let na = Vec_TsSlot.len(a.slots)
+    let nb = Vec_TsSlot.len(b.slots)
+    if na == 0 as usize && nb == 0 as usize {
+        overwrite_slots(mutable dst, a, allocator)?
+        return
+    }
+    let a_lo = if na == 0 as usize { b.base } else { a.base }
+    let b_lo = if nb == 0 as usize { a.base } else { b.base }
+    let lo = if a_lo < b_lo { a_lo } else { b_lo }
+    let a_end = if na == 0 as usize { lo } else { a.base + na }
+    let b_end = if nb == 0 as usize { lo } else { b.base + nb }
+    let hi = if a_end > b_end { a_end } else { b_end }
+    if Vec_TsSlot.len(dst.slots) == 0 as usize {
+        dst.base = lo
+    }
+    if lo < dst.base {
+        align_down(mutable dst, lo, allocator)?
+    }
+    ensure_covers(mutable dst, hi - 1 as usize, allocator)?
+    let copy_n = hi - dst.base
+    var i: usize = 0 as usize
+    loop decreases (copy_n - i) {
+        if i >= copy_n { break }
+        let abs = dst.base + i
+        Vec_TsSlot.set_at(mutable dst.slots, i, merge_slot(src_slot_abs(a, abs), src_slot_abs(b, abs)))
+        i = i + 1 as usize
+    }
+    let dn = Vec_TsSlot.len(dst.slots)
+    var j: usize = copy_n
+    loop decreases (dn - j) {
+        if j >= dn { break }
+        let cur = Vec_TsSlot.at(dst.slots, j)
+        Vec_TsSlot.set_at(mutable dst.slots, j, TsSlot { tracked: cur.tracked, state: surface_mod.TypeState.alloc_open })
+        j = j + 1 as usize
+    }
+}
+
+
+public function merge_accumulate(
+    dst: mutable TsTable,
+    b: TsTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let na = Vec_TsSlot.len(dst.slots)
+    let nb = Vec_TsSlot.len(b.slots)
+    if na == 0 as usize && nb == 0 as usize {
+        return
+    }
+    let a_lo = if na == 0 as usize { b.base } else { dst.base }
+    let b_lo = if nb == 0 as usize { dst.base } else { b.base }
+    let lo = if a_lo < b_lo { a_lo } else { b_lo }
+    let a_end = if na == 0 as usize { lo } else { dst.base + na }
+    let b_end = if nb == 0 as usize { lo } else { b.base + nb }
+    let hi = if a_end > b_end { a_end } else { b_end }
+    if Vec_TsSlot.len(dst.slots) == 0 as usize {
+        dst.base = lo
+    }
+    if lo < dst.base {
+        align_down(mutable dst, lo, allocator)?
+    }
+    ensure_covers(mutable dst, hi - 1 as usize, allocator)?
+    let copy_n = hi - dst.base
+    var i: usize = 0 as usize
+    loop decreases (copy_n - i) {
+        if i >= copy_n { break }
+        let cur = Vec_TsSlot.at(dst.slots, i)
+        Vec_TsSlot.set_at(mutable dst.slots, i, merge_slot(cur, src_slot_abs(b, dst.base + i)))
+        i = i + 1 as usize
+    }
+}
+
+
+function merge_slot(a: TsSlot, b: TsSlot) -> TsSlot {
+    let tracked = a.tracked || b.tracked
+    return TsSlot { tracked: tracked, state: merge_state(a.state, b.state) }
+}
+
+
+function merge_state(a: surface_mod.TypeState, b: surface_mod.TypeState) -> surface_mod.TypeState {
+    if surface_mod.is_terminal(a) {
+        return a
+    }
+    if surface_mod.is_terminal(b) {
+        return b
+    }
+    return a
+}

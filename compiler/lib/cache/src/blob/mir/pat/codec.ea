@@ -1,0 +1,383 @@
+
+module cache.blob.mir.pat.codec
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import intern.interner as interner_mod
+import syntax.ast.tree as ast_tree_mod
+import syntax.ast.ident as ident_mod
+import local.error as error_mod
+import local.blob.mir.prim as prim_mod
+import local.blob.mir.ast.codec as ast_codec_mod
+import local.blob.mir.ast.literal as ast_literal_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(ast_tree_mod.Pat)
+spec std.collections.vec.Vec(ast_tree_mod.StructPatField)
+spec std.core.option.Option(ast_tree_mod.SliceRest)
+spec std.core.option.Option(ident_mod.Ident)
+spec std.mem.alloc.Box(ast_tree_mod.Pat)
+
+
+public function write_pat(
+    it: interner_mod.Interner,
+    pat: ast_tree_mod.Pat,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+    write_expr_fn: function(it: interner_mod.Interner, expr: ast_tree_mod.Expr, out: mutable Vec_u8.Vec, allocator: Allocator) -> () with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(pat.span, mutable out, allocator)?
+    match pat.kind {
+        case .wildcard => prim_mod.push_u8(mutable out, 0, allocator)?
+        case .binding(let name) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            ast_codec_mod.write_ident(it, name, mutable out, allocator)?
+        }
+        case .literal(let value) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            ast_literal_mod.write_literal(it, value, mutable out, allocator)?
+        }
+        case .range(let lo, let hi, let inclusive) => {
+            prim_mod.push_u8(mutable out, 3, allocator)?
+            ast_literal_mod.write_literal(it, lo, mutable out, allocator)?
+            ast_literal_mod.write_literal(it, hi, mutable out, allocator)?
+            prim_mod.push_bool(mutable out, inclusive, allocator)?
+        }
+        case .tuple(let elements) => {
+            prim_mod.push_u8(mutable out, 4, allocator)?
+            write_pat_vec(elements, it, mutable out, allocator, write_expr_fn)?
+        }
+        case .slice(let prefix, let rest, let suffix) => {
+            prim_mod.push_u8(mutable out, 5, allocator)?
+            write_pat_vec(prefix, it, mutable out, allocator, write_expr_fn)?
+            write_option_slice_rest(rest, it, mutable out, allocator)?
+            write_pat_vec(suffix, it, mutable out, allocator, write_expr_fn)?
+        }
+        case .variant(let path, let payload) => {
+            prim_mod.push_u8(mutable out, 6, allocator)?
+            ast_codec_mod.write_path(it, path, mutable out, allocator)?
+            write_variant_pat_payload(payload, it, mutable out, allocator, write_expr_fn)?
+        }
+        case .struct_(let path, let fields, let rest) => {
+            prim_mod.push_u8(mutable out, 7, allocator)?
+            ast_codec_mod.write_path(it, path, mutable out, allocator)?
+            write_struct_pat_field_vec(fields, it, mutable out, allocator, write_expr_fn)?
+            prim_mod.push_bool(mutable out, rest, allocator)?
+        }
+        case .or_(let alternatives) => {
+            prim_mod.push_u8(mutable out, 8, allocator)?
+            write_pat_vec(alternatives, it, mutable out, allocator, write_expr_fn)?
+        }
+        case .at_binding(let name, let inner) => {
+            prim_mod.push_u8(mutable out, 9, allocator)?
+            ast_codec_mod.write_ident(it, name, mutable out, allocator)?
+            write_pat(it, Box_Pat.get(inner), mutable out, allocator, write_expr_fn)?
+        }
+        case .guard(let inner, let cond) => {
+            prim_mod.push_u8(mutable out, 11, allocator)?
+            write_pat(it, Box_Pat.get(inner), mutable out, allocator, write_expr_fn)?
+            write_expr_fn(it, cond, mutable out, allocator)?
+        }
+        case .error => prim_mod.push_u8(mutable out, 10, allocator)?
+    }
+}
+
+public function read_pat(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.Pat
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    let kind = match tag {
+        case 0 => ast_tree_mod.PatKind.wildcard
+        case 1 => ast_tree_mod.PatKind.binding(name: ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?)
+        case 2 => ast_tree_mod.PatKind.literal(value: ast_literal_mod.read_literal(bytes, mutable cur, mutable it, allocator)?)
+        case 3 => {
+            let lo = ast_literal_mod.read_literal(bytes, mutable cur, mutable it, allocator)?
+            let hi = ast_literal_mod.read_literal(bytes, mutable cur, mutable it, allocator)?
+            let inclusive = prim_mod.read_bool(bytes, mutable cur)?
+            ast_tree_mod.PatKind.range(lo: lo, hi: hi, inclusive: inclusive)
+        }
+        case 4 => ast_tree_mod.PatKind.tuple(elements: read_pat_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?)
+        case 5 => {
+            let prefix = read_pat_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            let rest = read_option_slice_rest(bytes, mutable cur, mutable it, allocator)?
+            let suffix = read_pat_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.PatKind.slice(prefix: prefix, rest: rest, suffix: suffix)
+        }
+        case 6 => {
+            let path = ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?
+            let payload = read_variant_pat_payload(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.PatKind.variant(path: path, payload: payload)
+        }
+        case 7 => {
+            let path = ast_codec_mod.read_path(bytes, mutable cur, mutable it, allocator)?
+            let fields = read_struct_pat_field_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            let rest = prim_mod.read_bool(bytes, mutable cur)?
+            ast_tree_mod.PatKind.struct_(path: path, fields: fields, rest: rest)
+        }
+        case 8 => ast_tree_mod.PatKind.or_(alternatives: read_pat_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?)
+        case 9 => {
+            let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+            let inner = read_pat(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            ast_tree_mod.PatKind.at_binding(name: name, inner: Box_Pat.new(take inner, allocator)?)
+        }
+        case 10 => ast_tree_mod.PatKind.error
+        case 11 => {
+            let inner = read_pat(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+            let cond = read_expr_fn(bytes, mutable cur, mutable it, allocator)?
+            ast_tree_mod.PatKind.guard(pat: Box_Pat.new(take inner, allocator)?, cond: cond)
+        }
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown PatKind tag")
+    }
+    return ast_tree_mod.Pat { span: span, kind: kind }
+}
+
+public function write_pat_vec(
+    elements: Vec_Pat.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+    write_expr_fn: function(it: interner_mod.Interner, expr: ast_tree_mod.Expr, out: mutable Vec_u8.Vec, allocator: Allocator) -> () with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_Pat.len(elements)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_pat(it, Vec_Pat.at(elements, i), mutable out, allocator, write_expr_fn)?
+        i += 1
+    }
+}
+
+public function read_pat_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> Vec_Pat.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit elements: Vec_Pat.Vec
+    Vec_Pat.new(init elements, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let p = read_pat(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+        Vec_Pat.push(mutable elements, take p, allocator)?
+        i += 1
+    }
+    return elements
+}
+
+public function write_variant_pat_payload(
+    payload: ast_tree_mod.VariantPatPayload,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+    write_expr_fn: function(it: interner_mod.Interner, expr: ast_tree_mod.Expr, out: mutable Vec_u8.Vec, allocator: Allocator) -> () with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    match payload {
+        case .none => prim_mod.push_u8(mutable out, 0, allocator)?
+        case .tuple(let elements) => {
+            prim_mod.push_u8(mutable out, 1, allocator)?
+            write_pat_vec(elements, it, mutable out, allocator, write_expr_fn)?
+        }
+        case .struct_(let fields) => {
+            prim_mod.push_u8(mutable out, 2, allocator)?
+            write_struct_pat_field_vec(fields, it, mutable out, allocator, write_expr_fn)?
+        }
+    }
+}
+
+public function read_variant_pat_payload(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.VariantPatPayload
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let tag = prim_mod.read_u8(bytes, mutable cur)?
+    return match tag {
+        case 0 => ast_tree_mod.VariantPatPayload.none
+        case 1 => ast_tree_mod.VariantPatPayload.tuple(elements: read_pat_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?)
+        case 2 => ast_tree_mod.VariantPatPayload.struct_(fields: read_struct_pat_field_vec(bytes, mutable cur, mutable it, allocator, read_expr_fn)?)
+        case _ => raise error_mod.CacheError.body_parse(message: "unknown VariantPatPayload tag")
+    }
+}
+
+public function write_struct_pat_field(
+    it: interner_mod.Interner,
+    field: ast_tree_mod.StructPatField,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+    write_expr_fn: function(it: interner_mod.Interner, expr: ast_tree_mod.Expr, out: mutable Vec_u8.Vec, allocator: Allocator) -> () with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    ast_codec_mod.write_span(field.span, mutable out, allocator)?
+    ast_codec_mod.write_ident(it, field.name, mutable out, allocator)?
+    write_pat(it, field.pat, mutable out, allocator, write_expr_fn)?
+}
+
+public function read_struct_pat_field(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ast_tree_mod.StructPatField
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let name = ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?
+    let pat = read_pat(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+    return ast_tree_mod.StructPatField { span: span, name: name, pat: pat }
+}
+
+public function write_struct_pat_field_vec(
+    fields: Vec_StructPatField.Vec,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+    write_expr_fn: function(it: interner_mod.Interner, expr: ast_tree_mod.Expr, out: mutable Vec_u8.Vec, allocator: Allocator) -> () with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> ()
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = Vec_StructPatField.len(fields)
+    prim_mod.push_u32_le(mutable out, n as u32 wrapping, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        write_struct_pat_field(it, Vec_StructPatField.at(fields, i), mutable out, allocator, write_expr_fn)?
+        i += 1
+    }
+}
+
+public function read_struct_pat_field_vec(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+    read_expr_fn: function(bytes: [u8], cur: mutable prim_mod.Reader, it: mutable interner_mod.Interner, allocator: Allocator) -> ast_tree_mod.Expr with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence},
+) -> Vec_StructPatField.Vec
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError, divergence}
+{
+    let n = prim_mod.read_u32_le(bytes, mutable cur)? as usize
+    uninit fields: Vec_StructPatField.Vec
+    Vec_StructPatField.new(init fields, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let f = read_struct_pat_field(bytes, mutable cur, mutable it, allocator, read_expr_fn)?
+        Vec_StructPatField.push(mutable fields, take f, allocator)?
+        i += 1
+    }
+    return fields
+}
+
+public function write_slice_rest(
+    it: interner_mod.Interner,
+    rest: ast_tree_mod.SliceRest,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    ast_codec_mod.write_span(rest.span, mutable out, allocator)?
+    write_option_ident(rest.binding, it, mutable out, allocator)?
+}
+
+public function read_slice_rest(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> ast_tree_mod.SliceRest
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let span = ast_codec_mod.read_span(bytes, mutable cur)?
+    let binding = read_option_ident(bytes, mutable cur, mutable it, allocator)?
+    return ast_tree_mod.SliceRest { span: span, binding: binding }
+}
+
+public function write_option_slice_rest(
+    rest: Option_SliceRest,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match rest {
+        case .some(let r) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            write_slice_rest(it, r, mutable out, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_option_slice_rest(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_SliceRest
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_SliceRest.some(value: read_slice_rest(bytes, mutable cur, mutable it, allocator)?)
+    }
+    return Option_SliceRest.none
+}
+
+public function write_option_ident(
+    name: Option_Ident,
+    it: interner_mod.Interner,
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    match name {
+        case .some(let value) => {
+            prim_mod.push_bool(mutable out, true, allocator)?
+            ast_codec_mod.write_ident(it, value, mutable out, allocator)?
+        }
+        case .none => prim_mod.push_bool(mutable out, false, allocator)?
+    }
+}
+
+public function read_option_ident(
+    bytes: [u8],
+    cur: mutable prim_mod.Reader,
+    it: mutable interner_mod.Interner,
+    allocator: Allocator,
+) -> Option_Ident
+    with {allocator, err: alloc.AllocError, err: error_mod.CacheError}
+{
+    let present = prim_mod.read_bool(bytes, mutable cur)?
+    if present {
+        return Option_Ident.some(value: ast_codec_mod.read_ident(bytes, mutable cur, mutable it, allocator)?)
+    }
+    return Option_Ident.none
+}

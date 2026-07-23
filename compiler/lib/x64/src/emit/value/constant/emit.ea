@@ -1,0 +1,167 @@
+
+module x64.emit.value.constant.emit
+
+import std.mem.alloc
+import std.collections.vec
+import std.text.string
+import std.core.fmt
+
+import span.loc.pos.span as span_mod
+import hir.def as def_mod
+import intern.symbol as symbol_mod
+
+import mir.rvalue as mir_rvalue_mod
+import resolve.build.builtins as builtins_mod
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.error as lir_error_mod
+import ir.lir.id.vreg as lir_vreg_mod
+import ir.runtime as runtime_mod
+
+import local.gen.sel.regs as regs_mod
+import local.encoding.integer.alu as alu_mod
+import local.encoding.simd.vector as vector_mod
+import ir.emitted as etypes_mod
+import local.emit.regsel as regsel_mod
+import local.emit.fixup as fixup_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(etypes_mod.EmittedReloc)
+
+
+public function emit_constant(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    c: lir_op_mod.LConstant,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    match c {
+        case .int_(let value, _) => emit_int_constant(mutable code, body, value, dst, allocator)?
+        case .bool_(let value) => emit_int_constant(mutable code, body, bool_bit(value), dst, allocator)?
+        case .unit_ => ()
+        case .fn_ref(let def) => emit_fn_ref(mutable code, mutable relocs, body, def, dst, allocator)?
+        case .string_(let sym) => emit_string_ref(mutable code, mutable relocs, body, sym, dst, allocator)?
+        case .float_(let bits, let width) => emit_float_ref(mutable code, mutable relocs, body, bits, width, dst, allocator)?
+        case .runtime_fn(let fn_) => emit_runtime_ref(mutable code, mutable relocs, body, fn_, dst, allocator)?
+    }
+}
+
+function emit_runtime_ref(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    fn_: runtime_mod.RuntimeFn,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    alu_mod.encode_lea_rip(mutable code, regs_mod.OpSize.qword_, dg, 0, allocator)?
+    let site = fixup_mod.tail_site(code)?
+    fixup_mod.record_reloc(mutable relocs, site, etypes_mod.RelocTarget.runtime_symbol(fn_: fn_), etypes_mod.RelocKind.rel32, allocator)?
+}
+
+function emit_float_ref(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    bits: u64,
+    width: mir_rvalue_mod.FloatWidth,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dx = regsel_mod.vreg_xmm(body, dst)?
+    let size = match width {
+        case .f32_ => {
+            vector_mod.encode_movss_x_rip(mutable code, dx, 0 as i32, allocator)?
+            4 as u8
+        }
+        case .f64_ => {
+            vector_mod.encode_movsd_x_rip(mutable code, dx, 0 as i32, allocator)?
+            8 as u8
+        }
+    }
+    let site = fixup_mod.tail_site(code)?
+    fixup_mod.record_reloc(mutable relocs, site, etypes_mod.RelocTarget.float_const(bits: bits, size: size), etypes_mod.RelocKind.rel32, allocator)?
+}
+
+function bool_bit(value: bool) -> i128 {
+    return if value { 1 as i128 } else { 0 as i128 }
+}
+
+function emit_int_constant(
+    code: mutable Vec_u8.Vec,
+    body: lir_body_mod.LirBody,
+    value: i128,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dst_reg = regsel_mod.vreg_gp(body, dst)?
+    let i32_min: i128 = -2147483648 as i128
+    let i32_max: i128 = 2147483647 as i128
+    if value >= i32_min && value <= i32_max {
+        alu_mod.encode_mov_rm_imm(mutable code, regs_mod.OpSize.qword_, dst_reg, value as i32, allocator)?
+        return ()
+    }
+    let i64_min: i128 = -9223372036854775808 as i128
+    let u64_max: i128 = 18446744073709551615 as i128
+    if value >= i64_min && value <= u64_max {
+        alu_mod.encode_mov_r64_imm64(mutable code, dst_reg, value as i64 wrapping, allocator)?
+        return ()
+    }
+    let lo = value as u64 wrapping
+    let hi = (value >> (64 as i128)) as u64 wrapping
+    let lo_str = fmt.u64_to_string(lo, allocator)?
+    let hi_str = fmt.u64_to_string(hi, allocator)?
+    let with_hi = string.concat("x64.gen.emit: integer constant exceeds 64-bit register width (hi=", hi_str, allocator)?
+    let with_sep = string.concat(with_hi, " lo=", allocator)?
+    let with_lo = string.concat(with_sep, lo_str, allocator)?
+    let detail = string.concat(with_lo, ")", allocator)?
+    raise lir_error_mod.LirError.internal_lowering_invariant(
+        at: span_mod.dummy(),
+        message: detail,
+    )
+}
+
+function emit_fn_ref(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    def: def_mod.DefId,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    if builtins_mod.is_inline_intrinsic_def(def) { return () }
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    alu_mod.encode_lea_rip(mutable code, regs_mod.OpSize.qword_, dg, 0, allocator)?
+    let site = fixup_mod.tail_site(code)?
+    fixup_mod.record_reloc(mutable relocs, site, etypes_mod.RelocTarget.function_(def: def), etypes_mod.RelocKind.rel32, allocator)?
+}
+
+function emit_string_ref(
+    code: mutable Vec_u8.Vec,
+    relocs: mutable Vec_EmittedReloc.Vec,
+    body: lir_body_mod.LirBody,
+    sym: symbol_mod.Symbol,
+    dst: lir_vreg_mod.LirVRegId,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: lir_error_mod.LirError}
+{
+    let dg = regsel_mod.vreg_gp(body, dst)?
+    alu_mod.encode_lea_rip(mutable code, regs_mod.OpSize.qword_, dg, 0, allocator)?
+    let site = fixup_mod.tail_site(code)?
+    fixup_mod.record_reloc(mutable relocs, site, etypes_mod.RelocTarget.data_symbol(symbol: sym), etypes_mod.RelocKind.rel32, allocator)?
+}

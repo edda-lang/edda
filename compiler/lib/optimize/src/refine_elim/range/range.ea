@@ -1,0 +1,264 @@
+
+module optimize.refine_elim.range.range
+
+import std.collections.vec
+import std.core.option
+import std.mem.alloc as alloc
+
+import mir.body.model as mir_body_mod
+import mir.id.local as mir_local_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.ty.kind as ty_kind_mod
+
+spec std.collections.vec.Vec(IntRange)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.core.option.Option(IntType)
+
+derive eq, debug for IntType
+derive eq, debug for IntRange
+
+public type IntType {
+    signed: bool
+    bits: u32
+    lo: i128
+    hi: i128
+}
+
+public type IntRange {
+    known: bool
+    lo: i128
+    hi: i128
+}
+
+public type RangeTable {
+    ranges: Vec_IntRange.Vec
+}
+
+function mk(signed: bool, bits: u32, lo: i128, hi: i128) -> IntType {
+    return IntType { signed: signed, bits: bits, lo: lo, hi: hi }
+}
+
+public function from_prim(p: ty_kind_mod.PrimKind) -> Option_IntType.Option {
+    return match p {
+        case .i8_ => Option_IntType.some(value: mk(true, 8, ((-128) as i128), (127 as i128)))
+        case .i16_ => Option_IntType.some(value: mk(true, 16, ((-32768) as i128), (32767 as i128)))
+        case .i32_ => Option_IntType.some(value: mk(true, 32, ((-2147483648) as i128), (2147483647 as i128)))
+        case .i64_ => Option_IntType.some(value: mk(true, 64, i64_min(), i64_max()))
+        case .u8_ => Option_IntType.some(value: mk(false, 8, (0 as i128), (255 as i128)))
+        case .u16_ => Option_IntType.some(value: mk(false, 16, (0 as i128), (65535 as i128)))
+        case .u32_ => Option_IntType.some(value: mk(false, 32, (0 as i128), (4294967295 as i128)))
+        case .u64_ => Option_IntType.some(value: mk(false, 64, (0 as i128), u64_max()))
+        case .isize_ => Option_IntType.some(value: mk(true, 64, i64_min(), i64_max()))
+        case .usize_ => Option_IntType.some(value: mk(false, 64, (0 as i128), u64_max()))
+        case _ => Option_IntType.none
+    }
+}
+
+function i64_max() -> i128 {
+    return 9223372036854775807 as i128
+}
+
+function i64_min() -> i128 {
+    return (0 as i128) - (9223372036854775807 as i128) - (1 as i128)
+}
+
+function u64_max() -> i128 {
+    return (9223372036854775807 as i128) + (9223372036854775807 as i128) + (1 as i128)
+}
+
+public function top() -> IntRange {
+    return IntRange { known: false, lo: (0 as i128), hi: (0 as i128) }
+}
+
+public function interval(lo: i128, hi: i128) -> IntRange {
+    return IntRange { known: true, lo: lo, hi: hi }
+}
+
+public function exact(value: i128) -> IntRange {
+    return interval(value, value)
+}
+
+public function of_int_type(it: IntType) -> IntRange {
+    return interval(it.lo, it.hi)
+}
+
+public function is_top(r: IntRange) -> bool {
+    return !r.known
+}
+
+public function is_empty(r: IntRange) -> bool {
+    return r.known && r.lo > r.hi
+}
+
+public function contains_value(r: IntRange, value: i128) -> bool {
+    if !r.known {
+        return true
+    }
+    return r.lo <= value && value <= r.hi
+}
+
+public function is_subrange(a: IntRange, b: IntRange) -> bool {
+    if !b.known {
+        return true
+    }
+    if !a.known {
+        return false
+    }
+    return b.lo <= a.lo && a.hi <= b.hi
+}
+
+public function join(a: IntRange, b: IntRange) -> IntRange {
+    if !a.known || !b.known {
+        return top()
+    }
+    let lo = if a.lo <= b.lo { a.lo } else { b.lo }
+    let hi = if a.hi >= b.hi { a.hi } else { b.hi }
+    return interval(lo, hi)
+}
+
+public function meet(a: IntRange, b: IntRange) -> IntRange {
+    if !a.known {
+        return b
+    }
+    if !b.known {
+        return a
+    }
+    let lo = if a.lo >= b.lo { a.lo } else { b.lo }
+    let hi = if a.hi <= b.hi { a.hi } else { b.hi }
+    return interval(lo, hi)
+}
+
+function n_candidates() -> usize {
+    return 8
+}
+
+function candidate_at(i: usize) -> ty_kind_mod.PrimKind {
+    return match i {
+        case 0 => ty_kind_mod.PrimKind.u8_
+        case 1 => ty_kind_mod.PrimKind.i8_
+        case 2 => ty_kind_mod.PrimKind.u16_
+        case 3 => ty_kind_mod.PrimKind.i16_
+        case 4 => ty_kind_mod.PrimKind.u32_
+        case 5 => ty_kind_mod.PrimKind.i32_
+        case 6 => ty_kind_mod.PrimKind.u64_
+        case _ => ty_kind_mod.PrimKind.i64_
+    }
+}
+
+public function narrowest_int_type(r: IntRange) -> Option_IntType.Option {
+    if !r.known {
+        return Option_IntType.none
+    }
+    if r.lo > r.hi {
+        return Option_IntType.none
+    }
+    let n = n_candidates()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let it = match from_prim(candidate_at(i)) {
+            case .some(let v) => v
+            case .none => mk(true, 64, i64_min(), i64_max())
+        }
+        if r.lo >= it.lo && r.hi <= it.hi {
+            return Option_IntType.some(value: it)
+        }
+        i = i + 1
+    }
+    return Option_IntType.none
+}
+
+function int_type_of_ty(
+    ty: ty_mod.TyId,
+    it_interner: ty_interner_mod.Interner,
+    fuel: usize,
+) -> Option_IntType.Option
+    decreases fuel
+{
+    if fuel == 0 {
+        return Option_IntType.none
+    }
+    if ty_mod.is_error(ty) {
+        return Option_IntType.none
+    }
+    if ty_mod.index(ty) >= ty_interner_mod.slot_count(it_interner) {
+        return Option_IntType.none
+    }
+    let cty = ty_interner_mod.lookup(it_interner, ty)
+    return match cty {
+        case .primitive(let p) => from_prim(p)
+        case .refined(let base, _) => int_type_of_ty(base, it_interner, fuel - 1)
+        case _ => Option_IntType.none
+    }
+}
+
+public function range_of_ty(
+    ty: ty_mod.TyId,
+    it_interner: ty_interner_mod.Interner,
+) -> IntRange {
+    let fuel = ty_interner_mod.slot_count(it_interner) + 1 as usize
+    return match int_type_of_ty(ty, it_interner, fuel) {
+        case .some(let it) => of_int_type(it)
+        case .none => top()
+    }
+}
+
+public function seeded(
+    body: mir_body_mod.MirBody,
+    it_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> RangeTable
+    with {allocator, err: alloc.AllocError}
+{
+    uninit ranges: Vec_IntRange.Vec
+    Vec_IntRange.new(init ranges, allocator)?
+    let n = Vec_Local.len(body.locals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let local = Vec_Local.at(body.locals, i)
+        let r = range_of_ty(local.ty, it_interner)
+        Vec_IntRange.push(mutable ranges, take r, allocator)?
+        i = i + 1
+    }
+    return RangeTable { ranges: ranges }
+}
+
+public function local_count(t: RangeTable) -> usize {
+    return Vec_IntRange.len(t.ranges)
+}
+
+public function get_at(t: RangeTable, index: usize) -> IntRange {
+    if index >= Vec_IntRange.len(t.ranges) {
+        return top()
+    }
+    return Vec_IntRange.at(t.ranges, index)
+}
+
+public function get_for(t: RangeTable, local: mir_local_mod.LocalId) -> IntRange {
+    return get_at(t, mir_local_mod.index(local))
+}
+
+public function set_at(t: mutable RangeTable, index: usize, r: IntRange) -> () {
+    if index >= Vec_IntRange.len(t.ranges) {
+        return
+    }
+    Vec_IntRange.set_at(mutable t.ranges, index, r)
+}
+
+public function refine_at(t: mutable RangeTable, index: usize, r: IntRange) -> () {
+    if index >= Vec_IntRange.len(t.ranges) {
+        return
+    }
+    let cur = Vec_IntRange.at(t.ranges, index)
+    Vec_IntRange.set_at(mutable t.ranges, index, meet(cur, r))
+}
+
+public function merge_at(t: mutable RangeTable, index: usize, r: IntRange) -> () {
+    if index >= Vec_IntRange.len(t.ranges) {
+        return
+    }
+    let cur = Vec_IntRange.at(t.ranges, index)
+    Vec_IntRange.set_at(mutable t.ranges, index, join(cur, r))
+}

@@ -1,0 +1,222 @@
+
+module toml.parse.ast.tree
+
+import std.mem.alloc
+import toml.error
+import toml.value
+import toml.parse.decode.walk
+
+spec alloc.Box(value.Value)
+
+function _alloc_entry_slots(allocator: Allocator, n: usize) -> [value.TableEntry]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_flat_binding_slots(allocator: Allocator, n: usize) -> [walk.FlatBinding]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _alloc_table_slots(allocator: Allocator, n: usize) -> [value.Table]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _bytes_eq(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let n = a.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if a[i] != b[i] { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+function _seg_eq(a: walk.PathSeg, b: walk.PathSeg) -> bool {
+    return match a {
+        case .key(let sa) => match b {
+            case .key(let sb)  => _bytes_eq(sa.bytes(), sb.bytes())
+            case .index(_)     => false
+        }
+        case .index(let ia) => match b {
+            case .key(_)        => false
+            case .index(let ib) => ia == ib
+        }
+    }
+}
+
+function _seg_string(seg: walk.PathSeg) -> String {
+    return match seg {
+        case .key(let s) => s
+        case .index(_)   => ""
+    }
+}
+
+function _seg_index(seg: walk.PathSeg) -> usize {
+    return match seg {
+        case .key(_)        => 0 as usize
+        case .index(let i)  => i
+    }
+}
+
+function _materialize_array(
+    bindings: [walk.FlatBinding],
+    n_bindings: usize,
+    depth: usize,
+    allocator: Allocator,
+) -> value.TableArray
+    with {allocator, err: error.ParseError, err: alloc.AllocError, divergence}
+{
+    var max_idx: usize = 0
+    var i: usize = 0
+    loop decreases n_bindings - i + 1 as usize {
+        if i >= n_bindings { break }
+        let e = _seg_index(bindings[i].path[depth])
+        if e > max_idx { max_idx = e }
+        i = i + 1 as usize
+    }
+    let n_elems = max_idx + 1 as usize
+    let tables = _alloc_table_slots(allocator, n_elems)?
+    var elem: usize = 0
+    loop decreases n_elems - elem + 1 as usize {
+        if elem >= n_elems { break }
+        var cnt: usize = 0
+        var j: usize = 0
+        loop decreases n_bindings - j + 1 as usize {
+            if j >= n_bindings { break }
+            if _seg_index(bindings[j].path[depth]) == elem {
+                cnt = cnt + 1 as usize
+            }
+            j = j + 1 as usize
+        }
+        let elem_bindings = _alloc_flat_binding_slots(allocator, cnt)?
+        var en: usize = 0
+        var jj: usize = 0
+        loop decreases n_bindings - jj + 1 as usize {
+            if jj >= n_bindings { break }
+            if _seg_index(bindings[jj].path[depth]) == elem {
+                elem_bindings[en] = bindings[jj]
+                en = en + 1 as usize
+            }
+            jj = jj + 1 as usize
+        }
+        tables[elem] = materialize(elem_bindings, cnt, depth + 1 as usize, allocator)?
+        elem = elem + 1 as usize
+    }
+    return value.TableArray { items: tables }
+}
+
+public function materialize(
+    bindings: [walk.FlatBinding],
+    n_bindings: usize,
+    depth: usize,
+    allocator: Allocator,
+) -> value.Table
+    with {allocator, err: error.ParseError, err: alloc.AllocError, divergence}
+{
+    if n_bindings == 0 as usize {
+        let empty = _alloc_entry_slots(allocator, 0 as usize)?
+        return value.Table { entries: empty }
+    }
+    let slots = _alloc_entry_slots(allocator, n_bindings)?
+    var n_entries: usize = 0
+    var i: usize = 0
+    loop decreases n_bindings - i + 1 as usize {
+        if i >= n_bindings { break }
+        let name_seg = bindings[i].path[depth]
+
+        var already_seen: bool = false
+        var k: usize = 0
+        loop decreases i - k + 1 as usize {
+            if k >= i { break }
+            if _seg_eq(bindings[k].path[depth], name_seg) {
+                already_seen = true
+                break
+            }
+            k = k + 1 as usize
+        }
+
+        if !already_seen {
+            var match_count: usize = 0
+            var leaf_count: usize = 0
+            var first_leaf_idx: usize = 0
+            var has_leaf: bool = false
+            var first_subtable_idx: usize = 0
+            var has_subtable: bool = false
+            var second_leaf_at: usize = 0
+
+            var j: usize = i
+            loop decreases n_bindings - j + 1 as usize {
+                if j >= n_bindings { break }
+                if _seg_eq(bindings[j].path[depth], name_seg) {
+                    match_count = match_count + 1 as usize
+                    let pl = bindings[j].path.len()
+                    if pl == depth + 1 as usize {
+                        if has_leaf && second_leaf_at == 0 as usize {
+                            second_leaf_at = bindings[j].at
+                        }
+                        if !has_leaf {
+                            first_leaf_idx = j
+                            has_leaf = true
+                        }
+                        leaf_count = leaf_count + 1 as usize
+                    } else {
+                        if !has_subtable {
+                            first_subtable_idx = j
+                            has_subtable = true
+                        }
+                    }
+                }
+                j = j + 1 as usize
+            }
+
+            if leaf_count > 1 as usize {
+                raise error.ParseError.duplicate_key(at: second_leaf_at)
+            }
+            if has_leaf && has_subtable {
+                raise error.ParseError.key_after_table(at: bindings[first_subtable_idx].at)
+            }
+
+            if has_leaf {
+                slots[n_entries] = value.TableEntry {
+                    key: _seg_string(name_seg),
+                    value: Box_Value.new(take bindings[first_leaf_idx].val, allocator)?,
+                }
+            } else {
+                let sub = _alloc_flat_binding_slots(allocator, match_count)?
+                var sub_n: usize = 0
+                var jj: usize = i
+                loop decreases n_bindings - jj + 1 as usize {
+                    if jj >= n_bindings { break }
+                    if _seg_eq(bindings[jj].path[depth], name_seg) {
+                        sub[sub_n] = bindings[jj]
+                        sub_n = sub_n + 1 as usize
+                    }
+                    jj = jj + 1 as usize
+                }
+
+                let is_array = match sub[0 as usize].path[depth + 1 as usize] {
+                    case .index(_) => true
+                    case _         => false
+                }
+
+                if is_array {
+                    let arr = _materialize_array(sub, match_count, depth + 1 as usize, allocator)?
+                    slots[n_entries] = value.TableEntry {
+                        key: _seg_string(name_seg),
+                        value: Box_Value.new(take value.Value.table_array(arr), allocator)?,
+                    }
+                } else {
+                    let sub_table = materialize(sub, match_count, depth + 1 as usize, allocator)?
+                    slots[n_entries] = value.TableEntry {
+                        key: _seg_string(name_seg),
+                        value: Box_Value.new(take value.Value.table(sub_table), allocator)?,
+                    }
+                }
+            }
+            n_entries = n_entries + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+    return value.Table { entries: slots[0 as usize..<n_entries] }
+}

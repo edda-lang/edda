@@ -1,0 +1,398 @@
+
+module object.coff.codeview.build.build
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.text.string
+
+import span.loc.pos.span as span_mod
+import span.file as span_file_mod
+import span.loc.loc as loc_mod
+import hir.build.file as hir_file_mod
+import source.map as source_map_mod
+import intern.interner as interner_mod
+import intern.symbol as symbol_mod
+import types.ty.interner as ty_interner_mod
+import types.pass.ty as ty_mod
+import local.coff.codeview.typetable.table as debug_mod
+
+import local.coff as coff_mod
+import local.coff.wrap.wrap as coff_wrap_mod
+import local.bytes as bytes_mod
+import ir.emitted as emit_types_mod
+import ir.lir.tree.body as lir_body_mod
+import local.coff.codeview.emit.encode as cv_mod
+import local.coff.codeview.emit.sym.tymap as cv_tymap_mod
+import local.coff.codeview.emit.typestream.build as typerec_mod
+import local.coff.codeview.emit.sym.symbols as cv_symbols_mod
+import local.coff.codeview.emit.sym.subsections as cv_subsections_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(String)
+spec std.collections.vec.Vec(emit_types_mod.EmittedBody)
+spec std.collections.vec.Vec(emit_types_mod.LineRow)
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(cv_mod.CvFunction)
+spec std.collections.vec.Vec(cv_mod.CvLine)
+spec std.collections.vec.Vec(cv_mod.CvLocal)
+spec std.collections.vec.Vec(lir_body_mod.LirDebugLocal)
+spec std.collections.vec.Vec(lir_body_mod.LirDebugSlot)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+spec std.collections.hashmap.IntMap(String)
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(i32)
+spec std.core.option.Option(span_mod.Span)
+
+
+function no_repr() -> u32 {
+    return 0xffffffff as u32
+}
+
+
+function type_fuel() -> usize {
+    return 64 as usize
+}
+
+
+public function add_debug_sections(
+    file: mutable coff_mod.CoffFile,
+    emitted: Vec_EmittedBody.Vec,
+    hir_files: Vec_HirFile.Vec,
+    global_syms: IntMap_String.IntMap,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_bodies = Vec_EmittedBody.len(emitted)
+    var total_locals: usize = 0
+    var ei: usize = 0
+    loop decreases n_bodies - ei {
+        if ei >= n_bodies { break }
+        let eb = Vec_EmittedBody.at(emitted, ei)
+        total_locals = total_locals +| Vec_LirDebugLocal.len(eb.debug_locals)
+        ei += 1
+    }
+
+    uninit dt: Vec_u8.Vec
+    Vec_u8.with_capacity(init dt, 64 +| (total_locals *| 32), allocator)?
+    bytes_mod.push_u32_le(mutable dt, cv_mod.cv_signature_c13(), allocator)?
+    var tctx = typerec_mod.new_ctx(allocator)?
+    emit_local_types(mutable dt, mutable tctx, emitted, ty_interner, debug_table, allocator)?
+
+    uninit funcs: Vec_CvFunction.Vec
+    Vec_CvFunction.new(init funcs, allocator)?
+    uninit repr_idx: Vec_u32.Vec
+    Vec_u32.new(init repr_idx, allocator)?
+    uninit fids: Vec_u32.Vec
+    Vec_u32.new(init fids, allocator)?
+
+    collect_functions(emitted, hir_files, global_syms, map, interner, ty_interner, tctx, mutable funcs, mutable repr_idx, mutable fids, allocator)?
+
+    uninit paths: Vec_String.Vec
+    collect_paths(init paths, fids, map, allocator)?
+
+    uninit ds: Vec_u8.Vec
+    Vec_u8.with_capacity(init ds, 256 +| (n_bodies *| 192), allocator)?
+    bytes_mod.push_u32_le(mutable ds, cv_mod.cv_signature_c13(), allocator)?
+    uninit relocs: Vec_CoffRelocation.Vec
+    Vec_CoffRelocation.new(init relocs, allocator)?
+
+    let string_offsets = cv_subsections_mod.build_stringtable(mutable ds, paths, allocator)?
+    let file_ids = cv_subsections_mod.build_filechecksums(mutable ds, string_offsets, allocator)?
+    cv_symbols_mod.build_symbols(mutable ds, mutable relocs, funcs, allocator)?
+
+    uninit per_func_fids: Vec_u32.Vec
+    map_file_ids(init per_func_fids, repr_idx, file_ids, allocator)?
+    cv_subsections_mod.build_lines(mutable ds, mutable relocs, funcs, per_func_fids, allocator)?
+
+    coff_wrap_mod.add_section(mutable file, ".debug$S", coff_wrap_mod.debug_characteristics(), take ds, take relocs, allocator)?
+
+    uninit no_relocs: Vec_CoffRelocation.Vec
+    Vec_CoffRelocation.new(init no_relocs, allocator)?
+    coff_wrap_mod.add_section(mutable file, ".debug$T", coff_wrap_mod.debug_characteristics(), take dt, take no_relocs, allocator)?
+}
+
+
+function emit_local_types(
+    dt: mutable Vec_u8.Vec,
+    tctx: mutable typerec_mod.TypeStreamCtx,
+    emitted: Vec_EmittedBody.Vec,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_EmittedBody.len(emitted)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        let locals = body.debug_locals
+        let m = Vec_LirDebugLocal.len(locals)
+        var j: usize = 0
+        loop decreases m - j {
+            if j >= m { break }
+            let dl = Vec_LirDebugLocal.at(locals, j)
+            let _ = typerec_mod.emit_type(mutable dt, mutable tctx, ty_interner, debug_table, dl.ty, type_fuel(), allocator)?
+            j += 1
+        }
+        i += 1
+    }
+}
+
+
+function resolve_type_index(
+    tctx: typerec_mod.TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    ty: ty_mod.TyId,
+) -> u32 {
+    let base = cv_tymap_mod.cv_type_for(ty_interner, ty)
+    if base != cv_mod.t_notype() { return base }
+    return typerec_mod.index_for(tctx, ty)
+}
+
+
+function collect_functions(
+    emitted: Vec_EmittedBody.Vec,
+    hir_files: Vec_HirFile.Vec,
+    global_syms: IntMap_String.IntMap,
+    map: source_map_mod.SourceMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    tctx: typerec_mod.TypeStreamCtx,
+    funcs: mutable Vec_CvFunction.Vec,
+    repr_idx: mutable Vec_u32.Vec,
+    fids: mutable Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_EmittedBody.len(emitted)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let body = Vec_EmittedBody.at(emitted, i)
+        if (body.lines.file.raw as usize) >= Vec_HirFile.len(hir_files) {
+            i += 1
+            continue
+        }
+        let hf = Vec_HirFile.at(hir_files, body.lines.file.raw as usize)
+
+        uninit lines: Vec_CvLine.Vec
+        Vec_CvLine.new(init lines, allocator)?
+        let repr = resolve_body_lines(hf, body.lines.rows, map, mutable lines, allocator)?
+        let ridx = if repr == no_repr() { 0 as u32 } else { distinct_index(mutable fids, repr, allocator)? }
+        Vec_u32.push(mutable repr_idx, ridx, allocator)?
+
+        uninit locals: Vec_CvLocal.Vec
+        build_locals(init locals, body.debug_locals, body.debug_slots, interner, ty_interner, tctx, allocator)?
+
+        Vec_CvFunction.push(
+            mutable funcs,
+            take cv_mod.CvFunction {
+                symbol_index: i as u32 wrapping,
+                code_len: Vec_u8.len(body.code) as u32 wrapping,
+                name: func_name(global_syms, body.def_id.raw),
+                lines: lines,
+                locals: locals,
+            },
+            allocator,
+        )?
+        i += 1
+    }
+}
+
+
+function resolve_body_lines(
+    hir_file: hir_file_mod.HirFile,
+    rows: Vec_LineRow.Vec,
+    map: source_map_mod.SourceMap,
+    out_lines: mutable Vec_CvLine.Vec,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    var repr_raw: u32 = no_repr()
+    let n = Vec_LineRow.len(rows)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let row = Vec_LineRow.at(rows, i)
+        match hir_file_mod.span_of_opt(hir_file, row.node) {
+            case .some(let sp) => {
+                if (!span_mod.is_dummy(sp)) && (sp.file.raw as usize) < source_map_mod.file_count(map) {
+                    if repr_raw == no_repr() { repr_raw = sp.file.raw }
+                    let lc = source_map_mod.byte_to_linecol(map, loc_mod.loc_of(sp.file, sp.start))
+                    Vec_CvLine.push(
+                        mutable out_lines,
+                        cv_mod.CvLine { code_offset: row.code_offset, line: lc.line as u32 wrapping },
+                        allocator,
+                    )?
+                }
+            }
+            case .none => {}
+        }
+        i += 1
+    }
+    return repr_raw
+}
+
+
+function build_locals(
+    out: init Vec_CvLocal.Vec,
+    debug_locals: Vec_LirDebugLocal.Vec,
+    debug_slots: Vec_LirDebugSlot.Vec,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    tctx: typerec_mod.TypeStreamCtx,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit result_locals: Vec_CvLocal.Vec
+    Vec_CvLocal.new(init result_locals, allocator)?
+    let n = Vec_LirDebugLocal.len(debug_locals)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let dl = Vec_LirDebugLocal.at(debug_locals, i)
+        match find_slot_disp(debug_slots, dl.vreg_raw) {
+            case .some(let disp) => {
+                let nm = local_name(dl.name, interner, allocator)?
+                Vec_CvLocal.push(
+                    mutable result_locals,
+                    take cv_mod.CvLocal {
+                        name: nm,
+                        type_index: resolve_type_index(tctx, ty_interner, dl.ty),
+                        frame_disp: disp,
+                        is_param: true,
+                    },
+                    allocator,
+                )?
+            }
+            case .none => {}
+        }
+        i += 1
+    }
+    out = result_locals
+}
+
+
+function find_slot_disp(slots: Vec_LirDebugSlot.Vec, vreg_raw: u32) -> Option_i32.Option {
+    let n = Vec_LirDebugSlot.len(slots)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let s = Vec_LirDebugSlot.at(slots, i)
+        if s.vreg_raw == vreg_raw { return Option_i32.some(value: s.frame_disp) }
+        i += 1
+    }
+    return Option_i32.none
+}
+
+
+function local_name(name: symbol_mod.Symbol, interner: interner_mod.Interner, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    if symbol_mod.is_empty(name) { return "local" }
+    return bytes_to_string(interner_mod.lookup(interner, name), allocator)?
+}
+
+
+function bytes_to_string(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    let buf: [u8] = allocator.alloc_array(u8, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i += 1
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function func_name(global_syms: IntMap_String.IntMap, def_raw: u32) -> String {
+    match IntMap_String.get(global_syms, def_raw as i64) {
+        case .some(let s) => return s
+        case .none => return "cv_fn"
+    }
+}
+
+
+function distinct_index(fids: mutable Vec_u32.Vec, raw: u32, allocator: Allocator) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let n = Vec_u32.len(fids)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_u32.at(fids, i) == raw { return i as u32 wrapping }
+        i += 1
+    }
+    Vec_u32.push(mutable fids, raw, allocator)?
+    return n as u32 wrapping
+}
+
+
+function collect_paths(
+    out: init Vec_String.Vec,
+    fids: Vec_u32.Vec,
+    map: source_map_mod.SourceMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit paths: Vec_String.Vec
+    Vec_String.new(init paths, allocator)?
+    let n = Vec_u32.len(fids)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let raw = Vec_u32.at(fids, i)
+        let name = if (raw as usize) < source_map_mod.file_count(map) {
+            source_map_mod.file_name_of(map, span_file_mod.FileId { raw: raw })
+        } else {
+            "unknown"
+        }
+        Vec_String.push(mutable paths, name, allocator)?
+        i += 1
+    }
+    out = paths
+}
+
+
+function map_file_ids(
+    out: init Vec_u32.Vec,
+    repr_idx: Vec_u32.Vec,
+    file_ids: Vec_u32.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit result_ids: Vec_u32.Vec
+    Vec_u32.new(init result_ids, allocator)?
+    let n = Vec_u32.len(repr_idx)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let idx = Vec_u32.at(repr_idx, i)
+        let fid = if (idx as usize) < Vec_u32.len(file_ids) { Vec_u32.at(file_ids, idx as usize) } else { 0 as u32 }
+        Vec_u32.push(mutable result_ids, fid, allocator)?
+        i += 1
+    }
+    out = result_ids
+}

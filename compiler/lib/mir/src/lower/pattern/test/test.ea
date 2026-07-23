@@ -1,0 +1,425 @@
+module mir.lower.pattern.test.test
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+import hir.node as node_mod
+import syntax.ast.ident as ident_mod
+import syntax.ast.literal as literal_mod
+import syntax.ast.tree as ast_pat_mod
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import types.check as check_mod
+import intern.symbol as symbol_mod
+import local.place as place_mod
+import local.rvalue as rvalue_mod
+import local.body.model as body_mod
+import local.term as term_mod
+import local.id.local as local_mod
+import local.lower.build.ctx.builder as builder_mod
+import local.lower.eqmap.targets as eqmap_mod
+import local.lower.pattern.decide.build as build_mod
+import local.lower.pattern.query.query as query_mod
+
+
+spec std.collections.vec.Vec(ast_pat_mod.Pat)
+spec std.collections.vec.Vec(ast_pat_mod.StructPatField)
+spec std.collections.vec.Vec(rvalue_mod.Operand)
+spec std.mem.alloc.Box(ast_pat_mod.Pat)
+spec std.core.option.Option(ast_pat_mod.SliceRest)
+spec std.core.option.Option(symbol_mod.Symbol)
+spec std.core.option.Option(node_mod.NodeId)
+spec std.core.option.Option(body_mod.RegionId)
+spec std.core.option.Option(eqmap_mod.EqTarget)
+
+
+function emit_literal_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    lit: literal_mod.Literal,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic}
+{
+    match lit {
+        case .str(_) => {
+            match eqmap_mod.lookup_target(builder_mod.eq_targets(builder), scrut_ty) {
+                case .some(let target) => {
+                    let str_lit_op = build_mod.lit_to_operand(lit, scrut_ty)
+                    let str_scrut_op = rvalue_mod.Operand.copy_(place: builder_mod.local_place(scrut_local), ty: scrut_ty)
+                    return emit_string_eq_call(mutable builder, target, take str_scrut_op, take str_lit_op, bool_ty, origin, allocator)?
+                }
+                case .none => ()
+            }
+        }
+        case _ => ()
+    }
+    let lit_op = build_mod.lit_to_operand(lit, scrut_ty)
+    let scrut_op = rvalue_mod.Operand.copy_(place: builder_mod.local_place(scrut_local), ty: scrut_ty)
+    return build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.eq, lhs: scrut_op, rhs: lit_op),
+        bool_ty,
+        origin,
+        allocator,
+    )?
+}
+
+
+function emit_string_eq_call(
+    builder: mutable builder_mod.LowerCtx,
+    target: eqmap_mod.EqTarget,
+    scrut_op: take rvalue_mod.Operand,
+    lit_op: take rvalue_mod.Operand,
+    bool_ty: ty_mod.TyId,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError}
+{
+    let callee = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant {
+            ty: target.fn_ty,
+            kind: rvalue_mod.ConstantKind.fn_ref(def: target.comparator),
+        },
+    )
+    uninit args: Vec_Operand.Vec
+    Vec_Operand.new(init args, allocator)?
+    Vec_Operand.push(mutable args, take scrut_op, allocator)?
+    Vec_Operand.push(mutable args, take lit_op, allocator)?
+    let dest_local = builder_mod.alloc_local(
+        mutable builder,
+        bool_ty,
+        body_mod.Mutability.immutable_,
+        body_mod.Consumption.copy_,
+        Option_Symbol.none,
+        Option_NodeId.some(value: origin),
+        allocator,
+    )?
+    let success = builder_mod.alloc_block(mutable builder, origin, Option_RegionId.none, allocator)?
+    let call_term = term_mod.Terminator {
+        origin: origin,
+        kind: term_mod.TermKind.call_(
+            callee: callee,
+            args: args,
+            dest: builder_mod.local_place(dest_local),
+            return_: success,
+            unwind: term_mod.UnwindAction.propagate,
+        ),
+    }
+    builder_mod.seal_block_with(mutable builder, take call_term, allocator)?
+    builder_mod.switch_to(mutable builder, success)
+    return rvalue_mod.Operand.copy_(place: builder_mod.local_place(dest_local), ty: bool_ty)
+}
+
+function emit_range_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    lo: literal_mod.Literal,
+    hi: literal_mod.Literal,
+    inclusive: bool,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic}
+{
+    let lo_op = build_mod.lit_to_operand(lo, scrut_ty)
+    let hi_op = build_mod.lit_to_operand(hi, scrut_ty)
+    let scrut_lo = rvalue_mod.Operand.copy_(place: builder_mod.local_place(scrut_local), ty: scrut_ty)
+    let scrut_hi = rvalue_mod.Operand.copy_(place: builder_mod.local_place(scrut_local), ty: scrut_ty)
+    let ge_cond = build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.ge, lhs: scrut_lo, rhs: lo_op),
+        bool_ty,
+        origin,
+        allocator,
+    )?
+    let upper_op = if inclusive { rvalue_mod.MBinOp.le } else { rvalue_mod.MBinOp.lt }
+    let le_cond = build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: upper_op, lhs: scrut_hi, rhs: hi_op),
+        bool_ty,
+        origin,
+        allocator,
+    )?
+    return build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.logical_and, lhs: ge_cond, rhs: le_cond),
+        bool_ty,
+        origin,
+        allocator,
+    )?
+}
+
+function emit_or_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    alternatives: Vec_Pat.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let m = Vec_Pat.len(alternatives)
+    if m == 0 as usize {
+        return build_mod.const_true(bool_ty)
+    }
+    var acc = emit_arm_test(mutable builder, scrut_local, scrut_ty, bool_ty, Vec_Pat.at(alternatives, 0 as usize), types_out, ty_interner, origin, allocator)?
+    var k: usize = 1
+    loop
+        decreases (m - k)
+    {
+        if k >= m {
+            break
+        }
+        let t = emit_arm_test(mutable builder, scrut_local, scrut_ty, bool_ty, Vec_Pat.at(alternatives, k), types_out, ty_interner, origin, allocator)?
+        acc = build_mod.materialize_bool(
+            mutable builder,
+            rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.logical_or, lhs: acc, rhs: t),
+            bool_ty,
+            origin,
+            allocator,
+        )?
+        k = k + 1
+    }
+    return acc
+}
+
+function emit_variant_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    path: ident_mod.Path,
+    types_out: check_mod.TypeOutput,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let sum_def = match check_mod.sum_def_of_ty(types_out, scrut_ty) {
+        case .some(let d) => d
+        case .none => panic("walker.emit_variant_test: variant pattern on non-sum scrutinee — typecheck should have rejected")
+    }
+    let discr_ty = check_mod.discriminant_ty(types_out)
+    let dl = build_mod.materialize_discriminant(mutable builder, scrut_local, discr_ty, origin, allocator)?
+    let vidx = query_mod.resolve_variant_idx(types_out, sum_def, path)
+    let discr_op = rvalue_mod.Operand.copy_(place: builder_mod.local_place(dl), ty: discr_ty)
+    let vconst = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant { ty: discr_ty, kind: rvalue_mod.ConstantKind.int_(bits: vidx as u128) },
+    )
+    return build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.eq, lhs: discr_op, rhs: vconst),
+        bool_ty,
+        origin,
+        allocator,
+    )?
+}
+
+function emit_tuple_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    elems: Vec_Pat.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    var acc = build_mod.const_true(bool_ty)
+    let m = Vec_Pat.len(elems)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let ep = Vec_Pat.at(elems, i)
+        if !query_mod.pat_is_irrefutable(ep) {
+            let ety = query_mod.tuple_elem_ty(ty_interner, scrut_ty, i)
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.field(idx: i as u32), ety, origin, allocator)?
+            let t = emit_arm_test(mutable builder, el, ety, bool_ty, ep, types_out, ty_interner, origin, allocator)?
+            acc = build_mod.materialize_bool(
+                mutable builder,
+                rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.logical_and, lhs: acc, rhs: t),
+                bool_ty,
+                origin,
+                allocator,
+            )?
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+function emit_slice_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    prefix: Vec_Pat.Vec,
+    rest: Option_SliceRest.Option,
+    suffix: Vec_Pat.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let usize_ty = types_out.builtins.usize_
+    let pl = Vec_Pat.len(prefix)
+    let sl = Vec_Pat.len(suffix)
+    let elem_ty = query_mod.slice_elem_ty(ty_interner, scrut_ty)
+    let len_local = build_mod.materialize_len(mutable builder, scrut_local, usize_ty, origin, allocator)?
+    let len_op = rvalue_mod.Operand.copy_(place: builder_mod.local_place(len_local), ty: usize_ty)
+    let min_op = rvalue_mod.Operand.constant(
+        c: rvalue_mod.Constant { ty: usize_ty, kind: rvalue_mod.ConstantKind.int_(bits: (pl + sl) as u128) },
+    )
+    let has_rest = match rest {
+        case .some(_) => true
+        case .none => false
+    }
+    let len_binop = if has_rest { rvalue_mod.MBinOp.ge } else { rvalue_mod.MBinOp.eq }
+    var acc = build_mod.materialize_bool(
+        mutable builder,
+        rvalue_mod.Rvalue.binary(op: len_binop, lhs: len_op, rhs: min_op),
+        bool_ty,
+        origin,
+        allocator,
+    )?
+    var i: usize = 0
+    loop
+        decreases (pl - i)
+    {
+        if i >= pl {
+            break
+        }
+        let ep = Vec_Pat.at(prefix, i)
+        if !query_mod.pat_is_irrefutable(ep) {
+            let idx_local = build_mod.materialize_usize_const(mutable builder, i as u128, usize_ty, origin, allocator)?
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.index(idx_local: idx_local, proven: false), elem_ty, origin, allocator)?
+            let t = emit_arm_test(mutable builder, el, elem_ty, bool_ty, ep, types_out, ty_interner, origin, allocator)?
+            acc = build_mod.materialize_bool(
+                mutable builder,
+                rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.logical_and, lhs: acc, rhs: t),
+                bool_ty,
+                origin,
+                allocator,
+            )?
+        }
+        i = i + 1
+    }
+    var k: usize = 0
+    loop
+        decreases (sl - k)
+    {
+        if k >= sl {
+            break
+        }
+        let sp = Vec_Pat.at(suffix, k)
+        if !query_mod.pat_is_irrefutable(sp) {
+            let idx_local = build_mod.materialize_index_from_end(mutable builder, len_local, (sl - k) as u128, usize_ty, origin, allocator)?
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.index(idx_local: idx_local, proven: false), elem_ty, origin, allocator)?
+            let t = emit_arm_test(mutable builder, el, elem_ty, bool_ty, sp, types_out, ty_interner, origin, allocator)?
+            acc = build_mod.materialize_bool(
+                mutable builder,
+                rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.logical_and, lhs: acc, rhs: t),
+                bool_ty,
+                origin,
+                allocator,
+            )?
+        }
+        k = k + 1
+    }
+    return acc
+}
+
+function emit_struct_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    fields: Vec_StructPatField.Vec,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    let rec_def = match query_mod.record_def_of_ty(ty_interner, scrut_ty) {
+        case .some(let d) => d
+        case .none => panic("walker.emit_struct_test: struct pattern on non-record scrutinee — typecheck should have rejected")
+    }
+    var acc = build_mod.const_true(bool_ty)
+    let m = Vec_StructPatField.len(fields)
+    var i: usize = 0
+    loop
+        decreases (m - i)
+    {
+        if i >= m {
+            break
+        }
+        let f = Vec_StructPatField.at(fields, i)
+        if !query_mod.pat_is_irrefutable(f.pat) {
+            let fidx = query_mod.resolve_field_index(types_out, rec_def, 0 as u32, f.name.name)
+            let fty = check_mod.field_ty_at(types_out, rec_def, fidx as usize)
+            let el = build_mod.project_into_local(mutable builder, scrut_local, place_mod.ProjectionKind.field(idx: fidx), fty, origin, allocator)?
+            let t = emit_arm_test(mutable builder, el, fty, bool_ty, f.pat, types_out, ty_interner, origin, allocator)?
+            acc = build_mod.materialize_bool(
+                mutable builder,
+                rvalue_mod.Rvalue.binary(op: rvalue_mod.MBinOp.logical_and, lhs: acc, rhs: t),
+                bool_ty,
+                origin,
+                allocator,
+            )?
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+public function emit_arm_test(
+    builder: mutable builder_mod.LowerCtx,
+    scrut_local: local_mod.LocalId,
+    scrut_ty: ty_mod.TyId,
+    bool_ty: ty_mod.TyId,
+    pat: ast_pat_mod.Pat,
+    types_out: check_mod.TypeOutput,
+    ty_interner: ty_interner_mod.Interner,
+    origin: node_mod.NodeId,
+    allocator: Allocator,
+) -> rvalue_mod.Operand
+    with {allocator, err: alloc.AllocError, panic, divergence}
+{
+    return match pat.kind {
+        case .wildcard => build_mod.const_true(bool_ty)
+        case .binding(_) => build_mod.const_true(bool_ty)
+        case .at_binding(_, let inner_box) => emit_arm_test(mutable builder, scrut_local, scrut_ty, bool_ty, Box_Pat.get(inner_box), types_out, ty_interner, origin, allocator)?
+        case .variant(let path, _) => emit_variant_test(mutable builder, scrut_local, scrut_ty, bool_ty, path, types_out, origin, allocator)?
+        case .literal(let lit) => emit_literal_test(mutable builder, scrut_local, scrut_ty, bool_ty, lit, origin, allocator)?
+        case .range(let lo, let hi, let inclusive) => emit_range_test(mutable builder, scrut_local, scrut_ty, bool_ty, lo, hi, inclusive, origin, allocator)?
+        case .or_(let alternatives) => emit_or_test(mutable builder, scrut_local, scrut_ty, bool_ty, alternatives, types_out, ty_interner, origin, allocator)?
+        case .tuple(let elems) => emit_tuple_test(mutable builder, scrut_local, scrut_ty, bool_ty, elems, types_out, ty_interner, origin, allocator)?
+        case .slice(let prefix, let rest, let suffix) => emit_slice_test(mutable builder, scrut_local, scrut_ty, bool_ty, prefix, rest, suffix, types_out, ty_interner, origin, allocator)?
+        case .struct_(_, let fields, _) => emit_struct_test(mutable builder, scrut_local, scrut_ty, bool_ty, fields, types_out, ty_interner, origin, allocator)?
+        case .guard(_, _) => panic("walker.emit_arm_test: nested pattern-level guard deferred — arm-level guards lower via HArm.guard; nested PatKind.guard is match-tail residue")
+        case .error => panic("walker.emit_arm_test: error pattern reached MIR — upstream typecheck should have rejected")
+    }
+}
+

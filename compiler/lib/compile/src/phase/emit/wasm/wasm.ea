@@ -1,0 +1,229 @@
+
+module compile.phase.emit.wasm.wasm
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.os.fs
+import std.text.string
+
+import target.triple as triple_mod
+import intern.interner as interner_mod
+import types.ty.interner as ty_interner_mod
+import source.map as source_map_mod
+import mir.file.store as mir_file_mod
+import ir.lir.tree.file as lir_file_mod
+import ir.hlir.error as hlir_error_mod
+import ir.lir.error as lir_error_mod
+import wasm.lower as wasm_lower_mod
+import wasm.fmt.emit as wasm_emit_mod
+import wasm.model as wasm_model_mod
+import resolve.build.builtins as builtins_mod
+
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import diagnostics.code as diag_code_mod
+import span.loc.pos.span as span_mod
+
+import local.phase.emit.link.link as link_phase_mod
+import local.phase.emit.symbols.symbols as symbols_mod
+import local.phase.emit.codegen.codegen as codegen_mod
+import local.phase.emit.wasm.mv3 as mv3_mod
+import local.phase.emit.wasm.suspend as suspend_mod
+
+
+spec std.collections.vec.Vec(mir_file_mod.MirFile)
+spec std.collections.vec.Vec(lir_file_mod.LirFile)
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(wasm_model_mod.Import)
+spec std.collections.hashmap.IntMap(String)
+spec std.collections.hashmap.StringMap(bool)
+
+
+public function emit_wasm(
+    optimized: Vec_MirFile.Vec,
+    target: triple_mod.TargetTriple,
+    workspace_root: String,
+    wfs: Filesystem,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    source_map: source_map_mod.SourceMap,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError, panic}
+{
+    let triple_str = triple_mod.to_string(target, allocator)?
+    let outdir = link_phase_mod.output_dir(workspace_root, triple_str, allocator)?
+    fs.create_dir_all(wfs, outdir)?
+    suspend_mod.audit_suspend_points(optimized, target, mutable diags, allocator)?
+    let rt_provided = StringMap_bool.new(allocator)?
+    let syms = symbols_mod.build_global_symbols(optimized, rt_provided, interner, mutable diags, allocator)?
+
+    handle err: hlir_error_mod.HlirError -> link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), "wasm-hlir-lowering", allocator)? {
+    handle err: lir_error_mod.LirError -> link_phase_mod.emit_codegen_diag(mutable diags, span_mod.dummy(), "wasm-lir-lowering", allocator)? {
+        uninit wmod: wasm_model_mod.WasmModule
+        build_wasm_module(init wmod, optimized, target, syms, interner, ty_interner, allocator)?
+
+        if gate_web_imports(wmod, target, mutable diags, allocator)? {
+            return
+        }
+
+        uninit bytes: Vec_u8.Vec
+        Vec_u8.new(init bytes, allocator)?
+        wasm_emit_mod.serialize_module(mutable bytes, wmod, allocator)?
+        let wasm_path = string.concat(outdir, "/program.wasm", allocator)?
+        let buf = Vec_u8.into_array(take bytes, allocator)?
+        fs.write_bytes(wfs, wasm_path, buf)?
+
+        write_loader_js(wfs, string.concat(outdir, "/loader.js", allocator)?, allocator)?
+        write_loader_html(wfs, string.concat(outdir, "/index.html", allocator)?, allocator)?
+        mv3_mod.emit_mv3(wfs, outdir, allocator)?
+    }}
+}
+
+
+function build_wasm_module(
+    out: init wasm_model_mod.WasmModule,
+    optimized: Vec_MirFile.Vec,
+    target: triple_mod.TargetTriple,
+    syms: IntMap_String.IntMap,
+    interner: interner_mod.Interner,
+    ty_interner: ty_interner_mod.Interner,
+    allocator: Allocator,
+) -> ()
+    with {
+        allocator,
+        err: alloc.AllocError,
+        err: hlir_error_mod.HlirError,
+        err: lir_error_mod.LirError,
+        panic,
+    }
+{
+    uninit files: Vec_LirFile.Vec
+    Vec_LirFile.new(init files, allocator)?
+    let n: usize = Vec_MirFile.len(optimized)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let file = Vec_MirFile.at(optimized, i)
+        uninit lir: lir_file_mod.LirFile
+        codegen_mod.lower_mir_to_lir(init lir, file, ty_interner, target, allocator)?
+        Vec_LirFile.push(mutable files, take lir, allocator)?
+        i += 1
+    }
+    let wake_def_raw = builtins_mod.task_wake_reserved().raw
+    let dispatch_def_raw = builtins_mod.task_dispatch_event_reserved().raw
+    uninit built: wasm_model_mod.WasmModule
+    wasm_lower_mod.build_module(init built, files, syms, wake_def_raw, dispatch_def_raw, interner, allocator)?
+    out = built
+}
+
+
+function gate_web_imports(
+    wmod: wasm_model_mod.WasmModule,
+    target: triple_mod.TargetTriple,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> bool
+    with {allocator, err: alloc.AllocError}
+{
+    if is_browser_target(target) {
+        return false
+    }
+    var blocked = false
+    let n = Vec_Import.len(wmod.imports)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let imp = Vec_Import.at(wmod.imports, i)
+        if is_web_module(imp.module_name) {
+            emit_web_import_diag(imp.module_name, imp.field_name, mutable diags, allocator)?
+            blocked = true
+        }
+        i = i + 1
+    }
+    return blocked
+}
+
+
+function is_browser_target(target: triple_mod.TargetTriple) -> bool {
+    return match triple_mod.os(target) {
+        case .browser => true
+        case _        => false
+    }
+}
+
+
+function is_web_module(name: String) -> bool {
+    return string.equals(name, "dom") || string.equals(name, "webext")
+}
+
+
+function emit_web_import_diag(
+    module_name: String,
+    field_name: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let p1 = string.concat("host import `", module_name, allocator)?
+    let p2 = string.concat(p1, ".", allocator)?
+    let p3 = string.concat(p2, field_name, allocator)?
+    let msg = string.concat(p3, "` requires a browser target; __edda_dom_*/__edda_webext_* host imports are only provided on Os.browser", allocator)?
+    let d = diag_mod.error_at(diag_code_mod.web_import_requires_browser(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, d, allocator)?
+}
+
+
+function push_line(buf: mutable Vec_u8.Vec, s: String, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let bytes = s.bytes()
+    let n: usize = bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_u8.push(mutable buf, bytes[i], allocator)?
+        i += 1
+    }
+    Vec_u8.push(mutable buf, 0x0A, allocator)?
+}
+
+
+function write_loader_html(wfs: Filesystem, path: String, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    push_line(mutable buf, "<!doctype html>", allocator)?
+    push_line(mutable buf, "<html>", allocator)?
+    push_line(mutable buf, "  <head><meta charset='utf-8'><title>Edda wasm</title></head>", allocator)?
+    push_line(mutable buf, "  <body><script src='loader.js'></script></body>", allocator)?
+    push_line(mutable buf, "</html>", allocator)?
+    let arr = Vec_u8.into_array(take buf, allocator)?
+    fs.write_bytes(wfs, path, arr)?
+}
+
+
+function write_loader_js(wfs: Filesystem, path: String, allocator: Allocator) -> ()
+    with {wfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    uninit buf: Vec_u8.Vec
+    Vec_u8.new(init buf, allocator)?
+    push_line(mutable buf, "(function () {", allocator)?
+    mv3_mod.push_host_glue(mutable buf, allocator)?
+    push_line(mutable buf, "  fetch('program.wasm')", allocator)?
+    push_line(mutable buf, "    .then(function (r) { return r.arrayBuffer(); })", allocator)?
+    push_line(mutable buf, "    .then(function (b) { return WebAssembly.instantiate(b, imports); })", allocator)?
+    push_line(mutable buf, "    .then(function (res) {", allocator)?
+    push_line(mutable buf, "      ex = res.instance.exports;", allocator)?
+    push_line(mutable buf, "      mem = ex.memory;", allocator)?
+    push_line(mutable buf, "      if (typeof ex.main === 'function') { try { ex.main(); } catch (e) { console.error('edda main trapped', e); } }", allocator)?
+    push_line(mutable buf, "    })", allocator)?
+    push_line(mutable buf, "    .catch(function (e) { console.error('edda wasm load failed', e); });", allocator)?
+    push_line(mutable buf, "})();", allocator)?
+    let arr = Vec_u8.into_array(take buf, allocator)?
+    fs.write_bytes(wfs, path, arr)?
+}

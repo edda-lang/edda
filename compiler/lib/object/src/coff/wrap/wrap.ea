@@ -1,0 +1,356 @@
+
+module object.coff.wrap.wrap
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+
+import local.coff as coff_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(coff_mod.CoffSection)
+spec std.collections.vec.Vec(coff_mod.CoffSymbol)
+spec std.collections.vec.Vec(coff_mod.CoffRelocation)
+
+spec std.collections.hashmap.StringMap(u32)
+
+spec std.core.option.Option(u32)
+
+
+derive eq, debug for WrapError
+
+
+public type WrapError {
+    case section_size_exceeds_u32(actual: usize)
+
+    case symbol_name_too_long(actual: usize)
+
+    case symbol_name_empty
+}
+
+
+public function wrap_function_obj(
+    out: init coff_mod.CoffFile,
+    machine: coff_mod.CoffMachine,
+    code: take Vec_u8.Vec,
+    symbol_name: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError, err: WrapError}
+{
+    let code_len = Vec_u8.len(code)
+    let u32_max_us: usize = 4294967295 as usize
+    if code_len > u32_max_us {
+        raise WrapError.section_size_exceeds_u32(actual: code_len)
+    }
+
+    let name_bytes = symbol_name.bytes()
+    if name_bytes.len() == 0 {
+        raise WrapError.symbol_name_empty
+    }
+
+    uninit file: coff_mod.CoffFile
+    new_object(init file, machine, allocator)?
+    add_function(mutable file, symbol_name, take code, allocator)?
+    out = file
+}
+
+
+public function add_function(
+    file: mutable coff_mod.CoffFile,
+    symbol_name: String,
+    code: take Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit relocs: Vec_CoffRelocation.Vec
+    Vec_CoffRelocation.new(init relocs, allocator)?
+    add_function_relocated(mutable file, symbol_name, take code, take relocs, allocator)?
+}
+
+
+public function add_function_relocated(
+    file: mutable coff_mod.CoffFile,
+    symbol_name: String,
+    code: take Vec_u8.Vec,
+    relocations: take Vec_CoffRelocation.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    add_section(mutable file, ".text", text_characteristics(), take code, take relocations, allocator)?
+    let section_number = Vec_CoffSection.len(file.sections) as i16
+    add_symbol(mutable file, symbol_name, section_number, 0 as u32, storage_external(), symbol_type_function(), allocator)?
+}
+
+
+function pack_name_8(bytes: [u8]) -> u64
+    requires bytes.len() <= 8
+{
+    let n = bytes.len()
+    var packed: u64 = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let b: u64 = bytes[i] as u64
+        let shift: u64 = (i as u64) * (8 as u64)
+        packed = packed | (b << shift)
+        i += 1
+    }
+    return packed
+}
+
+
+public function text_characteristics() -> u32 {
+    return 0x60500020 as u32
+}
+
+public function data_characteristics() -> u32 {
+    return 0xC0500040 as u32
+}
+
+public function rdata_characteristics() -> u32 {
+    return 0x40500040 as u32
+}
+
+public function bss_characteristics() -> u32 {
+    return 0xC0500080 as u32
+}
+
+public function debug_characteristics() -> u32 {
+    return 0x42100040 as u32
+}
+
+public function storage_external() -> u8 {
+    return 2 as u8
+}
+
+public function storage_static() -> u8 {
+    return 3 as u8
+}
+
+public function symbol_type_function() -> u16 {
+    return 0x20 as u16
+}
+
+public function symbol_type_null() -> u16 {
+    return 0x00 as u16
+}
+
+
+public function new_object(
+    out: init coff_mod.CoffFile,
+    machine: coff_mod.CoffMachine,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit sections: Vec_CoffSection.Vec
+    Vec_CoffSection.new(init sections, allocator)?
+    uninit symbols: Vec_CoffSymbol.Vec
+    Vec_CoffSymbol.new(init symbols, allocator)?
+    uninit string_bytes: Vec_u8.Vec
+    Vec_u8.new(init string_bytes, allocator)?
+    let dedup = StringMap_u32.new(allocator)?
+
+    let header = coff_mod.CoffHeader {
+        machine: machine,
+        number_of_sections: 0,
+        time_date_stamp: 0,
+        pointer_to_symbol_table: 0,
+        number_of_symbols: 0,
+        size_of_optional_header: 0,
+        characteristics: 0,
+    }
+
+    out = coff_mod.CoffFile {
+        header: header,
+        sections: sections,
+        symbols: symbols,
+        string_table: coff_mod.CoffStringTable { bytes: string_bytes, dedup: dedup },
+    }
+}
+
+public function intern_string(
+    table: mutable coff_mod.CoffStringTable,
+    name_str: String,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let name_bytes = name_str.bytes()
+    match StringMap_u32.get_bytes(table.dedup, name_bytes) {
+        case .some(let existing) => return existing
+        case .none => ()
+    }
+    let offset = (Vec_u8.len(table.bytes) as u32) + 4
+    let n = name_bytes.len()
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let byte_value = name_bytes[i]
+        Vec_u8.push(mutable table.bytes, take byte_value, allocator)?
+        i += 1
+    }
+    Vec_u8.push(mutable table.bytes, take (0 as u8), allocator)?
+    let offset_copy = offset
+    let _ = StringMap_u32.insert(mutable table.dedup, name_str, take offset_copy, allocator)?
+    return offset
+}
+
+function section_name_for(
+    name_str: String,
+    table: mutable coff_mod.CoffStringTable,
+    allocator: Allocator,
+) -> coff_mod.CoffSectionName
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = name_str.bytes()
+    if nb.len() <= 8 {
+        return coff_mod.CoffSectionName.inline_(name: pack_name_8(nb))
+    }
+    let offset = intern_string(mutable table, name_str, allocator)?
+    return coff_mod.CoffSectionName.string_table_ref(offset: offset)
+}
+
+function symbol_name_for(
+    name_str: String,
+    table: mutable coff_mod.CoffStringTable,
+    allocator: Allocator,
+) -> coff_mod.CoffSymbolName
+    with {allocator, err: alloc.AllocError}
+{
+    let nb = name_str.bytes()
+    if nb.len() <= 8 {
+        return coff_mod.CoffSymbolName.inline_(name: pack_name_8(nb))
+    }
+    let offset = intern_string(mutable table, name_str, allocator)?
+    return coff_mod.CoffSymbolName.string_table_ref(offset: offset)
+}
+
+public function add_section(
+    file: mutable coff_mod.CoffFile,
+    name_str: String,
+    characteristics: u32,
+    data: take Vec_u8.Vec,
+    relocations: take Vec_CoffRelocation.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let coff_name = section_name_for(name_str, mutable file.string_table, allocator)?
+    let data_len = Vec_u8.len(data) as u32
+    let header = coff_mod.CoffSectionHeader {
+        name: coff_name,
+        virtual_size: 0,
+        virtual_address: 0,
+        size_of_raw_data: data_len,
+        pointer_to_raw_data: 0,
+        pointer_to_relocations: 0,
+        pointer_to_linenumbers: 0,
+        number_of_relocations: 0,
+        number_of_linenumbers: 0,
+        characteristics: characteristics,
+    }
+    let section = coff_mod.CoffSection {
+        header: header,
+        data: data,
+        relocations: relocations,
+    }
+    Vec_CoffSection.push(mutable file.sections, take section, allocator)?
+}
+
+public function add_symbol(
+    file: mutable coff_mod.CoffFile,
+    name_str: String,
+    section_number: i16,
+    value: u32,
+    storage_class: u8,
+    type_: u16,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let coff_name = symbol_name_for(name_str, mutable file.string_table, allocator)?
+    let sym = coff_mod.CoffSymbol {
+        name: coff_name,
+        value: value,
+        section_number: section_number,
+        type_: type_,
+        storage_class: storage_class,
+        number_of_aux_symbols: 0,
+    }
+    Vec_CoffSymbol.push(mutable file.symbols, take sym, allocator)?
+}
+
+public function make_relocation(
+    virtual_address: u32,
+    symbol_table_index: u32,
+    type_: u16,
+) -> coff_mod.CoffRelocation {
+    return coff_mod.CoffRelocation {
+        virtual_address: virtual_address,
+        symbol_table_index: symbol_table_index,
+        type_: type_,
+    }
+}
+
+
+public function rel_amd64_absolute() -> u16 {
+    return 0x0000 as u16
+}
+
+public function rel_amd64_addr64() -> u16 {
+    return 0x0001 as u16
+}
+
+public function rel_amd64_addr32() -> u16 {
+    return 0x0002 as u16
+}
+
+public function rel_amd64_addr32nb() -> u16 {
+    return 0x0003 as u16
+}
+
+public function rel_amd64_rel32() -> u16 {
+    return 0x0004 as u16
+}
+
+public function rel_amd64_rel32_1() -> u16 {
+    return 0x0005 as u16
+}
+
+public function rel_amd64_rel32_2() -> u16 {
+    return 0x0006 as u16
+}
+
+public function rel_amd64_rel32_3() -> u16 {
+    return 0x0007 as u16
+}
+
+public function rel_amd64_rel32_4() -> u16 {
+    return 0x0008 as u16
+}
+
+public function rel_amd64_rel32_5() -> u16 {
+    return 0x0009 as u16
+}
+
+public function rel_amd64_section() -> u16 {
+    return 0x000A as u16
+}
+
+public function rel_amd64_secrel() -> u16 {
+    return 0x000B as u16
+}
+
+public function rel_arm64_pagebase_rel21() -> u16 {
+    return 0x0004 as u16
+}
+
+public function rel_arm64_pageoffset_12a() -> u16 {
+    return 0x0006 as u16
+}

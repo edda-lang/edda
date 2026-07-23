@@ -1,0 +1,295 @@
+
+module compile.stdlib.resolve
+
+import std.core.option
+import std.mem.alloc
+import std.os.env
+import std.os.fs
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import driver.build.meta as build_meta_mod
+import manifest.build.lockfile.parse.parse as lockfile_parse_mod
+import manifest.model.lockfile.lockfile as lockfile_model_mod
+import source.map as source_map_mod
+import source.read as source_read_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.core.option.Option(String)
+spec std.core.option.Option(lockfile_model_mod.LoadedLockfile)
+
+
+public function resolve_stdlib_lib(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    stdlib_override: Option_String.Option,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    match stdlib_override {
+        case .some(let flag) => return resolve_explicit_root(rfs, flag, "--stdlib", mutable diags, allocator)?
+        case .none => ()
+    }
+    let pinned = resolve_via_store(rfs, workspace_root, mutable diags, allocator)?
+    match pinned {
+        case .some(let lib) => return Option_String.some(value: lib)
+        case .none => ()
+    }
+    if diags_mod.has_fatal(diags) {
+        return Option_String.none
+    }
+    let env_root = env.read_optional("EDDA_STDLIB_ROOT", allocator)
+    match env_root {
+        case .some(let value) => return resolve_explicit_root(rfs, value, "EDDA_STDLIB_ROOT", mutable diags, allocator)?
+        case .none => ()
+    }
+    let walked = resolve_via_self_exe(rfs, allocator)?
+    match walked {
+        case .some(let lib) => return Option_String.some(value: lib)
+        case .none => ()
+    }
+    let d = diag_mod.fatal_at(diag_code_mod.cli_error(), span_mod.dummy(), "no stdlib root resolved: pass --stdlib <root> or set EDDA_STDLIB_ROOT to a tree root containing lib/")
+    diags_mod.emit(mutable diags, take d, allocator)?
+    return Option_String.none
+}
+
+
+function resolve_explicit_root(
+    rfs: ReadOnlyFilesystem,
+    raw_root: String,
+    source_label: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let abs_root = absolutize_root(raw_root, allocator)?
+    let lib_dir = string.concat(abs_root, "/lib", allocator)?
+    if fs.path_exists(rfs, lib_dir) {
+        return Option_String.some(value: lib_dir)
+    }
+    let detail = string.concat(": no package tree at ", lib_dir, allocator)?
+    let prefix = string.concat("invalid stdlib root from ", source_label, allocator)?
+    let msg = string.concat(prefix, detail, allocator)?
+    let d = diag_mod.fatal_at(diag_code_mod.cli_error(), span_mod.dummy(), msg)
+    diags_mod.emit(mutable diags, take d, allocator)?
+    return Option_String.none
+}
+
+
+function resolve_via_store(
+    rfs: ReadOnlyFilesystem,
+    workspace_root: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let expected = expected_std_hash(rfs, workspace_root, allocator)?
+    match expected {
+        case .none => return Option_String.none
+        case .some(let hash) => return lookup_store_artifact(rfs, hash, mutable diags, allocator)?
+    }
+}
+
+
+function expected_std_hash(rfs: ReadOnlyFilesystem, workspace_root: String, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let pinned = pinned_std_hash(rfs, workspace_root, allocator)?
+    match pinned {
+        case .some(let hash) => return Option_String.some(value: hash)
+        case .none => ()
+    }
+    let builtin = build_meta_mod.std_hash()
+    if string.equals(builtin, "unknown") {
+        return Option_String.none
+    }
+    return Option_String.some(value: builtin)
+}
+
+
+function pinned_std_hash(rfs: ReadOnlyFilesystem, workspace_root: String, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let lock_path = string.concat(workspace_root, "/package.lock.toml", allocator)?
+    if !fs.path_exists(rfs, lock_path) {
+        return Option_String.none
+    }
+    uninit scratch_map: source_map_mod.SourceMap
+    source_map_mod.new_map(init scratch_map, allocator)?
+    uninit scratch_diags: diags_mod.Diagnostics
+    diags_mod.new_diagnostics(init scratch_diags, allocator)?
+    let fid = source_read_mod.read_file(rfs, mutable scratch_map, take lock_path, allocator)?
+    let content = source_map_mod.file_content_of(scratch_map, fid)
+    let lf_opt = lockfile_parse_mod.parse_lockfile(content, fid, mutable scratch_diags, allocator)?
+    match lf_opt {
+        case .none => return Option_String.none
+        case .some(let lf) => return find_std_rune_hash(lf)
+    }
+}
+
+
+function find_std_rune_hash(lf: lockfile_model_mod.LoadedLockfile) -> Option_String.Option {
+    let n = lockfile_model_mod.rune_count(lf)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n {
+            break
+        }
+        let r = lockfile_model_mod.rune_at(lf, i)
+        if string.equals(lockfile_model_mod.name(r), "std") {
+            return Option_String.some(value: lockfile_model_mod.rune_hash(r))
+        }
+        i = i + 1
+    }
+    return Option_String.none
+}
+
+
+function lookup_store_artifact(
+    rfs: ReadOnlyFilesystem,
+    hash: String,
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let store_root = env.read_optional("EDDA_STORE", allocator)
+    match store_root {
+        case .none => {
+            let d = diag_mod.fatal_at(diag_code_mod.cli_error(), span_mod.dummy(), "stdlib pinned to a store hash but EDDA_STORE is not set: cannot verify")
+            diags_mod.emit(mutable diags, take d, allocator)?
+            return Option_String.none
+        }
+        case .some(let store) => {
+            let norm_store = string.replace(store, "\\", "/", allocator)?
+            let with_ns = string.concat(norm_store, "/std/", allocator)?
+            let with_hash = string.concat(with_ns, hash, allocator)?
+            let lib_dir = string.concat(with_hash, "/lib", allocator)?
+            if fs.path_exists(rfs, lib_dir) {
+                return Option_String.some(value: lib_dir)
+            }
+            let detail = string.concat(": no artifact at ", lib_dir, allocator)?
+            let prefix = string.concat("stdlib pin ", hash, allocator)?
+            let msg = string.concat(prefix, detail, allocator)?
+            let d = diag_mod.fatal_at(diag_code_mod.cli_error(), span_mod.dummy(), msg)
+            diags_mod.emit(mutable diags, take d, allocator)?
+            return Option_String.none
+        }
+    }
+}
+
+
+function absolutize_root(raw: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let normalized = string.replace(raw, "\\", "/", allocator)?
+    if is_absolute_path(normalized) {
+        return normalized
+    }
+    let cwd = string.replace(env.current_dir(allocator), "\\", "/", allocator)?
+    let cwd_sep = string.concat(cwd, "/", allocator)?
+    return string.concat(cwd_sep, normalized, allocator)?
+}
+
+
+function is_absolute_path(s: String) -> bool {
+    let b = s.bytes()
+    let n = b.len()
+    if n == 0 {
+        return false
+    }
+    if b[0] == 47 {
+        return true
+    }
+    if n >= 2 {
+        return b[1] == 58
+    }
+    return false
+}
+
+
+function resolve_via_self_exe(rfs: ReadOnlyFilesystem, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let exe = string.replace(env.self_exe_path(allocator), "\\", "/", allocator)?
+    let parts = string.split(exe, "/", allocator)?
+    let n = parts.len()
+    if n == 0 {
+        return Option_String.none
+    }
+    var k: usize = n - 1
+    var anchor_dev: u64 = 0
+    loop decreases k {
+        if k == 0 {
+            break
+        }
+        let dir = join_segments(parts, k, allocator)?
+        let dir_dev = fs.dev_id(rfs, dir)
+        if k == n - 1 {
+            anchor_dev = dir_dev
+        } else if anchor_dev != 0 && dir_dev != 0 && dir_dev != anchor_dev {
+            break
+        }
+        let here = stdlib_root_at(rfs, dir, allocator)?
+        match here {
+            case .some(let lib) => return Option_String.some(value: lib)
+            case .none => ()
+        }
+        let sibling = string.concat(dir, "/std", allocator)?
+        let via_sibling = stdlib_root_at(rfs, sibling, allocator)?
+        match via_sibling {
+            case .some(let lib) => return Option_String.some(value: lib)
+            case .none => ()
+        }
+        k = k - 1
+    }
+    return Option_String.none
+}
+
+
+function join_segments(parts: [String], upto: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires upto <= parts.len()
+{
+    var acc: String = ""
+    var i: usize = 0
+    loop decreases (upto - i) {
+        if i >= upto {
+            break
+        }
+        acc = if i == 0 {
+            string.clone(parts[i], allocator)?
+        } else {
+            let with_sep = string.concat(acc, "/", allocator)?
+            string.concat(with_sep, parts[i], allocator)?
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+
+function stdlib_root_at(rfs: ReadOnlyFilesystem, root: String, allocator: Allocator) -> Option_String.Option
+    with {rfs, allocator, err: alloc.AllocError}
+{
+    let manifest = string.concat(root, "/package.toml", allocator)?
+    if !fs.path_exists(rfs, manifest) {
+        return Option_String.none
+    }
+    let option_marker = string.concat(root, "/lib/core/option/src/option.ea", allocator)?
+    if !fs.path_exists(rfs, option_marker) {
+        return Option_String.none
+    }
+    let stream_marker = string.concat(root, "/lib/io/stream", allocator)?
+    if !fs.path_exists(rfs, stream_marker) {
+        return Option_String.none
+    }
+    let lib_dir = string.concat(root, "/lib", allocator)?
+    return Option_String.some(value: lib_dir)
+}

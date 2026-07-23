@@ -1,0 +1,196 @@
+
+module specs.specdefs
+
+import std.collections.vec
+import std.collections.hashmap
+import std.core.option
+import std.mem.alloc
+import hir.build.file as hir_file_mod
+import hir.item as hir_item_mod
+import hir.def as def_mod
+import intern.symbol as sym_mod
+import intern.interner as sym_interner_mod
+import resolve.paths.modules as mt_mod
+import resolve.paths.imports as imports_mod
+import syntax.ast.item as item_mod
+import local.gen.monomorphise.qualify.qualify as qualify_mod
+
+
+spec std.collections.vec.Vec(hir_file_mod.HirFile)
+spec std.collections.vec.Vec(hir_item_mod.HItem)
+spec std.collections.vec.Vec(sym_mod.Symbol)
+spec std.collections.vec.Vec(imports_mod.ImportEntry)
+spec std.mem.alloc.Box(item_mod.Spec)
+spec std.collections.hashmap.IntMap(item_mod.Spec)
+spec std.collections.hashmap.IntMap(SpecOrigin)
+spec std.core.option.Option(item_mod.Spec)
+spec std.core.option.Option(SpecOrigin)
+
+
+public type SpecOrigin {
+    segs: Vec_Symbol.Vec
+    import_scope: imports_mod.ImportScope
+}
+
+
+public type SpecDefMap {
+    defs: IntMap_Spec.IntMap
+    origins: IntMap_SpecOrigin.IntMap
+}
+
+
+public function collect_all(
+    files: Vec_HirFile.Vec,
+    mt: mt_mod.ModuleTree,
+    interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> SpecDefMap
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    var defs = IntMap_Spec.new(allocator)?
+    var origins = IntMap_SpecOrigin.new(allocator)?
+    collect_files_into(files, mt, interner, mutable defs, mutable origins, allocator)?
+    return SpecDefMap { defs: defs, origins: origins }
+}
+
+
+public function collect_all_pair(
+    files: Vec_HirFile.Vec,
+    dep_files: Vec_HirFile.Vec,
+    mt: mt_mod.ModuleTree,
+    interner: sym_interner_mod.Interner,
+    allocator: Allocator,
+) -> SpecDefMap
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    var defs = IntMap_Spec.new(allocator)?
+    var origins = IntMap_SpecOrigin.new(allocator)?
+    collect_files_into(files, mt, interner, mutable defs, mutable origins, allocator)?
+    collect_files_into(dep_files, mt, interner, mutable defs, mutable origins, allocator)?
+    return SpecDefMap { defs: defs, origins: origins }
+}
+
+
+function collect_files_into(
+    files: Vec_HirFile.Vec,
+    mt: mt_mod.ModuleTree,
+    interner: sym_interner_mod.Interner,
+    defs: mutable IntMap_Spec.IntMap,
+    origins: mutable IntMap_SpecOrigin.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let nf = Vec_HirFile.len(files)
+    var fi: usize = 0
+    loop decreases (nf - fi) {
+        if fi >= nf { break }
+        let f = Vec_HirFile.at(files, fi)
+        let mod_segs = qualify_mod.invoker_module_segments(f.source.items, allocator)?
+        let file_scope = imports_mod.build(f.source.items, mod_segs, mt, interner, allocator)?
+        collect_items(f.items, mod_segs, file_scope, mutable defs, mutable origins, allocator)?
+        fi = fi + 1
+    }
+}
+
+
+function collect_items(
+    items: Vec_HItem.Vec,
+    mod_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    defs: mutable IntMap_Spec.IntMap,
+    origins: mutable IntMap_SpecOrigin.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    let n = Vec_HItem.len(items)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let item = Vec_HItem.at(items, i)
+        match item.kind {
+            case .spec_decl(_, let inner) => {
+                record_spec_def(item, mod_segs, import_scope, mutable defs, mutable origins, allocator)?
+                collect_items(inner, mod_segs, import_scope, mutable defs, mutable origins, allocator)?
+            }
+            case _ => ()
+        }
+        i = i + 1
+    }
+}
+
+
+function record_spec_def(
+    item: hir_item_mod.HItem,
+    mod_segs: Vec_Symbol.Vec,
+    import_scope: imports_mod.ImportScope,
+    defs: mutable IntMap_Spec.IntMap,
+    origins: mutable IntMap_SpecOrigin.IntMap,
+    allocator: Allocator,
+) -> ()
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    match item.ast_item.kind {
+        case .spec_(let box) => {
+            let spec_ast = Box_Spec.get(box)
+            let _ = IntMap_Spec.insert(mutable defs, item.def_id.raw as i64, take spec_ast, allocator)?
+            let origin_copy = clone_symbols(mod_segs, allocator)?
+            let scope_copy = clone_import_scope(import_scope, allocator)?
+            let _ = IntMap_SpecOrigin.insert(mutable origins, item.def_id.raw as i64, take SpecOrigin { segs: origin_copy, import_scope: scope_copy }, allocator)?
+        }
+        case _ => ()
+    }
+}
+
+
+function clone_symbols(segs: Vec_Symbol.Vec, allocator: Allocator) -> Vec_Symbol.Vec
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_Symbol.Vec
+    Vec_Symbol.new(init out, allocator)?
+    let n = Vec_Symbol.len(segs)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        Vec_Symbol.push(mutable out, Vec_Symbol.at(segs, i), allocator)?
+        i = i + 1
+    }
+    return out
+}
+
+
+function clone_import_scope(src: imports_mod.ImportScope, allocator: Allocator) -> imports_mod.ImportScope
+    with {allocator, divergence, err: alloc.AllocError}
+{
+    uninit out: Vec_ImportEntry.Vec
+    Vec_ImportEntry.new(init out, allocator)?
+    let n = Vec_ImportEntry.len(src.entries)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        let e = Vec_ImportEntry.at(src.entries, i)
+        let cloned_path = clone_symbols(e.path, allocator)?
+        Vec_ImportEntry.push(mutable out, imports_mod.ImportEntry { name: e.name, path: cloned_path, is_selected: e.is_selected }, allocator)?
+        i = i + 1
+    }
+    return imports_mod.ImportScope { entries: out }
+}
+
+
+public function lookup(
+    map: SpecDefMap,
+    def_id: def_mod.DefId,
+) -> Option_Spec.Option
+{
+    return IntMap_Spec.get(map.defs, def_id.raw as i64)
+}
+
+
+public function lookup_origin(
+    map: SpecDefMap,
+    def_id: def_mod.DefId,
+) -> Option_SpecOrigin.Option
+{
+    return IntMap_SpecOrigin.get(map.origins, def_id.raw as i64)
+}

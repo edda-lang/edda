@@ -1,0 +1,106 @@
+
+module manifest.build.lockfile.meta.meta
+
+import std.collections.vec
+import std.mem.alloc
+import std.text.string
+import diagnostics.emit.collection as collection_mod
+import local.lex.toml.toml as toml_mod
+import local.lex.toml.val.values as values_mod
+
+spec std.collections.vec.Vec(toml_mod.TomlToken)
+
+
+public function parse_single_table(tokens: Vec_TomlToken.Vec, source: [u8], lockfile_hash: mutable String, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    if pos + 1 >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(Vec_TomlToken.at(tokens, pos)), "unterminated `[...]` header", allocator)?
+        return n
+    }
+    let name_tok = Vec_TomlToken.at(tokens, pos + 1)
+    if !toml_mod.is_bare_key(name_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(name_tok), "expected a bare-key block name after `[`", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    if pos + 2 >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(name_tok), "unterminated `[...]` header", allocator)?
+        return n
+    }
+    let rbr_tok = Vec_TomlToken.at(tokens, pos + 2)
+    if !toml_mod.is_rbracket(rbr_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(rbr_tok), "expected `]` to close the block header", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let key_sp = toml_mod.token_span(name_tok)
+    let block_name = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    let body_start = pos + 3
+    if string.equals(block_name, "lockfile_meta") {
+        return fill_meta_block(tokens, source, mutable lockfile_hash, mutable diags, body_start, allocator)?
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown block — entries skipped", allocator)?
+    return values_mod.skip_block_body(tokens, body_start)
+}
+
+
+function fill_meta_block(tokens: Vec_TomlToken.Vec, source: [u8], lockfile_hash: mutable String, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos <= Vec_TomlToken.len(tokens)
+    ensures result > pos || result == Vec_TomlToken.len(tokens)
+{
+    let n = Vec_TomlToken.len(tokens)
+    var p = pos
+    loop decreases (n - p) {
+        if p >= n { return n }
+        let tok = Vec_TomlToken.at(tokens, p)
+        if toml_mod.is_eof(tok) { return n }
+        if toml_mod.is_newline(tok) { p = p + 1; continue }
+        if toml_mod.is_lbracket(tok) { return p }
+        if toml_mod.is_lex_error(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "lockfile tokenizer rejected this input", allocator)?
+            return p + 1
+        }
+        if !toml_mod.is_bare_key(tok) {
+            values_mod.emit_error_at(mutable diags, toml_mod.token_span(tok), "expected a key=value pair inside `[lockfile_meta]`", allocator)?
+            p = values_mod.skip_to_newline(tokens, p)
+            continue
+        }
+        p = handle_meta_key(tokens, source, mutable lockfile_hash, mutable diags, p, allocator)?
+    }
+    return n
+}
+
+function handle_meta_key(tokens: Vec_TomlToken.Vec, source: [u8], lockfile_hash: mutable String, diags: mutable collection_mod.Diagnostics, pos: usize, allocator: Allocator) -> usize
+    with {allocator, err: alloc.AllocError}
+    requires pos < Vec_TomlToken.len(tokens)
+    ensures result > pos
+{
+    let n = Vec_TomlToken.len(tokens)
+    let key_tok = Vec_TomlToken.at(tokens, pos)
+    let key_sp = toml_mod.token_span(key_tok)
+    let key = values_mod.bytes_to_string(source, key_sp.start, key_sp.end, allocator)?
+    if pos + 1 >= n {
+        values_mod.emit_error_at(mutable diags, key_sp, "expected `=` after key", allocator)?
+        return n
+    }
+    let eq_tok = Vec_TomlToken.at(tokens, pos + 1)
+    if !toml_mod.is_equals(eq_tok) {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected `=` after key", allocator)?
+        return values_mod.skip_to_newline(tokens, pos)
+    }
+    let value_pos = pos + 2
+    if value_pos >= n {
+        values_mod.emit_error_at(mutable diags, toml_mod.token_span(eq_tok), "expected a value after `=`", allocator)?
+        return n
+    }
+    if string.equals(key, "lockfile_hash") {
+        let r = values_mod.parse_string_value(tokens, source, value_pos, mutable diags, allocator)?
+        lockfile_hash = r.text
+        return values_mod.after_value_newline(tokens, r.after)
+    }
+    values_mod.emit_warn_at(mutable diags, key_sp, "unknown key in `[lockfile_meta]` — ignored", allocator)?
+    return values_mod.skip_to_newline(tokens, value_pos - 1)
+}

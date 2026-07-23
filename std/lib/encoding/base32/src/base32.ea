@@ -1,0 +1,182 @@
+
+module std.encoding.base32
+import std.text.string
+
+import std.mem.alloc
+
+spec std.mem.alloc.Array(u8)
+
+
+public type Base32Error {
+    case bad_length
+    case invalid_char
+    case bad_padding
+}
+
+
+public stable function encoded_length(byte_count: usize) -> usize
+    ensures result % 8 == 0
+    ensures result >= byte_count
+{
+    return ((byte_count + 4) / 5) * 8
+}
+
+public stable function decoded_length_upper_bound(string_len: usize where string_len % 8 == 0) -> usize {
+    return (string_len / 8) * 5
+}
+
+
+function b32_char(v: u8) -> u8 {
+    let idx: u8 = v & 0x1F
+    if idx < 26 { return 0x41 +% idx }
+    return 0x32 +% (idx -% 26)
+}
+
+public function encode(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: [u8] = Array_u8.alloc(allocator, encoded_length(bytes.len()))?
+    let _ = encode_into(bytes, mutable out, 0)
+    return string.from_owned_utf8(take out)
+}
+
+public function encode_into(
+    bytes: [u8],
+    out: mutable [u8],
+    offset: usize where offset + encoded_length(bytes.len()) <= out.len(),
+) -> usize
+    ensures result == encoded_length(bytes.len())
+{
+    let n: usize = bytes.len()
+    let full: usize = n / 5
+    var k: usize = 0
+    loop
+        decreases full - k
+    {
+        if k >= full { break }
+        let b0: u8 = bytes[5 * k]
+        let b1: u8 = bytes[5 * k + 1]
+        let b2: u8 = bytes[5 * k + 2]
+        let b3: u8 = bytes[5 * k + 3]
+        let b4: u8 = bytes[5 * k + 4]
+        let o: usize = offset + 8 * k
+        out[o] = b32_char(b0 >> 3)
+        out[o + 1] = b32_char(((b0 & 0x07) << 2) | (b1 >> 6))
+        out[o + 2] = b32_char((b1 >> 1) & 0x1F)
+        out[o + 3] = b32_char(((b1 & 0x01) << 4) | (b2 >> 4))
+        out[o + 4] = b32_char(((b2 & 0x0F) << 1) | (b3 >> 7))
+        out[o + 5] = b32_char((b3 >> 2) & 0x1F)
+        out[o + 6] = b32_char(((b3 & 0x03) << 3) | (b4 >> 5))
+        out[o + 7] = b32_char(b4 & 0x1F)
+        k = k + 1
+    }
+    let rem: usize = n - full * 5
+    if rem != 0 {
+        let o: usize = offset + 8 * full
+        let p: usize = 5 * full
+        let b0: u8 = bytes[p]
+        let b1: u8 = if rem >= 2 { bytes[p + 1] } else { 0 }
+        let b2: u8 = if rem >= 3 { bytes[p + 2] } else { 0 }
+        let b3: u8 = if rem >= 4 { bytes[p + 3] } else { 0 }
+        out[o] = b32_char(b0 >> 3)
+        out[o + 1] = b32_char(((b0 & 0x07) << 2) | (b1 >> 6))
+        out[o + 2] = if rem >= 2 { b32_char((b1 >> 1) & 0x1F) } else { 0x3D }
+        out[o + 3] = if rem >= 2 { b32_char(((b1 & 0x01) << 4) | (b2 >> 4)) } else { 0x3D }
+        out[o + 4] = if rem >= 3 { b32_char(((b2 & 0x0F) << 1) | (b3 >> 7)) } else { 0x3D }
+        out[o + 5] = if rem >= 4 { b32_char((b3 >> 2) & 0x1F) } else { 0x3D }
+        out[o + 6] = if rem >= 4 { b32_char((b3 & 0x03) << 3) } else { 0x3D }
+        out[o + 7] = 0x3D
+    }
+    return encoded_length(n)
+}
+
+
+function b32_val(c: u8) -> u8
+    with {err: Base32Error}
+    ensures result < 32
+{
+    if c >= 0x41 && c <= 0x5A { return c - 0x41 }
+    if c >= 0x32 && c <= 0x37 { return c - 0x32 + 26 }
+    raise Base32Error.invalid_char
+}
+
+public function decode(s: String, allocator: Allocator) -> [u8]
+    with {allocator, err: alloc.AllocError, err: Base32Error}
+{
+    let bytes: [u8] = s.bytes()
+    if bytes.len() % 8 != 0 { raise Base32Error.bad_length }
+    var out: [u8] = Array_u8.alloc(allocator, decoded_length_upper_bound(bytes.len()))?
+    let written: usize = decode_into(s, mutable out, 0)?
+    return out[..written]
+}
+
+public function decode_into(
+    s: String where s.len() % 8 == 0,
+    out: mutable [u8],
+    offset: usize where offset + decoded_length_upper_bound(s.len()) <= out.len(),
+) -> usize
+    with {err: Base32Error}
+    ensures result <= decoded_length_upper_bound(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let blocks: usize = bytes.len() / 8
+    var written: usize = 0
+    var k: usize = 0
+    loop
+        decreases blocks - k
+    {
+        if k >= blocks { break }
+        let i: usize = 8 * k
+        let c0: u8 = bytes[i]
+        let c1: u8 = bytes[i + 1]
+        let c2: u8 = bytes[i + 2]
+        let c3: u8 = bytes[i + 3]
+        let c4: u8 = bytes[i + 4]
+        let c5: u8 = bytes[i + 5]
+        let c6: u8 = bytes[i + 6]
+        let c7: u8 = bytes[i + 7]
+        let v0: u8 = b32_val(c0)?
+        let v1: u8 = b32_val(c1)?
+        out[offset + 5 * k] = (v0 << 3) | (v1 >> 2)
+        written = written + 1
+        if c2 == 0x3D {
+            if k + 1 != blocks { raise Base32Error.bad_padding }
+            if c3 != 0x3D || c4 != 0x3D || c5 != 0x3D || c6 != 0x3D || c7 != 0x3D { raise Base32Error.bad_padding }
+            k = k + 1
+            continue
+        }
+        let v2: u8 = b32_val(c2)?
+        let v3: u8 = b32_val(c3)?
+        out[offset + 5 * k + 1] = ((v1 & 0x03) << 6) | (v2 << 1) | (v3 >> 4)
+        written = written + 1
+        if c4 == 0x3D {
+            if k + 1 != blocks { raise Base32Error.bad_padding }
+            if c5 != 0x3D || c6 != 0x3D || c7 != 0x3D { raise Base32Error.bad_padding }
+            k = k + 1
+            continue
+        }
+        let v4: u8 = b32_val(c4)?
+        out[offset + 5 * k + 2] = ((v3 & 0x0F) << 4) | (v4 >> 1)
+        written = written + 1
+        if c5 == 0x3D {
+            if k + 1 != blocks { raise Base32Error.bad_padding }
+            if c6 != 0x3D || c7 != 0x3D { raise Base32Error.bad_padding }
+            k = k + 1
+            continue
+        }
+        let v5: u8 = b32_val(c5)?
+        let v6: u8 = b32_val(c6)?
+        out[offset + 5 * k + 3] = ((v4 & 0x01) << 7) | (v5 << 2) | (v6 >> 3)
+        written = written + 1
+        if c7 == 0x3D {
+            if k + 1 != blocks { raise Base32Error.bad_padding }
+            k = k + 1
+            continue
+        }
+        let v7: u8 = b32_val(c7)?
+        out[offset + 5 * k + 4] = ((v6 & 0x07) << 5) | v7
+        written = written + 1
+        k = k + 1
+    }
+    return written
+}

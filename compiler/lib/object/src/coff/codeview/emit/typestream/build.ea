@@ -1,0 +1,441 @@
+
+module object.coff.codeview.emit.typestream.build
+
+import std.mem.alloc
+import std.collections.vec
+import std.collections.hashmap
+
+import types.pass.ty as ty_mod
+import types.ty.interner as ty_interner_mod
+import local.coff.codeview.typetable.table as debug_mod
+
+import local.bytes as bytes_mod
+import local.coff.codeview.emit.encode as enc_mod
+import local.coff.codeview.emit.sym.tymap as cv_tymap_mod
+
+
+spec std.collections.vec.Vec(u8)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(debug_mod.DebugMember)
+spec std.collections.hashmap.IntMap(u32)
+
+
+public type TypeStreamCtx {
+    map: IntMap_u32.IntMap
+    next_index: u32
+    in_progress: Vec_u32.Vec
+}
+
+
+public function new_ctx(allocator: Allocator) -> TypeStreamCtx
+    with {allocator, err: alloc.AllocError}
+{
+    let m = IntMap_u32.new(allocator)?
+    uninit ip: Vec_u32.Vec
+    Vec_u32.new(init ip, allocator)?
+    return TypeStreamCtx { map: m, next_index: enc_mod.ti_first(), in_progress: ip }
+}
+
+
+public function index_for(ctx: TypeStreamCtx, ty: ty_mod.TyId) -> u32 {
+    return match IntMap_u32.get(ctx.map, ty.raw as i64) {
+        case .some(let idx) => idx
+        case .none => enc_mod.t_notype()
+    }
+}
+
+
+function in_progress_has(ctx: TypeStreamCtx, raw: u32) -> bool {
+    let n = Vec_u32.len(ctx.in_progress)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if Vec_u32.at(ctx.in_progress, i) == raw { return true }
+        i += 1
+    }
+    return false
+}
+
+
+public function emit_type(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    ty: ty_mod.TyId,
+    fuel: usize,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 { return enc_mod.t_notype() }
+
+    let prim = cv_tymap_mod.cv_type_for(ty_interner, ty)
+    if prim != enc_mod.t_notype() { return prim }
+
+    match IntMap_u32.get(ctx.map, ty.raw as i64) {
+        case .some(let idx) => return idx
+        case .none => ()
+    }
+
+    if in_progress_has(ctx, ty.raw) { return enc_mod.t_notype() }
+
+    match debug_mod.lookup_debug(debug_table, ty) {
+        case .none => return enc_mod.t_notype()
+        case .some(let agg) => {
+            Vec_u32.push(mutable ctx.in_progress, ty.raw, allocator)?
+            let idx = emit_agg(mutable out, mutable ctx, ty_interner, debug_table, ty, agg, fuel - (1 as usize), allocator)?
+            let _ = IntMap_u32.insert(mutable ctx.map, ty.raw as i64, idx, allocator)?
+            let _popped = Vec_u32.pop(mutable ctx.in_progress)
+            return idx
+        }
+    }
+}
+
+
+function emit_agg(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    ty: ty_mod.TyId,
+    agg: debug_mod.DebugAgg,
+    fuel: usize,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 { return enc_mod.t_notype() }
+    return match agg.kind {
+        case .record_ => emit_struct(mutable out, mutable ctx, ty_interner, debug_table, agg.members, agg.total_size, fuel - (1 as usize), allocator)?
+        case .tuple_ => emit_struct(mutable out, mutable ctx, ty_interner, debug_table, agg.members, agg.total_size, fuel - (1 as usize), allocator)?
+        case .array_ => {
+            let elem_idx = emit_type(mutable out, mutable ctx, ty_interner, debug_table, agg.elem_ty, fuel - (1 as usize), allocator)?
+            emit_array(mutable out, mutable ctx, elem_idx, agg.array_count, agg.total_size, allocator)?
+        }
+        case .fatptr_ => emit_fatptr(mutable out, mutable ctx, ty_interner, debug_table, agg, fuel - (1 as usize), allocator)?
+        case .enum_ => emit_enum(mutable out, mutable ctx, ty_interner, agg.members, agg.elem_ty, allocator)?
+        case .sum_ => emit_sum(mutable out, mutable ctx, ty_interner, debug_table, agg, fuel - (1 as usize), allocator)?
+    }
+}
+
+
+function emit_enum(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    members: Vec_DebugMember.Vec,
+    disc_ty: ty_mod.TyId,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let fl_len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let fl_data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_fieldlist(), allocator)?
+
+    let n = Vec_DebugMember.len(members)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let m = Vec_DebugMember.at(members, i)
+        bytes_mod.push_u16_le(mutable out, enc_mod.leaf_enumerate(), allocator)?
+        bytes_mod.push_u16_le(mutable out, enc_mod.member_attr_public(), allocator)?
+        enc_mod.push_numeric_leaf(mutable out, m.offset as u64, allocator)?
+        enc_mod.push_cstr(mutable out, m.name, allocator)?
+        enc_mod.pad_type_record_rel(mutable out, fl_data_start, allocator)?
+        i += 1
+    }
+    enc_mod.patch_u32_le_lo16(mutable out, fl_len_pos, (Vec_u8.len(out) - fl_data_start) as u32 wrapping)
+    let fl_idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+
+    let utype = cv_tymap_mod.cv_type_for(ty_interner, disc_ty)
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_enum(), allocator)?
+    bytes_mod.push_u16_le(mutable out, n as u16 wrapping, allocator)?
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u32_le(mutable out, utype, allocator)?
+    bytes_mod.push_u32_le(mutable out, fl_idx, allocator)?
+    enc_mod.push_cstr(mutable out, "", allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}
+
+
+function emit_sum(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    agg: debug_mod.DebugAgg,
+    fuel: usize,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 { return enc_mod.t_notype() }
+
+    uninit child: Vec_u32.Vec
+    Vec_u32.new(init child, allocator)?
+    let n = Vec_DebugMember.len(agg.members)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let m = Vec_DebugMember.at(agg.members, i)
+        let ci = emit_type(mutable out, mutable ctx, ty_interner, debug_table, m.ty, fuel - (1 as usize), allocator)?
+        Vec_u32.push(mutable child, ci, allocator)?
+        i += 1
+    }
+
+    let union_fl = emit_fieldlist(mutable out, mutable ctx, agg.members, child, allocator)?
+    let payload_off = agg.array_count as u32 wrapping
+    let union_size = agg.total_size -% payload_off
+    let union_idx = emit_union_record(mutable out, mutable ctx, union_fl, n as u32 wrapping, union_size, allocator)?
+
+    uninit outer: Vec_DebugMember.Vec
+    Vec_DebugMember.new(init outer, allocator)?
+    Vec_DebugMember.push(mutable outer, take debug_mod.DebugMember { name: "tag", ty: ty_mod.error(), offset: 0 as u32 }, allocator)?
+    Vec_DebugMember.push(mutable outer, take debug_mod.DebugMember { name: "payload", ty: ty_mod.error(), offset: payload_off }, allocator)?
+
+    uninit outer_child: Vec_u32.Vec
+    Vec_u32.new(init outer_child, allocator)?
+    Vec_u32.push(mutable outer_child, cv_tymap_mod.cv_type_for(ty_interner, agg.elem_ty), allocator)?
+    Vec_u32.push(mutable outer_child, union_idx, allocator)?
+
+    let outer_fl = emit_fieldlist(mutable out, mutable ctx, outer, outer_child, allocator)?
+    return emit_structure_record(mutable out, mutable ctx, outer_fl, 2 as u32, agg.total_size, allocator)?
+}
+
+
+function emit_union_record(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    fl_idx: u32,
+    count: u32,
+    size: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_union(), allocator)?
+    bytes_mod.push_u16_le(mutable out, count as u16 wrapping, allocator)?
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u32_le(mutable out, fl_idx, allocator)?
+    enc_mod.push_numeric_leaf(mutable out, size as u64, allocator)?
+    enc_mod.push_cstr(mutable out, "", allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}
+
+
+function emit_struct(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    members: Vec_DebugMember.Vec,
+    total_size: u32,
+    fuel: usize,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 { return enc_mod.t_notype() }
+    uninit child: Vec_u32.Vec
+    Vec_u32.new(init child, allocator)?
+    let n = Vec_DebugMember.len(members)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let m = Vec_DebugMember.at(members, i)
+        let ci = emit_type(mutable out, mutable ctx, ty_interner, debug_table, m.ty, fuel - (1 as usize), allocator)?
+        Vec_u32.push(mutable child, ci, allocator)?
+        i += 1
+    }
+
+    let fl_idx = emit_fieldlist(mutable out, mutable ctx, members, child, allocator)?
+    return emit_structure_record(mutable out, mutable ctx, fl_idx, n as u32 wrapping, total_size, allocator)?
+}
+
+
+function emit_structure_record(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    fl_idx: u32,
+    count: u32,
+    total_size: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_structure(), allocator)?
+    bytes_mod.push_u16_le(mutable out, count as u16 wrapping, allocator)?
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u32_le(mutable out, fl_idx, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    enc_mod.push_numeric_leaf(mutable out, total_size as u64, allocator)?
+    enc_mod.push_cstr(mutable out, "", allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}
+
+
+function emit_fieldlist(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    members: Vec_DebugMember.Vec,
+    child: Vec_u32.Vec,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_fieldlist(), allocator)?
+
+    let n = Vec_DebugMember.len(members)
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        let m = Vec_DebugMember.at(members, i)
+        let ci = if i < Vec_u32.len(child) { Vec_u32.at(child, i) } else { enc_mod.t_notype() }
+        bytes_mod.push_u16_le(mutable out, enc_mod.leaf_member(), allocator)?
+        bytes_mod.push_u16_le(mutable out, enc_mod.member_attr_public(), allocator)?
+        bytes_mod.push_u32_le(mutable out, ci, allocator)?
+        enc_mod.push_numeric_leaf(mutable out, m.offset as u64, allocator)?
+        enc_mod.push_cstr(mutable out, m.name, allocator)?
+        enc_mod.pad_type_record_rel(mutable out, data_start, allocator)?
+        i += 1
+    }
+
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}
+
+
+function emit_array(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    elem_idx: u32,
+    count: u64,
+    total_size: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let _ = count
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_array(), allocator)?
+    bytes_mod.push_u32_le(mutable out, elem_idx, allocator)?
+    bytes_mod.push_u32_le(mutable out, enc_mod.t_uquad(), allocator)?
+    enc_mod.push_numeric_leaf(mutable out, total_size as u64, allocator)?
+    enc_mod.push_cstr(mutable out, "", allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}
+
+
+function emit_pointer(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    utype: u32,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+{
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_pointer(), allocator)?
+    bytes_mod.push_u32_le(mutable out, utype, allocator)?
+    bytes_mod.push_u32_le(mutable out, enc_mod.pointer_attr_64(), allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}
+
+
+function emit_fatptr(
+    out: mutable Vec_u8.Vec,
+    ctx: mutable TypeStreamCtx,
+    ty_interner: ty_interner_mod.Interner,
+    debug_table: debug_mod.DebugTypeTable,
+    agg: debug_mod.DebugAgg,
+    fuel: usize,
+    allocator: Allocator,
+) -> u32
+    with {allocator, err: alloc.AllocError}
+    decreases fuel
+{
+    if fuel == 0 { return enc_mod.t_notype() }
+    let elem_idx = if ty_mod.is_error(agg.elem_ty) {
+        enc_mod.t_u8()
+    } else {
+        emit_type(mutable out, mutable ctx, ty_interner, debug_table, agg.elem_ty, fuel - (1 as usize), allocator)?
+    }
+    let ptr_idx = emit_pointer(mutable out, mutable ctx, elem_idx, allocator)?
+
+    uninit members: Vec_DebugMember.Vec
+    Vec_DebugMember.new(init members, allocator)?
+    Vec_DebugMember.push(mutable members, take debug_mod.DebugMember { name: "ptr", ty: ty_mod.error(), offset: 0 as u32 }, allocator)?
+    Vec_DebugMember.push(mutable members, take debug_mod.DebugMember { name: "len", ty: ty_mod.error(), offset: 8 as u32 }, allocator)?
+
+    uninit child: Vec_u32.Vec
+    Vec_u32.new(init child, allocator)?
+    Vec_u32.push(mutable child, ptr_idx, allocator)?
+    Vec_u32.push(mutable child, enc_mod.t_u64(), allocator)?
+
+    let fl_idx = emit_fieldlist(mutable out, mutable ctx, members, child, allocator)?
+
+    let len_pos = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    let data_start = Vec_u8.len(out)
+    bytes_mod.push_u16_le(mutable out, enc_mod.leaf_structure(), allocator)?
+    bytes_mod.push_u16_le(mutable out, 2 as u16, allocator)?
+    bytes_mod.push_u16_le(mutable out, 0 as u16, allocator)?
+    bytes_mod.push_u32_le(mutable out, fl_idx, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    bytes_mod.push_u32_le(mutable out, 0 as u32, allocator)?
+    enc_mod.push_numeric_leaf(mutable out, agg.total_size as u64, allocator)?
+    enc_mod.push_cstr(mutable out, "", allocator)?
+    enc_mod.patch_u32_le_lo16(mutable out, len_pos, (Vec_u8.len(out) - data_start) as u32 wrapping)
+
+    let idx = ctx.next_index
+    ctx.next_index = ctx.next_index +% (1 as u32)
+    return idx
+}

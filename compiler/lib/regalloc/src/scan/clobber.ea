@@ -1,0 +1,170 @@
+
+module regalloc.scan.clobber
+
+import std.mem.alloc
+import std.collections.vec
+
+import target.triple as triple_mod
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import ir.lir.op as lir_op_mod
+import ir.lir.id.op as lir_op_id_mod
+import ir.lir.id.vreg as lir_vreg_id_mod
+
+
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+spec std.collections.vec.Vec(lir_op_id_mod.LirOpId)
+spec std.collections.vec.Vec(lir_op_mod.LirOp)
+
+
+public function collect_clobber_positions(
+    calls: init Vec_usize.Vec,
+    rdxrax: init Vec_usize.Vec,
+    rcx: init Vec_usize.Vec,
+    body: lir_body_mod.LirBody,
+    target: triple_mod.TargetTriple,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit call_v: Vec_usize.Vec
+    Vec_usize.new(init call_v, allocator)?
+    uninit rdxrax_v: Vec_usize.Vec
+    Vec_usize.new(init rdxrax_v, allocator)?
+    uninit rcx_v: Vec_usize.Vec
+    Vec_usize.new(init rcx_v, allocator)?
+    let track_rcx = is_x86_64(target)
+    let n_blocks = Vec_LirBlock.len(body.blocks)
+    var pos: usize = 0
+    var b: usize = 1
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        let block = Vec_LirBlock.at(body.blocks, b)
+        let no = Vec_LirOpId.len(block.ops)
+        var i: usize = 0
+        loop decreases no - i {
+            if i >= no { break }
+            pos += 1
+            let op_id = Vec_LirOpId.at(block.ops, i)
+            let idx = op_id.raw as usize
+            if idx != 0 {
+                if idx < Vec_LirOp.len(body.ops) {
+                    let op = Vec_LirOp.at(body.ops, idx)
+                    match op.kind {
+                        case .call_(_, _, _) => Vec_usize.push(mutable call_v, pos, allocator)?
+                        case .call_indirect(_, _, _) => Vec_usize.push(mutable call_v, pos, allocator)?
+                        case .binary(let bop, _, let rhs, let bdst) => {
+                            if binary_clobbers_rdx_rax(body, bop, op.flags.overflow_safe, bdst) {
+                                Vec_usize.push(mutable rdxrax_v, pos, allocator)?
+                            }
+                            if track_rcx && binary_clobbers_rcx(bop, rhs) {
+                                Vec_usize.push(mutable rcx_v, pos, allocator)?
+                            }
+                        }
+                        case _               => ()
+                    }
+                }
+            }
+            i += 1
+        }
+        pos += 1
+        b += 1
+    }
+    calls = call_v
+    rdxrax = rdxrax_v
+    rcx = rcx_v
+}
+
+
+function is_x86_64(target: triple_mod.TargetTriple) -> bool {
+    return match triple_mod.arch(target) {
+        case .x86_64 => true
+        case _       => false
+    }
+}
+
+
+function binary_clobbers_rdx_rax(
+    body: lir_body_mod.LirBody,
+    op: lir_op_mod.LBinOp,
+    overflow_safe: bool,
+    dst: lir_vreg_id_mod.LirVRegId,
+) -> bool {
+    return match op {
+        case .udiv   => true
+        case .sdiv   => true
+        case .urem   => true
+        case .srem   => true
+        case .umulhi => true
+        case .smulhi => true
+        case .mul    => mul_uses_one_operand(body, overflow_safe, dst)
+        case _       => false
+    }
+}
+
+
+function binary_clobbers_rcx(op: lir_op_mod.LBinOp, rhs: lir_reg_mod.Operand) -> bool {
+    let is_variable_shift = match op {
+        case .shl  => true
+        case .lshr => true
+        case .ashr => true
+        case _     => false
+    }
+    if !is_variable_shift { return false }
+    return match rhs {
+        case .vreg(_) => true
+        case _        => false
+    }
+}
+
+
+function mul_uses_one_operand(
+    body: lir_body_mod.LirBody,
+    overflow_safe: bool,
+    dst: lir_vreg_id_mod.LirVRegId,
+) -> bool {
+    if overflow_safe { return false }
+    let idx = dst.raw as usize
+    if idx >= Vec_LirVReg.len(body.vregs) { return false }
+    let v = Vec_LirVReg.at(body.vregs, idx)
+    return v.int_width >= (8 as u32) && !v.int_signed
+}
+
+
+public function spans_clobber(clobbers: Vec_usize.Vec, start: usize, end_: usize) -> bool {
+    let n = Vec_usize.len(clobbers)
+    var lo: usize = 0
+    var hi: usize = n
+    loop decreases hi - lo {
+        if lo >= hi { break }
+        let mid = lo + (hi - lo) / 2
+        if Vec_usize.at(clobbers, mid) > start {
+            hi = mid
+        } else {
+            lo = mid + 1
+        }
+    }
+    if lo >= n { return false }
+    return Vec_usize.at(clobbers, lo) < end_
+}
+
+
+public function clobbers_at(clobbers: Vec_usize.Vec, pos: usize) -> bool {
+    let n = Vec_usize.len(clobbers)
+    var lo: usize = 0
+    var hi: usize = n
+    loop decreases hi - lo {
+        if lo >= hi { break }
+        let mid = lo + (hi - lo) / 2
+        if Vec_usize.at(clobbers, mid) >= pos {
+            hi = mid
+        } else {
+            lo = mid + 1
+        }
+    }
+    if lo >= n { return false }
+    return Vec_usize.at(clobbers, lo) == pos
+}

@@ -1,0 +1,555 @@
+
+module x64.encoding.integer.alu
+
+import std.mem.alloc
+import std.collections.vec
+import object.bytes as bytes_mod
+import local.gen.sel.regs as regs_mod
+import local.encoding.encode.prefix as prefix_mod
+import local.encoding.encode.modrm as modrm_mod
+
+
+spec std.collections.vec.Vec(u8)
+
+
+public type AluOp {
+    case add_
+    case or_
+    case adc_
+    case sbb_
+    case and_
+    case sub_
+    case xor_
+    case cmp_
+}
+
+derive eq, hash, debug for AluOp
+
+public type Grp3Op {
+    case not_
+    case neg_
+    case mul_
+    case imul1_
+    case div_
+    case idiv_
+}
+
+derive eq, hash, debug for Grp3Op
+
+
+public stable function alu_op_index(op: AluOp) -> u8 {
+    return match op {
+        case .add_ => 0 as u8
+        case .or_  => 1 as u8
+        case .adc_ => 2 as u8
+        case .sbb_ => 3 as u8
+        case .and_ => 4 as u8
+        case .sub_ => 5 as u8
+        case .xor_ => 6 as u8
+        case .cmp_ => 7 as u8
+    }
+}
+
+public stable function grp3_digit(op: Grp3Op) -> u8 {
+    return match op {
+        case .not_   => 2 as u8
+        case .neg_   => 3 as u8
+        case .mul_   => 4 as u8
+        case .imul1_ => 5 as u8
+        case .div_   => 6 as u8
+        case .idiv_  => 7 as u8
+    }
+}
+
+
+function push_imm_sized(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    imm: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if regs_mod.op_size_is_16(size) {
+        bytes_mod.push_i16_le(mutable out, imm as i16 wrapping, allocator)?
+    } else {
+        bytes_mod.push_i32_le(mutable out, imm, allocator)?
+    }
+}
+
+
+public function encode_alu_rm_r(
+    out: mutable Vec_u8.Vec,
+    op: AluOp,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(src), false, regs_mod.gp64_is_extended(dst), allocator)?
+    let opcode = (0x01 as u8) + (alu_op_index(op) * (8 as u8))
+    bytes_mod.push_u8(mutable out, opcode, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(src), regs_mod.gp64_reg_low3(dst), allocator)?
+}
+
+public function encode_alu_r_mem(
+    out: mutable Vec_u8.Vec,
+    op: AluOp,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(base), allocator)?
+    let opcode = (0x03 as u8) + (alu_op_index(op) * (8 as u8))
+    bytes_mod.push_u8(mutable out, opcode, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, disp, allocator)?
+}
+
+public function encode_alu_rm_imm(
+    out: mutable Vec_u8.Vec,
+    op: AluOp,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    imm: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, false, false, regs_mod.gp64_is_extended(dst), allocator)?
+    if imm >= -128 && imm <= 127 {
+        bytes_mod.push_u8(mutable out, 0x83 as u8, allocator)?
+        modrm_mod.push_modrm_direct(mutable out, alu_op_index(op), regs_mod.gp64_reg_low3(dst), allocator)?
+        bytes_mod.push_u8(mutable out, imm as u8 wrapping, allocator)?
+    } else {
+        bytes_mod.push_u8(mutable out, 0x81 as u8, allocator)?
+        modrm_mod.push_modrm_direct(mutable out, alu_op_index(op), regs_mod.gp64_reg_low3(dst), allocator)?
+        push_imm_sized(mutable out, size, imm, allocator)?
+    }
+}
+
+public function encode_mov_rm_r(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(src), false, regs_mod.gp64_is_extended(dst), allocator)?
+    bytes_mod.push_u8(mutable out, 0x89 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(src), regs_mod.gp64_reg_low3(dst), allocator)?
+}
+
+public function encode_mov_r_mem(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x8B as u8, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, disp, allocator)?
+}
+
+public function encode_mov_mem_r(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(src), false, regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x89 as u8, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(src), base, disp, allocator)?
+}
+
+public function encode_mov_rm_imm(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    imm: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, false, false, regs_mod.gp64_is_extended(dst), allocator)?
+    bytes_mod.push_u8(mutable out, 0xC7 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, 0 as u8, regs_mod.gp64_reg_low3(dst), allocator)?
+    push_imm_sized(mutable out, size, imm, allocator)?
+}
+
+public function encode_mov_r_mem_idx(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), regs_mod.gp64_is_extended(index), regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x8B as u8, allocator)?
+    modrm_mod.push_mem_base_index_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, index, scale_log2, disp, allocator)?
+}
+
+public function encode_mov_mem_r_idx(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(src), regs_mod.gp64_is_extended(index), regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x89 as u8, allocator)?
+    modrm_mod.push_mem_base_index_disp(mutable out, regs_mod.gp64_reg_low3(src), base, index, scale_log2, disp, allocator)?
+}
+
+public function encode_mov_r64_imm64(
+    out: mutable Vec_u8.Vec,
+    dst: regs_mod.Gp64Reg,
+    imm: i64,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.push_rex(mutable out, true, false, false, regs_mod.gp64_is_extended(dst), allocator)?
+    let opcode = (0xB8 as u8) | regs_mod.gp64_reg_low3(dst)
+    bytes_mod.push_u8(mutable out, opcode, allocator)?
+    bytes_mod.push_i64_le(mutable out, imm, allocator)?
+}
+
+public function encode_mov_r32_imm32(
+    out: mutable Vec_u8.Vec,
+    dst: regs_mod.Gp64Reg,
+    imm: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    if regs_mod.gp64_is_extended(dst) {
+        bytes_mod.push_u8(mutable out, 0x41 as u8, allocator)?
+    }
+
+    let opcode = (0xB8 as u8) | regs_mod.gp64_reg_low3(dst)
+    bytes_mod.push_u8(mutable out, opcode, allocator)?
+
+    bytes_mod.push_i32_le(mutable out, imm, allocator)?
+}
+
+public function encode_test_rm_r(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    a: regs_mod.Gp64Reg,
+    b: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(b), false, regs_mod.gp64_is_extended(a), allocator)?
+    bytes_mod.push_u8(mutable out, 0x85 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(b), regs_mod.gp64_reg_low3(a), allocator)?
+}
+
+public function encode_grp3_rm(
+    out: mutable Vec_u8.Vec,
+    op: Grp3Op,
+    size: regs_mod.OpSize,
+    rm: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, false, false, regs_mod.gp64_is_extended(rm), allocator)?
+    bytes_mod.push_u8(mutable out, 0xF7 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, grp3_digit(op), regs_mod.gp64_reg_low3(rm), allocator)?
+}
+
+public function encode_imul_r_rm(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xAF as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+}
+
+public function encode_imul_r_rm_imm32(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    imm: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x69 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+    push_imm_sized(mutable out, size, imm, allocator)?
+}
+
+public function encode_cdq(
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    bytes_mod.push_u8(mutable out, 0x99 as u8, allocator)?
+}
+
+public function encode_cqo(
+    out: mutable Vec_u8.Vec,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.push_rex(mutable out, true, false, false, false, allocator)?
+    bytes_mod.push_u8(mutable out, 0x99 as u8, allocator)?
+}
+
+public function encode_lea(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x8D as u8, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, disp, allocator)?
+}
+
+public function encode_lea_rip(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, false, allocator)?
+    bytes_mod.push_u8(mutable out, 0x8D as u8, allocator)?
+    modrm_mod.push_mem_rip_disp32(mutable out, regs_mod.gp64_reg_low3(dst), disp, allocator)?
+}
+
+public function encode_movzx_r_rm8(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xB6 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+}
+
+public function encode_movsx_r_rm8(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xBE as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+}
+
+public function encode_movzx_r_rm16(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xB7 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+}
+
+public function encode_movsx_r_rm16(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xBF as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+}
+
+public function encode_movsxd_r_rm32(
+    out: mutable Vec_u8.Vec,
+    dst: regs_mod.Gp64Reg,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, regs_mod.OpSize.qword_, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(src), allocator)?
+    bytes_mod.push_u8(mutable out, 0x63 as u8, allocator)?
+    modrm_mod.push_modrm_direct(mutable out, regs_mod.gp64_reg_low3(dst), regs_mod.gp64_reg_low3(src), allocator)?
+}
+
+public function encode_movzx_r_mem8(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xB6 as u8, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, disp, allocator)?
+}
+
+public function encode_movzx_r_mem16(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), false, regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xB7 as u8, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, disp, allocator)?
+}
+
+public function encode_movzx_r_mem8_idx(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), regs_mod.gp64_is_extended(index), regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xB6 as u8, allocator)?
+    modrm_mod.push_mem_base_index_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, index, scale_log2, disp, allocator)?
+}
+
+public function encode_movzx_r_mem16_idx(
+    out: mutable Vec_u8.Vec,
+    size: regs_mod.OpSize,
+    dst: regs_mod.Gp64Reg,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    prefix_mod.emit_size_prefixes(mutable out, size, regs_mod.gp64_is_extended(dst), regs_mod.gp64_is_extended(index), regs_mod.gp64_is_extended(base), allocator)?
+    bytes_mod.push_u8(mutable out, 0x0F as u8, allocator)?
+    bytes_mod.push_u8(mutable out, 0xB7 as u8, allocator)?
+    modrm_mod.push_mem_base_index_disp(mutable out, regs_mod.gp64_reg_low3(dst), base, index, scale_log2, disp, allocator)?
+}
+
+public function encode_mov_mem_r8(
+    out: mutable Vec_u8.Vec,
+    base: regs_mod.Gp64Reg,
+    disp: i32,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n = regs_mod.gp64_reg_num(src)
+    let force_rex = (n >= (4 as u8)) && (n <= (7 as u8))
+    if force_rex || regs_mod.gp64_is_extended(src) || regs_mod.gp64_is_extended(base) {
+        prefix_mod.push_rex(mutable out, false, regs_mod.gp64_is_extended(src), false, regs_mod.gp64_is_extended(base), allocator)?
+    }
+    bytes_mod.push_u8(mutable out, 0x88 as u8, allocator)?
+    modrm_mod.push_mem_base_disp(mutable out, regs_mod.gp64_reg_low3(src), base, disp, allocator)?
+}
+
+public function encode_mov_mem_r8_idx(
+    out: mutable Vec_u8.Vec,
+    base: regs_mod.Gp64Reg,
+    index: regs_mod.Gp64Reg,
+    scale_log2: u8,
+    disp: i32,
+    src: regs_mod.Gp64Reg,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+    requires regs_mod.gp64_reg_num(index) != (4 as u8)
+    requires scale_log2 <= (3 as u8)
+{
+    let n = regs_mod.gp64_reg_num(src)
+    let force_rex = (n >= (4 as u8)) && (n <= (7 as u8))
+    if force_rex || regs_mod.gp64_is_extended(src) || regs_mod.gp64_is_extended(index) || regs_mod.gp64_is_extended(base) {
+        prefix_mod.push_rex(mutable out, false, regs_mod.gp64_is_extended(src), regs_mod.gp64_is_extended(index), regs_mod.gp64_is_extended(base), allocator)?
+    }
+    bytes_mod.push_u8(mutable out, 0x88 as u8, allocator)?
+    modrm_mod.push_mem_base_index_disp(mutable out, regs_mod.gp64_reg_low3(src), base, index, scale_log2, disp, allocator)?
+}

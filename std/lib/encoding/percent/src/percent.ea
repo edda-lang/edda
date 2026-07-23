@@ -1,0 +1,223 @@
+
+module std.encoding.percent
+import std.text.string
+
+import std.mem.alloc
+
+spec std.mem.alloc.Array(u8)
+
+public type PercentError {
+    case invalid_escape
+    case truncated_escape
+}
+
+
+public stable function encoded_max_byte_length(byte_count: usize) -> usize {
+    return 3 * byte_count
+}
+
+public stable function decoded_max_byte_length(byte_count: usize) -> usize {
+    return byte_count
+}
+
+
+function is_alnum(b: u8) -> bool {
+    return (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || (b >= 0x30 && b <= 0x39)
+}
+
+function hex_digit_upper(n: u8 where n < 16) -> u8
+    ensures result < 128
+{
+    if n < 10 { return 0x30 + n }
+    return 0x41 + (n - 10)
+}
+
+function hex_val(c: u8) -> u8
+    with {err: PercentError}
+    ensures result < 16
+{
+    if c >= 0x30 && c <= 0x39 { return c - 0x30 }
+    if c >= 0x41 && c <= 0x46 { return c - 0x41 + 10 }
+    if c >= 0x61 && c <= 0x66 { return c - 0x61 + 10 }
+    raise PercentError.invalid_escape
+}
+
+
+function keep_component(b: u8) -> bool {
+    return is_alnum(b) || b == 0x2D || b == 0x5F || b == 0x2E || b == 0x21 || b == 0x7E || b == 0x2A || b == 0x27 || b == 0x28 || b == 0x29
+}
+
+function keep_path(b: u8) -> bool {
+    return b > 0x20 && b <= 0x7E && b != 0x22 && b != 0x23 && b != 0x3C && b != 0x3E && b != 0x3F && b != 0x60 && b != 0x7B && b != 0x7D
+}
+
+function keep_query(b: u8) -> bool {
+    return is_alnum(b) || b == 0x2A || b == 0x2D || b == 0x2E || b == 0x5F
+}
+
+
+public function encode_component(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: [u8] = Array_u8.alloc(allocator, encoded_max_byte_length(s.bytes().len()))?
+    let written: usize = encode_component_into(s, mutable out, 0)
+    return string.from_owned_utf8(take out[..written])
+}
+
+public function encode_component_into(
+    s: String,
+    out: mutable [u8],
+    offset: usize where offset + encoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    ensures result <= encoded_max_byte_length(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let n: usize = bytes.len()
+    var w: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let b: u8 = bytes[i]
+        if keep_component(b) {
+            out[offset + w] = b
+            w = w + 1
+        } else {
+            out[offset + w] = 0x25
+            out[offset + w + 1] = hex_digit_upper(b >> 4)
+            out[offset + w + 2] = hex_digit_upper(b & 0x0F)
+            w = w + 3
+        }
+        i = i + 1
+    }
+    return w
+}
+
+
+public function encode_path(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: [u8] = Array_u8.alloc(allocator, encoded_max_byte_length(s.bytes().len()))?
+    let written: usize = encode_path_into(s, mutable out, 0)
+    return string.from_owned_utf8(take out[..written])
+}
+
+public function encode_path_into(
+    s: String,
+    out: mutable [u8],
+    offset: usize where offset + encoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    ensures result <= encoded_max_byte_length(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let n: usize = bytes.len()
+    var w: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let b: u8 = bytes[i]
+        if keep_path(b) {
+            out[offset + w] = b
+            w = w + 1
+        } else {
+            out[offset + w] = 0x25
+            out[offset + w + 1] = hex_digit_upper(b >> 4)
+            out[offset + w + 2] = hex_digit_upper(b & 0x0F)
+            w = w + 3
+        }
+        i = i + 1
+    }
+    return w
+}
+
+
+public function encode_query_form(s: String, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var out: [u8] = Array_u8.alloc(allocator, encoded_max_byte_length(s.bytes().len()))?
+    let written: usize = encode_query_form_into(s, mutable out, 0)
+    return string.from_owned_utf8(take out[..written])
+}
+
+public function encode_query_form_into(
+    s: String,
+    out: mutable [u8],
+    offset: usize where offset + encoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    ensures result <= encoded_max_byte_length(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let n: usize = bytes.len()
+    var w: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let b: u8 = bytes[i]
+        if b == 0x20 {
+            out[offset + w] = 0x2B
+            w = w + 1
+        } else if keep_query(b) {
+            out[offset + w] = b
+            w = w + 1
+        } else {
+            out[offset + w] = 0x25
+            out[offset + w + 1] = hex_digit_upper(b >> 4)
+            out[offset + w + 2] = hex_digit_upper(b & 0x0F)
+            w = w + 3
+        }
+        i = i + 1
+    }
+    return w
+}
+
+
+public function decode(s: String, space_is_plus: bool, allocator: Allocator) -> String
+    with {allocator, err: PercentError, err: alloc.AllocError}
+{
+    var out: [u8] = Array_u8.alloc(allocator, decoded_max_byte_length(s.bytes().len()))?
+    let written: usize = decode_into(s, space_is_plus, mutable out, 0)?
+    return string.from_owned_utf8(take out[..written])
+}
+
+public function decode_into(
+    s: String,
+    space_is_plus: bool,
+    out: mutable [u8],
+    offset: usize where offset + decoded_max_byte_length(s.len()) <= out.len(),
+) -> usize
+    with {err: PercentError}
+    ensures result <= decoded_max_byte_length(s.len())
+{
+    let bytes: [u8] = s.bytes()
+    let n: usize = bytes.len()
+    var written: usize = 0
+    var i: usize = 0
+    loop
+        decreases n - i
+    {
+        if i >= n { break }
+        let c: u8 = bytes[i]
+        if c == 0x25 {
+            if i + 2 >= n { raise PercentError.truncated_escape }
+            let hi: u8 = hex_val(bytes[i + 1])?
+            let lo: u8 = hex_val(bytes[i + 2])?
+            out[offset + written] = hi * 16 + lo
+            written = written + 1
+            i = i + 3
+        } else if c == 0x2B && space_is_plus {
+            out[offset + written] = 0x20
+            written = written + 1
+            i = i + 1
+        } else {
+            out[offset + written] = c
+            written = written + 1
+            i = i + 1
+        }
+    }
+    return written
+}

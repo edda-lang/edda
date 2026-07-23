@@ -1,0 +1,124 @@
+
+module inspect.cli
+
+import std.core.option
+import std.mem.alloc
+import std.text.string
+import diagnostics.code as diag_code_mod
+import diagnostics.emit.collection as diags_mod
+import diagnostics.emit.diagnostic as diag_mod
+import span.loc.pos.span as span_mod
+
+
+spec std.core.option.Option(Stage)
+spec std.core.option.Option(InspectArgs)
+spec std.core.option.Option(String)
+
+
+public type Stage {
+    case parse
+    case hir
+    case types
+    case mir
+}
+
+
+public type InspectArgs {
+    stage: Stage
+    file: String
+    fn_name: Option_String.Option
+    stdlib_root: Option_String.Option
+}
+
+
+public function stage_rank(s: Stage) -> u32 {
+    return match s {
+        case .parse => 0
+        case .hir => 1
+        case .types => 2
+        case .mir => 3
+    }
+}
+
+
+public function parse_args(
+    args: [String],
+    diags: mutable diags_mod.Diagnostics,
+    allocator: Allocator,
+) -> Option_InspectArgs.Option
+    with {allocator, err: alloc.AllocError}
+{
+    if args.len() < 2 as usize {
+        emit_cli_error(mutable diags, "usage: inspect <parse|hir|types|mir> <file.ea> [--fn <name>] [--stdlib <root>]", allocator)?
+        return Option_InspectArgs.none
+    }
+    let stage_opt = parse_stage(args[0])
+    let stage = match stage_opt {
+        case .some(let s) => s
+        case .none => {
+            let msg = string.concat("unknown stage: ", args[0], allocator)?
+            emit_cli_error(mutable diags, msg, allocator)?
+            return Option_InspectArgs.none
+        }
+    }
+    let file = string.clone(args[1], allocator)?
+
+    var fn_name: Option_String.Option = Option_String.none
+    var stdlib_root: Option_String.Option = Option_String.none
+    let n = args.len()
+    var i: usize = 2
+    loop decreases (n - i) {
+        if i >= n { break }
+        let arg = args[i]
+        if string.equals(arg, "--fn") {
+            if i + 1 as usize >= n {
+                emit_cli_error(mutable diags, "flag --fn requires a value", allocator)?
+                return Option_InspectArgs.none
+            }
+            let v = string.clone(args[i + 1 as usize], allocator)?
+            fn_name = Option_String.some(value: v)
+            i = i + 2 as usize
+        } else if string.equals(arg, "--stdlib") {
+            if i + 1 as usize >= n {
+                emit_cli_error(mutable diags, "flag --stdlib requires a value", allocator)?
+                return Option_InspectArgs.none
+            }
+            let v = string.clone(args[i + 1 as usize], allocator)?
+            stdlib_root = Option_String.some(value: v)
+            i = i + 2 as usize
+        } else {
+            let msg = string.concat("unknown flag: ", arg, allocator)?
+            emit_cli_error(mutable diags, msg, allocator)?
+            return Option_InspectArgs.none
+        }
+    }
+
+    let parsed = InspectArgs {
+        stage: stage,
+        file: file,
+        fn_name: fn_name,
+        stdlib_root: stdlib_root,
+    }
+    return Option_InspectArgs.some(value: parsed)
+}
+
+
+function parse_stage(name: String) -> Option_Stage.Option {
+    if string.equals(name, "parse") { return Option_Stage.some(value: Stage.parse) }
+    if string.equals(name, "hir") { return Option_Stage.some(value: Stage.hir) }
+    if string.equals(name, "types") { return Option_Stage.some(value: Stage.types) }
+    if string.equals(name, "mir") { return Option_Stage.some(value: Stage.mir) }
+    return Option_Stage.none
+}
+
+
+function emit_cli_error(
+    diags: mutable diags_mod.Diagnostics,
+    message: String,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let d = diag_mod.error_at(diag_code_mod.cli_error(), span_mod.dummy(), message)
+    diags_mod.emit(mutable diags, d, allocator)?
+}

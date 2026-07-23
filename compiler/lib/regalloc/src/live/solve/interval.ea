@@ -1,0 +1,167 @@
+
+module regalloc.live.solve.interval
+
+import std.mem.alloc
+import std.collections.vec
+import std.core.option
+
+import ir.lir.tree.body as lir_body_mod
+import ir.lir.tree.reg as lir_reg_mod
+import local.live.live as live_mod
+import local.interval.positions as positions_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(usize)
+spec std.collections.vec.Vec(LiveInterval)
+spec std.collections.vec.Vec(lir_reg_mod.LirVReg)
+spec std.collections.vec.Vec(lir_body_mod.LirBlock)
+
+
+spec std.core.option.Option(lir_reg_mod.PReg)
+
+
+public type LiveInterval {
+    vreg_raw: u32
+    start: usize
+    end: usize
+    class_: lir_reg_mod.RegClass
+    pin: Option_PReg.Option
+}
+
+
+public function build(
+    out: init Vec_LiveInterval.Vec,
+    body: lir_body_mod.LirBody,
+    live: live_mod.Liveness,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_vregs = Vec_LirVReg.len(body.vregs)
+    let n_blocks = Vec_LirBlock.len(body.blocks)
+
+    uninit present: Vec_bool.Vec
+    new_bools(init present, n_vregs, allocator)?
+    uninit starts: Vec_usize.Vec
+    new_usizes(init starts, n_vregs, allocator)?
+    uninit ends: Vec_usize.Vec
+    new_usizes(init ends, n_vregs, allocator)?
+
+    let max_pos = positions_mod.scan(mutable present, mutable starts, mutable ends, body, live, n_blocks, n_vregs, allocator)?
+
+    uninit ivals: Vec_LiveInterval.Vec
+    Vec_LiveInterval.new(init ivals, allocator)?
+    emit_sorted(mutable ivals, present, starts, ends, body, max_pos, n_vregs, allocator)?
+    out = ivals
+}
+
+
+function emit_sorted(
+    out: mutable Vec_LiveInterval.Vec,
+    present: Vec_bool.Vec,
+    starts: Vec_usize.Vec,
+    ends: Vec_usize.Vec,
+    body: lir_body_mod.LirBody,
+    max_pos: usize,
+    n_vregs: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let limit = max_pos + 1
+    uninit offsets: Vec_usize.Vec
+    new_usizes(init offsets, limit + 1, allocator)?
+    var vc: usize = 1
+    loop decreases n_vregs - vc {
+        if vc >= n_vregs { break }
+        if Vec_bool.at(present, vc) {
+            let p = Vec_usize.at(starts, vc) + 1
+            Vec_usize.set_at(mutable offsets, p, Vec_usize.at(offsets, p) + 1)
+        }
+        vc += 1
+    }
+    var p: usize = 0
+    loop decreases limit - p {
+        if p >= limit { break }
+        Vec_usize.set_at(mutable offsets, p + 1, Vec_usize.at(offsets, p + 1) + Vec_usize.at(offsets, p))
+        p += 1
+    }
+    let total = Vec_usize.at(offsets, limit)
+
+    uninit order: Vec_usize.Vec
+    new_usizes(init order, total, allocator)?
+    uninit cursor: Vec_usize.Vec
+    new_usizes(init cursor, limit, allocator)?
+    var vp: usize = 1
+    loop decreases n_vregs - vp {
+        if vp >= n_vregs { break }
+        if Vec_bool.at(present, vp) {
+            let p2 = Vec_usize.at(starts, vp)
+            let slot = Vec_usize.at(offsets, p2) + Vec_usize.at(cursor, p2)
+            Vec_usize.set_at(mutable order, slot, vp)
+            Vec_usize.set_at(mutable cursor, p2, Vec_usize.at(cursor, p2) + 1)
+        }
+        vp += 1
+    }
+
+    var i: usize = 0
+    loop decreases total - i {
+        if i >= total { break }
+        let v = Vec_usize.at(order, i)
+        push_interval(mutable out, body, v, Vec_usize.at(starts, v), Vec_usize.at(ends, v), allocator)?
+        i += 1
+    }
+}
+
+
+function push_interval(
+    out: mutable Vec_LiveInterval.Vec,
+    body: lir_body_mod.LirBody,
+    v: usize,
+    s: usize,
+    e: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let vreg = Vec_LirVReg.at(body.vregs, v)
+    let iv = LiveInterval {
+        vreg_raw: v as u32,
+        start: s,
+        end: e,
+        class_: vreg.class_,
+        pin: vreg.pin,
+    }
+    Vec_LiveInterval.push(mutable out, take iv, allocator)?
+}
+
+
+function new_bools(out: init Vec_bool.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_bool.Vec
+    Vec_bool.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_bool.push(mutable v, false, allocator)?
+        i += 1
+    }
+    out = v
+}
+
+
+function new_usizes(out: init Vec_usize.Vec, n: usize, allocator: Allocator) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit v: Vec_usize.Vec
+    Vec_usize.new(init v, allocator)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        Vec_usize.push(mutable v, 0 as usize, allocator)?
+        i += 1
+    }
+    out = v
+}

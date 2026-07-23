@@ -1,0 +1,198 @@
+
+module lower.flow.plan.plan
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+
+import local.flow.cfg.cfg as cfg_mod
+import local.flow.live.live as live_mod
+import local.flow.ssa.ssa as dom_mod
+import local.flow.plan.defs as defs_mod
+import local.flow.plan.place as place_mod
+
+
+spec std.collections.vec.Vec(mir_body_mod.BasicBlock)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(u32)
+spec std.collections.vec.Vec(u64)
+spec std.collections.vec.Vec(usize)
+
+
+public type MergePlan {
+    param_offsets: Vec_usize.Vec
+    param_locals: Vec_u32.Vec
+    param_values: Vec_u32.Vec
+}
+
+
+public function build(
+    out: init MergePlan,
+    body: mir_body_mod.MirBody,
+    cfg: cfg_mod.Cfg,
+    liv: live_mod.Liveness,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_blocks = Vec_BasicBlock.len(body.blocks)
+    let n_locals = Vec_Local.len(body.locals)
+
+    uninit dom: dom_mod.SsaDom
+    dom_mod.build(init dom, cfg, n_blocks, allocator)?
+
+    uninit def_offsets: Vec_usize.Vec
+    uninit def_pool: Vec_u32.Vec
+    defs_mod.collect_defs(init def_offsets, init def_pool, body, cfg, n_blocks, n_locals, allocator)?
+
+    let wpr = place_mod.words_per_row(n_locals)
+    uninit phi_bits: Vec_u64.Vec
+    place_mod.new_zeros(init phi_bits, n_blocks * wpr, allocator)?
+    uninit queued_bits: Vec_u64.Vec
+    place_mod.new_zeros(init queued_bits, n_blocks * wpr, allocator)?
+    uninit worklist: Vec_u32.Vec
+    Vec_u32.new(init worklist, allocator)?
+
+    var l: usize = 1
+    loop decreases n_locals - l {
+        if l >= n_locals { break }
+        place_mod.place_phis_for_local(
+            mutable phi_bits,
+            mutable queued_bits,
+            mutable worklist,
+            def_offsets,
+            def_pool,
+            dom,
+            cfg,
+            liv,
+            l,
+            n_blocks,
+            n_locals,
+            allocator,
+        )?
+        l += 1
+    }
+
+    uninit param_offsets: Vec_usize.Vec
+    uninit param_locals: Vec_u32.Vec
+    uninit param_values: Vec_u32.Vec
+    emit_params(init param_offsets, init param_locals, init param_values, phi_bits, n_blocks, n_locals, allocator)?
+
+    out = MergePlan {
+        param_offsets: param_offsets,
+        param_locals: param_locals,
+        param_values: param_values,
+    }
+}
+
+
+function emit_params(
+    offsets_out: init Vec_usize.Vec,
+    locals_out: init Vec_u32.Vec,
+    values_out: init Vec_u32.Vec,
+    phi_bits: Vec_u64.Vec,
+    n_blocks: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    uninit param_offsets: Vec_usize.Vec
+    Vec_usize.new(init param_offsets, allocator)?
+    uninit param_locals: Vec_u32.Vec
+    Vec_u32.new(init param_locals, allocator)?
+    uninit param_values: Vec_u32.Vec
+    Vec_u32.new(init param_values, allocator)?
+
+    let wpr = place_mod.words_per_row(n_locals)
+    Vec_usize.push(mutable param_offsets, 0, allocator)?
+    var b: usize = 0
+    loop decreases n_blocks - b {
+        if b >= n_blocks { break }
+        emit_block_params(mutable param_locals, mutable param_values, phi_bits, b, wpr, n_locals, allocator)?
+        Vec_usize.push(mutable param_offsets, Vec_u32.len(param_locals), allocator)?
+        b += 1
+    }
+
+    offsets_out = param_offsets
+    locals_out = param_locals
+    values_out = param_values
+}
+
+
+function emit_block_params(
+    param_locals: mutable Vec_u32.Vec,
+    param_values: mutable Vec_u32.Vec,
+    phi_bits: Vec_u64.Vec,
+    b: usize,
+    wpr: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let base = b * wpr
+    var w: usize = 0
+    loop decreases wpr - w {
+        if w >= wpr { break }
+        if base + w < Vec_u64.len(phi_bits) {
+            let word = Vec_u64.at(phi_bits, base + w)
+            if word != (0 as u64) {
+                emit_word_params(mutable param_locals, mutable param_values, word, w, n_locals, allocator)?
+            }
+        }
+        w += 1
+    }
+}
+
+
+function emit_word_params(
+    param_locals: mutable Vec_u32.Vec,
+    param_values: mutable Vec_u32.Vec,
+    word: u64,
+    w: usize,
+    n_locals: usize,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    var bit: usize = 0
+    loop decreases 64 - bit {
+        if bit >= 64 { break }
+        if ((word >> (bit as u64)) & (1 as u64)) == (1 as u64) {
+            let l = w * 64 + bit
+            if l < n_locals {
+                Vec_u32.push(mutable param_locals, l as u32 wrapping, allocator)?
+                Vec_u32.push(mutable param_values, 0 as u32, allocator)?
+            }
+        }
+        bit += 1
+    }
+}
+
+
+public function params_start(plan: MergePlan, block: usize) -> usize {
+    if block + 1 >= Vec_usize.len(plan.param_offsets) { return 0 }
+    return Vec_usize.at(plan.param_offsets, block)
+}
+
+public function params_end(plan: MergePlan, block: usize) -> usize {
+    if block + 1 >= Vec_usize.len(plan.param_offsets) { return 0 }
+    return Vec_usize.at(plan.param_offsets, block + 1)
+}
+
+public function param_local_at(plan: MergePlan, idx: usize) -> u32 {
+    if idx >= Vec_u32.len(plan.param_locals) { return 0 }
+    return Vec_u32.at(plan.param_locals, idx)
+}
+
+public function param_value_at(plan: MergePlan, idx: usize) -> u32 {
+    if idx >= Vec_u32.len(plan.param_values) { return 0 }
+    return Vec_u32.at(plan.param_values, idx)
+}
+
+public function set_param_value(plan: mutable MergePlan, idx: usize, raw: u32) -> () {
+    if idx >= Vec_u32.len(plan.param_values) { return }
+    Vec_u32.set_at(mutable plan.param_values, idx, raw)
+}

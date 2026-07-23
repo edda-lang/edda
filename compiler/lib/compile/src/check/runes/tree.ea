@@ -1,0 +1,69 @@
+
+module compile.check.runes.tree
+
+import std.collections.vec
+import std.mem.alloc
+import std.os.fs
+import std.text.string
+import cache.addr.hash as chash_mod
+import local.setup.env.discover as discover_mod
+import local.check.runes.util as util_mod
+
+spec std.collections.vec.Vec(String)
+
+
+public function tree_files(rfs: ReadOnlyFilesystem, dep_root: String, allocator: Allocator) -> Vec_String.Vec
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError, divergence}
+{
+    uninit files: Vec_String.Vec
+    Vec_String.new(init files, allocator)?
+    let src_dir = string.concat(dep_root, "/src", allocator)?
+    if fs.path_exists(rfs, src_dir) {
+        discover_mod.walk_dir(rfs, src_dir, mutable files, allocator)?
+    }
+    util_mod.sort_strings(mutable files)
+    return files
+}
+
+
+public function hash_tree(rfs: ReadOnlyFilesystem, dep_root: String, files: Vec_String.Vec, allocator: Allocator) -> String
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    var acc: String = ""
+    let manifest_path = string.concat(dep_root, "/package.toml", allocator)?
+    acc = append_file_line(rfs, acc, dep_root, manifest_path, allocator)?
+    let n = Vec_String.len(files)
+    var i: usize = 0
+    loop decreases (n - i) {
+        if i >= n { break }
+        acc = append_file_line(rfs, acc, dep_root, Vec_String.at(files, i), allocator)?
+        i = i + 1
+    }
+    return util_mod.hex_hash_of(acc, allocator)?
+}
+
+
+function append_file_line(
+    rfs: ReadOnlyFilesystem,
+    acc: String,
+    dep_root: String,
+    path: String,
+    allocator: Allocator,
+) -> String
+    with {rfs, allocator, err: fs.FsError, err: alloc.AllocError}
+{
+    let bytes = fs.read_bytes(rfs, path, allocator)?
+    let h = chash_mod.hash_bytes(bytes, allocator)?
+    let hex = chash_mod.to_hex_string(h, allocator)?
+    let path_bytes = path.bytes()
+    let root_len = dep_root.len()
+    let rel = if path_bytes.len() > root_len + 1 {
+        string.bytes_slice_to_string(path_bytes, root_len + 1, path_bytes.len(), allocator)?
+    } else {
+        string.clone(path, allocator)?
+    }
+    let a = string.concat(acc, rel, allocator)?
+    let b = string.concat(a, " blake3:", allocator)?
+    let c = string.concat(b, hex, allocator)?
+    return string.concat(c, "\n", allocator)?
+}

@@ -1,0 +1,56 @@
+module optimize.alias_mem.mem2reg
+
+import std.mem.alloc
+import std.collections.vec
+
+import mir.body.model as mir_body_mod
+import mir.id.local as mir_local_mod
+
+import local.alias_mem.escape as escape_mod
+import local.alias_mem.mem2reg.model as model_mod
+import local.alias_mem.mem2reg.scan.scan as scan_mod
+import local.alias_mem.mem2reg.rewrite as rewrite_mod
+
+
+spec std.collections.vec.Vec(bool)
+spec std.collections.vec.Vec(mir_body_mod.Local)
+spec std.collections.vec.Vec(model_mod.DefOp)
+
+
+public function run(
+    body: mutable mir_body_mod.MirBody,
+    info: escape_mod.EscapeInfo,
+    allocator: Allocator,
+) -> ()
+    with {allocator, err: alloc.AllocError}
+{
+    let n_locals: usize = Vec_Local.len(body.locals)
+    let counters = scan_mod.build_counters(body, n_locals, allocator)?
+
+    uninit candidate: Vec_bool.Vec
+    Vec_bool.new(init candidate, allocator)?
+    uninit subst: Vec_DefOp.Vec
+    Vec_DefOp.new(init subst, allocator)?
+
+    var any_candidate: bool = false
+    var li: usize = 0
+    loop decreases n_locals - li {
+        if li >= n_locals { break }
+        let fits_u32: bool = li <= 4294967295
+        let local_id = mir_local_mod.LocalId { raw: li as u32 wrapping }
+        let is_cand: bool = fits_u32 && scan_mod.qualifies(counters, info, body, local_id, li)
+        Vec_bool.push(mutable candidate, is_cand, allocator)?
+        let op_opt = scan_mod.candidate_def_op(counters, is_cand, li)
+        Vec_DefOp.push(mutable subst, take op_opt, allocator)?
+        if is_cand {
+            any_candidate = true
+        }
+        li += 1
+    }
+
+    if any_candidate == false {
+        return
+    }
+
+    rewrite_mod.rewrite_blocks(mutable body, candidate, subst, allocator)?
+}

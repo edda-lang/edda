@@ -1,0 +1,166 @@
+module jwt.jwt
+
+import std.mem.alloc
+import std.crypto.mac.hmac.sha256 as hmac
+import std.crypto.subtle
+import std.text.string
+import json.value.core as jvcore
+import json.encode.encoder as jvencode
+import json.parse.parser as jvparse
+import local.base64url as b64url
+
+
+public type Verified {
+    case valid(claims: jvcore.JsonValue)
+    case bad_signature
+    case malformed
+}
+
+function _header_json() -> String {
+    return "{\"alg\":\"HS256\",\"typ\":\"JWT\"}"
+}
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+function _to_string(bytes: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = bytes.len()
+    var buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        buf[i] = bytes[i]
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+function _hmac_b64url(secret: [u8], signing_input: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    var tag = allocator.alloc_array(u8, 32 as usize)?
+    hmac.hmac_sha256(secret, signing_input, mutable tag, 0 as usize)
+    return b64url.encode(tag, allocator)?
+}
+
+function _encode_claims(claims: take jvcore.JsonValue, allocator: mutable Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return handle err: jvencode.EncodeError -> { raise alloc.AllocError.out_of_memory } {
+        jvencode.encode_to_string(take claims, mutable allocator)?
+    }
+}
+
+public function sign(claims: take jvcore.JsonValue, secret: [u8], allocator: mutable Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let header_b64 = b64url.encode(_header_json().bytes(), allocator)?
+    let payload_json = _encode_claims(take claims, mutable allocator)?
+    let payload_b64 = b64url.encode(payload_json.bytes(), allocator)?
+    let dotted = string.concat(header_b64, ".", allocator)?
+    let signing_input = string.concat(dotted, payload_b64, allocator)?
+    let sig_b64 = _hmac_b64url(secret, signing_input.bytes(), allocator)?
+    let with_dot = string.concat(signing_input, ".", allocator)?
+    return string.concat(with_dot, sig_b64, allocator)?
+}
+
+function _find_dots(bytes: [u8]) -> (usize, usize, usize)
+    with {err: SplitError}
+{
+    let n = bytes.len()
+    var first: usize = n
+    var second: usize = n
+    var count: usize = 0
+    var i: usize = 0
+    loop decreases n - i {
+        if i >= n { break }
+        if bytes[i] == 46 as u8 {
+            if count == 0 as usize {
+                first = i
+            } else if count == 1 as usize {
+                second = i
+            }
+            count = count + 1 as usize
+        }
+        i = i + 1 as usize
+    }
+    if count != 2 as usize {
+        raise SplitError.wrong_part_count
+    }
+    return (first, second, n)
+}
+
+type SplitError {
+    case wrong_part_count
+}
+
+function _slice_to_string(bytes: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+    requires hi >= lo
+    requires hi <= bytes.len()
+{
+    return _to_string(bytes[lo..<hi], allocator)?
+}
+
+function _decode_segment(seg: String, allocator: mutable Allocator) -> jvcore.JsonValue
+    with {allocator, err: alloc.AllocError, err: DecodeError, divergence}
+{
+    let raw = handle err: b64url.Base64UrlError -> { raise DecodeError.bad_base64 } {
+        b64url.decode(seg, allocator)?
+    }
+    let json_str = _to_string(raw, allocator)?
+    return handle err: jvparse.ParseError -> { raise DecodeError.bad_json } {
+        jvparse.parse_string(json_str, mutable allocator)?
+    }
+}
+
+public type DecodeError {
+    case bad_base64
+    case bad_json
+}
+
+public function decode_header(token: String, allocator: mutable Allocator) -> jvcore.JsonValue
+    with {allocator, err: alloc.AllocError, err: DecodeError, divergence}
+{
+    let bytes = token.bytes()
+    let (first, _, _) = handle err: SplitError -> { raise DecodeError.bad_json } {
+        _find_dots(bytes)?
+    }
+    let header_seg = _slice_to_string(bytes, 0 as usize, first, allocator)?
+    return _decode_segment(header_seg, mutable allocator)?
+}
+
+public function decode_payload(token: String, allocator: mutable Allocator) -> jvcore.JsonValue
+    with {allocator, err: alloc.AllocError, err: DecodeError, divergence}
+{
+    let bytes = token.bytes()
+    let (first, second, _) = handle err: SplitError -> { raise DecodeError.bad_json } {
+        _find_dots(bytes)?
+    }
+    let payload_seg = _slice_to_string(bytes, first + 1 as usize, second, allocator)?
+    return _decode_segment(payload_seg, mutable allocator)?
+}
+
+public function verify(token: String, secret: [u8], allocator: mutable Allocator) -> Verified
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let bytes = token.bytes()
+    let dots = handle err: SplitError -> { return Verified.malformed } {
+        _find_dots(bytes)?
+    }
+    let (first, second, n) = dots
+    let signing_input = _slice_to_string(bytes, 0 as usize, second, allocator)?
+    let sig_b64 = _slice_to_string(bytes, second + 1 as usize, n, allocator)?
+    let expected_b64 = _hmac_b64url(secret, signing_input.bytes(), allocator)?
+    if !subtle.eq_bytes(expected_b64.bytes(), sig_b64.bytes()) {
+        return Verified.bad_signature
+    }
+    let payload_seg = _slice_to_string(bytes, first + 1 as usize, second, allocator)?
+    let claims = handle err: DecodeError -> { return Verified.malformed } {
+        _decode_segment(payload_seg, mutable allocator)?
+    }
+    return Verified.valid(claims: claims)
+}

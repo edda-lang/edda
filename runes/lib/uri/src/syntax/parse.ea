@@ -1,0 +1,171 @@
+
+module uri.syntax.parse
+
+import std.mem.alloc
+import std.core.option
+import std.text.string
+
+import uri.error
+import uri.value
+import uri.syntax.scan
+
+spec option.Option(String)
+spec option.Option(u16)
+spec option.Option(usize)
+
+function _alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+
+function _is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+function _is_upper(c: u8) -> bool {
+    return c >= 65 as u8 && c <= 90 as u8
+}
+
+function _is_lower(c: u8) -> bool {
+    return c >= 97 as u8 && c <= 122 as u8
+}
+
+function _is_alpha(c: u8) -> bool {
+    return _is_upper(c) || _is_lower(c)
+}
+
+function _is_scheme_char(c: u8) -> bool {
+    return _is_alpha(c)
+        || _is_digit(c)
+        || c == 43 as u8
+        || c == 45 as u8
+        || c == 46 as u8
+}
+
+function _to_lower(c: u8) -> u8 {
+    if _is_upper(c) {
+        return c +% (32 as u8)
+    }
+    return c
+}
+
+
+function _substring_lower(
+    src: [u8], lo: usize, hi: usize, allocator: Allocator,
+) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = hi - lo
+    let buf = _alloc_byte_slab(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[i] = _to_lower(src[lo + i])
+        i = i + 1 as usize
+    }
+    return string.from_owned_utf8(take buf)
+}
+
+
+function _scan_scheme(src: [u8]) -> usize
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    if n == 0 as usize { raise error.ParseError.empty_input }
+    if !_is_alpha(src[0 as usize]) {
+        raise error.ParseError.bad_scheme_start(at: 0 as usize)
+    }
+    var i: usize = 1 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n {
+            raise error.ParseError.missing_scheme(at: i)
+        }
+        let c = src[i]
+        if c == 58 as u8 { return i }
+        if !_is_scheme_char(c) {
+            raise error.ParseError.bad_scheme_char(at: i)
+        }
+        i = i + 1 as usize
+    }
+    raise error.ParseError.missing_scheme(at: i)
+}
+
+function _try_scan_scheme(src: [u8]) -> Option_usize {
+    let n = src.len()
+    if n == 0 as usize { return Option_usize.none }
+    if !_is_alpha(src[0 as usize]) { return Option_usize.none }
+    var i: usize = 1 as usize
+    loop decreases n - i + 1 as usize {
+        if i >= n { return Option_usize.none }
+        let c = src[i]
+        if c == 58 as u8 { return Option_usize.some(value: i) }
+        if !_is_scheme_char(c) { return Option_usize.none }
+        i = i + 1 as usize
+    }
+    return Option_usize.none
+}
+
+
+public function parse_bytes(src: [u8], allocator: Allocator) -> value.Uri
+    with {allocator, err: error.ParseError}
+{
+    return handle err: alloc.AllocError -> { raise error.ParseError.allocation_failed } {
+        let scheme_end = _scan_scheme(src)?
+        let scheme = _substring_lower(src, 0 as usize, scheme_end, allocator)?
+        let (userinfo, host, port, path, query, fragment) =
+            scan.parse_body(src, scheme_end + 1 as usize, allocator)?
+        value.Uri {
+            scheme: scheme,
+            userinfo: userinfo,
+            host: host,
+            port: port,
+            path: path,
+            query: query,
+            fragment: fragment,
+        }
+    }
+}
+
+public function parse(src: String, allocator: Allocator) -> value.Uri
+    with {allocator, err: error.ParseError}
+{
+    return parse_bytes(src.bytes(), allocator)?
+}
+
+public function parse_reference_bytes(
+    src: [u8], allocator: Allocator,
+) -> value.UriReference
+    with {allocator, err: error.ParseError}
+{
+    return handle err: alloc.AllocError -> { raise error.ParseError.allocation_failed } {
+        var scheme_opt: Option_String = Option_String.none
+        var cursor: usize = 0 as usize
+        match _try_scan_scheme(src) {
+            case .some(let end) => {
+                let s = _substring_lower(src, 0 as usize, end, allocator)?
+                scheme_opt = Option_String.some(value: s)
+                cursor = end + 1 as usize
+            }
+            case .none => {}
+        }
+        let (userinfo, host, port, path, query, fragment) =
+            scan.parse_body(src, cursor, allocator)?
+        value.UriReference {
+            scheme: scheme_opt,
+            userinfo: userinfo,
+            host: host,
+            port: port,
+            path: path,
+            query: query,
+            fragment: fragment,
+        }
+    }
+}
+
+public function parse_reference(
+    src: String, allocator: Allocator,
+) -> value.UriReference
+    with {allocator, err: error.ParseError}
+{
+    return parse_reference_bytes(src.bytes(), allocator)?
+}

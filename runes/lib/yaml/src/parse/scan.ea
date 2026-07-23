@@ -1,0 +1,140 @@
+
+module yaml.parse.scan
+
+import std.mem.alloc
+import std.text.string
+
+import yaml.error
+import yaml.value.core as value
+
+spec alloc.Box(value.YamlValue)
+
+public function alloc_byte_slab(allocator: Allocator, n: usize) -> [u8]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function alloc_entry_slots(allocator: Allocator, n: usize) -> [value.MappingEntry]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function alloc_item_slots(allocator: Allocator, n: usize) -> [Box_YamlValue]
+    with {allocator, err: alloc.AllocError}
+extern "__edda_alloc_array"
+
+public function bytes_to_string(b: [u8], allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    return string.bytes_slice_to_string(b, 0 as usize, b.len(), allocator)?
+}
+
+
+public function is_space(c: u8) -> bool {
+    return c == 32 as u8
+}
+
+public function is_tab(c: u8) -> bool {
+    return c == 9 as u8
+}
+
+public function is_ws(c: u8) -> bool {
+    return is_space(c) || is_tab(c)
+}
+
+public function is_newline(c: u8) -> bool {
+    return c == 10 as u8 || c == 13 as u8
+}
+
+public function is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+
+public function substring(src: [u8], lo: usize, hi: usize, allocator: Allocator) -> String
+    with {allocator, err: alloc.AllocError}
+{
+    let n = hi - lo
+    let buf = alloc_byte_slab(allocator, n)?
+    var i: usize = 0
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        buf[i] = src[lo + i]
+        i = i + 1 as usize
+    }
+    return bytes_to_string(buf, allocator)?
+}
+
+public function trim_right_ws(src: [u8], lo: usize, hi: usize) -> usize {
+    var b: usize = hi
+    loop decreases b - lo + 1 as usize {
+        if b <= lo { break }
+        if !is_ws(src[b - 1 as usize]) { break }
+        b = b - 1 as usize
+    }
+    return b
+}
+
+
+public function line_end(src: [u8], p: usize) -> usize {
+    let n = src.len()
+    var i: usize = p
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        if is_newline(src[i]) { return i }
+        i = i + 1 as usize
+    }
+    return n
+}
+
+public function advance_past_newline(src: [u8], p: usize) -> usize {
+    let n = src.len()
+    if p >= n { return n }
+    if src[p] == 13 as u8 {
+        if p + 1 as usize < n && src[p + 1 as usize] == 10 as u8 {
+            return p + 2 as usize
+        }
+        return p + 1 as usize
+    }
+    if src[p] == 10 as u8 {
+        return p + 1 as usize
+    }
+    return p
+}
+
+public function line_indent(src: [u8], line_start: usize) -> usize
+    with {err: error.ParseError}
+{
+    let n = src.len()
+    var i: usize = line_start
+    loop decreases n - i + 1 as usize {
+        if i >= n { break }
+        let c = src[i]
+        if is_tab(c) { raise error.ParseError.tab_indentation(at: i) }
+        if !is_space(c) { break }
+        i = i + 1 as usize
+    }
+    return i - line_start
+}
+
+public function is_blank_or_comment_line(src: [u8], line_start: usize) -> bool {
+    let line_hi = line_end(src, line_start)
+    var i: usize = line_start
+    loop decreases line_hi - i + 1 as usize {
+        if i >= line_hi { return true }
+        let c = src[i]
+        if c == 35 as u8 { return true }
+        if !is_ws(c) { return false }
+        i = i + 1 as usize
+    }
+    return true
+}
+
+public function skip_blanks_and_comments(src: [u8], p: usize) -> usize {
+    let n = src.len()
+    var c: usize = p
+    loop decreases n - c + 1 as usize {
+        if c >= n { break }
+        if !is_blank_or_comment_line(src, c) { break }
+        c = advance_past_newline(src, line_end(src, c))
+    }
+    return c
+}

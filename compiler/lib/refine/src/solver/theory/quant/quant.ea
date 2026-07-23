@@ -1,0 +1,180 @@
+
+module refine.solver.theory.quant.quant
+
+import std.collections.vec
+import std.mem.alloc
+import intern.symbol as symbol_mod
+import local.smt.term as term_mod
+
+
+spec std.mem.alloc.Box(term_mod.SmtTerm)
+spec std.collections.vec.Vec(term_mod.SmtTerm)
+
+
+public function substitute(
+    term: term_mod.SmtTerm,
+    binder: symbol_mod.Symbol,
+    value: i64,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    return match term {
+        case .var_(let name, _) => substitute_var(term, name, binder, value)
+        case .app(let op, let args) => subst_app(op, args, binder, value, allocator)?
+        case .forall_(let b2, let s2, let body) => subst_quant(true, b2, s2, body, binder, value, allocator)?
+        case .exists_(let b2, let s2, let body) => subst_quant(false, b2, s2, body, binder, value, allocator)?
+        case _ => term
+    }
+}
+
+
+function substitute_var(
+    term: term_mod.SmtTerm,
+    name: symbol_mod.Symbol,
+    binder: symbol_mod.Symbol,
+    value: i64,
+) -> term_mod.SmtTerm {
+    if name == binder {
+        return term_mod.SmtTerm.numeral(value: value as i128)
+    }
+    return term
+}
+
+
+function subst_app(
+    op: term_mod.SmtOp,
+    args: Vec_SmtTerm.Vec,
+    binder: symbol_mod.Symbol,
+    value: i64,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit new_args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init new_args, allocator)?
+    let n = Vec_SmtTerm.len(args)
+    var i: usize = 0
+    loop
+        decreases (n - i)
+    {
+        if i >= n {
+            break
+        }
+        let arg = Vec_SmtTerm.at(args, i)
+        let s = substitute(arg, binder, value, allocator)?
+        Vec_SmtTerm.push(mutable new_args, take s, allocator)?
+        i = i + 1
+    }
+    return term_mod.SmtTerm.app(op: op, args: new_args)
+}
+
+
+function subst_quant(
+    is_forall: bool,
+    inner_binder: symbol_mod.Symbol,
+    sort: term_mod.SmtSort,
+    body: Box_SmtTerm,
+    binder: symbol_mod.Symbol,
+    value: i64,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    if inner_binder == binder {
+        return rebuild_quant(is_forall, inner_binder, sort, body)
+    }
+    let inner = Box_SmtTerm.get(body)
+    let substituted = substitute(inner, binder, value, allocator)?
+    let new_body = Box_SmtTerm.new(take substituted, allocator)?
+    return rebuild_quant(is_forall, inner_binder, sort, new_body)
+}
+
+
+function rebuild_quant(
+    is_forall: bool,
+    inner_binder: symbol_mod.Symbol,
+    sort: term_mod.SmtSort,
+    body: Box_SmtTerm,
+) -> term_mod.SmtTerm {
+    if is_forall {
+        return term_mod.SmtTerm.forall_(binder: inner_binder, binder_sort: sort, body: body)
+    }
+    return term_mod.SmtTerm.exists_(binder: inner_binder, binder_sort: sort, body: body)
+}
+
+
+function and_term(a: term_mod.SmtTerm, b: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take a, allocator)?
+    Vec_SmtTerm.push(mutable args, take b, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.and_, args: args)
+}
+
+
+function or_term(a: term_mod.SmtTerm, b: term_mod.SmtTerm, allocator: Allocator) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    uninit args: Vec_SmtTerm.Vec
+    Vec_SmtTerm.new(init args, allocator)?
+    Vec_SmtTerm.push(mutable args, take a, allocator)?
+    Vec_SmtTerm.push(mutable args, take b, allocator)?
+    return term_mod.SmtTerm.app(op: term_mod.SmtOp.or_, args: args)
+}
+
+
+public function expand_forall(
+    binder: symbol_mod.Symbol,
+    body: term_mod.SmtTerm,
+    lo: i64,
+    hi: i64,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let count: usize = if hi > lo { (hi - lo) as usize } else { 0 }
+    var acc = term_mod.SmtTerm.true_
+    var idx: usize = 0
+    loop
+        decreases (count - idx)
+    {
+        if idx >= count {
+            break
+        }
+        let k = lo + (idx as i64)
+        let inst = substitute(body, binder, k, allocator)?
+        acc = and_term(acc, inst, allocator)?
+        idx = idx + 1
+    }
+    return acc
+}
+
+
+public function expand_exists(
+    binder: symbol_mod.Symbol,
+    body: term_mod.SmtTerm,
+    lo: i64,
+    hi: i64,
+    allocator: Allocator,
+) -> term_mod.SmtTerm
+    with {allocator, err: alloc.AllocError, divergence}
+{
+    let count: usize = if hi > lo { (hi - lo) as usize } else { 0 }
+    var acc = term_mod.SmtTerm.false_
+    var idx: usize = 0
+    loop
+        decreases (count - idx)
+    {
+        if idx >= count {
+            break
+        }
+        let k = lo + (idx as i64)
+        let inst = substitute(body, binder, k, allocator)?
+        acc = or_term(acc, inst, allocator)?
+        idx = idx + 1
+    }
+    return acc
+}
